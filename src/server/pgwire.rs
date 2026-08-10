@@ -322,8 +322,7 @@ impl PgConn {
                 // Use a dummy salt + iteration count so the handshake
                 // proceeds and fails at the proof step. For simplicity we
                 // just reject now.
-                let _ =
-                    self.send_error("28000", &format!("user \"{username}\" does not exist")).await;
+                let _ = self.send_error("28000", "authentication failed").await;
                 self.flush().await?;
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unknown user"));
             }
@@ -505,7 +504,7 @@ impl PgConn {
                     self.send_command_complete(&command_tag(&r, trimmed), r.row_count).await?;
                 }
                 Err(e) => {
-                    let _ = self.send_error("42000", &format!("{e}")).await;
+                    let _ = self.send_error(e.sqlstate(), &format!("{e}")).await;
                     if was_txn {
                         self.session.txn = TxnStatus::FailedTransaction;
                     }
@@ -799,7 +798,7 @@ impl PgConn {
                 }
             }
             Err(e) => {
-                let _ = self.send_error("42000", &format!("{e}")).await;
+                let _ = self.send_error(e.sqlstate(), &format!("{e}")).await;
             }
         }
         Ok(())

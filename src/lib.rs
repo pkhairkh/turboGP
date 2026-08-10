@@ -124,6 +124,42 @@ mod error {
         Timeout(u64),
     }
 
+    impl Error {
+        /// Map an Error to its SQLSTATE SQL state code (Wave 2 security fix).
+        ///
+        /// See: https://www.postgresql.org/docs/current/errcodes-appendix.html
+        #[must_use]
+        pub fn sqlstate(&self) -> &'static str {
+            match self {
+                Error::NotFound(_) => "42P01",        // undefined_table
+                Error::Parse(_) => "42601",           // syntax_error
+                Error::InvalidArg(_) => "22023",      // invalid_parameter_value
+                Error::DimMismatch { .. } => "22000", // data_exception
+                Error::Corruption(_) => "XX001",      // data_corrupted
+                Error::Io(_) => "58030",              // io_error
+                Error::Json(_) => "22P02",            // invalid_text_representation
+                Error::Unsupported(_) => "0A000",     // feature_not_supported
+                Error::Tier(_) => "55006",            // object_in_use
+                Error::Protocol(_) => "08000",        // connection_exception
+                Error::Timeout(_) => "57014",         // query_canceled
+                Error::Other(msg) => {
+                    // Check for constraint violations in the message text.
+                    if msg.contains("23502") || msg.contains("NOT NULL") {
+                        "23502" // not_null_violation
+                    } else if msg.contains("23505") || msg.contains("unique") {
+                        "23505" // unique_violation
+                    } else if msg.contains("23503") || msg.contains("foreign key") {
+                        "23503" // foreign_key_violation
+                    } else if msg.contains("42501") || msg.contains("not in allowed_copy_dirs") {
+                        "42501" // insufficient_privilege
+                    } else {
+                        "42000" // syntax_error_or_access_rule_violation (fallback)
+                    }
+                }
+            }
+        }
+    }
+
     /// Convenience Result alias.
     pub type Result<T> = std::result::Result<T, Error>;
 }
