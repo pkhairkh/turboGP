@@ -3,7 +3,8 @@
 //! and verifies the full protocol: startup, simple query, error handling,
 //! multi-statement batch.
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use turbogp::engine::QueryEngine;

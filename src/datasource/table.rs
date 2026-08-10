@@ -41,6 +41,10 @@ pub struct Table {
     /// Optional table schema preserving column types from DDL (Wave 36).
     /// None for tables loaded from Parquet/CSV (no DDL).
     pub schema: Option<crate::schema::table_schema::TableSchema>,
+    /// Row version metadata for MVCC (Wave 4). Each entry is parallel to
+    /// a row in `columns`. `xmin` = creating txn, `xmax` = deleting txn (0 = live).
+    /// Empty when MVCC is not in use (backward compatible).
+    pub row_versions: Vec<crate::txn::mvcc::RowVersion>,
 }
 
 impl Table {
@@ -92,6 +96,7 @@ impl Table {
             string_columns,
             null_bitmaps,
             schema: None,
+            row_versions: Vec::new(),
         }
     }
 

@@ -8,7 +8,8 @@
 //! This test does NOT use synthetic data — it boots the real server via
 //! `Server::bind` and uses the real pgwire protocol via raw TCP.
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use turbogp::engine::QueryEngine;

@@ -11,7 +11,8 @@
 //!    max_rows: it sends at most max_rows DataRow messages and signals
 //!    PortalSuspended ('s') when more rows remain.
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use turbogp::engine::QueryEngine;

@@ -15,8 +15,9 @@ pub use pgwire::PgConn;
 pub use session::Session;
 
 use crate::engine::QueryEngine;
+use parking_lot::RwLock;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -55,10 +56,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("auth_required", &self.auth_required)
             .field("tls", &self.tls)
             .field("max_connections", &self.max_connections)
-            .field(
-                "passwords",
-                &format!("<{} users>", self.passwords.read().map(|m| m.len()).unwrap_or(0)),
-            )
+            .field("passwords", &format!("<{} users>", self.passwords.read().len()))
             .finish()
     }
 }

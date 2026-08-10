@@ -1744,6 +1744,7 @@ fn eval_arith_row(
                     string_columns: vec![],
                     null_bitmaps: vec![],
                     schema: None,
+                    row_versions: Vec::new(),
                 },
             )
             .unwrap_or(0);
