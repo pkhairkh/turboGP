@@ -4,7 +4,7 @@
 //! extensions (ADR-015 approximate aggregation, ADR-010 tier pinning, etc.).
 //! This module provides the tokenizer, the recursive-descent parser for
 //! standard `SELECT`, the extension scanner, and the lowering pass that
-//! turns a parsed query into a [`crate::executor::plan::LogicalPlan`].
+//! turns a parsed query into a LogicalPlan.
 //!
 //! ## Pipeline
 //!
@@ -38,7 +38,6 @@ pub mod dml;
 pub mod extensions;
 pub mod lexer;
 pub mod parser;
-pub mod plan;
 
 pub use cte::{parse_with, CteDef, WithClause};
 pub use ddl::{
@@ -49,7 +48,6 @@ pub use dml::{parse_dml, Delete, DmlStatement, Insert, Update};
 pub use extensions::{parse_extensions, parse_extensions_and_strip, QueryExtensions};
 pub use lexer::{tokenize, Token, KEYWORDS};
 pub use parser::{parse, Expr, SelectItem, SelectQuery, Value};
-pub use plan::build_plan;
 
 /// Parse a SQL string into a `(SelectQuery, QueryExtensions)` pair.
 ///

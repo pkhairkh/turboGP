@@ -48,19 +48,15 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod catalog;
-pub mod compress;
 pub mod datasource;
 pub mod engine;
 pub mod exec;
-pub mod executor;
 pub mod index;
 pub mod kernel;
 pub mod memory;
 pub mod planner;
-pub mod protocol;
 pub mod schema;
 pub mod server;
-pub mod sketch;
 pub mod sql;
 pub mod storage;
 pub mod txn;

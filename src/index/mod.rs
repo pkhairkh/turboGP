@@ -13,6 +13,4 @@
 //! u64-only) for raw instruction throughput: every primitive operation is
 //! a bitwise SIMD-friendly op over a contiguous bit-vector.
 
-pub mod bsi;
-pub mod lsh;
 pub mod manager;
