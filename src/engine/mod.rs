@@ -253,14 +253,23 @@ impl QueryEngine {
     /// durable after COMMIT.
     pub fn with_data_dir<P: AsRef<std::path::Path>>(data_dir: P) -> Result<Self> {
         let data_dir = data_dir.as_ref();
-        let mut engine = Self::new();
+        // Use in_memory() to get a clean engine, then wire persistence.
+        // (Self::new() would recurse into with_data_dir, causing infinite loop.)
+        let mut engine = Self::in_memory();
         let bp = crate::storage::buffer_pool::BufferPool::new(data_dir, 256)?;
         engine.buffer_pool = Some(bp);
         // Also open a WAL in the same data directory.
         let wal_path = data_dir.join("wal.log");
         let wal = crate::storage::recovery::Wal::open(&wal_path)?;
         engine.wal = Some(wal);
-        // Replay the WAL to restore committed state.
+        // Wave 5 (A4 fix): Load checkpoint BEFORE replaying WAL.
+        // The checkpoint contains the catalog state at the last VACUUM;
+        // WAL replay then applies any records written after the checkpoint.
+        let checkpoint_path = data_dir.join("checkpoint.sql");
+        if let Err(e) = crate::storage::recovery::Checkpoint::load(&mut engine, &checkpoint_path) {
+            log::warn!("checkpoint load failed: {e}");
+        }
+        // Replay the WAL to restore committed state after the checkpoint.
         engine.replay_wal()?;
         Ok(engine)
     }
