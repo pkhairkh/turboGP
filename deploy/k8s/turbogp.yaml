@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: turbogp
+  labels:
+    app: turbogp
+spec:
+  serviceName: turbogp
+  replicas: 1
+  selector:
+    matchLabels:
+      app: turbogp
+  template:
+    metadata:
+      labels:
+        app: turbogp
+    spec:
+      containers:
+        - name: turbogp
+          image: turbogp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+              name: pgwire
+          env:
+            - name: TURBOGP_DATA_DIR
+              value: /data
+            - name: TURBOGP_LISTEN_PORT
+              value: "5432"
+            - name: RUST_LOG
+              value: info
+            - name: RUST_BACKTRACE
+              value: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "4000m"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: turbogp
+  labels:
+    app: turbogp
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: pgwire
+      protocol: TCP
+  selector:
+    app: turbogp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: turbogp-config
+data:
+  TURBOGP_DATA_DIR: /data
+  TURBOGP_LISTEN_PORT: "5432"
+  RUST_LOG: info
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: turbogp-secret
+type: Opaque
+stringData:
+  TURBOGP_ADMIN_PASSWORD: "changeme"
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: turbogp-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: turbogp

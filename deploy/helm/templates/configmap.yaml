@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+data:
+  TURBOGP_DATA_DIR: {{ .Values.config.dataDir | quote }}
+  TURBOGP_LISTEN_PORT: {{ .Values.config.listenPort | quote }}
+  RUST_LOG: {{ .Values.config.rustLog | quote }}
