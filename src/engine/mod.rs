@@ -740,10 +740,24 @@ impl QueryEngine {
             // transaction state.
             std::mem::swap(&mut self.catalog, &mut txn.snapshot);
             self.txn_manager.active = Some(txn);
-            return result;
+            let mut result = result?;
+            // Wave 12: Slow query logging.
+            let elapsed_ms = start.elapsed().as_millis();
+            if elapsed_ms > 100 {
+                log::warn!("slow query ({} ms): {}", elapsed_ms, sql.trim());
+            }
+            result.elapsed_us = start.elapsed().as_micros() as u64;
+            return Ok(result);
         }
 
-        self.execute_inner(sql, &start, None)
+        let mut result = self.execute_inner(sql, &start, None)?;
+        // Wave 12: Slow query logging.
+        let elapsed_ms = start.elapsed().as_millis();
+        if elapsed_ms > 100 {
+            log::warn!("slow query ({} ms): {}", elapsed_ms, sql.trim());
+        }
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
     }
 
     /// Inner execution: dispatches DDL, DML, CTE, and SELECT without

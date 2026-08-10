@@ -46,6 +46,14 @@ pub struct ServerConfig {
     /// New connections beyond this limit receive a pgwire error and are
     /// closed. Defaults to 128.
     pub max_connections: usize,
+    /// Query timeout in milliseconds (Wave 12). Queries that exceed this
+    /// duration are aborted with SQLSTATE 57014. 0 = no timeout.
+    /// Default: 30000 (30 seconds).
+    pub statement_timeout_ms: u64,
+    /// Slow query threshold in milliseconds (Wave 12). Queries that exceed
+    /// this duration are logged at WARN level. 0 = no slow query logging.
+    /// Default: 100 (100ms).
+    pub slow_query_threshold_ms: u64,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -72,6 +80,8 @@ impl Default for ServerConfig {
             tls: None,
             passwords: Arc::new(RwLock::new(PasswordManager::new())),
             max_connections: 128,
+            statement_timeout_ms: 30_000,
+            slow_query_threshold_ms: 100,
         }
     }
 }

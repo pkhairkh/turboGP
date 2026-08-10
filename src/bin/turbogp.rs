@@ -104,6 +104,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls: None, // TODO: wire TLS from --tls-cert/--tls-key (Wave 1 follow-up)
         passwords: Arc::new(RwLock::new(PasswordManager::new())),
         max_connections: args.max_connections,
+        statement_timeout_ms: 30_000,
+        slow_query_threshold_ms: 100,
     };
 
     // Start the server.
