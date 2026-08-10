@@ -57,7 +57,7 @@
 
 pub mod executor;
 pub mod result;
-pub mod tpch;
+pub mod query_interpreter;
 
 pub use executor::execute_select;
 pub use result::{QueryResult, ResultColumn};
@@ -162,8 +162,8 @@ impl QueryEngine {
         let (query, extensions) = match crate::sql::parse_with_extensions(sql) {
             Ok(qe) => qe,
             Err(_parse_err) => {
-                // Basic parser failed — need tpch fallback, which requires &mut self.
-                return Err(Error::Other("query needs tpch fallback — requires write lock".into()));
+                // Basic parser failed — need interpreter fallback, which requires &mut self.
+                return Err(Error::Other("query needs interpreter fallback — requires write lock".into()));
             }
         };
 
@@ -179,8 +179,8 @@ impl QueryEngine {
                 Ok(result)
             }
             Err(_exec_err) => {
-                // execute_select failed — need tpch fallback.
-                Err(Error::Other("query failed in execute_select — needs tpch fallback".into()))
+                // execute_select failed — need interpreter fallback.
+                Err(Error::Other("query failed in execute_select — needs interpreter fallback".into()))
             }
         }
     }
@@ -971,10 +971,10 @@ impl QueryEngine {
                 // The basic parser failed — try the TPC-H interpreter
                 // which has a richer parser (CASE, EXTRACT, subqueries,
                 // HAVING, arithmetic in aggregates, etc.).
-                let mut tpch_result =
-                    crate::engine::tpch::parse_and_execute(&expanded_sql, &self.catalog)?;
-                tpch_result.elapsed_us = start.elapsed().as_micros() as u64;
-                return Ok(tpch_result);
+                let mut interpreter_result =
+                    crate::engine::query_interpreter::parse_and_execute(&expanded_sql, &self.catalog)?;
+                interpreter_result.elapsed_us = start.elapsed().as_micros() as u64;
+                return Ok(interpreter_result);
             }
         };
 
@@ -1024,17 +1024,17 @@ impl QueryEngine {
                 // as a fallback. This handles queries with features the
                 // basic executor doesn't support (multi-aggregate, HAVING,
                 // CASE WHEN, subqueries, etc.).
-                let mut tpch_result =
-                    crate::engine::tpch::parse_and_execute(&expanded_sql, &self.catalog)
+                let mut interpreter_result =
+                    crate::engine::query_interpreter::parse_and_execute(&expanded_sql, &self.catalog)
                         .map_err(|_| exec_err)?;
-                // Wave 60d: apply DISTINCT deduplication even on the tpch
-                // fallback path (the tpch parser skips DISTINCT but doesn't
+                // Wave 60d: apply DISTINCT deduplication even on the interpreter
+                // fallback path (the interpreter parser skips DISTINCT but doesn't
                 // deduplicate).
                 if query.distinct {
-                    tpch_result = deduplicate_rows(tpch_result);
+                    interpreter_result = deduplicate_rows(interpreter_result);
                 }
-                tpch_result.elapsed_us = start.elapsed().as_micros() as u64;
-                Ok(tpch_result)
+                interpreter_result.elapsed_us = start.elapsed().as_micros() as u64;
+                Ok(interpreter_result)
             }
         }
     }
@@ -2130,13 +2130,13 @@ impl QueryEngine {
 
     /// Execute a TPC-H SQL query using the dedicated TPC-H interpreter.
     ///
-    /// This path uses `src/engine/tpch.rs` which has a richer parser
+    /// This path uses `src/engine/interpreter.rs` which has a richer parser
     /// (arithmetic in aggregates, CASE WHEN, EXTRACT, BETWEEN, IN,
     /// subqueries, derived tables, multi-table implicit joins, HAVING,
     /// LEFT JOIN) and a type-aware row-based evaluator.
-    pub fn execute_tpch(&self, sql: &str) -> Result<QueryResult> {
+    pub fn execute_interpreter(&self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
-        let mut result = crate::engine::tpch::parse_and_execute(sql, &self.catalog)?;
+        let mut result = crate::engine::query_interpreter::parse_and_execute(sql, &self.catalog)?;
         result.elapsed_us = start.elapsed().as_micros() as u64;
         Ok(result)
     }

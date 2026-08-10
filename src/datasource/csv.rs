@@ -174,16 +174,16 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
 //     the actual strings to hash them with xxh3_64 — see
 //     `execute_string_group_by` in `src/engine/dispatch.rs`).
 //
-// `read_tpch_csv` solves all four: it splits on `|`, looks up a
+// `read_tpc_h_csv` solves all four: it splits on `|`, looks up a
 // hardcoded per-table schema, and encodes each column to match the
 // parquet reader's `Vec<u64>` cell format exactly (Int64 / Float64 /
 // Date / String). String columns additionally carry a
 // `StringSearchColumn` for LIKE + GROUP BY.
 
 /// TPC-H column types for the schema-aware CSV loader. See
-/// [`tpch_schema`] for the per-table mapping.
+/// [`tpc_h_schema`] for the per-table mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TpchType {
+pub enum TpcHType {
     /// 64-bit signed integer — `value as u64` (bit-reinterpret for
     /// negatives). Matches parquet reader's `Int64` arm.
     Int64,
@@ -207,9 +207,9 @@ pub enum TpchType {
 /// matches the canonical TPC-H Table-Maintenance specs).
 ///
 /// Returns `None` for unknown table names so callers can fail fast.
-pub fn tpch_schema(table: &str) -> Option<Vec<(&'static str, TpchType)>> {
-    use TpchType::*;
-    let schema: Vec<(&'static str, TpchType)> = match table {
+pub fn tpc_h_schema(table: &str) -> Option<Vec<(&'static str, TpcHType)>> {
+    use TpcHType::*;
+    let schema: Vec<(&'static str, TpcHType)> = match table {
         "customer" => vec![
             ("c_custkey", Int64),
             ("c_name", String),
@@ -352,7 +352,7 @@ fn strip_quotes(field: &[u8]) -> &[u8] {
 
 /// Read a TPC-H pipe-delimited CSV file with a known schema.
 ///
-/// `table_name` selects the schema via [`tpch_schema`] (one of
+/// `table_name` selects the schema via [`tpc_h_schema`] (one of
 /// `customer`, `lineitem`, `nation`, `orders`, `part`, `partsupp`,
 /// `region`, `supplier`). The CSV file must have a header row (column
 /// names); the header is read and skipped — the output columns take
@@ -383,9 +383,9 @@ fn strip_quotes(field: &[u8]) -> &[u8] {
 /// - the file cannot be opened,
 /// - a row has the wrong number of `|`-separated fields,
 /// - an integer / float field fails to parse.
-pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dyn Error>> {
+pub fn read_tpc_h_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dyn Error>> {
     let schema =
-        tpch_schema(table_name).ok_or_else(|| format!("unknown TPC-H table: {}", table_name))?;
+        tpc_h_schema(table_name).ok_or_else(|| format!("unknown TPC-H table: {}", table_name))?;
     let ncols = schema.len();
 
     let file = File::open(path)?;
@@ -417,7 +417,7 @@ pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dy
     // for the integer/float/date columns).
     let mut col_strings: Vec<Vec<String>> = (0..ncols).map(|_| Vec::new()).collect();
     for (i, (_, t)) in schema.iter().enumerate() {
-        if *t == TpchType::String {
+        if *t == TpcHType::String {
             col_strings[i] = Vec::with_capacity(est_rows);
         }
     }
@@ -431,7 +431,7 @@ pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dy
     line_buf.clear();
     let n = reader.read_until(b'\n', &mut line_buf)?;
     if n == 0 {
-        return Err("tpch csv: file is empty (no header)".into());
+        return Err("interpreter csv: file is empty (no header)".into());
     }
 
     // Wrap reader in a mutable binding so we can call read_until.
@@ -490,7 +490,7 @@ pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dy
 
         if field_count != ncols {
             return Err(format!(
-                "tpch[{}] row {} has {} fields, expected {} (line: {:?})",
+                "interpreter[{}] row {} has {} fields, expected {} (line: {:?})",
                 table_name,
                 row_count + 1,
                 field_count,
@@ -504,20 +504,20 @@ pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dy
             let field = strip_quotes(field_slices[i]);
             let (_, t) = schema[i];
             match t {
-                TpchType::Int64 => {
+                TpcHType::Int64 => {
                     let s = std::str::from_utf8(field)?;
                     let v: i64 = s.parse()?;
                     col_cells[i].push(v as u64);
                 }
-                TpchType::Float64 => {
+                TpcHType::Float64 => {
                     let s = std::str::from_utf8(field)?;
                     let v: f64 = s.parse()?;
                     col_cells[i].push(v.to_bits());
                 }
-                TpchType::Date => {
+                TpcHType::Date => {
                     col_cells[i].push(parse_date_to_days(field));
                 }
-                TpchType::String => {
+                TpcHType::String => {
                     // TPC-H text is ASCII; `from_utf8` succeeds in
                     // the common case (no allocation). On the rare
                     // non-ASCII byte sequence, fall back to lossy.
@@ -554,7 +554,7 @@ pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dy
     }
 
     // Use `table_name` as the LoadedTable's name (NOT the path-derived
-    // `tpch_lineitem` stem) so callers can `SELECT ... FROM lineitem`
+    // `tpc_h_lineitem` stem) so callers can `SELECT ... FROM lineitem`
     // directly after registering the table without an extra rename
     // step. This matches the convention used by `QueryEngine::load_csv`
     // and `QueryEngine::load_parquet`, which both rename to the
@@ -680,18 +680,18 @@ mod tests {
 
     // === TPC-H loader tests (Wave 5) ===
 
-    /// `tpch_schema` returns the right number of columns per table.
+    /// `tpc_h_schema` returns the right number of columns per table.
     #[test]
-    fn tpch_schema_column_counts() {
-        assert_eq!(tpch_schema("region").unwrap().len(), 3);
-        assert_eq!(tpch_schema("nation").unwrap().len(), 4);
-        assert_eq!(tpch_schema("supplier").unwrap().len(), 7);
-        assert_eq!(tpch_schema("customer").unwrap().len(), 8);
-        assert_eq!(tpch_schema("part").unwrap().len(), 9);
-        assert_eq!(tpch_schema("partsupp").unwrap().len(), 5);
-        assert_eq!(tpch_schema("orders").unwrap().len(), 9);
-        assert_eq!(tpch_schema("lineitem").unwrap().len(), 16);
-        assert!(tpch_schema("unknown").is_none());
+    fn tpc_h_schema_column_counts() {
+        assert_eq!(tpc_h_schema("region").unwrap().len(), 3);
+        assert_eq!(tpc_h_schema("nation").unwrap().len(), 4);
+        assert_eq!(tpc_h_schema("supplier").unwrap().len(), 7);
+        assert_eq!(tpc_h_schema("customer").unwrap().len(), 8);
+        assert_eq!(tpc_h_schema("part").unwrap().len(), 9);
+        assert_eq!(tpc_h_schema("partsupp").unwrap().len(), 5);
+        assert_eq!(tpc_h_schema("orders").unwrap().len(), 9);
+        assert_eq!(tpc_h_schema("lineitem").unwrap().len(), 16);
+        assert!(tpc_h_schema("unknown").is_none());
     }
 
     /// `parse_date_to_days` matches the canonical Unix-epoch day
@@ -745,13 +745,13 @@ mod tests {
     /// Load a tiny pipe-delimited region CSV and verify all column
     /// types are encoded correctly.
     #[test]
-    fn read_tpch_csv_region_mini() {
+    fn read_tpc_h_csv_region_mini() {
         let csv = "r_regionkey|r_name|r_comment\n\
                    0|AFRICA|lazy dog\n\
                    1|AMERICA|quick brown fox\n\
                    2|ASIA|jumps over\n";
         let (_tmp, path) = write_tmp(csv);
-        let table = read_tpch_csv(&path, "region").expect("read");
+        let table = read_tpc_h_csv(&path, "region").expect("read");
 
         assert_eq!(table.row_count, 3);
         assert_eq!(table.columns.len(), 3);
@@ -781,7 +781,7 @@ mod tests {
     /// Load a tiny lineitem CSV with a Float column and a Date column
     /// to verify the Float64 bit-encoding and Date day-encoding.
     #[test]
-    fn read_tpch_csv_lineitem_mini_types() {
+    fn read_tpc_h_csv_lineitem_mini_types() {
         // Minimal lineitem: 3 rows × all 16 columns. We only assert
         // the Float64 (l_quantity) and Date (l_shipdate) encodings.
         let csv = "l_orderkey|l_partkey|l_suppkey|l_linenumber|l_quantity|l_extendedprice|l_discount|l_tax|l_returnflag|l_linestatus|l_shipdate|l_commitdate|l_receiptdate|l_shipinstruct|l_shipmode|l_comment\n\
@@ -789,7 +789,7 @@ mod tests {
                    2|67310|7311|2|36.00|45983.16|0.09|0.06|N|O|1996-04-12|1996-02-28|1996-04-20|TAKE BACK RETURN|MAIL|blah2\n\
                    3|63700|3701|3|8.00|13309.60|0.10|0.02|R|F|1994-02-02|1994-01-04|1994-02-23|TAKE BACK RETURN|FOB|blah3\n";
         let (_tmp, path) = write_tmp(csv);
-        let table = read_tpch_csv(&path, "lineitem").expect("read");
+        let table = read_tpc_h_csv(&path, "lineitem").expect("read");
 
         assert_eq!(table.row_count, 3);
         assert_eq!(table.columns.len(), 16);
@@ -831,14 +831,14 @@ mod tests {
     /// Quoted string fields (e.g. `"Customer#000000001"`) have their
     /// surrounding quotes stripped.
     #[test]
-    fn read_tpch_csv_strips_quotes() {
+    fn read_tpc_h_csv_strips_quotes() {
         // customer schema: c_custkey, c_name, c_address, c_nationkey,
         // c_phone, c_acctbal, c_mktsegment, c_comment. c_name is
         // quoted in the real dbgen output.
         let csv = "c_custkey|c_name|c_address|c_nationkey|c_phone|c_acctbal|c_mktsegment|c_comment\n\
                    1|\"Customer#000000001\"|j5JsirBM9PsCy0O1m|15|25-989-741-2988|711.56|BUILDING|hi\n";
         let (_tmp, path) = write_tmp(csv);
-        let table = read_tpch_csv(&path, "customer").expect("read");
+        let table = read_tpc_h_csv(&path, "customer").expect("read");
 
         assert_eq!(table.row_count, 1);
         // c_name (col 1): the StringSearchColumn should hold the
@@ -853,34 +853,34 @@ mod tests {
 
     /// Unknown table name → error.
     #[test]
-    fn read_tpch_csv_unknown_table_errors() {
+    fn read_tpc_h_csv_unknown_table_errors() {
         let (_tmp, path) = write_tmp("a|b\n1|2\n");
-        let err = read_tpch_csv(&path, "unknown_table").unwrap_err();
+        let err = read_tpc_h_csv(&path, "unknown_table").unwrap_err();
         assert!(err.to_string().contains("unknown TPC-H table"), "got: {err}");
     }
 
     /// Wrong field count → error.
     #[test]
-    fn read_tpch_csv_wrong_field_count_errors() {
+    fn read_tpc_h_csv_wrong_field_count_errors() {
         // region expects 3 fields; this row has only 2.
         let csv = "r_regionkey|r_name|r_comment\n0|AFRICA\n";
         let (_tmp, path) = write_tmp(csv);
-        let err = read_tpch_csv(&path, "region").unwrap_err();
+        let err = read_tpc_h_csv(&path, "region").unwrap_err();
         assert!(err.to_string().contains("expected 3"), "got: {err}");
     }
 
     /// Integration test: load the REAL TPC-H region CSV from
-    /// `/tmp/tpch_region.csv` (5 rows). Skipped if the file is not
+    /// `/tmp/tpc_h_region.csv` (5 rows). Skipped if the file is not
     /// present (e.g., when running on a dev machine without the
     /// benchmark data).
     #[test]
-    fn read_tpch_csv_region_integration() {
-        let path = "/tmp/tpch_region.csv";
+    fn read_tpc_h_csv_region_integration() {
+        let path = "/tmp/tpc_h_region.csv";
         if !std::path::Path::new(path).exists() {
             eprintln!("skipping: {} not present", path);
             return;
         }
-        let table = read_tpch_csv(path, "region").expect("read region");
+        let table = read_tpc_h_csv(path, "region").expect("read region");
         assert_eq!(table.row_count, 5, "region must have 5 rows");
         assert_eq!(table.columns.len(), 3);
         assert_eq!(table.columns[0].name, "r_regionkey");
@@ -898,13 +898,13 @@ mod tests {
 
     /// Integration test: load the REAL TPC-H nation CSV (25 rows).
     #[test]
-    fn read_tpch_csv_nation_integration() {
-        let path = "/tmp/tpch_nation.csv";
+    fn read_tpc_h_csv_nation_integration() {
+        let path = "/tmp/tpc_h_nation.csv";
         if !std::path::Path::new(path).exists() {
             eprintln!("skipping: {} not present", path);
             return;
         }
-        let table = read_tpch_csv(path, "nation").expect("read nation");
+        let table = read_tpc_h_csv(path, "nation").expect("read nation");
         assert_eq!(table.row_count, 25, "nation must have 25 rows");
         assert_eq!(table.columns.len(), 4);
         assert_eq!(table.columns[0].name, "n_nationkey");
@@ -923,13 +923,13 @@ mod tests {
     /// rows). Verifies that quoted fields (s_name, e.g.
     /// "Supplier#000000001") are handled correctly across many rows.
     #[test]
-    fn read_tpch_csv_supplier_integration() {
-        let path = "/tmp/tpch_supplier.csv";
+    fn read_tpc_h_csv_supplier_integration() {
+        let path = "/tmp/tpc_h_supplier.csv";
         if !std::path::Path::new(path).exists() {
             eprintln!("skipping: {} not present", path);
             return;
         }
-        let table = read_tpch_csv(path, "supplier").expect("read supplier");
+        let table = read_tpc_h_csv(path, "supplier").expect("read supplier");
         assert_eq!(table.row_count, 10_000, "supplier must have 10000 rows");
         assert_eq!(table.columns.len(), 7);
         // s_name (col 1) has a StringSearchColumn — verify the first
@@ -948,14 +948,14 @@ mod tests {
     /// rows). This is the slowest test — ~3-5 s on the benchmark
     /// server. Skipped if the file is absent (developer machines).
     #[test]
-    fn read_tpch_csv_lineitem_integration() {
-        let path = "/tmp/tpch_lineitem.csv";
+    fn read_tpc_h_csv_lineitem_integration() {
+        let path = "/tmp/tpc_h_lineitem.csv";
         if !std::path::Path::new(path).exists() {
             eprintln!("skipping: {} not present", path);
             return;
         }
         let start = std::time::Instant::now();
-        let table = read_tpch_csv(path, "lineitem").expect("read lineitem");
+        let table = read_tpc_h_csv(path, "lineitem").expect("read lineitem");
         let elapsed = start.elapsed();
 
         assert_eq!(table.row_count, 6_001_215, "lineitem must have 6001215 rows");

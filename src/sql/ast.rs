@@ -2,7 +2,7 @@
 //!
 //! **Wave 3 (IR Unification, Part 1):** This module defines the single
 //! canonical expression AST for turboGP, merging the former `sql::parser::Expr`
-//! (6 variants) and `engine::tpch::Expr2` (16 variants) into one unified type.
+//! (6 variants) and `engine::query_interpreter::Expr2` (16 variants) into one unified type.
 //!
 //! ## Design
 //!
@@ -23,7 +23,7 @@
 //!    `Expr2` remain in their modules for now.
 //! 2. **Wave 3 (Task 3.3):** Refactor `sql::parser` to produce `ast::Expr`.
 //!    Delete the old 6-variant `Expr`.
-//! 3. **Wave 3 (Task 3.3):** Refactor `engine::tpch` to consume `ast::Expr`.
+//! 3. **Wave 3 (Task 3.3):** Refactor `engine::query_interpreter` to consume `ast::Expr`.
 //!    Delete `Expr2`, `Value2`, `BinOp2`.
 //! 4. **Wave 4:** Expand `PlanNode` to carry `ast::Expr` in Filter/Project nodes.
 //! 5. **Wave 5:** The lowerer translates `ast::Expr` in filter predicates into
@@ -40,7 +40,7 @@ use std::fmt;
 /// A unified SQL value literal.
 ///
 /// Replaces the former `Value` (in `sql::parser`) and `Value2` (in
-/// `engine::tpch`). Every value is one of: 64-bit integer, 64-bit float,
+/// `engine::query_interpreter`). Every value is one of: 64-bit integer, 64-bit float,
 /// UTF-8 string, days-since-epoch date, or NULL.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -182,7 +182,7 @@ impl fmt::Display for BinOp {
 /// The unified SQL expression AST.
 ///
 /// This single type replaces the former `sql::parser::Expr` (6 variants)
-/// and `engine::tpch::Expr2` (16 variants). Every SQL expression — from
+/// and `engine::query_interpreter::Expr2` (16 variants). Every SQL expression — from
 /// `SELECT 1` to `CASE WHEN EXISTS (SELECT ...) THEN ... END` — is
 /// represented as an `Expr`.
 ///
