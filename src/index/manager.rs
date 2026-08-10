@@ -157,13 +157,16 @@ impl IndexManager {
             return false;
         }
         if let Some(entry) = self.get(table, column) {
-            // Use index if selectivity > 10% (i.e., cardinality / row_count > 0.1)
-            // and the index type is appropriate.
+            // Wave 9 fix (I1): Use index when selectivity is LOW (few rows match).
+            // Previously this was inverted (> 0.1 instead of < 0.1), causing the
+            // index to be skipped exactly when it should be used.
+            // Correct logic: if cardinality / row_count is small, each value
+            // matches few rows, so an index lookup is cheaper than a full scan.
             if table_row_count == 0 {
                 return false;
             }
             let selectivity = entry.cardinality as f64 / table_row_count as f64;
-            return selectivity > 0.1;
+            return selectivity < 0.1;
         }
         false
     }
@@ -217,19 +220,21 @@ mod tests {
     }
 
     #[test]
-    fn use_index_high_selectivity() {
+    fn use_index_low_selectivity() {
         let mut mgr = IndexManager::new();
-        // cardinality 500 out of 1000 rows = 50% selectivity → use index
-        mgr.create("users", "id", IndexType::BSI, 500);
-        assert!(mgr.should_use_index("users", "id", 1000));
+        // Wave 9 fix (I1): cardinality 50 out of 1000 rows = 5% selectivity
+        // → USE index (each value matches few rows, index is cheaper than scan)
+        mgr.create("users", "status", IndexType::BSI, 50);
+        assert!(mgr.should_use_index("users", "status", 1000));
     }
 
     #[test]
-    fn skip_index_low_selectivity() {
+    fn skip_index_high_selectivity() {
         let mut mgr = IndexManager::new();
-        // cardinality 50 out of 1000 rows = 5% selectivity → skip index
-        mgr.create("users", "status", IndexType::BSI, 50);
-        assert!(!mgr.should_use_index("users", "status", 1000));
+        // Wave 9 fix (I1): cardinality 500 out of 1000 rows = 50% selectivity
+        // → SKIP index (each value matches many rows, scan is cheaper)
+        mgr.create("users", "id", IndexType::BSI, 500);
+        assert!(!mgr.should_use_index("users", "id", 1000));
     }
 
     #[test]
