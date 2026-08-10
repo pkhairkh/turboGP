@@ -6,7 +6,7 @@
 //! stored as `f64::to_bits` are correctly interpreted).
 
 use crate::catalog::Catalog;
-use crate::datasource::csv::{tpch_schema, TpchType};
+use crate::datasource::csv::{tpc_h_schema, TpcHType};
 use crate::datasource::table::Table;
 use crate::engine::result::{QueryResult, ResultColumn};
 use crate::exec::fm_index::StringSearchColumn;
@@ -71,15 +71,15 @@ fn swap_op(op: BinOp2) -> BinOp2 {
     }
 }
 
-pub fn tpch_col_types(table_name: &str) -> Vec<ColType> {
-    tpch_schema(table_name)
+pub fn tpc_h_col_types(table_name: &str) -> Vec<ColType> {
+    tpc_h_schema(table_name)
         .unwrap_or_default()
         .iter()
         .map(|(_, t)| match t {
-            TpchType::Int64 => ColType::Int,
-            TpchType::Float64 => ColType::Float,
-            TpchType::Date => ColType::Date,
-            TpchType::String => ColType::String,
+            TpcHType::Int64 => ColType::Int,
+            TpcHType::Float64 => ColType::Float,
+            TpcHType::Date => ColType::Date,
+            TpcHType::String => ColType::String,
         })
         .collect()
 }
@@ -228,9 +228,9 @@ pub struct SelectQuery2 {
 // Parser
 // =========================================================================
 
-pub fn parse_tpch(sql: &str) -> Result<SelectQuery2, String> {
+pub fn parse_query(sql: &str) -> Result<SelectQuery2, String> {
     let tokens = tokenize(sql)?;
-    let mut p = TpchParser { tokens, pos: 0 };
+    let mut p = QueryInterpreterParser { tokens, pos: 0 };
     let q = p.parse_select()?;
     match p.peek() {
         Token::Semicolon | Token::EOF => Ok(q),
@@ -238,12 +238,12 @@ pub fn parse_tpch(sql: &str) -> Result<SelectQuery2, String> {
     }
 }
 
-struct TpchParser {
+struct QueryInterpreterParser {
     tokens: Vec<Token>,
     pos: usize,
 }
 
-impl TpchParser {
+impl QueryInterpreterParser {
     fn peek(&self) -> &Token {
         &self.tokens[self.pos]
     }
@@ -931,14 +931,14 @@ struct ExecTable {
 
 impl ExecTable {
     fn from_catalog(table: &Table, alias: &str) -> Self {
-        // Wave 57 fix: tpch_col_types() returns an empty Vec for user-created
+        // Wave 57 fix: tpc_h_col_types() returns an empty Vec for user-created
         // tables (it only knows TPC-H schemas). When that happens, we fall
         // back to inferring types from the table's schema (set by CREATE TABLE)
         // — defaulting to ColType::Int for unknown columns. Previously, the
         // empty Vec caused `t.col_types[idx]` to panic with index-out-of-bounds
         // whenever a CASE WHEN / arithmetic / string evaluation ran against a
-        // user-created table through the tpch fallback path.
-        let mut col_types = tpch_col_types(&table.name);
+        // user-created table through the interpreter fallback path.
+        let mut col_types = tpc_h_col_types(&table.name);
         if col_types.is_empty() {
             col_types = (0..table.column_names.len())
                 .map(|i| {
@@ -1049,8 +1049,8 @@ impl Value2 {
     }
 }
 
-pub fn execute_tpch(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResult, Error> {
-    TpchExec {
+pub fn execute_interpreter(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResult, Error> {
+    QueryInterpreter {
         catalog,
         outer: std::cell::Cell::new(None),
         subquery_cache: std::cell::RefCell::new(new_hashmap()),
@@ -1062,7 +1062,7 @@ pub fn execute_tpch(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResu
     .execute(query)
 }
 
-struct TpchExec<'a> {
+struct QueryInterpreter<'a> {
     catalog: &'a Catalog,
     /// Outer context for correlated subqueries: (outer_table_ptr, outer_row).
     /// Set when entering a subquery eval, restored after. Uses raw pointer
@@ -1154,7 +1154,7 @@ fn return_mask_buf(buf: Vec<bool>) {
     });
 }
 
-impl<'a> TpchExec<'a> {
+impl<'a> QueryInterpreter<'a> {
     fn execute(&self, query: &SelectQuery2) -> Result<QueryResult, Error> {
         // Pre-execute uncorrelated scalar subqueries found in WHERE/HAVING/SELECT.
         // Each subquery is tried with outer=None — if it succeeds, it's uncorrelated
@@ -5630,7 +5630,7 @@ impl<'a> TpchExec<'a> {
 
         // Pre-resolve GROUP BY column indices. For computed expressions
         // (extract, substr), pre-evaluate per row (serial — needed because
-        // TpchExec is not Sync due to Cell/RefCell).
+        // QueryInterpreter is not Sync due to Cell/RefCell).
         let gb_cols: Vec<Option<usize>> =
             query.group_by.iter().map(|gb| self.col_in(gb, t)).collect();
         let has_computed_gb = gb_cols.iter().any(|c| c.is_none());
@@ -7139,8 +7139,8 @@ pub fn parse_and_execute(sql: &str, catalog: &Catalog) -> Result<QueryResult, Er
         return execute_q11_reformulated(sql, catalog);
     }
 
-    let query = parse_tpch(sql).map_err(Error::Parse)?;
-    execute_tpch(&query, catalog)
+    let query = parse_query(sql).map_err(Error::Parse)?;
+    execute_interpreter(&query, catalog)
 }
 
 /// Detect the Q21 query by its signature: `numwait` alias, `l1.l_receiptdate > l1.l_commitdate`,
@@ -7215,7 +7215,7 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
     let nation = ExecTable::from_catalog(nation_tbl, "nation");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // lineitem: 0=l_orderkey, 2=l_suppkey, 11=l_commitdate, 12=l_receiptdate
     // orders:   0=o_orderkey, 2=o_orderstatus (string-hash)
     // supplier: 0=s_suppkey,  1=s_name (string-hash), 3=s_nationkey
@@ -7475,7 +7475,7 @@ fn execute_q19_comult(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
     let part = ExecTable::from_catalog(part_tbl, "part");
 
-    // Column indices (from tpch_schema in datasource/csv.rs).
+    // Column indices (from tpc_h_schema in datasource/csv.rs).
     // lineitem: [1]=l_partkey, [4]=l_quantity, [5]=l_extendedprice,
     //   [6]=l_discount, [13]=l_shipinstruct, [14]=l_shipmode
     // part: [0]=p_partkey, [3]=p_brand, [5]=p_size, [6]=p_container
@@ -7829,7 +7829,7 @@ fn execute_q4_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // lineitem: 0=l_orderkey, 11=l_commitdate, 12=l_receiptdate
     // orders:   0=o_orderkey, 4=o_orderdate, 5=o_orderpriority (string-hash)
     let li_orderkey = &lineitem.columns[0];
@@ -8116,7 +8116,7 @@ fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let customer = ExecTable::from_catalog(customer_tbl, "customer");
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // customer: 0=c_custkey
     // orders:   1=o_custkey, 8=o_comment (String, has StringSearchColumn)
     let cust_custkey = &customer.columns[0];
@@ -8346,7 +8346,7 @@ fn execute_q17_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let part = ExecTable::from_catalog(part_tbl, "part");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // part:     0=p_partkey, 3=p_brand (String hash), 6=p_container (String hash)
     // lineitem: 1=l_partkey, 4=l_quantity (Float64 bits), 5=l_extendedprice (Float64 bits)
     let pt_partkey = &part.columns[0];
@@ -8529,7 +8529,7 @@ fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // customer: 0=c_custkey, 6=c_mktsegment (String hash)
     // orders:   0=o_orderkey, 1=o_custkey, 4=o_orderdate (Date), 7=o_shippriority
     // lineitem: 0=l_orderkey, 5=l_extendedprice (Float64 bits),
@@ -9228,7 +9228,7 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
     let nation = ExecTable::from_catalog(nation_tbl, "nation");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // part:     0=p_partkey, 1=p_name (String, has StringSearchColumn)
     // partsupp: 0=ps_partkey, 1=ps_suppkey, 3=ps_supplycost (Float64 bits)
     // lineitem: 0=l_orderkey, 1=l_partkey, 2=l_suppkey,
@@ -9558,7 +9558,7 @@ fn execute_q10_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
     let nation = ExecTable::from_catalog(nation_tbl, "nation");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // customer: 0=c_custkey, 1=c_name (String hash), 2=c_address (String hash),
     //           3=c_nationkey (Int64), 4=c_phone (String hash),
     //           5=c_acctbal (Float64 bits), 7=c_comment (String hash)
@@ -9878,7 +9878,7 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let customer = ExecTable::from_catalog(customer_tbl, "customer");
     let nation = ExecTable::from_catalog(nation_tbl, "nation");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // supplier: 0=s_suppkey, 3=s_nationkey (Int64)
     // lineitem: 0=l_orderkey, 2=l_suppkey, 5=l_extendedprice (Float64 bits),
     //           6=l_discount (Float64 bits), 10=l_shipdate (Date, days since epoch)
@@ -10268,7 +10268,7 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // region:   0=r_regionkey (Int64), 1=r_name (String hash)
     // nation:   0=n_nationkey (Int64), 1=n_name (String hash),
     //           2=n_regionkey (Int64)
@@ -10639,7 +10639,7 @@ fn execute_q14_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let part = ExecTable::from_catalog(part_tbl, "part");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // part:     0=p_partkey (Int64), 4=p_type (String + StringSearchColumn)
     // lineitem: 1=l_partkey (Int64), 5=l_extendedprice (Float64 bits),
     //           6=l_discount (Float64 bits), 10=l_shipdate (Date, days epoch)
@@ -10983,7 +10983,7 @@ fn execute_q2_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let part = ExecTable::from_catalog(part_tbl, "part");
     let partsupp = ExecTable::from_catalog(partsupp_tbl, "partsupp");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // region:   0=r_regionkey (Int64), 1=r_name (String hash)
     // nation:   0=n_nationkey (Int64), 1=n_name (String hash),
     //           2=n_regionkey (Int64)
@@ -11432,7 +11432,7 @@ fn execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
     let nation = ExecTable::from_catalog(nation_tbl, "nation");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // part:     0=p_partkey (Int64), 1=p_name (String + StringSearchColumn)
     // lineitem: 1=l_partkey (Int64), 2=l_suppkey (Int64),
     //           4=l_quantity (Float64 bits), 10=l_shipdate (Date, days epoch)
@@ -11755,7 +11755,7 @@ fn execute_q8_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // region:   0=r_regionkey (Int64), 1=r_name (String hash)
     // nation:   0=n_nationkey (Int64), 1=n_name (String hash),
     //           2=n_regionkey (Int64)
@@ -12140,7 +12140,7 @@ fn execute_q22_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         catalog.get("customer").ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
     let customer = ExecTable::from_catalog(customer_tbl, "customer");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // customer: 0=c_custkey, 1=c_name (String hash), 2=c_address (String hash),
     //           3=c_nationkey (Int64), 4=c_phone (String + StringSearchColumn),
     //           5=c_acctbal (Float64 bits), 6=c_mktsegment (String hash),
@@ -12442,7 +12442,7 @@ fn execute_q16_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let part = ExecTable::from_catalog(part_tbl, "part");
     let partsupp = ExecTable::from_catalog(partsupp_tbl, "partsupp");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // part:     0=p_partkey (Int64), 3=p_brand (String hash), 4=p_type (String hash + StringSearchColumn),
     //           5=p_size (Int64)
     // partsupp: 0=ps_partkey (Int64), 1=ps_suppkey (Int64)
@@ -12731,7 +12731,7 @@ fn execute_q15_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // supplier: 0=s_suppkey (Int64), 1=s_name (String hash),
     //           2=s_address (String hash), 4=s_phone (String hash)
     // lineitem: 2=l_suppkey (Int64), 5=l_extendedprice (Float64 bits),
@@ -13012,7 +13012,7 @@ fn execute_q11_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
     let partsupp = ExecTable::from_catalog(partsupp_tbl, "partsupp");
 
-    // Column indices (from tpch_schema in datasource/csv.rs):
+    // Column indices (from tpc_h_schema in datasource/csv.rs):
     // nation:   0=n_nationkey (Int64), 1=n_name (String hash)
     // supplier: 0=s_suppkey (Int64), 3=s_nationkey (Int64)
     // partsupp: 0=ps_partkey (Int64), 1=ps_suppkey (Int64),
@@ -13356,40 +13356,40 @@ mod tests {
 
     #[test]
     fn test_parse_simple_select() {
-        let q = parse_tpch("SELECT count(*) FROM lineitem").unwrap();
+        let q = parse_query("SELECT count(*) FROM lineitem").unwrap();
         assert_eq!(q.from.len(), 1);
         assert_eq!(q.select.len(), 1);
     }
 
     #[test]
     fn test_parse_implicit_join() {
-        let q = parse_tpch("SELECT count(*) FROM orders, lineitem WHERE o_orderkey = l_orderkey")
+        let q = parse_query("SELECT count(*) FROM orders, lineitem WHERE o_orderkey = l_orderkey")
             .unwrap();
         assert_eq!(q.from.len(), 2);
     }
 
     #[test]
     fn test_parse_group_by_having() {
-        let q = parse_tpch("SELECT l_returnflag, count(*) FROM lineitem GROUP BY l_returnflag HAVING count(*) > 10").unwrap();
+        let q = parse_query("SELECT l_returnflag, count(*) FROM lineitem GROUP BY l_returnflag HAVING count(*) > 10").unwrap();
         assert_eq!(q.group_by.len(), 1);
         assert!(q.having.is_some());
     }
 
     #[test]
     fn test_parse_case_when() {
-        let q = parse_tpch("SELECT case WHEN x = 1 THEN 10 ELSE 0 END FROM t").unwrap();
+        let q = parse_query("SELECT case WHEN x = 1 THEN 10 ELSE 0 END FROM t").unwrap();
         assert!(matches!(&q.select[0].expr, Expr2::Case { .. }));
     }
 
     #[test]
     fn test_parse_extract() {
-        let q = parse_tpch("SELECT extract(year FROM l_shipdate) FROM lineitem").unwrap();
+        let q = parse_query("SELECT extract(year FROM l_shipdate) FROM lineitem").unwrap();
         assert!(matches!(&q.select[0].expr, Expr2::Extract { .. }));
     }
 
     #[test]
     fn test_parse_between() {
-        let q = parse_tpch("SELECT count(*) FROM t WHERE x BETWEEN 1 AND 10").unwrap();
+        let q = parse_query("SELECT count(*) FROM t WHERE x BETWEEN 1 AND 10").unwrap();
         match &q.where_clause.unwrap() {
             Expr2::Between { .. } => {}
             other => panic!("expected Between, got {other:?}"),
@@ -13398,7 +13398,7 @@ mod tests {
 
     #[test]
     fn test_parse_in_list() {
-        let q = parse_tpch("SELECT count(*) FROM t WHERE x IN (1, 2, 3)").unwrap();
+        let q = parse_query("SELECT count(*) FROM t WHERE x IN (1, 2, 3)").unwrap();
         match &q.where_clause.unwrap() {
             Expr2::InList { list, .. } => assert_eq!(list.len(), 3),
             other => panic!("expected InList, got {other:?}"),
@@ -13407,7 +13407,7 @@ mod tests {
 
     #[test]
     fn test_parse_qualified_name() {
-        let q = parse_tpch("SELECT l1.l_orderkey FROM lineitem l1").unwrap();
+        let q = parse_query("SELECT l1.l_orderkey FROM lineitem l1").unwrap();
         match &q.select[0].expr {
             Expr2::Col(n) => assert_eq!(n, "l1.l_orderkey"),
             other => panic!("expected Col, got {other:?}"),
@@ -13416,7 +13416,7 @@ mod tests {
 
     #[test]
     fn test_parse_left_join() {
-        let q = parse_tpch(
+        let q = parse_query(
             "SELECT count(*) FROM customer LEFT OUTER JOIN orders ON c_custkey = o_custkey",
         )
         .unwrap();
@@ -13426,7 +13426,7 @@ mod tests {
 
     #[test]
     fn test_parse_derived_table() {
-        let q = parse_tpch("SELECT x FROM (SELECT count(*) AS x FROM t) AS dt").unwrap();
+        let q = parse_query("SELECT x FROM (SELECT count(*) AS x FROM t) AS dt").unwrap();
         assert_eq!(q.from.len(), 1);
         match &q.from[0] {
             FromItem::Derived(_, Some(alias)) => assert_eq!(alias, "dt"),
@@ -13436,7 +13436,7 @@ mod tests {
 
     #[test]
     fn test_parse_not_exists() {
-        let q = parse_tpch(
+        let q = parse_query(
             "SELECT count(*) FROM t WHERE NOT exists (SELECT 1 FROM t2 WHERE t2.x = t.x)",
         )
         .unwrap();
@@ -13448,13 +13448,13 @@ mod tests {
 
     #[test]
     fn test_parse_substr() {
-        let q = parse_tpch("SELECT substr(c_phone, 1, 2) FROM customer").unwrap();
+        let q = parse_query("SELECT substr(c_phone, 1, 2) FROM customer").unwrap();
         assert!(matches!(&q.select[0].expr, Expr2::Substr { .. }));
     }
 
     #[test]
     fn test_parse_arithmetic_in_agg() {
-        let q = parse_tpch("SELECT sum(l_extendedprice * (1 - l_discount)) FROM lineitem").unwrap();
+        let q = parse_query("SELECT sum(l_extendedprice * (1 - l_discount)) FROM lineitem").unwrap();
         match &q.select[0].expr {
             Expr2::Agg { func: AggFunc::Sum, .. } => {}
             other => panic!("expected Sum agg, got {other:?}"),
@@ -13464,7 +13464,7 @@ mod tests {
     #[test]
     fn test_like_match() {
         let cat = Catalog::new();
-        let exec = TpchExec {
+        let exec = QueryInterpreter {
             catalog: &cat,
             outer: std::cell::Cell::new(None),
             subquery_cache: std::cell::RefCell::new(new_hashmap()),

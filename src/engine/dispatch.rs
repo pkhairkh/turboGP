@@ -104,10 +104,10 @@ pub fn classify_query(query: &SelectQuery) -> QueryShape {
             // A bare literal in a single-item SELECT (e.g. `SELECT 1`)
             // is not a shape we dispatch — let the fallback handle it.
             SelectItem::Literal(_) => QueryShape::Complex,
-            // Window functions go through the tpch fallback.
+            // Window functions go through the interpreter fallback.
             SelectItem::Window { .. } => QueryShape::Complex,
             // Wave 60a: CASE WHEN / general expressions go through the
-            // tpch fallback (which evaluates them correctly). A future
+            // interpreter fallback (which evaluates them correctly). A future
             // wave can add a fast dispatch path for Expression items.
             SelectItem::Expression { .. } => QueryShape::Complex,
         }
@@ -134,23 +134,23 @@ pub fn execute_dispatched(query: &SelectQuery, table: &Table) -> Option<Result<Q
     // Wave 60a: if the WHERE clause contains a CASE WHEN expression, the
     // dispatch path can't evaluate it (build_filter_mask / vectorized::filter_rows
     // don't handle Expr::Case). Return None so the query falls through to
-    // the tpch interpreter, which evaluates CASE WHEN correctly.
+    // the interpreter interpreter, which evaluates CASE WHEN correctly.
     // Wave 67: same for EXTRACT and CAST — the basic executor can't
-    // evaluate them per-row, so route to tpch.
+    // evaluate them per-row, so route to interpreter.
     if let Some(ref where_expr) = query.where_clause {
-        if expr_needs_tpch_fallback(where_expr) {
+        if expr_needs_interpreter_fallback(where_expr) {
             return None;
         }
     }
     // Wave 60b: if the HAVING clause is present, the dispatch path can't
     // evaluate it (the basic executor doesn't evaluate Expr::Function
-    // aggregates in HAVING context). Return None so the query falls to tpch,
+    // aggregates in HAVING context). Return None so the query falls to interpreter,
     // which has a full HAVING implementation.
     // Wave 62 fix: the basic parser now PARSES HAVING correctly (including
     // count(*) etc. as Expr::Function), but the basic executor still can't
-    // evaluate it — so we still route to tpch. The difference is that
-    // previously the parser ERRORED and the query fell to tpch as an error
-    // fallback; now the parser SUCCEEDS and we explicitly route to tpch.
+    // evaluate it — so we still route to interpreter. The difference is that
+    // previously the parser ERRORED and the query fell to interpreter as an error
+    // fallback; now the parser SUCCEEDS and we explicitly route to interpreter.
     if query.having.is_some() {
         return None;
     }
@@ -159,12 +159,12 @@ pub fn execute_dispatched(query: &SelectQuery, table: &Table) -> Option<Result<Q
 
 /// Check whether an Expr contains a construct the basic dispatch path
 /// can't evaluate (CASE WHEN, EXTRACT, CAST). Used by execute_dispatched
-/// to route such queries to the tpch fallback.
-fn expr_needs_tpch_fallback(expr: &Expr) -> bool {
+/// to route such queries to the interpreter fallback.
+fn expr_needs_interpreter_fallback(expr: &Expr) -> bool {
     match expr {
         Expr::Case { .. } | Expr::Extract { .. } | Expr::Cast { .. } => true,
         Expr::Binary { left, right, .. } => {
-            expr_needs_tpch_fallback(left) || expr_needs_tpch_fallback(right)
+            expr_needs_interpreter_fallback(left) || expr_needs_interpreter_fallback(right)
         }
         Expr::Function { .. } => false,
         Expr::Column(_) | Expr::Literal(_) => false,
@@ -1036,13 +1036,13 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                 }
                 SelectItem::Window { .. } => {
                     return Err(Error::Other(
-                        "window function in single-key GROUP BY — use tpch fallback".into(),
+                        "window function in single-key GROUP BY — use interpreter fallback".into(),
                     ));
                 }
-                // Wave 60a: general expressions go through the tpch fallback.
+                // Wave 60a: general expressions go through the interpreter fallback.
                 SelectItem::Expression { .. } => {
                     return Err(Error::Other(
-                        "expression in single-key GROUP BY — use tpch fallback".into(),
+                        "expression in single-key GROUP BY — use interpreter fallback".into(),
                     ));
                 }
             }
@@ -1370,13 +1370,13 @@ fn execute_string_group_by(
             }
             SelectItem::Window { .. } => {
                 return Err(Error::Other(
-                    "window function in string GROUP BY — use tpch fallback".into(),
+                    "window function in string GROUP BY — use interpreter fallback".into(),
                 ));
             }
-            // Wave 60a: general expressions go through the tpch fallback.
+            // Wave 60a: general expressions go through the interpreter fallback.
             SelectItem::Expression { .. } => {
                 return Err(Error::Other(
-                    "expression in string GROUP BY — use tpch fallback".into(),
+                    "expression in string GROUP BY — use interpreter fallback".into(),
                 ));
             }
         }
@@ -1798,6 +1798,6 @@ pub fn sum_arithmetic(
 }
 
 // Wave 62 fix: removed dead code `eval_case_row` — it was added in Wave 60a
-// but never called because CASE WHEN expressions are routed to the tpch
+// but never called because CASE WHEN expressions are routed to the interpreter
 // fallback (the basic executor can't evaluate Expr::Case per row). The
 // audit caught this as new dead code introduced by Wave 60a.

@@ -41,11 +41,11 @@ pub fn execute_select(
 ) -> Result<QueryResult> {
     // Wave 62 fix: if HAVING is present, the basic executor can't evaluate
     // it (it doesn't process aggregate expressions in HAVING context).
-    // Return Err immediately so execute_inner falls to the tpch interpreter,
+    // Return Err immediately so execute_inner falls to the interpreter interpreter,
     // which has a full HAVING implementation. Previously, HAVING queries
     // could silently execute WITHOUT the HAVING filter, returning wrong rows.
     if query.having.is_some() {
-        return Err(Error::Other("HAVING requires tpch fallback".into()));
+        return Err(Error::Other("HAVING requires interpreter fallback".into()));
     }
 
     // 1. Resolve the table(s)
@@ -64,7 +64,7 @@ pub fn execute_select(
         has_where,
         has_group_by,
         has_join,
-        false, // subquery detection is handled by the tpch fallback
+        false, // subquery detection is handled by the interpreter fallback
         query.select.len(),
     );
     log::debug!(
@@ -83,9 +83,9 @@ pub fn execute_select(
     }
 
     // If the optimizer says TpchFallback, return an error so the caller
-    // (execute_inner) routes to the tpch interpreter.
+    // (execute_inner) routes to the interpreter interpreter.
     if plan.strategy == crate::planner::optimizer::ExecStrategy::TpchFallback {
-        return Err(Error::Other("optimizer chose tpch fallback".into()));
+        return Err(Error::Other("optimizer chose interpreter fallback".into()));
     }
 
     // Try kernel-direct dispatch first (10-30x faster than per-row evaluation).
@@ -161,9 +161,9 @@ pub fn execute_select(
             SelectItem::Window { .. } => {
                 return Err(Error::Other("internal: window item not stripped".into()));
             }
-            // Wave 60a: general expressions go through the tpch fallback.
+            // Wave 60a: general expressions go through the interpreter fallback.
             SelectItem::Expression { .. } => {
-                return Err(Error::Other("expression in SELECT — use tpch fallback".into()));
+                return Err(Error::Other("expression in SELECT — use interpreter fallback".into()));
             }
         }
     } else if query_ref.select.len() > 1 {
@@ -653,13 +653,13 @@ fn execute_aggregate_no_group(
             }
             SelectItem::Window { .. } => {
                 return Err(Error::Other(
-                    "window function in multi-aggregate — should use tpch fallback".into(),
+                    "window function in multi-aggregate — should use interpreter fallback".into(),
                 ));
             }
-            // Wave 60a: general expressions go through the tpch fallback.
+            // Wave 60a: general expressions go through the interpreter fallback.
             SelectItem::Expression { .. } => {
                 return Err(Error::Other(
-                    "expression in multi-aggregate — use tpch fallback".into(),
+                    "expression in multi-aggregate — use interpreter fallback".into(),
                 ));
             }
         }
@@ -1328,11 +1328,11 @@ fn execute_with_join(
                 elapsed_us: 0,
             }),
             crate::sql::parser::SelectItem::Window { .. } => {
-                Err(Error::Other("window function in join context — use tpch fallback".into()))
+                Err(Error::Other("window function in join context — use interpreter fallback".into()))
             }
-            // Wave 60a: general expressions go through the tpch fallback.
+            // Wave 60a: general expressions go through the interpreter fallback.
             crate::sql::parser::SelectItem::Expression { .. } => {
-                Err(Error::Other("expression in join context — use tpch fallback".into()))
+                Err(Error::Other("expression in join context — use interpreter fallback".into()))
             }
         }
     } else {

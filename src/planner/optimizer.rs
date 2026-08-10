@@ -53,7 +53,7 @@ pub fn choose_plan(
     if has_subquery {
         return ExecPlan {
             strategy: ExecStrategy::TpchFallback,
-            estimated_cost_us: estimate_tpch(cost_model, row_count),
+            estimated_cost_us: estimate_interpreter(cost_model, row_count),
             estimated_rows: 1,
         };
     }
@@ -108,7 +108,7 @@ fn estimate_hash_join(cost_model: &CostModel, row_count: u64) -> f64 {
     scan_cost * 2.0
 }
 
-fn estimate_tpch(cost_model: &CostModel, row_count: u64) -> f64 {
+fn estimate_interpreter(cost_model: &CostModel, row_count: u64) -> f64 {
     // TPC-H interpreter is row-based, ~10x slower than vectorized.
     estimate_scan(cost_model, row_count, true) * 10.0
 }
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn choose_tpch_for_subquery() {
+    fn choose_interpreter_for_subquery() {
         let cm = CostModel::default();
         let plan = choose_plan(&cm, 1_000_000, true, false, false, true, 1);
         assert_eq!(plan.strategy, ExecStrategy::TpchFallback);
@@ -171,10 +171,10 @@ mod tests {
     }
 
     #[test]
-    fn tpch_cost_higher_than_kernel() {
+    fn interpreter_cost_higher_than_kernel() {
         let cm = CostModel::default();
         let kernel = estimate_scan(&cm, 1_000_000, false);
-        let tpch = estimate_tpch(&cm, 1_000_000);
-        assert!(tpch > kernel * 5.0);
+        let interpreter = estimate_interpreter(&cm, 1_000_000);
+        assert!(interpreter > kernel * 5.0);
     }
 }

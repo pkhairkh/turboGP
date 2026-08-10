@@ -386,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn w1c_year_tpch_range_1992_1998() {
+    fn w1c_year_tpc_h_range_1992_1998() {
         // Sweep every year boundary in the TPC-H date range plus a few
         // leap days — bit-exact check against time::Date.
         for year in 1992..=1998 {
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn w1c_year_tpch_forward_window_1998_2003() {
+    fn w1c_year_tpc_h_forward_window_1998_2003() {
         // 5-year forward window per TPC-H spec.
         for year in 1998..=2003 {
             for (m, d) in [(1, 1), (2, 28), (3, 1), (12, 31)] {
