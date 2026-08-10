@@ -179,7 +179,10 @@ required-features = ["bench-external"]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Wave 20: Changed from "abort" to "unwind" — with panic remediation
+# largely complete, unwind provides graceful degradation for unexpected
+# runtime panics instead of killing the server process.
+panic = "unwind"
 strip = "none"
 debug = "line-tables-only"
 
