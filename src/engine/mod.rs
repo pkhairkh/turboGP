@@ -56,6 +56,7 @@
 //! Both return the row count so the caller can sanity-check the load.
 
 pub mod executor;
+pub mod query_features;
 pub mod result;
 pub mod query_interpreter;
 
