@@ -2,7 +2,7 @@
 //!
 //! These queries use SQL features that the basic parser/executor doesn't
 //! support but the TPC-H interpreter does: CASE WHEN, HAVING, subqueries,
-//! arithmetic in aggregates, IN, BETWEEN. They are routed to execute_tpch()
+//! arithmetic in aggregates, IN, BETWEEN. They are routed to execute_interpreter()
 //! automatically when the basic path fails.
 //!
 //! Wave 55 fix: previously the test names claimed to test CASE WHEN, HAVING,
@@ -78,9 +78,9 @@ fn complex_where_with_nested_conditions() {
 }
 
 /// Wave 57: CASE WHEN through engine.execute() — the previous wave DELETED
-/// this test because `tpch.rs` panicked with index-out-of-bounds in
+/// this test because `query_interpreter/` panicked with index-out-of-bounds in
 /// `t.col_types[idx]` (col_types was empty for user-created tables). The
-/// root cause was that `tpch_col_types()` only knows TPC-H schemas, so it
+/// root cause was that `tpc_h_col_types()` only knows TPC-H schemas, so it
 /// returned an empty Vec for tables created via CREATE TABLE. The fix in
 /// `ExecTable::from_catalog` falls back to inferring types from the table's
 /// schema (set by CREATE TABLE), defaulting to ColType::Int.
@@ -96,7 +96,7 @@ fn case_when_in_where_through_engine() {
     assert_eq!(r.scalar_u64(), Some(2), "CASE WHEN in WHERE must match 2 rows (amount > 200)");
 }
 
-/// Wave 57: CASE WHEN in SELECT list — the tpch interpreter evaluates
+/// Wave 57: CASE WHEN in SELECT list — the interpreter evaluates
 /// CASE WHEN per row and returns the result as a column.
 #[test]
 fn case_when_in_select_through_engine() {
@@ -127,7 +127,7 @@ fn in_list_in_where() {
 }
 
 /// Wave 58b: real subquery in WHERE — `WHERE region IN (SELECT region FROM
-/// sales WHERE amount > 250)`. The tpch interpreter parses the subquery,
+/// sales WHERE amount > 250)`. The interpreter parses the subquery,
 /// executes it to get the set of regions with amount > 250 (region 3 only,
 /// since row 5 has amount=250 which is NOT > 250, and row 4 has amount=300
 /// in region 2), and filters the outer query by membership in that set.

@@ -26,7 +26,7 @@ pub enum ExecStrategy {
     /// Use the vectorized fallback path (for complex predicates).
     Vectorized,
     /// Use the row-based TPC-H interpreter (for subqueries, CASE, etc.).
-    TpchFallback,
+    InterpreterFallback,
     /// Use a hash join (for JOIN queries).
     HashJoin,
 }
@@ -52,7 +52,7 @@ pub fn choose_plan(
     // handle, route to the TPC-H interpreter.
     if has_subquery {
         return ExecPlan {
-            strategy: ExecStrategy::TpchFallback,
+            strategy: ExecStrategy::InterpreterFallback,
             estimated_cost_us: estimate_interpreter(cost_model, row_count),
             estimated_rows: 1,
         };
@@ -145,7 +145,7 @@ mod tests {
     fn choose_interpreter_for_subquery() {
         let cm = CostModel::default();
         let plan = choose_plan(&cm, 1_000_000, true, false, false, true, 1);
-        assert_eq!(plan.strategy, ExecStrategy::TpchFallback);
+        assert_eq!(plan.strategy, ExecStrategy::InterpreterFallback);
     }
 
     #[test]

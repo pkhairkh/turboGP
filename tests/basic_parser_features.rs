@@ -1,9 +1,9 @@
 //! Wave 60 — Basic parser features: CASE WHEN, HAVING, UNION ALL, DISTINCT.
 //!
-//! These features were previously only available through the tpch fallback
+//! These features were previously only available through the interpreter fallback
 //! interpreter (213x slower than DuckDB). Wave 60 adds them to the basic
 //! parser so they go through the fast dispatch path (or at least don't
-//! require the tpch parser to recognize them).
+//! require the query interpreter parser to recognize them).
 
 use turbogp::engine::QueryEngine;
 

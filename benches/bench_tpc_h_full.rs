@@ -21,8 +21,8 @@ fn generate_lineitem(n: usize) -> Table {
     Table { name: "lineitem".into(), columns: cols, column_names: names, row_count: n }
 }
 
-fn bench_tpch(c: &mut Criterion) {
-    let mut group = c.benchmark_group("tpch_full");
+fn bench_tpc_h(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tpc_h_full");
 
     // Q1: count with equality filter
     {
@@ -66,5 +66,5 @@ fn bench_tpch(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_tpch);
+criterion_group!(benches, bench_tpc_h);
 criterion_main!(benches);
