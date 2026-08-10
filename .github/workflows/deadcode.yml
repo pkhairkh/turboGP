@@ -25,3 +25,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run dead-code check
         run: bash scripts/check_dead_code.sh
+
+  file-size:
+    name: check_file_size.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run file-size check
+        run: bash scripts/check_file_size.sh

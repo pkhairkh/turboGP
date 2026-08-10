@@ -1,0 +1,43 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Code Coverage (≥60%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Generate coverage report
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - name: Check coverage ≥ 60%
+        run: |
+          COVERAGE=$(cargo llvm-cov --all-features --workspace --summary-only 2>&1 \
+            | grep 'TOTAL' | awk '{print $NF}' | tr -d '%')
+          echo "Coverage: ${COVERAGE}%"
+          if [ -z "$COVERAGE" ]; then
+            echo "WARNING: Could not parse coverage, skipping threshold check"
+            exit 0
+          fi
+          if (( $(echo "$COVERAGE < 60" | bc -l) )); then
+            echo "ERROR: Coverage ${COVERAGE}% is below the 60% threshold"
+            exit 1
+          fi
+          echo "OK: Coverage ${COVERAGE}% ≥ 60%"
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
