@@ -515,6 +515,43 @@ impl Checkpoint {
         }
         Ok(table_count)
     }
+
+    /// Load a checkpoint file and replay its SQL statements against the
+    /// engine (Wave 5 — A4 data-loss bug fix).
+    ///
+    /// This reads the `checkpoint.sql` file written by [`Checkpoint::save`]
+    /// and executes each statement via `engine.execute()`. This restores
+    /// the catalog to the state at checkpoint time, after which WAL replay
+    /// applies any records written after the checkpoint.
+    ///
+    /// Returns the number of SQL statements executed.
+    pub fn load<P: AsRef<Path>>(
+        engine: &mut crate::engine::QueryEngine,
+        path: P,
+    ) -> std::io::Result<usize> {
+        let path = path.as_ref();
+        if !path.exists() {
+            log::debug!("checkpoint: no file at {}, skipping load", path.display());
+            return Ok(0);
+        }
+        let content = std::fs::read_to_string(path)?;
+        let mut count = 0;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("--") {
+                continue;
+            }
+            // Each line is a complete SQL statement (CREATE TABLE or INSERT).
+            match engine.execute(line) {
+                Ok(_) => count += 1,
+                Err(e) => {
+                    log::warn!("checkpoint: error replaying '{}': {}", line, e);
+                }
+            }
+        }
+        log::info!("checkpoint: loaded {count} statements from {}", path.display());
+        Ok(count)
+    }
 }
 
 // -----------------------------------------------------------------------
