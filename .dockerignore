@@ -1,0 +1,18 @@
+# Wave 11: .dockerignore — exclude files not needed in the Docker build context.
+target/
+.git/
+*.md
+!README.md
+docs/
+benches/
+examples/
+tests/
+waves/
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+turbogp_data/
+data/
+.download/
