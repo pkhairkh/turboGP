@@ -11,13 +11,13 @@
 
 | Document | What it is |
 |----------|-----------|
-| **[docs/FINE_DRAFT.md](docs/FINE_DRAFT.md)** | The definitive synthesis: venture + 25 ADRs + measured performance |
-| **[docs/adr/](docs/adr/)** | 25 accepted ADRs + 7 open questions |
-| **[SPECIFICATION.md](SPECIFICATION.md)** | Formal technical specification for implementers |
-| **[ARCHITECTURE.md](ARCHITECTURE.md)** | The architecture in 1 page |
+| **[ARCHITECTURE.md](ARCHITECTURE.md)** | The architecture in 1 page (dispatch path + module map) |
+| **[CHANGELOG.md](CHANGELOG.md)** | Per-wave change log (v3 remediation Waves 0-14) |
+| **[CONTRIBUTING.md](CONTRIBUTING.md)** | MSRV, coding standards, CI gates, branch/PR process |
 | **[docs/README.md](docs/README.md)** | Documentation index (reading order for new contributors) |
-| **[docs/problems/](docs/problems/)** | Problem catalog: 99 problems with status, math, effort, impact |
-| **[docs/research/waves/](docs/research/waves/)** | Per-problem solution evaluations (performance / time / energy) |
+| **[docs/adr/](docs/adr/)** | 25 accepted ADRs + open questions |
+| **[docs/REFERENCES.md](docs/REFERENCES.md)** | Academic bibliography (instruction-first, morsel, WCOJ, AQP) |
+| **[waves/](waves/)** | Per-wave Definition-of-Done checklists (Waves 0-12) |
 
 ## Why this exists
 
@@ -55,29 +55,53 @@ Instruction Sets → Memory Hierarchy → Protocols → Storage Layout → Execu
 turboGP/
 ├── README.md                         ← you are here
 ├── ARCHITECTURE.md                   ← the dispatch-based architecture (1-page summary)
-├── Cargo.toml
+├── CHANGELOG.md                      ← per-wave change log
+├── CONTRIBUTING.md                   ← MSRV, coding standards, CI gates
+├── Cargo.toml                        ← package metadata (MSRV 1.89, edition 2021)
 ├── src/                              ← Rust source code
 │   ├── kernel/                       ← SIMD kernels (the moat)
 │   ├── memory/                       ← tier-aware memory manager
-│   ├── storage/                      ← WAL + checkpoint (recovery.rs)
-│   ├── engine/                       ← QueryEngine + dispatch + tpch fallback
-│   │   ├── mod.rs                    ← QueryEngine::execute() entry point
+│   ├── storage/                      ← WAL + checkpoint + buffer pool
+│   ├── engine/                       ← QueryEngine + dispatch + query_interpreter
+│   │   ├── mod.rs                    ← QueryEngine::execute() entry point + routing
 │   │   ├── dispatch.rs               ← kernel-direct query dispatch
-│   │   ├── executor.rs               ← basic executor (JOIN, GROUP BY, etc.)
-│   │   └── tpch.rs                   ← TPC-H interpreter (rich SQL fallback)
-│   ├── sql/                          ← lexer, parser, DDL, DML, CTE
+│   │   ├── executor.rs               ← execute_select() — optimizer → dispatch → fallback
+│   │   ├── result.rs                 ← QueryResult + ResultColumn
+│   │   ├── dml.rs                    ← INSERT / UPDATE / DELETE
+│   │   ├── ddl.rs                    ← CREATE / DROP / ALTER
+│   │   ├── copy.rs                   ← COPY TO / COPY FROM (allow-listed dirs)
+│   │   ├── vacuum.rs                 ← VACUUM / dead-tuple reclamation
+│   │   ├── transaction.rs            ← BEGIN / COMMIT / ROLLBACK + savepoints
+│   │   ├── helpers.rs                ← shared engine helpers (re-exported *)
+│   │   └── query_interpreter/        ← rich-SQL fallback (formerly the god module)
+│   │       ├── mod.rs                ← parse_and_execute() + per-query fast paths
+│   │       ├── types.rs              ← Expr2 / BinOp2 / Value2 / SelectQuery2
+│   │       ├── parser.rs             ← QueryInterpreterParser + parse helpers
+│   │       ├── exec.rs               ← QueryInterpreter struct + execute
+│   │       ├── join.rs               ← hash/cross join + DP join ordering
+│   │       ├── aggregate.rs          ← grouped/scalar aggregates + vectorized sum
+│   │       ├── subquery.rs           ← decorrelation + EXISTS/IN hash-set caching
+│   │       ├── expr.rs               ← expression eval (binop, comparison, like, cast)
+│   │       └── tpc_h_queries_q{1_6, 7_12, 13_18, 19_22}.rs  ← TPC-H per-query detectors
+│   ├── sql/                          ← lexer, parser, AST, DDL, DML, CTE, extensions
 │   ├── exec/                         ← window, pivot, merge, json, temporal, etc.
 │   ├── datasource/                   ← CSV/Parquet loaders + Table struct
 │   ├── catalog/                      ← table + view registries
-│   ├── server/                       ← pgwire protocol server
+│   ├── server/                       ← pgwire protocol server (auth, session)
+│   ├── bin/turbogp.rs                ← `cargo run --bin turbogp` server entrypoint
 │   └── schema/                       ← column type schema (TableSchema)
 ├── examples/smoke.rs                 ← end-to-end demo
-├── benches/                          ← criterion benchmarks
+├── benches/                          ← criterion benchmarks (TPC-H, WCOJ, kernels)
+├── tests/                            ← integration tests (33+ suites)
+├── scripts/                          ← check_no_panics.sh, check_dead_code.sh, check_file_size.sh
+├── deploy/                           ← Helm chart + K8s manifests (Wave 10)
+│   ├── helm/                         ← Chart.yaml + templates/{statefulset,service,pdb,configmap,secret}.yaml
+│   └── k8s/turbogp.yaml              ← bare K8s StatefulSet manifest
+├── .github/workflows/                ← CI: ci, cross-os, msrv, coverage, fuzz, deadcode, security, release
 └── docs/
     ├── README.md                     ← documentation index (start here)
-    ├── adr/                          ← 25 ADRs + open questions
-    ├── research/                     ← math foundations + wave evaluations
-    └── problems/                     ← problem catalog
+    ├── REFERENCES.md                 ← academic bibliography
+    └── adr/                          ← 25 ADRs + OPEN_QUESTIONS.md
 ```
 
 ## The storage format: instruction-shaped, not schema-shaped
@@ -115,15 +139,33 @@ The kernel table is indexed at startup via CPUID; the best kernel per
 ## Quick start
 
 ```bash
-cargo test                # run the test suite
+# Build the library and tests
+cargo build
+cargo test --lib --tests
+
+# Run the standalone pgwire server (Wave 11 binary entrypoint)
+cargo run --bin turbogp -- --port 5432 --data-dir ./data
+cargo run --bin turbogp -- --insecure           # no auth (development)
+cargo run --bin turbogp -- --tls-cert c.pem --tls-key k.pem
+
+# End-to-end smoke demo (in-process)
 cargo run --release --example smoke
-cargo bench               # AVX-512 throughput benchmarks
+
+# AVX-512 throughput benchmarks (external baselines opt-in)
+cargo bench --features bench-external
 ```
+
+The server speaks the pgwire protocol — connect with `psql -h 127.0.0.1 -p 5432`.
+For deployment, the `deploy/` directory ships a Helm chart
+(`deploy/helm/Chart.yaml`) and a bare K8s StatefulSet manifest
+(`deploy/k8s/turbogp.yaml`), both with graceful shutdown wired through
+SIGTERM/SIGINT.
 
 ## What this is not
 
 - **Not a faster OLAP engine.** On TPC-H, this loses to DuckDB by 1.2–1.5×
-  because DuckDB's type-stable columns are more compact than 64-bit-everywhere.
+  because DuckDB's type-stable columns are more compact than 64-bit-everywhere
+  (see ADR-021 — accepted as the cost of the design point).
 - **Not a production database.** This is a research prototype demonstrating
   the instruction-first architecture.
 
@@ -135,20 +177,25 @@ cargo bench               # AVX-512 throughput benchmarks
   - Memory-disaggregated scale-up: 2–3× effective capacity via CXL
   - Energy efficiency: 3–5× lower energy per query
   - Schema evolution: near-zero cost (metadata only)
-  - TPC-C consolidation: ~11× energy efficiency vs PolarDB (see `docs/tpcc_math.md`)
 
 ## Research agenda
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| 1 | ✅ Done | Kernel table + memory manager + storage format (Waves 1-3) |
-| 2 | ✅ Done | Full executor with cross-tier joins (Waves 4-45) |
-| 3 | ⚠️ Stub | CXL-aware buffer pool + migration policy (stubs only, not production) |
-| 4 | ✅ Done | WAL + checkpoint (Waves 14, 37, 50, 51) |
-| 5 | ⚠️ Stub | Protocol coordinator (CXL/Raft stubs exist, not wired to executor) |
-| 6 | ✅ Done | SQL parser + schema layer (Waves 3, 6, 12, 22, 36) |
-| 7 | ⚠️ Stub | DPU offload + computational storage pushdown (stubs only) |
-| 8 | ✅ Done | TPC-H benchmark suite (Waves 10, 24, 28) |
+| 1 | ✅ Done (v3 Wave 1) | Dead-code purge + `ast.rs` wired; check_dead_code.sh in CI |
+| 2 | ✅ Done (v3 Wave 2) | God-module decomposition: the 13.5 K-LOC interpreter → `query_interpreter/` (12 sub-modules); `engine/mod.rs` (4.2 K LOC) → 7 sub-modules |
+| 3 | ✅ Done (v3 Wave 3) | Panic remediation — `check_no_panics.sh` passes (zero `unwrap`/`expect`/`panic!` in production code) |
+| 4 | ✅ Done (v3 Wave 4) | IR migration — all 7 `QueryExtensions` fields consumed; full `Expr` unification deferred to a later wave |
+| 5 | 🚧 In progress | ACID isolation + concurrent write transactions |
+| 6 | 🚧 In progress | Cost-based planner wiring (DPccp / MCTS off the hot path) |
+| 7 | 🚧 In progress | Index + sketch executor integration |
+| 8 | 🚧 In progress | Morsel-driven parallelism (ADR-018) |
+| 9 | ✅ Done (v3 Wave 9) | CI/CD — coverage 60 %, cross-OS (ubuntu+macos), MSRV 1.89, fuzz 10 k iterations |
+| 10 | ✅ Done (v3 Wave 10) | Deployment — Helm chart, K8s StatefulSet, graceful shutdown |
+| 11 | 🚧 In progress | Observability + slow-query logging hardening |
+| 12 | 🚧 In progress | Protocol coordinator (CXL / Raft-over-RoCEv2) — currently stubs |
+| 13 | 🚧 In progress | DPU / computational-storage pushdown — currently stubs |
+| 14 | 🚧 In progress | CXL-aware buffer pool + migration policy — currently stubs |
 
 ## Current SQL surface
 
@@ -163,41 +210,61 @@ The following SQL features work end-to-end through `QueryEngine::execute()`:
 - **LIMIT**: row count limiting
 - **WHERE**: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`, `LIKE` (with `%` wildcards), `AND`, `OR`
 - **NULL semantics**: NULL bitmaps track NULL cells; `COUNT(col)` excludes NULLs; pgwire sends NULL as `-1` length
-- **Transactions**: `BEGIN`, `COMMIT`, `ROLLBACK` with snapshot isolation
+- **Transactions**: `BEGIN`, `COMMIT`, `ROLLBACK` with snapshot isolation, plus `SAVEPOINT` / `ROLLBACK TO`
 - **WAL**: write-ahead log with BEGIN/COMMIT/ROLLBACK markers, base64-encoded SQL, replay on restart
-- **Checkpoint**: type-preserving (FLOAT, VARCHAR, NULL all round-trip correctly)
+- **Checkpoint**: type-preserving (FLOAT, VARCHAR, NULL all round-trip correctly), loaded on startup via `with_data_dir`
 - **CTE**: `WITH ... AS (...) SELECT ...` including recursive CTEs
 - **Views**: `CREATE VIEW` + `SELECT FROM view` (materialized on query)
 - **Procedures**: `CREATE PROCEDURE` + `EXEC proc_name [args]`
 - **MERGE**: `MERGE INTO target WHEN MATCHED THEN UPDATE/DELETE/INSERT`
 - **Temporal**: `FOR SYSTEM_TIME AS OF <timestamp>` (requires pre-registered TemporalTable)
 - **Window functions**: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `SUM()`, `COUNT()` with `OVER (PARTITION BY ... ORDER BY ...)`
-- **pgwire server**: extended query protocol (Parse/Bind/Describe/Execute/Sync), NULL handling, max_rows/cursor support
+- **pgwire server**: extended query protocol (Parse/Bind/Describe/Execute/Sync), NULL handling, max_rows/cursor support, SCRAM-SHA-256 auth, TLS
 - **Data loading**: CSV, Parquet (with NULL bitmap and StringSearchColumn sidecar)
+- **VACUUM**: dead-tuple reclamation
+- **COPY**: `COPY table TO/FROM '/path'` (gated by `allowed_copy_dirs` allow-list, SQLSTATE 42501 on violation)
 
 ## Known limitations
 
-- **No persistent storage**: all data is in-memory; WAL+checkpoint provide durability across restarts but there's no on-disk page store
-- **CXL/RoCEv2/IB are stubs**: the protocol modules exist but are not wired to the executor; single-node only
-- **Morsel executor not used**: `executor/morsel.rs` exists but the SQL executor uses dispatch + vectorized kernels, not morsel-driven parallelism
-- **DPccp/MCTS planners not wired**: `planner/dpccp.rs` and `planner/mcts.rs` exist but the executor uses a simple cost-based optimizer
-- **No concurrent write transactions**: snapshot isolation supports one transaction at a time per engine; concurrent connections each get their own engine
-- **String columns hashed**: strings are stored as xxh3 hashes in u64 cells; the original text is preserved in a `StringSearchColumn` sidecar (not all operations consult the sidecar)
-- **PIVOT/UNPIVOT SQL syntax not parsed**: the `pivot()` / `unpivot()` functions are callable but `PIVOT (...)` clause in SELECT is not yet parsed
-- **JSON functions not in expression evaluator**: `JSON_VALUE`, `JSON_QUERY`, etc. are callable as module functions but not yet integrated into the SELECT expression evaluator
-- **Describe returns NoData**: the pgwire Describe message always returns NoData without inferring the schema (psql tolerates this)
-- **No indexes used by executor**: `index/manager.rs` and `index/lsh.rs` exist but the executor does full scans
+- **No persistent page store**: WAL + checkpoint provide durability across
+  restarts, but the buffer pool (`storage/buffer_pool.rs`) is a recent
+  addition (Wave 63) and is not yet the default for all tables.
+- **CXL / RoCEv2 / IB are stubs**: the protocol modules exist as type
+  definitions but are not wired to the executor. turboGP is currently
+  single-node, in-memory.
+- **Morsel executor not used**: ADR-018 (data-centric morsel-driven pipeline)
+  is accepted, but the SQL executor uses dispatch + vectorized kernels, not
+  morsel-driven parallelism.
+- **DPccp / MCTS planners not wired**: `planner/optimizer.rs` exists with
+  DPccp + MCTS, but the executor uses a 5-rule heuristic
+  (`choose_plan` → KernelDirect vs `query_interpreter` fallback). Wiring the
+  cost-based planner to the hot path is Wave 6.
+- **No concurrent write transactions**: snapshot isolation supports one
+  writer at a time per engine; concurrent connections each get their own
+  engine via `Arc<RwLock<QueryEngine>>`.
+- **String columns hashed**: strings are stored as xxh3 hashes in `u64`
+  cells; the original text is preserved in a `StringSearchColumn` sidecar
+  (not all operations consult the sidecar).
+- **`PIVOT (...)` clause not parsed**: the `pivot()` / `unpivot()` functions
+  are callable but `PIVOT (...)` in SELECT is not yet parsed.
+- **JSON functions not in expression evaluator**: `JSON_VALUE`,
+  `JSON_QUERY`, etc. are callable as module functions but not yet
+  integrated into the SELECT expression evaluator.
+- **Describe returns NoData**: the pgwire `Describe` message always returns
+  NoData without inferring the schema (psql tolerates this).
+- **Indexes not used by executor**: `index/manager.rs` exists but the
+  executor does full scans for SELECT; index lookups are wired for
+  constraint enforcement (PRIMARY KEY / UNIQUE) only.
+- **`Expr` unification deferred (Wave 4)**: the legacy `Expr2` /
+  `BinOp2` / `Value2` types in `query_interpreter::types` are still the
+  canonical expression representation in the fallback path. The unified
+  `Expr` AST in `sql/ast.rs` is wired for the dispatch path only.
 
 See `ARCHITECTURE.md` and `docs/` for the full design.
 
 ## License
 
 CCL-X (Civil Common License X), Version 1.2 — see `LICENSE.md` for the full
-text. The `Cargo.toml` declares `license = "CCL-X-1.2"` and the LICENSE.md
+text. The `Cargo.toml` declares `license = "CCL-X-1.2"` and the `LICENSE.md`
 file in the repo root is the canonical CCL-X v1.2 text. All three sources
-(README, Cargo.toml, LICENSE.md) now agree on CCL-X-1.2.
-
-(Wave 59a fix: the previous README claimed "MIT OR Apache-2.0" and called
-the Cargo.toml value "historical" — but no MIT or Apache LICENSE file
-existed in the repo, and LICENSE.md was already CCL-X. This was a fake
-license claim. Corrected to match the actual license file.)
+(README, Cargo.toml, LICENSE.md) agree on CCL-X-1.2.

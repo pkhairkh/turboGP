@@ -67,14 +67,13 @@ the huge page granularity and amortizes TLB cost.
 
 ### 3. Protocols define coherence and reach boundaries
 
-> **⚠️ Status note (Wave 54):** The protocol coordinator (`src/protocol/`)
-> is a **stub**. CXL, Raft-over-RoCEv2, and IB modules exist as type
-> definitions but are **not wired** to the executor. turboGP is currently
-> single-node, in-memory. The protocol boundary diagram below describes
-> the *design intent*, not the current implementation.
+> **⚠️ Status note (Wave 12, in progress):** The protocol coordinator
+> (`src/protocol/` is not yet a separate module — CXL, Raft-over-RoCEv2, and
+> IB types are stubs that are **not wired** to the executor). turboGP is
+> currently single-node, in-memory. The protocol boundary diagram below
+> describes the *design intent*, not the current implementation.
 
-The transaction coordinator (`src/protocol/`) is designed to run at
-protocol boundaries:
+The transaction coordinator is designed to run at protocol boundaries:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -140,6 +139,46 @@ The executor (`src/engine/`) is **not** a Volcano-style pipeline or a DAG
 scheduler. It is a **dispatch-based** executor that pattern-matches the
 SQL shape and calls the appropriate vectorized kernel directly.
 
+### Engine module structure (post-Wave-2 decomposition)
+
+The `src/engine/` module was decomposed in v3 Wave 2 — `engine/mod.rs` was
+4,159 LOC and is now under 2,000 LOC, with the bulk pushed into focused
+sub-modules:
+
+```
+src/engine/
+├── mod.rs              ← QueryEngine struct + execute() routing + execute_inner()
+├── dispatch.rs         ← kernel-direct query dispatch (classify_query)
+├── executor.rs         ← execute_select() — optimizer → dispatch → fallback
+├── result.rs           ← QueryResult + ResultColumn
+├── dml.rs              ← INSERT / UPDATE / DELETE (constraint enforcement)
+├── ddl.rs              ← CREATE / DROP / ALTER (table, view, schema, proc)
+├── copy.rs             ← COPY TO / COPY FROM (allow-listed dirs, SQLSTATE 42501)
+├── vacuum.rs           ← VACUUM / dead-tuple reclamation
+├── transaction.rs      ← BEGIN / COMMIT / ROLLBACK + SAVEPOINT
+├── helpers.rs          ← shared engine helpers (re-exported via `pub use helpers::*`)
+├── mod_tests.rs        ← inline unit tests (cfg(test) only)
+└── query_interpreter/  ← rich-SQL fallback (the former god module)
+    ├── mod.rs                          ← parse_and_execute() + per-query fast paths
+    ├── types.rs                        ← Expr2 / BinOp2 / Value2 / SelectQuery2
+    ├── parser.rs                       ← QueryInterpreterParser + parse helpers
+    ├── exec.rs                         ← QueryInterpreter struct + execute
+    ├── join.rs                         ← hash/cross join + DP join ordering
+    ├── aggregate.rs                    ← grouped/scalar aggregates + vectorized sum
+    ├── subquery.rs                     ← decorrelation + EXISTS/IN hash-set caching
+    ├── expr.rs                         ← expression eval (binop, comparison, like, cast)
+    ├── tpc_h_queries_q1_q6.rs          ← TPC-H Q1–Q6 detectors (vectorized fast paths)
+    ├── tpc_h_queries_q7_q12.rs         ← TPC-H Q7–Q12 detectors
+    ├── tpc_h_queries_q13_q18.rs        ← TPC-H Q13–Q18 detectors
+    └── tpc_h_queries_q19_q22.rs        ← TPC-H Q19–Q22 detectors (comultiplication, etc.)
+```
+
+The `query_interpreter/` directory replaces the former 13,483-LOC
+interpreter god module that lived in `engine/`. It is split into 12
+focused sub-modules — one per responsibility (types, parser, exec, join,
+aggregate, subquery, expr) plus four per-query-group detectors that
+carry the TPC-H-specific fast paths.
+
 ### Execution flow
 
 ```
@@ -149,10 +188,11 @@ SQL string
     │  (transaction control, WAL, routing)
     │
     ▼  execute_inner()                 [src/engine/mod.rs]
-    │  (CTE → views → procedures → MERGE → DDL → DML → temporal → SELECT)
+    │  (CTE → views → procedures → MERGE → DDL → DML →
+    │   temporal → COPY → VACUUM → SELECT)
     │
     ▼  parse_with_extensions()         [src/sql/]
-    │  (lexer + parser → SelectQuery)
+    │  (lexer + parser → SelectQuery + QueryExtensions)
     │
     ▼  execute_select()                [src/engine/executor.rs]
     │  (optimizer → dispatch → fallback)
@@ -162,6 +202,12 @@ SQL string
     │
     ▼  vectorized kernels              [src/exec/vectorized.rs]
     │  (SIMD scan, filter, aggregate)
+    │
+    ├── if QueryShape::Complex ───────► query_interpreter::parse_and_execute()
+    │                                   [src/engine/query_interpreter/mod.rs]
+    │                                   (rich SQL: HAVING, CASE, subqueries,
+    │                                    multi-table implicit joins, arithmetic
+    │                                    in aggregates, TPC-H fast paths)
     │
     ▼  QueryResult                     [src/engine/result.rs]
 ```
@@ -176,26 +222,35 @@ the appropriate kernel directly:
 - `SumCol` / `AvgCol` / `MinMax` / `CountDistinct` — single-aggregate queries
 - `GroupByCount` / `GroupBySum` / `GroupByOrderByLimit` — GROUP BY queries
 - `SelectStar` / `SelectColumn` / `SelectMulti` — projection queries
-- `Complex` — falls back to the TPC-H interpreter (`src/engine/tpch.rs`)
+- `Complex` — falls back to the query interpreter
+  (`src/engine/query_interpreter/mod.rs`)
 
-### TPC-H fallback
+### Query interpreter fallback
 
 When the dispatcher classifies a query as `Complex` (e.g. HAVING, CASE WHEN,
 subqueries, multi-table implicit joins, arithmetic in aggregates), the
-executor falls back to `tpch::parse_and_execute()`. This interpreter has a
-richer parser and a type-aware row-based evaluator that handles the full
-TPC-H query set.
+executor falls back to `query_interpreter::parse_and_execute()`. This
+interpreter has a richer parser (`query_interpreter::parser.rs`) and a
+type-aware row-based evaluator (`query_interpreter::expr.rs`) that handles
+the full TPC-H query set. The four `tpc_h_queries_q{1_6, 7_12, 13_18,
+19_q22}.rs` modules carry per-query fast paths (Q19 comultiplication, Q21
+double-EXISTS reformulation, Q4 / Q13 pigeonhole rewrites, etc.).
 
 ### What the executor is NOT
 
-- **Not a DAG scheduler.** The `src/executor/` directory contains
-  `pipeline.rs`, `scheduler.rs`, `morsel.rs`, `eddy.rs`, `adaptive.rs` —
-  these are research prototypes that are **not wired** to the SQL executor.
-  The dispatch path in `src/engine/` is the actual execution path.
-- **Not morsel-driven.** `executor/morsel.rs` exists but is not used.
-- **Not cost-based.** The planner (`src/planner/`) has DPccp, MCTS, and
-  learned cost models, but the executor uses a simple heuristic optimizer
-  (`planner/optimizer.rs`) that picks KernelDirect vs TpchFallback.
+- **Not a DAG scheduler.** The `src/exec/` directory contains `parallel.rs`,
+  `join_hash_table.rs`, `merge.rs`, `bloom_filter.rs`, etc., but these are
+  the operator implementations the dispatch path *calls* — they are not a
+  Volcano pipeline. There is no `src/executor/` DAG/scheduler/morsel
+  directory (deleted in v3 Wave 1 dead-code purge; ADR-018 morsel-driven
+  parallelism is accepted but not on the hot path).
+- **Not morsel-driven.** Morsel execution (ADR-018) is the design target;
+  the current dispatch path runs vectorized kernels sequentially.
+- **Not cost-based.** The planner (`src/planner/`) has a `CostModel` and
+  `optimizer.rs`, but the executor uses a 5-rule heuristic
+  (`optimizer.rs::choose_plan`) that picks `KernelDirect` vs
+  `query_interpreter` fallback. Wiring DPccp / MCTS onto the hot path is
+  Wave 6.
 
 ## The kernel table: the moat
 
@@ -221,7 +276,8 @@ kernel for the detected CPU.
 ## What this is not
 
 - **Not a faster OLAP engine.** On TPC-H, this loses to DuckDB by 1.2–1.5×
-  because DuckDB's type-stable columns are more compact than 64-bit-everywhere.
+  because DuckDB's type-stable columns are more compact than 64-bit-everywhere
+  (ADR-021).
 - **Not a production database.** This is a research prototype demonstrating
   the instruction-first architecture.
 
@@ -233,14 +289,15 @@ that wins on:
 - Memory-disaggregated scale-up: 2–3× effective capacity via CXL
 - Energy efficiency: 3–5× lower energy per query
 - Schema evolution: near-zero cost (metadata only)
-- TPC-C consolidation: ~11× energy efficiency vs PolarDB (see `docs/tpcc_math.md`)
 
 ## References
 
-- `docs/cpu_energy_kb.md` — per-instruction energy and latency knowledgebase
-- `docs/instruction_first_architecture.md` — long-form architecture document
-- `docs/tpcc_analysis.md` — TPC-C bottleneck analysis
-- `docs/tpcc_math.md` — TPC-C mathematical analysis with path to beating it
+- [`docs/REFERENCES.md`](./docs/REFERENCES.md) — academic bibliography
+  (Polychroniou 2015, Leis 2014, Veldhuizen 2014, Atserias-Grohe-Marx 2008,
+  Cascades survey, energy-aware benchmarking, CXL tiered-memory expansion)
+- [`docs/adr/`](./docs/adr/) — 25 accepted ADRs + open questions
+- [`CHANGELOG.md`](./CHANGELOG.md) — per-wave change log (v3 Waves 0-14)
+- [`waves/`](./waves/) — per-wave Definition-of-Done checklists
 
 ## Academic Positioning
 
@@ -259,23 +316,20 @@ treats memory-tier heterogeneity (L3 vs DDR5 vs CXL vs NVMe) as a first-class
 kernel-selection axis rather than as a buffer-pool detail.
 
 On the **planning** side, turboGP is academically current but productionally
-unwired. The DPccp join orderer (`planner/dpccp.rs`, Moerkotte & Neumann
-2008), the MCTS fallback for n>15 joins (`planner/mcts.rs`), the AGM-bound
-WCOJ selector (`planner/agm.rs`, `planner/wcoj.rs`, Atserias-Grohe-Marx
-2008), and the tensor-network contraction model
-(`planner/tensor.rs`, `planner/contraction.rs`,
-arXiv:2209.12332, arXiv:2001.08063) are all genuine research-grade code.
-The calibrated analytic cost model (ADR-023, `planner/calibration.rs`)
-matches the Zen-5-measured AVX-512 throughput to within 5% of the
-theoretical `lanes × f_cpu` bound, which is **better calibrated than most
-academic cost models** and aligns closely with the adaptive-cost-model
-direction of arXiv:2409.17136. The honest weakness, documented in the
-Production Readiness Assessment, is that this planner is **not on the
-production hot path**: the actual executor uses a 5-rule heuristic
+unwired. The DPccp join orderer (`planner/optimizer.rs`, Moerkotte & Neumann
+2008), the AGM-bound WCOJ selector (`planner/mod.rs`,
+Atserias-Grohe-Marx 2008), and the calibrated analytic cost model
+(ADR-023) are genuine research-grade code. The calibrated cost model matches
+the Zen-5-measured AVX-512 throughput to within 5% of the theoretical
+`lanes × f_cpu` bound, which is **better calibrated than most academic cost
+models** and aligns closely with the adaptive-cost-model direction of
+arXiv:2409.17136. The honest weakness, documented in the Known Limitations
+section of `README.md`, is that this planner is **not on the production hot
+path**: the actual executor uses a 5-rule heuristic
 (`planner/optimizer.rs::choose_plan`) and a per-query-shape dispatcher
-(`engine/dispatch.rs`). Closing that gap is the single most important
-remaining piece of work, and the Cascades survey (arXiv:2510.20082) is the
-right reference for the rule-engine scope a production optimizer needs.
+(`engine/dispatch.rs`). Closing that gap is Wave 6, and the Cascades survey
+(arXiv:2510.20082) is the right reference for the rule-engine scope a
+production optimizer needs.
 
 On **approximate query processing** (ADR-015 Empirical Bernstein,
 ADR-024 McDiarmid through joins) turboGP is closer to the analytic
@@ -293,4 +347,3 @@ alignment is with DBOS (arXiv:2007.11112): turboGP is narrower
 (single-node, in-memory) but shares the data-centric instinct that the
 storage layout, not the OS scheduler, should drive execution. The full
 bibliography is in [`docs/REFERENCES.md`](./docs/REFERENCES.md).
-
