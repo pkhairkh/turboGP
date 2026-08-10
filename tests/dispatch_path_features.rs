@@ -2,7 +2,7 @@
 //!
 //! These tests verify that features work through the DISPATCH path
 //! (the hot path that handles most real queries), not just through
-//! the fallback executor or the tpch interpreter.
+//! the fallback executor or the interpreter.
 
 use turbogp::engine::QueryEngine;
 

@@ -34,7 +34,7 @@ parking_lot = "0.12"
 # malloc_consolidate + free). mimalloc has thread-local heaps.
 mimalloc = { version = "0.1", features = ["override"] }
 # Fast hashing — replaces std SipHash (9% of Q21 time) with hardware AES.
-# Used for all HashMap/HashSet in tpch.rs via type aliases.
+# Used for all HashMap/HashSet in query_interpreter/ via type aliases.
 ahash = "0.8"
 # CPU detection
 raw-cpuid = "11.0"
@@ -115,9 +115,9 @@ path = "benches/bench_kernels.rs"
 required-features = ["bench-external"]
 
 [[bench]]
-name = "bench_tpch"
+name = "bench_tpc_h"
 harness = false
-path = "benches/bench_tpch.rs"
+path = "benches/bench_tpc_h.rs"
 required-features = ["bench-external"]
 
 [[bench]]
@@ -163,9 +163,9 @@ path = "benches/bench_3x_proof.rs"
 required-features = ["bench-external"]
 
 [[bench]]
-name = "bench_tpch_full"
+name = "bench_tpc_h_full"
 harness = false
-path = "benches/bench_tpch_full.rs"
+path = "benches/bench_tpc_h_full.rs"
 required-features = ["bench-external"]
 
 [[example]]

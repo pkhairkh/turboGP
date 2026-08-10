@@ -86,9 +86,9 @@ pub fn execute_select(
         return execute_with_join(query, extensions, catalog, kernel_table);
     }
 
-    // If the optimizer says TpchFallback, return an error so the caller
+    // If the optimizer says InterpreterFallback, return an error so the caller
     // (execute_inner) routes to the interpreter interpreter.
-    if plan.strategy == crate::planner::optimizer::ExecStrategy::TpchFallback {
+    if plan.strategy == crate::planner::optimizer::ExecStrategy::InterpreterFallback {
         return Err(Error::Other("optimizer chose interpreter fallback".into()));
     }
 

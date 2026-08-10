@@ -27,8 +27,8 @@ fn extract_year_basic() {
     let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (d INT)").unwrap();
     e.execute("INSERT INTO t (d) VALUES (20240115)").unwrap();
-    // EXTRACT on an integer column — the tpch interpreter handles this.
+    // EXTRACT on an integer column — the interpreter handles this.
     let r = e.execute("SELECT EXTRACT(YEAR FROM d) FROM t");
-    // This may fall to tpch; just verify it doesn't error.
+    // This may fall to interpreter; just verify it doesn't error.
     assert!(r.is_ok(), "EXTRACT must execute; got: {:?}", r.err());
 }

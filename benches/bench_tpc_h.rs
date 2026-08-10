@@ -98,8 +98,8 @@ fn register_column(sched: &Scheduler, id: u64, cells: &[u64]) {
 /// 'A', 'N', 'R' → region IDs 1, 2, 3) and run a SUM on each partition. The
 /// reported throughput is `LINEITEM_ROWS / elapsed`, averaged across the three
 /// partitions.
-fn bench_tpch_q1(c: &mut Criterion) {
-    let mut group = c.benchmark_group("tpch_q1");
+fn bench_tpc_h_q1(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tpc_h_q1");
     group.throughput(Throughput::Elements(LINEITEM_ROWS as u64));
 
     let table = Arc::new(KernelTable::new());
@@ -147,8 +147,8 @@ fn bench_tpch_q1(c: &mut Criterion) {
 /// multi-predicate kernel can scan them as a contiguous u64 stream. The
 /// SUM(`l_extendedprice`) over the matching rows is computed in the host loop
 /// (the engine does not yet fuse filter+aggregate in a single kernel).
-fn bench_tpch_q6(c: &mut Criterion) {
-    let mut group = c.benchmark_group("tpch_q6");
+fn bench_tpc_h_q6(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tpc_h_q6");
     group.throughput(Throughput::Elements(LINEITEM_ROWS as u64));
 
     let table = Arc::new(KernelTable::new());
@@ -225,8 +225,8 @@ fn bench_tpch_q6(c: &mut Criterion) {
 /// Added because the multi-predicate scan (`VPTERNLOGQ`, ADR-004) is the
 /// kernel that benefits most from turboGP's instruction-first design — a
 /// generic vectorized executor would issue three separate comparisons.
-fn bench_tpch_multi_predicate(c: &mut Criterion) {
-    let mut group = c.benchmark_group("tpch_multi_predicate");
+fn bench_tpc_h_multi_predicate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tpc_h_multi_predicate");
     group.throughput(Throughput::Elements(LINEITEM_ROWS as u64));
 
     let table = Arc::new(KernelTable::new());
@@ -264,5 +264,5 @@ fn bench_tpch_multi_predicate(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_tpch_q1, bench_tpch_q6, bench_tpch_multi_predicate);
+criterion_group!(benches, bench_tpc_h_q1, bench_tpc_h_q6, bench_tpc_h_multi_predicate);
 criterion_main!(benches);
