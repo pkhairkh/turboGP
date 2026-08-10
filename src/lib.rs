@@ -17,8 +17,8 @@
 //! - [`planner`] — calibrated analytic cost model (ADR-023) + Kingman
 //!   queueing predictor (ADR-020) used for join ordering, index selection,
 //!   and admission control.
-//! - [`index`] — secondary indexes: bit-sliced index (ADR-014) and
-//!   locality-sensitive hash (ADR-017).
+//! - [`index`] — secondary indexes: bit-sliced index (no ADR — see
+//!   `src/index/bsi.rs`) and locality-sensitive hash (ADR-017).
 //! - [`sketch`] — probabilistic, mergeable summaries: HyperLogLog,
 //!   Count-Min, t-Digest (ADR-015).
 //! - [`protocol`] — protocol boundary coordinator (CXL, Raft/RoCEv2).

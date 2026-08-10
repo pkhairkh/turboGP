@@ -143,6 +143,6 @@ REP MOVSB copy bandwidth: 21.65 GB/s
 - Compatible with ADR-020 (Kingman admission): same Kingman formula, different application
 
 ## References
-- Measured on AMD EPYC-Turin (Zen 5) at 45.63.97.103, 2025-07-30
+- Measured on AMD EPYC-Turin (Zen 5) at [redacted], 2025-07-30
 - Kingman, "The Single Server Queue in Heavy Traffic" 1961
 - `examples/bench_kernel.rs` (the calibration benchmark)

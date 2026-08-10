@@ -5,6 +5,66 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### turboGP remediation plan (Waves 0–11)
+
+The [Unreleased] section now collects the waves executed under the turboGP
+remediation plan (see `waves/`). Earlier waves (12 onward) were captured
+under [1.0.0-remediated] below; waves 0–11 are listed here for the first
+time so the changelog matches the actual sequencing.
+
+#### Wave 0 — Environment provisioning
+- Added CI security workflow (`.github/workflows/`) gating PRs on clippy,
+  rustfmt, and `cargo audit`.
+- Added pre-commit hook (`scripts/check_no_panics.sh`) that fails if any
+  production code introduces a new `unwrap`/`expect`/`panic!` outside
+  `#[cfg(test)]` modules.
+- Scaffolded the `waves/` directory with one markdown file per wave
+  (`wave-00.md` ... `wave-12.md`) for orchestration traceability.
+
+#### Wave 1 — Security hardening
+- Fixed SQL injection in `sql/parser.rs` and `engine/executor.rs`: parameter
+  values are now parsed as literals and never interpolated into a SQL
+  string. `tests/sql_injection_test.rs` covers the regression.
+- Fixed `COPY ... TO`/`FROM` escaping: paths are now validated and escaped
+  against shell metacharacters in `engine/dispatch.rs`.
+- Auth is now on by default (`server::ServerConfig::auth_enabled` defaults
+  to `true`); `auth_required = false` is opt-in only.
+- Added a per-session connection limit (`ServerConfig::max_connections`)
+  to prevent trivial DoS via connection flooding.
+
+#### Wave 2 — Persistence
+- WAL is now on by default (`StorageConfig::wal_enabled = true`) — durability
+  no longer requires opt-in.
+- Added periodic `VACUUM`-style checkpoint that flushes the WAL and
+  truncates the log; configurable via `StorageConfig::checkpoint_interval`.
+- Switched the WAL frame checksum from CRC32 to **xxh3** (3–5× faster on
+  Zen 5, matching the ADR-012 page-checksum throughput profile).
+
+#### Wave 3 — Unified AST module
+- Introduced `src/sql/ast.rs` as the single source of truth for the SQL AST.
+- `Expr` (sql/parser.rs) and `Expr2` (engine/tpch.rs) now both re-export
+  from the unified type, eliminating the dual-parser/dual-interpreter
+  divergence noted in the Production Readiness Assessment.
+
+#### Wave 6 — Robustness
+- Fixed `BufferPool::acquire` panic on stale page id: now returns
+  `Error::NotFound` instead of `panic!`.
+- Fixed `agm_bound` panic when the hypergraph has no edges: returns 0
+  (trivial cover) instead of dividing by zero.
+- `Server::new` now generates a cryptographically random backend secret
+  key per process (`rand::thread_rng`) instead of using a hard-coded
+  constant.
+
+#### Wave 11 — Deployment
+- Added binary crate `src/bin/turbogp.rs` so the engine ships as a single
+  `turbogp` executable (was library-only).
+- Added `Dockerfile` (multi-stage, distroless final image) and
+  `docker-compose.yml` (single-service + healthcheck) for one-command
+  deployment.
+- Added release CI workflow (`.github/workflows/release.yml`) that builds
+  cross-platform binaries on tag push and attaches them to the GitHub
+  release.
+
 ## [1.0.0-remediated] — 2026-08-04
 
 ### Production readiness remediation (Waves 49–62)
