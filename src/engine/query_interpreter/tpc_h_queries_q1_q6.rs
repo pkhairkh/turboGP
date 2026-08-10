@@ -1264,6 +1264,7 @@ pub(crate) fn execute_q6_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
 mod tests {
 
     use super::*;
+    use super::super::parser::parse_query;
 
     #[test]
     fn test_parse_simple_select() {
