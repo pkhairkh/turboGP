@@ -1,0 +1,27 @@
+name: Dead Code Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  no-panics:
+    name: check_no_panics.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run no-panics check
+        run: bash scripts/check_no_panics.sh
+
+  deadcode:
+    name: check_dead_code.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run dead-code check
+        run: bash scripts/check_dead_code.sh
