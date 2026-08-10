@@ -118,6 +118,9 @@ pub struct QueryEngine {
     /// <name>, the catalog is restored from the snapshot. On COMMIT or
     /// ROLLBACK, all savepoints are cleared.
     savepoints: Vec<(String, Catalog)>,
+    /// Allowed directories for COPY TO/FROM operations (Wave 2 security).
+    /// Empty by default — COPY is disabled unless explicitly configured.
+    pub allowed_copy_dirs: Vec<std::path::PathBuf>,
 }
 
 impl QueryEngine {
@@ -238,6 +241,7 @@ impl QueryEngine {
             table_ids: HashMap::new(),
             next_table_id: 1,
             savepoints: Vec::new(),
+            allowed_copy_dirs: Vec::new(),
         }
     }
 
@@ -1103,6 +1107,16 @@ impl QueryEngine {
         let direction = parts[2].to_uppercase();
         // The file path is the 4th part, possibly quoted.
         let file_path = parts[3].trim_matches(|c| c == '\'' || c == '"');
+        // Wave 2 security: validate COPY path against allow-list.
+        let path = std::path::Path::new(file_path);
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let allowed = self.allowed_copy_dirs.iter().any(|dir| canonical.starts_with(dir));
+        if !allowed {
+            return Err(Error::Other(format!(
+                "COPY path '{}' not in allowed_copy_dirs (SQLSTATE 42501)",
+                file_path
+            )));
+        }
         match direction.as_str() {
             "TO" => {
                 // Export the table to a CSV file.
