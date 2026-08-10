@@ -16,7 +16,7 @@ fn make_engine_with_csv() -> QueryEngine {
     writeln!(tmp, "3,Carol,300").unwrap();
     tmp.flush().unwrap();
 
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.load_csv(tmp.path().to_str().unwrap(), "users", true).unwrap();
     e
 }

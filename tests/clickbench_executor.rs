@@ -4,7 +4,7 @@
 use turbogp::engine::QueryEngine;
 
 fn make_engine() -> QueryEngine {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute(
         "CREATE TABLE hits (id INT, user_id INT, engine_id INT, url VARCHAR(100), region_id INT)",
     )

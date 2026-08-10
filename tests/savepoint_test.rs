@@ -4,7 +4,7 @@ use turbogp::engine::QueryEngine;
 
 #[test]
 fn savepoint_rollback_to() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("BEGIN").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1)").unwrap();
@@ -20,7 +20,7 @@ fn savepoint_rollback_to() {
 
 #[test]
 fn savepoint_release() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("BEGIN").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1)").unwrap();
@@ -35,7 +35,7 @@ fn savepoint_release() {
 
 #[test]
 fn savepoint_requires_transaction() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     // SAVEPOINT without BEGIN creates a savepoint on the main catalog.
     // It's not useful but shouldn't crash.
     let r = e.execute("SAVEPOINT sp1");
@@ -44,7 +44,7 @@ fn savepoint_requires_transaction() {
 
 #[test]
 fn rollback_to_nonexistent_savepoint_errors() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("BEGIN").unwrap();
     let r = e.execute("ROLLBACK TO nonexistent");

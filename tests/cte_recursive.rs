@@ -3,7 +3,7 @@
 use turbogp::engine::QueryEngine;
 
 fn make_engine() -> QueryEngine {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE employees (id INT, manager_id INT, name VARCHAR(50))").unwrap();
     e.execute("INSERT INTO employees (id, manager_id, name) VALUES (1, 0, 'CEO')").unwrap();
     e.execute("INSERT INTO employees (id, manager_id, name) VALUES (2, 1, 'VP Eng')").unwrap();
@@ -33,7 +33,7 @@ fn non_recursive_cte_multiple() {
 
 #[test]
 fn recursive_cte_countdown() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     // A simple recursive CTE that counts down from 5 to 1.
     // The anchor is SELECT 5 AS n (produces 1 row: n=5).
     // The recursive part is SELECT n - 1 FROM countdown WHERE n > 1.
@@ -97,7 +97,7 @@ fn cte_temp_table_cleaned_up() {
 
 #[test]
 fn maxrecursion_zero_means_unlimited() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     // MAXRECURSION 0 should allow unlimited recursion (capped at 100k internally).
     // With a non-growing recursive CTE (produces no new rows), it terminates immediately.
     let sql = "WITH RECURSIVE t AS (

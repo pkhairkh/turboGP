@@ -30,7 +30,7 @@
 //! method, which is the shape callers actually want:
 //!
 //! ```ignore
-//! let mut engine = QueryEngine::new();
+//! let mut engine = QueryEngine::in_memory();
 //! engine.load_parquet("hits.parquet", "hits")?;
 //! let result = engine.execute("SELECT count(*) FROM hits")?;
 //! println!("{}", result.scalar_u64().unwrap());
@@ -186,7 +186,29 @@ impl QueryEngine {
     /// model. The catalog starts empty — register tables via
     /// [`QueryEngine::register_table`], [`QueryEngine::load_parquet`],
     /// or [`QueryEngine::load_csv`].
+    /// Create a QueryEngine with default on-disk persistence (Wave 2).
+    ///
+    /// The default data directory is `./turbogp_data`. If the directory
+    /// cannot be created or the WAL cannot be opened, the engine falls
+    /// back to in-memory mode with a warning log. For tests that
+    /// explicitly want no persistence, use [`QueryEngine::in_memory()`].
     pub fn new() -> Self {
+        match Self::with_data_dir("./turbogp_data") {
+            Ok(engine) => engine,
+            Err(e) => {
+                log::warn!(
+                    "QueryEngine: persistence unavailable ({e}), falling back to in-memory mode"
+                );
+                Self::in_memory()
+            }
+        }
+    }
+
+    /// Create a QueryEngine with no on-disk persistence.
+    ///
+    /// All data is in-memory and lost on process exit. Use this for
+    /// tests and ephemeral workloads where durability is not required.
+    pub fn in_memory() -> Self {
         let mut catalog = Catalog::new();
         // Register a dummy table that allows `SELECT 1` and `SELECT count(*)`
         // without a FROM clause. The table has one row and one column.
@@ -357,6 +379,34 @@ impl QueryEngine {
         }
         if let Some(ref mut wal) = self.wal {
             wal.sync().map_err(|e| Error::Other(format!("wal sync: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Flush + write a checkpoint file, so the WAL can be safely
+    /// truncated without data loss (Wave 2 fix).
+    ///
+    /// The checkpoint is written to `<data_dir>/checkpoint.sql` as a
+    /// series of CREATE TABLE + INSERT statements. On restart, the
+    /// engine replays the checkpoint first, then any WAL records
+    /// written after the checkpoint.
+    pub fn flush_with_checkpoint(&mut self) -> Result<()> {
+        // 1. Flush dirty pages to disk.
+        self.flush()?;
+        // 2. Write a checkpoint file (if we have a data directory).
+        if let Some(ref bp) = self.buffer_pool {
+            let checkpoint_path = bp.data_dir().join("checkpoint.sql");
+            match crate::storage::recovery::Checkpoint::save(&self.catalog, &checkpoint_path) {
+                Ok(n) => {
+                    log::debug!("checkpoint: wrote {n} tables to {}", checkpoint_path.display())
+                }
+                Err(e) => {
+                    return Err(Error::Other(format!(
+                        "checkpoint save to {}: {e}",
+                        checkpoint_path.display()
+                    )))
+                }
+            }
         }
         Ok(())
     }
@@ -612,9 +662,12 @@ impl QueryEngine {
         if lower.starts_with("copy ") {
             return self.execute_copy(trimmed, &start);
         }
-        // CHECKPOINT: flush all dirty pages to disk (Wave 63/68).
+        // CHECKPOINT: flush + write checkpoint file (Wave 2 fix).
+        // Previously this just called flush(), which left the WAL
+        // un-truncated and no checkpoint file was written. Now it
+        // calls flush_with_checkpoint() for consistency with VACUUM.
         if lower.starts_with("checkpoint") {
-            self.flush()?;
+            self.flush_with_checkpoint()?;
             return Ok(QueryResult::empty());
         }
 
@@ -1018,14 +1071,17 @@ impl QueryEngine {
         Ok(result)
     }
 
-    /// Execute VACUUM: reclaim space from deleted rows (Wave 68).
-    /// Currently a no-op placeholder — full vacuum requires page-level
-    /// compaction which depends on the page-level storage (Wave 63).
-    /// This implementation flushes the buffer pool and truncates the WAL.
+    /// Execute VACUUM: reclaim space and compact storage (Wave 68, Wave 2 fix).
+    ///
+    /// **Wave 2 fix:** Previously VACUUM called `flush()` then
+    /// `wal.truncate()` without writing a checkpoint, creating a
+    /// data-loss window. Now it calls `flush_with_checkpoint()` which
+    /// writes a `checkpoint.sql` file before truncating the WAL, so
+    /// committed data survives a crash at any point.
     fn execute_vacuum(&mut self, start: &Instant) -> Result<QueryResult> {
-        // Flush dirty pages.
-        self.flush()?;
-        // Truncate the WAL (all committed records are now on disk).
+        // 1. Flush dirty pages + write checkpoint file.
+        self.flush_with_checkpoint()?;
+        // 2. Now safe to truncate the WAL (committed state is in checkpoint).
         if let Some(ref mut wal) = self.wal {
             wal.truncate().map_err(|e| Error::Other(format!("WAL truncate: {e}")))?;
         }
@@ -2433,7 +2489,7 @@ mod tests {
     /// DoD 1: `SELECT count(*) FROM t` returns the table's row count.
     #[test]
     fn dod_count_star_returns_row_count() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(1000));
         let r = engine.execute("SELECT count(*) FROM t").expect("query");
         assert_eq!(r.scalar_u64(), Some(1000));
@@ -2442,7 +2498,7 @@ mod tests {
     /// DoD 2: `SELECT count(*) FROM t WHERE x = 42` returns the right count.
     #[test]
     fn dod_count_star_with_where() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         // Make a table where x = 42 appears exactly 7 times.
         let mut xs: Vec<u64> = (0..1000).map(|i| (i % 7) as u64).collect();
         // Make some entries equal to 42.
@@ -2478,7 +2534,7 @@ mod tests {
     /// DoD 3: `SELECT sum(col) FROM t` returns the right sum.
     #[test]
     fn dod_sum_returns_correct_sum() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(1000));
         let r = engine.execute("SELECT sum(id) FROM t").expect("query");
         let s = r.scalar_f64().expect("scalar");
@@ -2488,7 +2544,7 @@ mod tests {
     /// DoD 4: `SELECT * FROM t WHERE id = 5` returns the matching row.
     #[test]
     fn dod_select_star_with_where() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(1000));
         let r = engine.execute("SELECT * FROM t WHERE id = 5").expect("query");
         assert_eq!(r.row_count, 1);
@@ -2499,7 +2555,7 @@ mod tests {
     /// DoD 5: APPROXIMATE extension parses and runs.
     #[test]
     fn dod_count_distinct_with_approximate() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(1000));
         let r = engine
             .execute("SELECT count(DISTINCT x) APPROXIMATE WITHIN 0.05 CONFIDENCE 0.95 FROM t")
@@ -2510,7 +2566,7 @@ mod tests {
     /// DoD 6: TIER extension parses and runs.
     #[test]
     fn dod_count_star_with_tier_l3() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(1000));
         let r = engine.execute("SELECT count(*) FROM t TIER L3").expect("query");
         assert_eq!(r.scalar_u64(), Some(1000));
@@ -2519,7 +2575,7 @@ mod tests {
     /// DoD 7: Invalid SQL returns `Error::Parse`.
     #[test]
     fn dod_invalid_sql_returns_parse_error() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         let r = engine.execute("SELECT FROM WHERE");
         assert!(matches!(r, Err(Error::Parse(_))), "got {r:?}");
     }
@@ -2527,7 +2583,7 @@ mod tests {
     /// DoD 8: Non-existent table returns `Error::NotFound`.
     #[test]
     fn dod_non_existent_table_returns_not_found() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         let r = engine.execute("SELECT count(*) FROM missing");
         assert!(matches!(r, Err(Error::NotFound(_))), "got {r:?}");
     }
@@ -2544,7 +2600,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![arr]).expect("batch");
         crate::datasource::parquet::write_parquet_for_test(&path, &batch).expect("write");
 
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         let n = engine.load_parquet(&path, "loaded").expect("load");
         assert_eq!(n, 100);
 
@@ -2567,7 +2623,7 @@ mod tests {
         let path = tmp.path().to_str().expect("path str").to_string();
         std::fs::write(&path, "id,value\n1,10\n2,20\n3,30\n4,40\n5,50\n").expect("write");
 
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         let n = engine.load_csv(&path, "csvt", true).expect("load");
         assert_eq!(n, 5);
 
@@ -2590,7 +2646,7 @@ mod tests {
     /// Sum of an integer-encoded column through the engine API.
     #[test]
     fn engine_sum_integer_column() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         // Integer-encoded column: 1, 2, 3, 4 → sum = 10.
         engine.register_table(make_int_table(&[1, 2, 3, 4]));
         let r = engine.execute("SELECT sum(v) FROM ft").expect("query");
@@ -2601,7 +2657,7 @@ mod tests {
     /// The elapsed_us field is populated after `execute`.
     #[test]
     fn execute_populates_elapsed_us() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(100));
         let r = engine.execute("SELECT count(*) FROM t").expect("query");
         // elapsed_us should be non-negative (and almost certainly > 0,
@@ -2612,7 +2668,7 @@ mod tests {
     /// Re-registering a table replaces the old one.
     #[test]
     fn register_table_overwrites() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(100));
         engine.register_table(make_table(200));
         let r = engine.execute("SELECT count(*) FROM t").expect("query");
@@ -2646,7 +2702,7 @@ mod tests {
     /// Accessors return the right types.
     #[test]
     fn accessors_work() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         let _cat: &Catalog = engine.catalog();
         let _kt: &KernelTable = engine.kernel_table();
         let _cm: &CostModel = engine.cost_model();
@@ -2655,7 +2711,7 @@ mod tests {
     /// A query against a table with zero rows returns 0 for count(*).
     #[test]
     fn count_star_on_empty_table_returns_zero() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(0));
         let r = engine.execute("SELECT count(*) FROM t").expect("query");
         assert_eq!(r.scalar_u64(), Some(0));
@@ -2664,7 +2720,7 @@ mod tests {
     /// A sum against a table with zero rows returns 0.0.
     #[test]
     fn sum_on_empty_table_returns_zero() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(0));
         let r = engine.execute("SELECT sum(id) FROM t").expect("query");
         let s = r.scalar_f64().expect("scalar");
@@ -2674,7 +2730,7 @@ mod tests {
     /// Print does not panic on a real result.
     #[test]
     fn print_does_not_panic() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(10));
         let r = engine.execute("SELECT * FROM t").expect("query");
         r.print();
@@ -2684,7 +2740,7 @@ mod tests {
     /// Extensions other than TIER/APPROXIMATE are accepted (no-ops).
     #[test]
     fn other_extensions_accepted() {
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.register_table(make_table(100));
         let r = engine
             .execute("SELECT count(*) FROM t USING HYPERLOGLOG MEMORY BUDGET 1048576 ENERGY BUDGET 100 JOULES CONSISTENCY STRONG")
@@ -2702,7 +2758,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![arr]).expect("batch");
         crate::datasource::parquet::write_parquet_for_test(&path, &batch).expect("write");
 
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         let n = engine.load_parquet(&path, "custom_name").expect("load");
         assert_eq!(n, 3);
 
@@ -2726,7 +2782,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![arr]).expect("batch");
         crate::datasource::parquet::write_parquet_for_test(&path, &batch).expect("write");
 
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.load_parquet(&path, "ft").expect("load");
 
         // Count.

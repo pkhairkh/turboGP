@@ -3,7 +3,7 @@
 use turbogp::engine::QueryEngine;
 
 fn make_engine() -> QueryEngine {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE users (id INT, name VARCHAR(50))").unwrap();
     e.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
     e.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();

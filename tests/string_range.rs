@@ -12,7 +12,7 @@ fn make_engine() -> QueryEngine {
     writeln!(tmp, "4,David").unwrap();
     writeln!(tmp, "5,Eve").unwrap();
     tmp.flush().unwrap();
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.load_csv(tmp.path().to_str().unwrap(), "users", true).unwrap();
     e
 }

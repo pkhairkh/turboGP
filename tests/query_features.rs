@@ -35,7 +35,7 @@ fn parquet_null_count_excludes_null_cells() {
         row_count: 3,
     };
     let table = DS::from_loaded(loaded);
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.register_table(table);
 
     // COUNT(*) counts all rows = 3.
@@ -68,11 +68,11 @@ fn concurrent_selects_on_separate_engines() {
     // Each engine is independent (no shared state), so concurrent SELECTs
     // on separate engines should not interfere. We move the engines into
     // the threads (no Arc needed since each thread owns its engine).
-    let mut e1 = QueryEngine::new();
+    let mut e1 = QueryEngine::in_memory();
     e1.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     e1.execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)").unwrap();
 
-    let mut e2 = QueryEngine::new();
+    let mut e2 = QueryEngine::in_memory();
     e2.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     e2.execute("INSERT INTO t (id, v) VALUES (1, 100), (2, 200), (3, 300), (4, 400)").unwrap();
 
@@ -101,7 +101,7 @@ fn concurrent_selects_on_separate_engines() {
 
 #[test]
 fn select_returns_correct_values() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, name VARCHAR)").unwrap();
     e.execute("INSERT INTO t (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')").unwrap();
 
@@ -128,7 +128,7 @@ fn select_returns_correct_values() {
 
 #[test]
 fn update_then_select_returns_updated_values() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)").unwrap();
 
@@ -147,7 +147,7 @@ fn update_then_select_returns_updated_values() {
 
 #[test]
 fn delete_then_select_returns_remaining_rows() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3), (4), (5)").unwrap();
 
@@ -170,7 +170,7 @@ fn delete_then_select_returns_remaining_rows() {
 
 #[test]
 fn rollback_discards_writes_with_value_check() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1)").unwrap();
 
@@ -189,7 +189,7 @@ fn rollback_discards_writes_with_value_check() {
 
 #[test]
 fn commit_persists_writes_with_value_check() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1)").unwrap();
 

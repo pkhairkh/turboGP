@@ -28,3 +28,8 @@ Cargo.lock
 # Editor
 *.bak
 *.tmp
+
+# turboGP runtime data (WAL, checkpoints, table files)
+/turbogp_data/
+*.log
+checkpoint.sql

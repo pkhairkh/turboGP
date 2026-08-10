@@ -15,7 +15,7 @@ fn dispatch_path_sum_arithmetic() {
     // This query goes through dispatch → SumCol → errors (can't resolve
     // "price * 2" as a column) → falls through to compute_aggregate →
     // eval_expr. Previously the error was returned, bypassing eval_expr.
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (price INT, discount INT)").unwrap();
     e.execute("INSERT INTO t (price, discount) VALUES (100, 10), (200, 20)").unwrap();
     let r = e.execute("SELECT sum(price * 2) FROM t").unwrap();
@@ -26,7 +26,7 @@ fn dispatch_path_sum_arithmetic() {
 
 #[test]
 fn dispatch_path_sum_two_columns() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute("INSERT INTO t (a, b) VALUES (10, 20), (30, 40)").unwrap();
     let r = e.execute("SELECT sum(a * b) FROM t").unwrap();
@@ -48,7 +48,7 @@ fn dispatch_path_order_by_string() {
     writeln!(tmp, "2,Alice").unwrap();
     writeln!(tmp, "3,Bob").unwrap();
     tmp.flush().unwrap();
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.load_csv(tmp.path().to_str().unwrap(), "users", true).unwrap();
     let r = e.execute("SELECT name FROM users ORDER BY name").unwrap();
     assert!(r.columns[0].has_strings());
@@ -67,7 +67,7 @@ fn dispatch_path_order_by_string_desc() {
     writeln!(tmp, "2,Bob").unwrap();
     writeln!(tmp, "3,Charlie").unwrap();
     tmp.flush().unwrap();
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.load_csv(tmp.path().to_str().unwrap(), "users", true).unwrap();
     let r = e.execute("SELECT name FROM users ORDER BY name DESC").unwrap();
     // Descending: Charlie, Bob, Alice
@@ -128,7 +128,7 @@ fn type_oid_in_result_column() {
 
 #[test]
 fn readonly_select_works() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3)").unwrap();
     // try_readonly_select should succeed for simple SELECT
@@ -138,7 +138,7 @@ fn readonly_select_works() {
 
 #[test]
 fn readonly_select_rejects_dml() {
-    let e = QueryEngine::new();
+    let e = QueryEngine::in_memory();
     let r = e.try_readonly_select("INSERT INTO t VALUES (1)");
     assert!(r.is_err());
 }
@@ -197,7 +197,7 @@ fn all_bugs_fixed_summary() {
     // 4. ORDER BY on strings: works through dispatch ✓
     // 5. NULL bitmap: populated by Parquet loader ✓
     // 6. Type OID: threaded through ResultColumn to pgwire ✓
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE audit (id INT)").unwrap();
     e.execute("INSERT INTO audit (id) VALUES (1)").unwrap();
     let r = e.try_readonly_select("SELECT count(*) FROM audit").unwrap();

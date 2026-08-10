@@ -8,7 +8,7 @@
 use turbogp::engine::QueryEngine;
 
 fn make_engine() -> QueryEngine {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, dept INT, salary INT)").unwrap();
     e.execute("INSERT INTO t (id, dept, salary) VALUES (1, 1, 100)").unwrap();
     e.execute("INSERT INTO t (id, dept, salary) VALUES (2, 1, 200)").unwrap();
@@ -172,7 +172,7 @@ fn select_distinct_multi_column() {
 
 #[test]
 fn select_distinct_with_duplicates() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE dups (v INT)").unwrap();
     e.execute("INSERT INTO dups (v) VALUES (1), (1), (2), (2), (2), (3)").unwrap();
     // SELECT DISTINCT v FROM dups → 1, 2, 3 (3 rows).

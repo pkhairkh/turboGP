@@ -10,7 +10,7 @@
 use turbogp::engine::QueryEngine;
 
 fn make_hits_engine() -> QueryEngine {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute(
         "CREATE TABLE hits (
         WatchID BIGINT,

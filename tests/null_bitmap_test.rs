@@ -78,7 +78,7 @@ fn null_bitmap_non_null_mask() {
 #[test]
 fn dml_insert_null_sets_bitmap() {
     use turbogp::engine::QueryEngine;
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, name VARCHAR(50))").unwrap();
     e.execute("INSERT INTO t (id, name) VALUES (1, NULL)").unwrap();
     // The NULL value is stored as 0u64, but with the null_bitmap feature
