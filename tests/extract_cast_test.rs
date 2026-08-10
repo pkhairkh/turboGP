@@ -4,7 +4,7 @@ use turbogp::engine::QueryEngine;
 
 #[test]
 fn cast_int_to_float() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (42)").unwrap();
     let r = e.execute("SELECT CAST(id AS FLOAT) FROM t");
@@ -15,7 +15,7 @@ fn cast_int_to_float() {
 
 #[test]
 fn cast_float_to_int() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (v FLOAT)").unwrap();
     e.execute("INSERT INTO t (v) VALUES (3.14)").unwrap();
     let r = e.execute("SELECT CAST(v AS INT) FROM t");
@@ -24,7 +24,7 @@ fn cast_float_to_int() {
 
 #[test]
 fn extract_year_basic() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (d INT)").unwrap();
     e.execute("INSERT INTO t (d) VALUES (20240115)").unwrap();
     // EXTRACT on an integer column — the tpch interpreter handles this.

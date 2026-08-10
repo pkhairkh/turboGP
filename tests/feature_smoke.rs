@@ -24,7 +24,7 @@ fn smoke_server_mode_compiles() {
 
 #[test]
 fn smoke_ddl_create_drop_table() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50), salary DECIMAL(18,2))")
         .expect("create table");
     e.execute("CREATE TABLE orders (id INT, user_id INT REFERENCES users(id))")
@@ -35,7 +35,7 @@ fn smoke_ddl_create_drop_table() {
 
 #[test]
 fn smoke_ddl_all_types() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute(
         "CREATE TABLE t (
         a INT, b BIGINT, c SMALLINT, d TINYINT,
@@ -51,7 +51,7 @@ fn smoke_ddl_all_types() {
 
 #[test]
 fn smoke_ddl_schemas() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE SCHEMA HR").expect("create schema");
     e.execute("CREATE TABLE HR.Employees (id INT)").expect("qualified table");
     let r = e.execute("SELECT count(*) FROM HR.Employees").unwrap();
@@ -64,7 +64,7 @@ fn smoke_ddl_schemas() {
 
 #[test]
 fn smoke_dml_insert_update_delete() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE users (id INT, name VARCHAR(50), active BIT)").unwrap();
     e.execute("INSERT INTO users (id, name, active) VALUES (1, 'Alice', 1), (2, 'Bob', 0), (3, 'Carol', 1)").unwrap();
     assert_eq!(e.execute("SELECT count(*) FROM users").unwrap().scalar_u64(), Some(3));
@@ -81,7 +81,7 @@ fn smoke_dml_insert_update_delete() {
 
 #[test]
 fn smoke_dml_null_and_float() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, val FLOAT)").unwrap();
     e.execute("INSERT INTO t (id, val) VALUES (1, NULL), (2, 3.14), (3, 99.99)").unwrap();
     assert_eq!(e.execute("SELECT count(*) FROM t").unwrap().scalar_u64(), Some(3));
@@ -93,7 +93,7 @@ fn smoke_dml_null_and_float() {
 
 #[test]
 fn smoke_transactions_commit_rollback() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
 
     e.execute("BEGIN").unwrap();
@@ -113,7 +113,7 @@ fn smoke_transactions_commit_rollback() {
 
 #[test]
 fn smoke_cte_recursive() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     let sql = "WITH RECURSIVE countdown AS (
         SELECT 5 AS n
         UNION ALL
@@ -126,7 +126,7 @@ fn smoke_cte_recursive() {
 
 #[test]
 fn smoke_cte_non_recursive() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3)").unwrap();
     let sql = "WITH c AS (SELECT count(*) FROM t) SELECT count(*) FROM c";
@@ -340,7 +340,7 @@ fn smoke_durability_wal() {
 
 #[test]
 fn smoke_cross_feature_ddl_dml_txn_query() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     // DDL
     e.execute("CREATE TABLE accounts (id INT, balance INT)").unwrap();
     // DML in a transaction
@@ -358,7 +358,7 @@ fn smoke_cross_feature_ddl_dml_txn_query() {
 
 #[test]
 fn smoke_create_insert_select_full_cycle() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE products (id INT, name VARCHAR(50), price FLOAT)").unwrap();
     e.execute("INSERT INTO products (id, name, price) VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99), (3, 'Gizmo', 29.99)").unwrap();
     let r = e.execute("SELECT count(*) FROM products").unwrap();

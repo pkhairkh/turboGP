@@ -4,35 +4,35 @@ use turbogp::engine::QueryEngine;
 
 #[test]
 fn create_table_with_json_column() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     let r = e.execute("CREATE TABLE docs (id INT, payload JSON)");
     assert!(r.is_ok(), "CREATE TABLE with JSON column must succeed; got: {:?}", r.err());
 }
 
 #[test]
 fn create_table_with_uuid_column() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     let r = e.execute("CREATE TABLE t (id UUID, name VARCHAR)");
     assert!(r.is_ok(), "CREATE TABLE with UUID column must succeed; got: {:?}", r.err());
 }
 
 #[test]
 fn create_table_with_bytea_column() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     let r = e.execute("CREATE TABLE t (id INT, data BYTEA)");
     assert!(r.is_ok(), "CREATE TABLE with BYTEA column must succeed; got: {:?}", r.err());
 }
 
 #[test]
 fn create_table_with_array_column() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     let r = e.execute("CREATE TABLE t (id INT, tags ARRAY)");
     assert!(r.is_ok(), "CREATE TABLE with ARRAY column must succeed; got: {:?}", r.err());
 }
 
 #[test]
 fn json_column_accepts_json_value() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE docs (id INT, payload JSON)").unwrap();
     // Insert a JSON string — it's stored as a VARCHAR sidecar.
     let r = e.execute("INSERT INTO docs (id, payload) VALUES (1, '{\"name\":\"Alice\"}')");

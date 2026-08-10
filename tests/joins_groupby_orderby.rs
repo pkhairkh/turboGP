@@ -18,7 +18,7 @@ use turbogp::engine::QueryEngine;
 
 #[test]
 fn left_join_keeps_unmatched_left_rows() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE orders (id INT, cust INT)").unwrap();
     e.execute("CREATE TABLE returns (oid INT, reason INT)").unwrap();
     e.execute("INSERT INTO orders (id, cust) VALUES (1, 10), (2, 20), (3, 30)").unwrap();
@@ -34,7 +34,7 @@ fn left_join_keeps_unmatched_left_rows() {
 
 #[test]
 fn inner_join_drops_unmatched_left_rows() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE orders (id INT, cust INT)").unwrap();
     e.execute("CREATE TABLE returns (oid INT, reason INT)").unwrap();
     e.execute("INSERT INTO orders (id, cust) VALUES (1, 10), (2, 20), (3, 30)").unwrap();
@@ -49,7 +49,7 @@ fn inner_join_drops_unmatched_left_rows() {
 
 #[test]
 fn left_join_count_returns_zero_for_unmatched() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE o (id INT)").unwrap();
     e.execute("CREATE TABLE r (oid INT)").unwrap();
     e.execute("INSERT INTO o (id) VALUES (1), (2), (3), (4)").unwrap();
@@ -64,7 +64,7 @@ fn left_join_count_returns_zero_for_unmatched() {
 
 #[test]
 fn group_by_emits_multiple_aggregates() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (grp INT, a INT, b INT)").unwrap();
     e.execute("INSERT INTO t (grp, a, b) VALUES (1, 10, 100), (1, 20, 200), (2, 30, 300)").unwrap();
 
@@ -80,7 +80,7 @@ fn group_by_emits_multiple_aggregates() {
 
 #[test]
 fn group_by_sum_count_values() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (grp INT, a INT)").unwrap();
     e.execute("INSERT INTO t (grp, a) VALUES (1, 10), (1, 20), (1, 30), (2, 40), (2, 50)").unwrap();
 
@@ -111,7 +111,7 @@ fn group_by_sum_count_values() {
 
 #[test]
 fn select_multi_order_by_sorts_results() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (a INT, b INT)").unwrap();
     // Insert rows out of order.
     e.execute("INSERT INTO t (a, b) VALUES (3, 30), (1, 10), (2, 20)").unwrap();
@@ -130,7 +130,7 @@ fn select_multi_order_by_sorts_results() {
 
 #[test]
 fn select_multi_order_by_desc() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute("INSERT INTO t (a, b) VALUES (1, 10), (3, 30), (2, 20)").unwrap();
 
@@ -143,7 +143,7 @@ fn select_multi_order_by_desc() {
 
 #[test]
 fn select_multi_order_by_with_limit() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (a INT, b INT)").unwrap();
     e.execute("INSERT INTO t (a, b) VALUES (5, 50), (1, 10), (3, 30), (2, 20), (4, 40)").unwrap();
 

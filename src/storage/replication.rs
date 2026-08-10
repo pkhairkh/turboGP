@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn backup_creates_manifest() {
         let tmp = TempDir::new().unwrap();
-        let mut engine = QueryEngine::new();
+        let mut engine = QueryEngine::in_memory();
         engine.execute("CREATE TABLE t (id INT, v INT)").unwrap();
         engine.execute("INSERT INTO t (id, v) VALUES (1, 10)").unwrap();
         let result = backup(&engine, tmp.path());

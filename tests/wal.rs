@@ -67,7 +67,7 @@ fn wal_replay_commit_marker_replays_transaction() {
     wal.append(&WalRecord::commit(1)).unwrap();
     wal.sync().unwrap();
 
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     let stats = replay_wal(&mut engine, &wal).unwrap();
     assert_eq!(stats.replayed, 3, "CREATE TABLE + 2 INSERTs should replay");
     assert_eq!(stats.errors, 0);
@@ -89,7 +89,7 @@ fn wal_replay_rollback_marker_skips_transaction() {
     wal.append(&WalRecord::rollback(1)).unwrap();
     wal.sync().unwrap();
 
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     let stats = replay_wal(&mut engine, &wal).unwrap();
     // The CREATE TABLE autocommit record replays; the rolled-back txn is skipped.
     assert_eq!(stats.replayed, 1, "only the autocommit CREATE TABLE should replay");
@@ -111,7 +111,7 @@ fn wal_replay_uncommitted_transaction_is_skipped() {
     wal.append(&WalRecord::txn_dml(1, "INSERT INTO t VALUES (1)")).unwrap();
     wal.sync().unwrap();
 
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     let stats = replay_wal(&mut engine, &wal).unwrap();
     assert_eq!(stats.replayed, 1, "only the autocommit CREATE TABLE should replay");
     assert_eq!(stats.skipped, 1, "the uncommitted txn must be skipped");
@@ -126,7 +126,7 @@ fn engine_writes_begin_commit_markers_through_execute() {
     // End-to-end: engine.execute("BEGIN"); execute("INSERT"); execute("COMMIT")
     // must produce BEGIN/txn_dml/COMMIT records in the WAL.
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine.enable_wal(tmp.path()).unwrap();
     engine.execute("CREATE TABLE t (id INT)").unwrap();
     engine.execute("BEGIN").unwrap();
@@ -162,7 +162,7 @@ fn engine_writes_begin_commit_markers_through_execute() {
 #[test]
 fn engine_writes_rollback_marker_through_execute() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine.enable_wal(tmp.path()).unwrap();
     engine.execute("CREATE TABLE t (id INT)").unwrap();
     engine.execute("BEGIN").unwrap();
@@ -184,7 +184,7 @@ fn engine_writes_rollback_marker_through_execute() {
 #[test]
 fn wal_does_not_append_failed_dml() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine.enable_wal(tmp.path()).unwrap();
     engine.execute("CREATE TABLE t (id INT)").unwrap();
 
@@ -202,7 +202,7 @@ fn wal_does_not_append_failed_dml() {
 #[test]
 fn wal_does_not_append_failed_ddl() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine.enable_wal(tmp.path()).unwrap();
 
     // DDL with a parse error should fail and not be appended.
@@ -286,7 +286,7 @@ fn wal_replay_handles_sql_with_special_chars() {
     wal.append(&WalRecord::autocommit(r"INSERT INTO t (id, name) VALUES (1, 'a|b\n')")).unwrap();
     wal.sync().unwrap();
 
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     let stats = replay_wal(&mut engine, &wal).unwrap();
     assert_eq!(stats.replayed, 2);
     assert_eq!(stats.errors, 0);

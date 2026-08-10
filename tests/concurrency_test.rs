@@ -37,7 +37,7 @@ fn make_engine() -> QueryEngine {
         ],
         row_count: 3,
     });
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.register_table(t);
     e
 }

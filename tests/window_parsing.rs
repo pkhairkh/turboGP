@@ -13,7 +13,7 @@
 use turbogp::engine::QueryEngine;
 
 fn make_engine() -> QueryEngine {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE scores (id INT, dept INT, score INT)").unwrap();
     e.execute("INSERT INTO scores (id, dept, score) VALUES (1, 1, 100)").unwrap();
     e.execute("INSERT INTO scores (id, dept, score) VALUES (2, 1, 200)").unwrap();
@@ -84,7 +84,7 @@ fn window_function_executes_successfully() {
 #[test]
 fn window_function_with_string_partition() {
     // Window functions with a string partition column.
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE emp (name VARCHAR, dept VARCHAR, salary INT)").unwrap();
     e.execute("INSERT INTO emp (name, dept, salary) VALUES ('Alice', 'Eng', 100)").unwrap();
     e.execute("INSERT INTO emp (name, dept, salary) VALUES ('Bob', 'Eng', 200)").unwrap();

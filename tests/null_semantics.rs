@@ -4,7 +4,7 @@
 use turbogp::engine::QueryEngine;
 
 fn make_engine() -> QueryEngine {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, val INT)").unwrap();
     e.execute("INSERT INTO t (id, val) VALUES (1, 10)").unwrap();
     e.execute("INSERT INTO t (id, val) VALUES (2, NULL)").unwrap();

@@ -10,7 +10,7 @@ use turbogp::engine::QueryEngine;
 
 #[test]
 fn create_view_and_select_from_it() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)").unwrap();
     e.execute("CREATE VIEW v_even AS SELECT id, v FROM t WHERE v = 20").unwrap();
@@ -23,7 +23,7 @@ fn create_view_and_select_from_it() {
 
 #[test]
 fn drop_view_removes_it() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("CREATE VIEW v1 AS SELECT id FROM t").unwrap();
     // The view is registered; SELECTing it should work (returns 0 rows).
@@ -47,7 +47,7 @@ fn drop_view_removes_it() {
 
 #[test]
 fn create_procedure_and_exec_it() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3)").unwrap();
     e.execute("CREATE PROCEDURE get_count AS SELECT count(*) FROM t").unwrap();
@@ -59,7 +59,7 @@ fn create_procedure_and_exec_it() {
 
 #[test]
 fn create_procedure_with_params_and_exec() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3)").unwrap();
     // Body uses @1 as a positional parameter placeholder.
@@ -81,7 +81,7 @@ fn create_procedure_with_params_and_exec() {
 
 #[test]
 fn merge_executes_through_engine() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE target (id INT, val INT)").unwrap();
     e.execute("INSERT INTO target (id, val) VALUES (1, 10), (2, 20)").unwrap();
 
@@ -150,7 +150,7 @@ fn json_query_and_modify_work_via_engine() {
 /// is loaded as a string, and json::json_value() is applied to each row.
 #[test]
 fn json_value_through_engine_execute() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     // Create a table with a VARCHAR column to hold JSON strings.
     e.execute("CREATE TABLE docs (id INT, payload VARCHAR)").unwrap();
     // Insert two rows with JSON payloads.
@@ -186,7 +186,7 @@ fn json_value_through_engine_execute() {
 /// become the result column name.
 #[test]
 fn json_value_with_alias_through_engine_execute() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE docs (id INT, payload VARCHAR)").unwrap();
     e.execute("INSERT INTO docs (id, payload) VALUES (1, '{\"name\":\"Alice\"}')").unwrap();
 
@@ -202,7 +202,7 @@ fn json_value_with_alias_through_engine_execute() {
 /// rather than a scalar.
 #[test]
 fn json_query_through_engine_execute() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE docs (id INT, payload VARCHAR)").unwrap();
     e.execute("INSERT INTO docs (id, payload) VALUES (1, '{\"user\":{\"name\":\"Alice\"}}')")
         .unwrap();
@@ -232,7 +232,7 @@ fn temporal_query_as_of_through_engine() {
     // Legacy test: still uses the Rust API to register the temporal table.
     // This verifies backward compatibility — the Rust API still works.
     use turbogp::exec::temporal::TemporalTable;
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     let mut t = TemporalTable::new(vec!["id".to_string(), "v".to_string()]);
     t.insert(vec![1, 100]);
     t.insert(vec![2, 200]);
@@ -260,7 +260,7 @@ fn temporal_query_as_of_through_engine() {
 #[test]
 fn temporal_table_created_via_ddl() {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
 
     // Create a temporal table via DDL.
     e.execute("CREATE TABLE t_hist (id INT, v INT) WITH (SYSTEM_VERSIONING = ON)").unwrap();
@@ -319,7 +319,7 @@ fn temporal_table_created_via_ddl() {
 
 #[test]
 fn window_row_number_through_engine() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (dept INT, salary INT)").unwrap();
     e.execute("INSERT INTO t (dept, salary) VALUES (1, 100), (1, 200), (2, 150)").unwrap();
     // ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC)
@@ -337,7 +337,7 @@ fn window_row_number_through_engine() {
 
 #[test]
 fn window_sum_over_through_engine() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (dept INT, salary INT)").unwrap();
     e.execute("INSERT INTO t (dept, salary) VALUES (1, 100), (1, 200), (2, 150)").unwrap();
     // SUM(salary) OVER (PARTITION BY dept) — running total per partition.
@@ -404,7 +404,7 @@ fn pivot_function_callable_via_engine() {
 /// input rows, and the pivot transformation is applied end-to-end.
 #[test]
 fn pivot_clause_through_engine_execute() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE sales (dept INT, qtr INT, amt INT)").unwrap();
     e.execute("INSERT INTO sales (dept, qtr, amt) VALUES (1, 1, 100), (1, 2, 200), (2, 1, 150)")
         .unwrap();

@@ -41,7 +41,7 @@ fn make_engine_with_nulls() -> QueryEngine {
         ],
         row_count: 3,
     });
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.register_table(t);
     e
 }
@@ -60,7 +60,7 @@ fn make_engine_with_rows(n: u64) -> QueryEngine {
         }],
         row_count: n as usize,
     });
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.register_table(t);
     e
 }

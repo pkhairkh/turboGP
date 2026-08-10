@@ -150,29 +150,31 @@ impl Wal {
     ///
     /// Wave 51 fix (Bug 10): the SQL payload is base64-encoded so that
     /// pipe characters, newlines, and backslashes inside SQL strings
-    /// round-trip unambiguously. The previous `\\|` / `\\n` escaping
-    /// was ambiguous (a SQL string containing literal `\n` bytes was
-    /// indistinguishable from a real newline on replay).
+    /// round-trip unambiguously.
+    ///
+    /// Wave 2 fix: an xxh3_64 checksum is appended as the 6th field so
+    /// that torn writes and bit-flips are detectable on replay. The
+    /// checksum is computed over the entire line (excluding the checksum
+    /// field and the trailing newline).
     pub fn append(&mut self, record: &WalRecord) -> std::io::Result<()> {
         if let Some(ref mut file) = self.file {
-            // Format: txn_id|commit|rollback|base64(sql)|physical_json\n
-            // The 5th field (physical_json) is a JSON encoding of the
-            // PhysicalChange enum, or empty if this is a SQL/boundary record.
-            // base64 alphabet is [A-Za-z0-9+/=] — no `|` or `\n`, so the
-            // field separator and record terminator are unambiguous.
+            // Format: txn_id|commit|rollback|base64(sql)|physical_json|xxh3\n
             let sql_b64 = general_purpose::STANDARD.encode(record.sql.as_bytes());
             let physical_json = match &record.physical_change {
                 Some(change) => serde_json::to_string(change).unwrap_or_default(),
                 None => String::new(),
             };
-            let line = format!(
-                "{}|{}|{}|{}|{}\n",
+            let data_line = format!(
+                "{}|{}|{}|{}|{}",
                 record.txn_id,
                 if record.is_commit { 1 } else { 0 },
                 if record.is_rollback { 1 } else { 0 },
                 sql_b64,
                 physical_json,
             );
+            // Compute xxh3_64 checksum over the data line (excluding checksum + newline).
+            let checksum = xxhash_rust::xxh3::xxh3_64(data_line.as_bytes());
+            let line = format!("{data_line}|{checksum:016x}\n");
             file.write_all(line.as_bytes())?;
         }
         Ok(())
@@ -189,8 +191,12 @@ impl Wal {
     /// Read all records from the WAL (for replay on startup).
     ///
     /// Wave 51 fix: the SQL field is base64-decoded. Records that fail to
-    /// decode are skipped (with a warning logged) so a corrupted tail
-    /// doesn't prevent replay of the valid prefix.
+    /// decode are skipped (with a warning logged).
+    ///
+    /// Wave 2 fix: the 6th field is an xxh3_64 checksum. Records whose
+    /// checksum does not match are skipped with a warning (torn write /
+    /// bit-flip detection). Legacy records without a checksum field are
+    /// accepted without verification for backward compatibility.
     pub fn read_all(&self) -> std::io::Result<Vec<WalRecord>> {
         let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
@@ -200,11 +206,34 @@ impl Wal {
             if line.trim().is_empty() {
                 continue;
             }
-            let parts: Vec<&str> = line.splitn(5, '|').collect();
+            // Wave 2: try to split off the checksum (last `|<hex>` field).
+            // If the last field is a 16-char hex string, treat it as a checksum.
+            let (data_line, checksum_opt) = match line.rsplit_once('|') {
+                Some((data, last_field))
+                    if last_field.len() == 16
+                        && last_field.chars().all(|c| c.is_ascii_hexdigit()) =>
+                {
+                    (data.to_string(), Some(last_field.to_string()))
+                }
+                _ => (line.clone(), None), // Legacy record without checksum.
+            };
+            // Verify checksum if present.
+            if let Some(ref expected_hex) = checksum_opt {
+                let expected = u64::from_str_radix(expected_hex, 16).unwrap_or(0);
+                let actual = xxhash_rust::xxh3::xxh3_64(data_line.as_bytes());
+                if expected != actual {
+                    log::warn!(
+                        "WAL checksum mismatch: expected {expected:016x}, got {actual:016x}, skipping record"
+                    );
+                    continue;
+                }
+            }
+            // Parse the data line (now without the checksum field).
+            let parts: Vec<&str> = data_line.splitn(5, '|').collect();
             if parts.len() < 4 {
                 // Legacy record format (pre-Wave-51) — try the old escaping.
                 if parts.len() >= 1 {
-                    if let Ok(rec) = parse_legacy_record(&line) {
+                    if let Ok(rec) = parse_legacy_record(&data_line) {
                         records.push(rec);
                     }
                 }
@@ -213,15 +242,10 @@ impl Wal {
             let txn_id: u64 = parts[0].parse().unwrap_or(0);
             let is_commit = parts[1] == "1";
             let is_rollback = parts[2] == "1";
-            // Wave 51 fix: try base64 first; if that fails (legacy record
-            // using the old `\\|` / `\\n` escaping), fall back to the
-            // legacy decoder so old WAL files still replay.
             let sql = match general_purpose::STANDARD.decode(parts[3].as_bytes()) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(_) => decode_legacy_sql(parts[3]),
             };
-            // Wave 63: parse the physical_change field (5th field, may be empty
-            // for SQL-only records or absent in legacy WAL files).
             let physical_change = if parts.len() >= 5 && !parts[4].is_empty() {
                 serde_json::from_str::<PhysicalChange>(parts[4]).ok()
             } else {
@@ -607,7 +631,7 @@ mod tests {
         .unwrap();
         wal.sync().unwrap();
 
-        let mut engine = crate::engine::QueryEngine::new();
+        let mut engine = crate::engine::QueryEngine::in_memory();
         let stats = replay_wal(&mut engine, &wal).unwrap();
         assert_eq!(stats.replayed, 3);
         assert_eq!(stats.errors, 0);
@@ -640,7 +664,7 @@ mod tests {
         .unwrap();
         wal.sync().unwrap();
 
-        let mut engine = crate::engine::QueryEngine::new();
+        let mut engine = crate::engine::QueryEngine::in_memory();
         let stats = replay_wal(&mut engine, &wal).unwrap();
         assert_eq!(stats.replayed, 1); // Only the CREATE TABLE
         assert_eq!(stats.skipped, 1); // Transaction 1 was not committed
@@ -677,7 +701,7 @@ mod tests {
         .unwrap();
         wal.sync().unwrap();
 
-        let mut engine = crate::engine::QueryEngine::new();
+        let mut engine = crate::engine::QueryEngine::in_memory();
         let stats = replay_wal(&mut engine, &wal).unwrap();
         assert_eq!(stats.replayed, 1); // Only the CREATE TABLE
         assert_eq!(stats.skipped, 1);

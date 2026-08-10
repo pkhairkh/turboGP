@@ -3,7 +3,7 @@
 use turbogp::engine::QueryEngine;
 
 fn make_engine() -> QueryEngine {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE users (id INT, name VARCHAR(50), active BIT)").unwrap();
     e
 }
@@ -99,7 +99,7 @@ fn delete_all_rows() {
 
 #[test]
 fn insert_float_values() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, price FLOAT)").unwrap();
     e.execute("INSERT INTO t (id, price) VALUES (1, 19.99), (2, 29.50)").unwrap();
     let r = e.execute("SELECT count(*) FROM t").unwrap();
@@ -132,7 +132,7 @@ fn delete_with_or_clause() {
 
 #[test]
 fn insert_into_qualified_table() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE SCHEMA HR").unwrap();
     e.execute("CREATE TABLE HR.Employees (id INT)").unwrap();
     e.execute("INSERT INTO HR.Employees (id) VALUES (1), (2), (3)").unwrap();

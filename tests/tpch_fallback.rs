@@ -13,7 +13,7 @@
 use turbogp::engine::QueryEngine;
 
 fn make_engine() -> QueryEngine {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE sales (id INT, region INT, amount INT, qty INT)").unwrap();
     e.execute("INSERT INTO sales (id, region, amount, qty) VALUES (1, 1, 100, 2)").unwrap();
     e.execute("INSERT INTO sales (id, region, amount, qty) VALUES (2, 1, 200, 3)").unwrap();

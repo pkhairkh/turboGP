@@ -106,6 +106,11 @@ impl BufferPool {
         })
     }
 
+    /// Get the data directory path (Wave 2: used for checkpoint file placement).
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     /// Get the file path for a table.
     fn table_path(&self, table_id: u64) -> PathBuf {
         self.data_dir.join(format!("{}.tbl", table_id))

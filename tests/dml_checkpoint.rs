@@ -21,7 +21,7 @@ use turbogp::storage::recovery::{Checkpoint, Wal, WalRecord};
 
 #[test]
 fn dml_where_less_than() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3), (4), (5)").unwrap();
     let r = e.execute("DELETE FROM t WHERE id < 3").unwrap();
@@ -32,7 +32,7 @@ fn dml_where_less_than() {
 
 #[test]
 fn dml_where_greater_than() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3), (4), (5)").unwrap();
     let r = e.execute("DELETE FROM t WHERE id > 3").unwrap();
@@ -43,7 +43,7 @@ fn dml_where_greater_than() {
 
 #[test]
 fn dml_where_not_equal() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3)").unwrap();
     let r = e.execute("DELETE FROM t WHERE id != 2").unwrap();
@@ -54,7 +54,7 @@ fn dml_where_not_equal() {
 
 #[test]
 fn dml_where_less_than_or_equal() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3)").unwrap();
     let r = e.execute("DELETE FROM t WHERE id <= 2").unwrap();
@@ -65,7 +65,7 @@ fn dml_where_less_than_or_equal() {
 
 #[test]
 fn dml_where_greater_than_or_equal() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3)").unwrap();
     let r = e.execute("DELETE FROM t WHERE id >= 2").unwrap();
@@ -76,7 +76,7 @@ fn dml_where_greater_than_or_equal() {
 
 #[test]
 fn dml_where_update_with_less_than() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute("INSERT INTO t (id, v) VALUES (1, 0), (2, 0), (3, 0), (4, 0)").unwrap();
     e.execute("UPDATE t SET v = 99 WHERE id >= 3").unwrap();
@@ -101,7 +101,7 @@ fn dml_where_string_with_spaces() {
     writeln!(tmp, "3,Alice Bob").unwrap();
     tmp.flush().unwrap();
 
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.load_csv(tmp.path().to_str().unwrap(), "users", true).unwrap();
 
     // UPDATE the rows with name = 'Alice Bob' (which contains a space).
@@ -118,7 +118,7 @@ fn dml_where_string_with_pipe() {
     writeln!(tmp, "1,a|b").unwrap();
     writeln!(tmp, "2,normal").unwrap();
     tmp.flush().unwrap();
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.load_csv(tmp.path().to_str().unwrap(), "t", true).unwrap();
     let r = e.execute("SELECT count(*) FROM t WHERE name = 'a|b'").unwrap();
     assert_eq!(r.scalar_u64(), Some(1), "string with pipe must round-trip through DML WHERE");
@@ -130,7 +130,7 @@ fn dml_where_string_with_pipe() {
 
 #[test]
 fn update_to_null_excludes_from_count() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, col INT)").unwrap();
     e.execute("INSERT INTO t (id, col) VALUES (1, 10), (2, 20), (3, 30)").unwrap();
 
@@ -148,7 +148,7 @@ fn update_to_null_excludes_from_count() {
 
 #[test]
 fn update_to_null_then_back_to_value() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, col INT)").unwrap();
     e.execute("INSERT INTO t (id, col) VALUES (1, 10)").unwrap();
 
@@ -370,7 +370,7 @@ fn checkpoint_roundtrip_floats_and_varchars() {
         "INSERT must emit quoted string + decoded float, got: {sql}"
     );
 
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     // Re-execute the checkpoint file statement by statement.
     for stmt in sql.lines().filter(|l| !l.trim().is_empty()) {
         e.execute(stmt).expect(&format!("replaying: {stmt}"));
@@ -423,7 +423,7 @@ fn wal_replays_after_wave50_changes() {
     .unwrap();
     wal.sync().unwrap();
 
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     let stats = turbogp::storage::recovery::replay_wal(&mut e, &wal).unwrap();
     assert_eq!(stats.replayed, 3);
     assert_eq!(stats.errors, 0);

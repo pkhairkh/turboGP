@@ -12,7 +12,7 @@ use turbogp::types::null_bitmap::NullBitmap;
 
 #[test]
 fn null_bitmap_consulted_by_count() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, val INT)").unwrap();
     e.execute("INSERT INTO t (id, val) VALUES (1, 10)").unwrap();
     e.execute("INSERT INTO t (id, val) VALUES (2, NULL)").unwrap();
@@ -24,7 +24,7 @@ fn null_bitmap_consulted_by_count() {
 
 #[test]
 fn null_bitmap_consulted_by_avg() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (val INT)").unwrap();
     e.execute("INSERT INTO t (val) VALUES (10)").unwrap();
     e.execute("INSERT INTO t (val) VALUES (NULL)").unwrap();
@@ -47,7 +47,7 @@ fn string_values_populated_for_select() {
     writeln!(tmp, "1,Alice").unwrap();
     writeln!(tmp, "2,Bob").unwrap();
     tmp.flush().unwrap();
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.load_csv(tmp.path().to_str().unwrap(), "users", true).unwrap();
     let r = e.execute("SELECT name FROM users").unwrap();
     assert!(r.columns[0].has_strings());
@@ -81,7 +81,7 @@ fn group_by_uses_precomputed_hashes() {
     writeln!(tmp, "4,B").unwrap();
     writeln!(tmp, "5,A").unwrap();
     tmp.flush().unwrap();
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.load_csv(tmp.path().to_str().unwrap(), "items", true).unwrap();
     // GROUP BY category should work with pre-computed hashes.
     let r = e.execute("SELECT count(*) FROM items GROUP BY category").unwrap();
@@ -94,7 +94,7 @@ fn group_by_uses_precomputed_hashes() {
 
 #[test]
 fn column_types_preserved() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, price FLOAT, name VARCHAR(50), active BOOLEAN)").unwrap();
     let cat = e.catalog();
     let table = cat.get("t").unwrap();
@@ -163,7 +163,7 @@ fn order_by_string_alphabetical() {
     writeln!(tmp, "2,Alice").unwrap();
     writeln!(tmp, "3,Bob").unwrap();
     tmp.flush().unwrap();
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.load_csv(tmp.path().to_str().unwrap(), "users", true).unwrap();
     // SELECT name FROM users ORDER BY name — should return Alice, Bob, Charlie.
     let r = e.execute("SELECT name FROM users").unwrap();
@@ -180,7 +180,7 @@ fn order_by_string_alphabetical() {
 fn all_audit_issues_fixed() {
     // This test exists as a checklist — if it compiles and passes,
     // all 7 fixes are in place.
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE audit (id INT, name VARCHAR(50))").unwrap();
     e.execute("INSERT INTO audit (id, name) VALUES (1, 'test')").unwrap();
     e.execute("INSERT INTO audit (id, name) VALUES (2, NULL)").unwrap();

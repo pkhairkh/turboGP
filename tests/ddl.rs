@@ -4,7 +4,7 @@ use turbogp::engine::QueryEngine;
 
 #[test]
 fn create_table_and_select_count() {
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine
         .execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100) NOT NULL)")
         .expect("create table");
@@ -14,7 +14,7 @@ fn create_table_and_select_count() {
 
 #[test]
 fn create_table_with_all_types() {
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine
         .execute(
             "CREATE TABLE t (
@@ -31,7 +31,7 @@ fn create_table_with_all_types() {
 
 #[test]
 fn create_qualified_table() {
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine.execute("CREATE SCHEMA HR").expect("schema");
     engine
         .execute("CREATE TABLE HR.Employees (id INT, name VARCHAR(50))")
@@ -42,7 +42,7 @@ fn create_qualified_table() {
 
 #[test]
 fn create_if_not_exists() {
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine.execute("CREATE TABLE t (id INT)").expect("first create");
     // Second create with IF NOT EXISTS should succeed (no-op).
     engine.execute("CREATE TABLE IF NOT EXISTS t (id INT)").expect("if not exists");
@@ -53,7 +53,7 @@ fn create_if_not_exists() {
 
 #[test]
 fn drop_table() {
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine.execute("CREATE TABLE temp (id INT)").expect("create");
     engine.execute("DROP TABLE temp").expect("drop");
     // Selecting from dropped table should fail.
@@ -63,7 +63,7 @@ fn drop_table() {
 
 #[test]
 fn drop_table_if_exists() {
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     // Dropping a non-existent table with IF EXISTS should succeed.
     engine.execute("DROP TABLE IF EXISTS nonexistent").expect("drop if exists");
     // Without IF EXISTS should fail.
@@ -73,7 +73,7 @@ fn drop_table_if_exists() {
 
 #[test]
 fn create_with_defaults_and_identity() {
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine
         .execute(
             "CREATE TABLE t (
@@ -89,7 +89,7 @@ fn create_with_defaults_and_identity() {
 
 #[test]
 fn create_with_references() {
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine.execute("CREATE TABLE users (id INT PRIMARY KEY)").expect("create users");
     engine
         .execute(
@@ -103,7 +103,7 @@ fn create_with_references() {
 
 #[test]
 fn create_then_drop_then_recreate() {
-    let mut engine = QueryEngine::new();
+    let mut engine = QueryEngine::in_memory();
     engine.execute("CREATE TABLE t (id INT)").expect("create");
     engine.execute("DROP TABLE t").expect("drop");
     engine.execute("CREATE TABLE t (id INT)").expect("recreate");

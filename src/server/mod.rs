@@ -175,7 +175,7 @@ mod tests {
     }
     #[tokio::test]
     async fn bind_returns_local_addr() {
-        let engine = Arc::new(RwLock::new(QueryEngine::new()));
+        let engine = Arc::new(RwLock::new(QueryEngine::in_memory()));
         let mut config = ServerConfig::default();
         // Tests opt out of auth.
         config.auth_required = false;

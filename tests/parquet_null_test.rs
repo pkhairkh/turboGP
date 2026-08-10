@@ -45,7 +45,7 @@ fn count_excludes_nulls() {
     let batch = batch_with_nulls();
     write_parquet(path, &batch).expect("write parquet");
 
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     let n = e.load_parquet(path, "t").expect("load parquet");
     assert_eq!(n, 5, "parquet file must have 5 rows");
 
@@ -76,7 +76,7 @@ fn sum_and_avg_exclude_nulls() {
     let batch = batch_with_nulls();
     write_parquet(path, &batch).expect("write parquet");
 
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.load_parquet(path, "t").expect("load parquet");
 
     // SUM(v) = 1 + 3 + 5 = 9 (NULLs excluded).

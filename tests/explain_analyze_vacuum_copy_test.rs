@@ -5,7 +5,7 @@ use turbogp::engine::QueryEngine;
 
 #[test]
 fn explain_basic() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20)").unwrap();
     let r = e.execute("EXPLAIN SELECT count(*) FROM t WHERE v > 15").unwrap();
@@ -17,7 +17,7 @@ fn explain_basic() {
 
 #[test]
 fn analyze_basic() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2), (3)").unwrap();
     let r = e.execute("ANALYZE SELECT count(*) FROM t").unwrap();
@@ -32,7 +32,7 @@ fn analyze_basic() {
 
 #[test]
 fn vacuum_basic() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     e.execute("INSERT INTO t (id) VALUES (1), (2)").unwrap();
     e.execute("DELETE FROM t WHERE id = 1").unwrap();
@@ -49,7 +49,7 @@ fn copy_to_and_from() {
 
     // Create a table and export it.
     {
-        let mut e = QueryEngine::new();
+        let mut e = QueryEngine::in_memory();
         e.execute("CREATE TABLE t (id INT, v INT)").unwrap();
         e.execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20)").unwrap();
         let r = e.execute(&format!("COPY t TO '{}'", csv_str)).unwrap();
@@ -64,7 +64,7 @@ fn copy_to_and_from() {
 
     // Import the CSV into a new table.
     {
-        let mut e = QueryEngine::new();
+        let mut e = QueryEngine::in_memory();
         e.execute("CREATE TABLE t2 (id INT, v INT)").unwrap();
         let r = e.execute(&format!("COPY t2 FROM '{}'", csv_str)).unwrap();
         assert_eq!(r.row_count, 2, "COPY FROM must import 2 rows");

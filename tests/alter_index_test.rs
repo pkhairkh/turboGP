@@ -4,7 +4,7 @@ use turbogp::engine::QueryEngine;
 
 #[test]
 fn alter_table_add_column() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20)").unwrap();
     let r = e.execute("ALTER TABLE t ADD COLUMN w INT DEFAULT 0");
@@ -16,7 +16,7 @@ fn alter_table_add_column() {
 
 #[test]
 fn create_index_basic() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20)").unwrap();
     let r = e.execute("CREATE INDEX idx_v ON t (v)");
@@ -25,7 +25,7 @@ fn create_index_basic() {
 
 #[test]
 fn drop_index_basic() {
-    let mut e = QueryEngine::new();
+    let mut e = QueryEngine::in_memory();
     e.execute("CREATE TABLE t (id INT, v INT)").unwrap();
     e.execute("INSERT INTO t (id, v) VALUES (1, 10)").unwrap();
     e.execute("CREATE INDEX idx_v ON t (v)").unwrap();
