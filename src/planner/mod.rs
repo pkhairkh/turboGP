@@ -75,7 +75,18 @@
 //! `CostModel` defaults (or by constructing a custom one and passing it to
 //! [`estimate_cost`]).
 
+pub mod cascades;
+pub mod dpccp;
+pub mod learned;
+pub mod logical_plan;
 pub mod optimizer;
+pub mod plan_builder;
+
+pub use cascades::{CascadesOptimizer, Rule};
+pub use dpccp::{build_join_graph, order_joins, JoinGraph, JoinOrder};
+pub use learned::{ColumnStats, LearnedCardinality};
+pub use logical_plan::{AggregateExpr, JoinType, PlanNode, SortOrder, WindowExpr, WindowFrame, FrameType, FrameBound};
+pub use plan_builder::build_plan;
 
 use crate::error::{Error, Result};
 use crate::kernel::Operator;
