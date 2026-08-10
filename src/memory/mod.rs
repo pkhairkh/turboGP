@@ -28,14 +28,6 @@
 //!
 //! [`RegionBacking`]: region::RegionBacking
 
-pub mod bandwidth;
-pub mod manager;
-pub mod numa;
-pub mod region;
 pub mod tier;
 
-pub use bandwidth::BandwidthMonitor;
-pub use manager::MemoryManager;
-pub use numa::{NumaNode, NumaTopology};
-pub use region::{Region, RegionId, RegionStats};
 pub use tier::MemoryTier;
