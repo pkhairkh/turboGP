@@ -444,14 +444,23 @@ impl QueryEngine {
     /// Wave 51 fix: `txn_id` is `Some(id)` for statements inside an
     /// explicit transaction, or `None` for autocommit. The record carries
     /// the txn_id so replay can group statements by transaction.
+    ///
+    /// Wave 3 (A5): WAL errors are now propagated — if the WAL append or
+    /// sync fails, the error is logged and the engine continues (the
+    /// transaction will be visible in-memory but may not survive a crash).
+    /// A future wave will make this abort the transaction.
     fn wal_append_txn(&mut self, sql: &str, txn_id: Option<u64>) {
         if let Some(ref mut wal) = self.wal {
             let record = match txn_id {
                 Some(id) => crate::storage::recovery::WalRecord::txn_dml(id, sql),
                 None => crate::storage::recovery::WalRecord::autocommit(sql),
             };
-            let _ = wal.append(&record);
-            let _ = wal.sync();
+            if let Err(e) = wal.append(&record) {
+                log::error!("WAL append failed (A5): {e}");
+            }
+            if let Err(e) = wal.sync() {
+                log::error!("WAL sync failed (A5): {e}");
+            }
         }
     }
 
@@ -460,8 +469,12 @@ impl QueryEngine {
     /// write transaction boundary markers (Wave 51 fix).
     fn wal_append_record(&mut self, record: crate::storage::recovery::WalRecord) {
         if let Some(ref mut wal) = self.wal {
-            let _ = wal.append(&record);
-            let _ = wal.sync();
+            if let Err(e) = wal.append(&record) {
+                log::error!("WAL append failed (A5): {e}");
+            }
+            if let Err(e) = wal.sync() {
+                log::error!("WAL sync failed (A5): {e}");
+            }
         }
     }
 
@@ -1630,6 +1643,36 @@ impl QueryEngine {
         }
 
         let n_new_rows = ins.values.len();
+
+        // Wave 3 (A2): Enforce NOT NULL and PRIMARY KEY constraints.
+        if let Some(ref schema) = table.schema {
+            for (row_idx, row_vals) in ins.values.iter().enumerate() {
+                for (i, &col_idx) in col_indices.iter().enumerate() {
+                    let val_str = &row_vals[i];
+                    let is_null = val_str.trim().eq_ignore_ascii_case("null");
+                    // Check NOT NULL constraint.
+                    if let Some(col_schema) = schema.columns.get(col_idx) {
+                        if col_schema.not_null && is_null {
+                            return Err(Error::Other(format!(
+                                "23502: NOT NULL constraint violated for column \"{}\" on row {}",
+                                col_schema.name, row_idx
+                            )));
+                        }
+                        // Check PRIMARY KEY uniqueness.
+                        if col_schema.primary_key && !is_null {
+                            let new_cell = parse_value_cell(val_str);
+                            let col = &table.columns[col_idx];
+                            if col.iter().any(|&existing| existing == new_cell) {
+                                return Err(Error::Other(format!(
+                                    "23505: duplicate key value violates UNIQUE constraint for PRIMARY KEY column \"{}\"",
+                                    col_schema.name
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Wave 56c: track which columns had string literals inserted, so we
         // can update their string_columns sidecar after the loop. We collect
