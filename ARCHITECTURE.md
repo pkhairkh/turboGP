@@ -242,3 +242,55 @@ that wins on:
 - `docs/tpcc_analysis.md` — TPC-C bottleneck analysis
 - `docs/tpcc_math.md` — TPC-C mathematical analysis with path to beating it
 
+## Academic Positioning
+
+turboGP sits at the intersection of three threads in the database-systems
+literature: **instruction-first / SIMD-vectorized execution** (Polychroniou
+et al. 2015, `polychroniou2015rethinking`), **morsel-driven parallelism**
+(Leis et al. 2014, `leis2014morsel`), and **worst-case-optimal join
+algorithms** (Veldhuizen 2014, `veldhuizen2014leapfrog`). The engine's
+defensible novelty is not any one of these in isolation — they are all
+well-established results — but the **three-axis kernel table** `(Operator,
+CpuTarget, MemoryTier)` (see `src/kernel/mod.rs`), which selects a different
+hand-tuned instruction sequence per tier. This is closer to the LLVM
+`TargetMachine`/`Subtarget` feature than to anything in DuckDB, Postgres, or
+Hyper, and it is the only published-style design we are aware of that
+treats memory-tier heterogeneity (L3 vs DDR5 vs CXL vs NVMe) as a first-class
+kernel-selection axis rather than as a buffer-pool detail.
+
+On the **planning** side, turboGP is academically current but productionally
+unwired. The DPccp join orderer (`planner/dpccp.rs`, Moerkotte & Neumann
+2008), the MCTS fallback for n>15 joins (`planner/mcts.rs`), the AGM-bound
+WCOJ selector (`planner/agm.rs`, `planner/wcoj.rs`, Atserias-Grohe-Marx
+2008), and the tensor-network contraction model
+(`planner/tensor.rs`, `planner/contraction.rs`,
+arXiv:2209.12332, arXiv:2001.08063) are all genuine research-grade code.
+The calibrated analytic cost model (ADR-023, `planner/calibration.rs`)
+matches the Zen-5-measured AVX-512 throughput to within 5% of the
+theoretical `lanes × f_cpu` bound, which is **better calibrated than most
+academic cost models** and aligns closely with the adaptive-cost-model
+direction of arXiv:2409.17136. The honest weakness, documented in the
+Production Readiness Assessment, is that this planner is **not on the
+production hot path**: the actual executor uses a 5-rule heuristic
+(`planner/optimizer.rs::choose_plan`) and a per-query-shape dispatcher
+(`engine/dispatch.rs`). Closing that gap is the single most important
+remaining piece of work, and the Cascades survey (arXiv:2510.20082) is the
+right reference for the rule-engine scope a production optimizer needs.
+
+On **approximate query processing** (ADR-015 Empirical Bernstein,
+ADR-024 McDiarmid through joins) turboGP is closer to the analytic
+end of the spectrum — VerdictDB (arXiv:1804.00770) and the deep-generative-
+model line (arXiv:1903.10000) represent the engine-agnostic and learned
+alternatives turboGP explicitly chose not to adopt, trading statistical
+generality for the (ε,δ) guarantees that come with sequential-stopping
+and bounded-differences theory. On **energy** (ADR-022 RAPL +
+external-meter benchmarking) turboGP's per-instruction-joule knowledgebase
+aligns with the energy-aware benchmarking direction of arXiv:2604.09048,
+and on **tiered memory** (ADR-010 LRU migration, ADR-025 rANS cold-tier
+compression, the `memory/` module) it anticipates the CXL/NVMe tiered-
+expansion story of arXiv:2606.12556 (ITME). The broader philosophical
+alignment is with DBOS (arXiv:2007.11112): turboGP is narrower
+(single-node, in-memory) but shares the data-centric instinct that the
+storage layout, not the OS scheduler, should drive execution. The full
+bibliography is in [`docs/REFERENCES.md`](./docs/REFERENCES.md).
+

@@ -112,5 +112,5 @@ the decode loop runs at 79 M symbols/sec whether or not the output is correct.
 ## References
 - Duda, "Asymmetric Numeral Systems" arXiv:0902.0277 2009
 - Giesen et al., "Interleaved Entropy Coders" 2014
-- Measured on AMD EPYC-Turin (Zen 5) at 45.63.97.103, 2025-07-30
+- Measured on AMD EPYC-Turin (Zen 5) at [redacted], 2025-07-30
 - `examples/bench_rans.rs` (the prototype benchmark)

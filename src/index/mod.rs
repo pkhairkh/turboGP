@@ -4,7 +4,8 @@
 //! instruction-shaped storage layer:
 //!
 //! - [`bsi`] — Bit-Sliced Index. 64 bitmaps, one per bit position of the
-//!   64-bit cell. Equality is a 64-way AND/OR over bit slices (ADR-014).
+//!   64-bit cell. Equality is a 64-way AND/OR over bit slices (no ADR — see
+//!   `src/index/bsi.rs`).
 //! - [`lsh`] — Locality-Sensitive Hash index for approximate nearest
 //!   neighbour search over floating-point vectors (ADR-017).
 //!

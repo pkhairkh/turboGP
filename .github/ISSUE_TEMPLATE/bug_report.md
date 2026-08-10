@@ -22,4 +22,4 @@ labels: bug
 - OS:
 - CPU:
 - Rust version:
-- TensorVault version:
+- turboGP version:

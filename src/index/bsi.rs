@@ -1,4 +1,8 @@
-//! Bit-Sliced Index (ADR-014).
+//! Bit-Sliced Index (no ADR — see `src/index/bsi.rs`).
+//!
+//! ADR-014 covers HLC over PTP for clock synchronization, *not* bit-sliced
+//! indexes; the historical cross-reference in this module was incorrect and
+//! has been removed.
 //!
 //! A Bit-Sliced Index represents a column of `u64` values as 64 separate
 //! bitmaps, one per bit position. Equality lookups then reduce to a fixed

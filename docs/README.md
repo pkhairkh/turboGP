@@ -21,7 +21,7 @@ docs/
 ├── adr/                       ← Architecture Decision Records (≥80% confidence)
 │   ├── README.md              ← ADR index with compatibility matrix
 │   ├── OPEN_QUESTIONS.md      ← decisions below 80% confidence
-│   ├── 001-64-bit-word-...    ← 22 accepted ADRs
+│   ├── 001-64-bit-word-...    ← 25 accepted ADRs
 │   └── ...
 ├── architecture/              ← design docs + CPU energy knowledgebase
 ├── research/                  ← math foundations + domain deep-dives + wave evaluations
@@ -36,7 +36,7 @@ docs/
 ## Reading order for a new contributor
 
 1. **[FINE_DRAFT.md](./FINE_DRAFT.md)** — the definitive synthesis of the venture
-2. **[adr/README.md](./adr/README.md)** — the 22 accepted decisions (≥80% confidence)
+2. **[adr/README.md](./adr/README.md)** — the 25 accepted decisions (≥80% confidence)
 3. **[adr/OPEN_QUESTIONS.md](./adr/OPEN_QUESTIONS.md)** — the 10 undecided questions (<80% confidence)
 4. **[architecture/instruction-first.md](./architecture/instruction-first.md)** — the design philosophy
 5. **[problems/README.md](./problems/README.md)** — the problem catalog index
