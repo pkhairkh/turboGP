@@ -35,4 +35,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build benchmarks
-        run: cargo build --benches --verbose
+        run: cargo build --benches --features bench-external --verbose
