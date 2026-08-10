@@ -8,9 +8,10 @@ use super::auth::{verify_scram, PasswordManager, ScramOutcome, TlsConfig};
 use super::session::{Session, TxnStatus};
 use crate::engine::{QueryEngine, QueryResult, ResultColumn};
 use base64::Engine as _;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
@@ -312,7 +313,7 @@ impl PgConn {
 
         // Look up the user.
         let cred = {
-            let mgr = self.passwords.read().expect("passwords lock");
+            let mgr = self.passwords.read();
             mgr.get(&username).cloned()
         };
         let cred = match cred {
@@ -485,14 +486,14 @@ impl PgConn {
                 // MVCC (Wave 41): try readonly SELECT first with a read lock.
                 // If that fails (not a SELECT), take a write lock for DML/DDL.
                 let readonly_result = {
-                    let guard = engine.read().expect("engine read lock");
+                    let guard = engine.read();
                     guard.try_readonly_select(trimmed)
                 };
                 match readonly_result {
                     Ok(r) => Ok(r),
                     Err(_) => {
                         // Not a readonly query — take write lock.
-                        let mut guard = engine.write().expect("engine write lock");
+                        let mut guard = engine.write();
                         guard.execute(trimmed)
                     }
                 }
@@ -767,12 +768,12 @@ impl PgConn {
             }
         }
         let result = {
-            let readonly = engine.read().expect("engine");
+            let readonly = engine.read();
             match readonly.try_readonly_select(&sql) {
                 Ok(r) => Ok(r),
                 Err(_) => {
                     drop(readonly);
-                    let mut guard = engine.write().expect("engine");
+                    let mut guard = engine.write();
                     guard.execute(&sql)
                 }
             }
@@ -1324,7 +1325,7 @@ fn handle_create_user(sql: &str, passwords: &Arc<RwLock<PasswordManager>>) -> Us
             return UserDdlOutcome::Err("expected 'password' string literal in CREATE USER".into())
         }
     };
-    let mut mgr = passwords.write().expect("passwords lock");
+    let mut mgr = passwords.write();
     mgr.create_user(&username, &password);
     UserDdlOutcome::Ok("CREATE USER".into())
 }
@@ -1343,7 +1344,7 @@ fn handle_drop_user(sql: &str, passwords: &Arc<RwLock<PasswordManager>>) -> User
     };
     // Trailing tokens (like a semicolon) are ignored.
     let _ = trailing;
-    let mut mgr = passwords.write().expect("passwords lock");
+    let mut mgr = passwords.write();
     if !mgr.drop_user(&username) {
         if !if_exists {
             return UserDdlOutcome::Err(format!("user \"{username}\" does not exist"));

@@ -12,7 +12,8 @@
 //! ```
 
 use clap::Parser;
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use tokio::signal;
 use turbogp::engine::QueryEngine;
 use turbogp::server::{PasswordManager, Server, ServerConfig};

@@ -1,6 +1,7 @@
 //! Authentication + TLS tests (Wave 65).
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use turbogp::server::auth::{PasswordManager, TlsConfig};
 use turbogp::server::ServerConfig;
 

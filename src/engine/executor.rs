@@ -1415,6 +1415,7 @@ fn cross_join_into(
         string_columns: vec![],
         null_bitmaps: vec![],
         schema: None,
+        row_versions: Vec::new(),
     };
     Ok(())
 }

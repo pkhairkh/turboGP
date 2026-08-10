@@ -40,6 +40,7 @@ impl JoinResult {
             string_columns: vec![],
             null_bitmaps: vec![],
             schema: None,
+            row_versions: Vec::new(),
         }
     }
 }
@@ -247,6 +248,7 @@ mod tests {
             string_columns: vec![],
             null_bitmaps: vec![],
             schema: None,
+            row_versions: Vec::new(),
         }
     }
 
