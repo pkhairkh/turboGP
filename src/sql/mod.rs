@@ -49,6 +49,11 @@ pub use extensions::{parse_extensions, parse_extensions_and_strip, QueryExtensio
 pub use lexer::{tokenize, Token, KEYWORDS};
 pub use parser::{parse, Expr, SelectItem, SelectQuery, Value};
 
+// Re-export the unified AST types. Wave 4 migrates all consumers to these;
+// until then they are staged here so the unified types are reachable from
+// the crate root and visible in docs.
+pub use ast::{BinOp as UnifiedBinOp, Expr as UnifiedExpr, Value as UnifiedValue};
+
 /// Parse a SQL string into a `(SelectQuery, QueryExtensions)` pair.
 ///
 /// This is the convenience entry point for users who want to parse a full

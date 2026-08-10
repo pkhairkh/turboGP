@@ -1,10 +1,15 @@
 #!/bin/bash
 # Wave 1: Check that no dead/unreachable modules exist in src/.
-# Scans for modules declared in mod.rs but never referenced from
-# the production execution path (QueryEngine::execute).
 #
-# This is a heuristic check — cargo-udeps catches unused dependencies,
-# this script catches unreachable modules. Both are needed.
+# A module file (non-mod.rs) is considered LIVE if any other .rs file
+# references it via one of:
+#   1. `crate::...::mod_name::`  (fully-qualified path)
+#   2. `mod_name::`               (brought into scope via `use`)
+#   3. `pub use mod_name::{...}`  in parent mod.rs, where at least one
+#      re-exported item is referenced elsewhere.
+#
+# Skips: src/lib.rs (crate root), src/bin/ (binary entry points),
+#        *tests.rs (test-only modules).
 #
 # Exit 0 = pass, Exit 1 = dead code found.
 
@@ -12,39 +17,45 @@ set -e
 
 echo "[dead-code-check] Scanning src/ for unreachable modules..."
 
-# Get all .rs files in src/
 FILES=$(find src/ -name '*.rs' | sort)
 
 DEAD_COUNT=0
 
-# For each module file, check if its primary type/function is referenced
-# anywhere in src/ outside its own file and outside #[cfg(test)].
 for file in $FILES; do
-    # Skip mod.rs files (they're just re-exports)
-    if [[ "$file" == *"/mod.rs" ]]; then
-        continue
-    fi
+    # Skip mod.rs, lib.rs, bin/, and test files
+    if [[ "$file" == *"/mod.rs" ]]; then continue; fi
+    if [[ "$file" == "src/lib.rs" ]]; then continue; fi
+    if [[ "$file" == "src/bin/"* ]]; then continue; fi
+    if [[ "$file" == *tests.rs ]]; then continue; fi
 
-    # Extract the module name from the file path
     mod_name=$(basename "$file" .rs)
 
-    # Get the primary type name (PascalCase version of mod_name)
-    # e.g., "flat_hash_table" -> "FlatHashTable"
-    type_name=$(echo "$mod_name" | awk -F_ '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1))substr($i,2)}1' OFS='')
+    # Check 1 & 2: mod_name:: appears anywhere outside this file
+    name_refs=$(grep -rl "${mod_name}::" src/ 2>/dev/null \
+        | grep -v "^${file}$" | head -1 || true)
 
-    # Check if this type is referenced anywhere in src/ except its own file
-    # and except test modules
-    refs=$(grep -rl "$type_name" src/ 2>/dev/null | grep -v "$file" | grep -v "#\[cfg(test)\]" | head -1 || true)
-
-    if [ -z "$refs" ]; then
-        # Also check if the module is `use`d anywhere
-        mod_path=$(echo "$file" | sed 's|src/||; s|/|::|g; s|\.rs$||')
-        use_refs=$(grep -rl "use.*$mod_name" src/ 2>/dev/null | grep -v "$file" | grep -v "mod.rs" | head -1 || true)
-
-        if [ -z "$use_refs" ]; then
-            echo "  DEAD: $file (type $type_name not referenced outside own file)"
-            DEAD_COUNT=$((DEAD_COUNT + 1))
+    # Check 3: re-exported from parent mod.rs, and a re-exported item is used
+    parent_dir=$(dirname "$file")
+    parent_mod="${parent_dir}/mod.rs"
+    pub_use_refs=""
+    if [ -f "$parent_mod" ]; then
+        if grep -q "pub use ${mod_name}::" "$parent_mod" 2>/dev/null; then
+            reexported=$(grep "pub use ${mod_name}::" "$parent_mod" \
+                | sed 's/.*::{//; s/}.*//; s/,/ /g' | tr -d ' ')
+            for item in $reexported; do
+                found=$(grep -rl "\b${item}\b" src/ 2>/dev/null \
+                    | grep -v "^${file}$" | grep -v "^${parent_mod}$" | head -1 || true)
+                if [ -n "$found" ]; then
+                    pub_use_refs="$found"
+                    break
+                fi
+            done
         fi
+    fi
+
+    if [ -z "$name_refs" ] && [ -z "$pub_use_refs" ]; then
+        echo "  DEAD: $file (no references via mod_name::, crate::, use, or pub use)"
+        DEAD_COUNT=$((DEAD_COUNT + 1))
     fi
 done
 
