@@ -2,6 +2,7 @@
 name = "turbogp"
 version = "1.0.0"
 edition = "2021"
+rust-version = "1.89"
 authors = ["turboGP Contributors"]
 license = "CCL-X-1.2"
 description = "Instruction-first, memory-centric relational database engine. The kernel table is the moat."
