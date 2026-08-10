@@ -1,0 +1,43 @@
+replicaCount: 1
+
+image:
+  repository: turbogp
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 5432
+
+storage:
+  size: 10Gi
+  storageClass: ""
+
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "500m"
+  limits:
+    memory: "4Gi"
+    cpu: "4000m"
+
+config:
+  dataDir: /data
+  listenPort: 5432
+  rustLog: info
+  rustBacktrace: "1"
+
+auth:
+  adminPassword: "changeme"
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+probes:
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  liveness:
+    initialDelaySeconds: 30
+    periodSeconds: 30
