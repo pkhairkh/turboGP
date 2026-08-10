@@ -31,6 +31,7 @@
 //! the surface area auditable; it also lets the parser grow the seven
 //! turboGP-specific extensions natively rather than via visitor patterns.
 
+pub mod ast;
 pub mod cte;
 pub mod ddl;
 pub mod dml;
