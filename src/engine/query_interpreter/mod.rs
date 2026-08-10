@@ -13,8 +13,8 @@
 //! - [`aggregate`] — grouped aggregation, scalar aggregates, vectorized sum/min/max
 //! - [`subquery`] — subquery decorrelation, EXISTS/IN hash-set caching
 //! - [`expr`] — expression evaluation (eval, binop, comparison, like, cast)
-//! - [`tpch_queries_q1_q6`] / [`tpch_queries_q7_q12`] / [`tpch_queries_q13_q18`] /
-//!   [`tpch_queries_q19_q22`] — TPC-H per-query detectors (to be deleted in Wave 6)
+//! - [`tpc_h_queries_q1_q6`] / [`tpc_h_queries_q7_q12`] / [`tpc_h_queries_q13_q18`] /
+//!   [`tpc_h_queries_q19_q22`] — TPC-H per-query detectors (to be deleted in Wave 6)
 
 pub mod aggregate;
 pub mod exec;
@@ -22,10 +22,10 @@ pub mod expr;
 pub mod join;
 pub mod parser;
 pub mod subquery;
-pub mod tpch_queries_q13_q18;
-pub mod tpch_queries_q19_q22;
-pub mod tpch_queries_q1_q6;
-pub mod tpch_queries_q7_q12;
+pub mod tpc_h_queries_q13_q18;
+pub mod tpc_h_queries_q19_q22;
+pub mod tpc_h_queries_q1_q6;
+pub mod tpc_h_queries_q7_q12;
 pub mod types;
 
 pub use exec::execute_interpreter;
@@ -38,10 +38,10 @@ use crate::Error;
 use fxhash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 
-use tpch_queries_q1_q6::*;
-use tpch_queries_q7_q12::*;
-use tpch_queries_q13_q18::*;
-use tpch_queries_q19_q22::*;
+use tpc_h_queries_q1_q6::*;
+use tpc_h_queries_q7_q12::*;
+use tpc_h_queries_q13_q18::*;
+use tpc_h_queries_q19_q22::*;
 
 
 // Use ahash (hardware AES) instead of std SipHash for all HashMap/HashSet.

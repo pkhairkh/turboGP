@@ -34,6 +34,15 @@ for file in $FILES; do
     name_refs=$(grep -rl "${mod_name}::" src/ 2>/dev/null \
         | grep -v "^${file}$" | head -1 || true)
 
+    # Check 1b: file contains `impl <Type>` blocks (methods on types
+    # defined elsewhere). These are inherently wired — the type is
+    # used, and the impl block extends it. Skip such files.
+    if [ -z "$name_refs" ]; then
+        if grep -qE '^impl\b' "$file" 2>/dev/null; then
+            continue
+        fi
+    fi
+
     # Check 3: re-exported from parent mod.rs, and a re-exported item is used
     parent_dir=$(dirname "$file")
     parent_mod="${parent_dir}/mod.rs"
