@@ -165,9 +165,11 @@ impl BufferPool {
     }
 
     /// Find a free frame (pin_count == 0) using the clock algorithm.
-    /// Returns the frame index. If no free frame is found, panics
-    /// (the pool is too small — increase capacity).
-    fn find_victim(&mut self) -> usize {
+    /// Returns `Some(frame_index)` if a victim is found, or `None` if all
+    /// frames are pinned (buffer pool exhausted). The caller should handle
+    /// `None` as an error, not a panic (Wave 6 fix: previously this panicked
+    /// with "buffer pool exhausted: all frames pinned").
+    fn find_victim(&mut self) -> Option<usize> {
         let n = self.frames.len();
         // Run the clock hand until we find a frame with referenced == false
         // and pin_count == 0. We clear the referenced bit as we go.
@@ -179,13 +181,13 @@ impl BufferPool {
                 if frame.referenced {
                     self.frames[idx].referenced = false;
                 } else {
-                    return idx;
+                    return Some(idx);
                 }
             }
         }
-        // No victim found — all frames are pinned. This is a deadlock condition
-        // in a real system; we panic to surface the bug.
-        panic!("buffer pool exhausted: all frames pinned (increase capacity)");
+        // No victim found — all frames are pinned. Return None so the
+        // caller can handle the error gracefully (Wave 6 fix).
+        None
     }
 
     /// Fetch a page into the buffer pool and return its frame index.
@@ -199,7 +201,12 @@ impl BufferPool {
             return Ok(idx);
         }
         // Page not in pool — find a victim frame.
-        let idx = self.find_victim();
+        let idx = self.find_victim().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "buffer pool exhausted: all frames pinned (increase capacity)",
+            )
+        })?;
         // If the victim is dirty, write it back to disk.
         let victim_page_id = self.frames[idx].page_id;
         if self.frames[idx].dirty {

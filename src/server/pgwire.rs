@@ -1199,10 +1199,10 @@ fn hex_encode(b: &[u8]) -> String {
 }
 
 fn rand_backend_key() -> i32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as i32)
-        .unwrap_or(0)
+    // Wave 6 fix: use rand::rng() instead of SystemTime::now().subsec_nanos()
+    // for a cryptographically-suitable random backend key.
+    use rand::Rng;
+    rand::rng().random()
 }
 
 // -----------------------------------------------------------------------

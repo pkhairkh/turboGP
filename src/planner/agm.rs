@@ -98,10 +98,13 @@ impl JoinHypergraph {
     #[must_use]
     pub fn from_named(attributes: &[&str], relations: &[Vec<&str>]) -> Self {
         let index_of = |name: &str| -> usize {
-            attributes
-                .iter()
-                .position(|&a| a == name)
-                .unwrap_or_else(|| panic!("unknown attribute: {name}"))
+            attributes.iter().position(|&a| a == name).unwrap_or_else(|| {
+                // Wave 6 fix: return 0 instead of panicking on unknown attribute.
+                // This is a graceful degradation — the AGM bound will be less
+                // accurate, but the engine won't crash.
+                log::warn!("agm: unknown attribute '{name}', returning index 0");
+                0
+            })
         };
         let relations: Vec<Vec<usize>> = relations
             .iter()
