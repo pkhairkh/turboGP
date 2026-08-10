@@ -101,7 +101,7 @@ fn column_types_preserved() {
     assert!(table.schema.is_some());
     let schema = table.schema.as_ref().unwrap();
     assert_eq!(schema.columns.len(), 4);
-    assert!(schema.is_float(1));  // price is FLOAT
+    assert!(schema.is_float(1)); // price is FLOAT
     assert!(schema.is_string(2)); // name is VARCHAR
 }
 
@@ -139,9 +139,11 @@ fn wal_durable_persistence() {
 fn order_by_string_alphabetical() {
     use turbogp::engine::{QueryResult, ResultColumn};
     let mut r = QueryResult::empty();
-    r.push_column(ResultColumn::from_strings("name", vec![
-        "Charlie".into(), "Alice".into(), "Bob".into()
-    ])).unwrap();
+    r.push_column(ResultColumn::from_strings(
+        "name",
+        vec!["Charlie".into(), "Alice".into(), "Bob".into()],
+    ))
+    .unwrap();
     r.row_count = 3;
 
     // Sort by name ASC — should be Alice, Bob, Charlie.

@@ -24,8 +24,20 @@ fn make_engine_with_nulls() -> QueryEngine {
     let t = DS::from_loaded(LoadedTable {
         name: "t".into(),
         columns: vec![
-            LoadedColumn { name: "id".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None, null_bitmap: None },
-            LoadedColumn { name: "v".into(), cells: vec![10, 0, 30], row_count: 3, string_search: None, null_bitmap: Some(vec![false, true, false]) },
+            LoadedColumn {
+                name: "id".into(),
+                cells: vec![1, 2, 3],
+                row_count: 3,
+                string_search: None,
+                null_bitmap: None,
+            },
+            LoadedColumn {
+                name: "v".into(),
+                cells: vec![10, 0, 30],
+                row_count: 3,
+                string_search: None,
+                null_bitmap: Some(vec![false, true, false]),
+            },
         ],
         row_count: 3,
     });
@@ -39,9 +51,13 @@ fn make_engine_with_rows(n: u64) -> QueryEngine {
     use turbogp::datasource::Table as DS;
     let t = DS::from_loaded(LoadedTable {
         name: "t".into(),
-        columns: vec![
-            LoadedColumn { name: "id".into(), cells: (1..=n).collect(), row_count: n as usize, string_search: None, null_bitmap: None },
-        ],
+        columns: vec![LoadedColumn {
+            name: "id".into(),
+            cells: (1..=n).collect(),
+            row_count: n as usize,
+            string_search: None,
+            null_bitmap: None,
+        }],
         row_count: n as usize,
     });
     let mut e = QueryEngine::new();
@@ -51,13 +67,17 @@ fn make_engine_with_rows(n: u64) -> QueryEngine {
 
 async fn boot(e: QueryEngine) -> std::net::SocketAddr {
     let e = Arc::new(RwLock::new(e));
-    let s = Server::bind(e, ServerConfig::default()).await.unwrap();
+    let mut cfg = ServerConfig::default();
+    cfg.auth_required = false;
+    let s = Server::bind(e, cfg).await.unwrap();
     let a = s.local_addr;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     a
 }
 
-struct PgClient { s: TcpStream }
+struct PgClient {
+    s: TcpStream,
+}
 impl PgClient {
     async fn connect(addr: std::net::SocketAddr) -> std::io::Result<Self> {
         Ok(PgClient { s: TcpStream::connect(addr).await? })
@@ -71,8 +91,12 @@ impl PgClient {
         assert_eq!(b[0], b'N');
         let mut body = Vec::new();
         body.extend_from_slice(&196608i32.to_be_bytes());
-        body.extend_from_slice(b"user\0"); body.extend_from_slice(user.as_bytes()); body.push(0);
-        body.extend_from_slice(b"database\0"); body.extend_from_slice(db.as_bytes()); body.push(0);
+        body.extend_from_slice(b"user\0");
+        body.extend_from_slice(user.as_bytes());
+        body.push(0);
+        body.extend_from_slice(b"database\0");
+        body.extend_from_slice(db.as_bytes());
+        body.push(0);
         body.push(0);
         self.s.write_all(&((body.len() + 4) as i32).to_be_bytes()).await?;
         self.s.write_all(&body).await?;
@@ -91,7 +115,8 @@ impl PgClient {
     }
     async fn send_query(&mut self, sql: &str) -> std::io::Result<()> {
         let mut body = Vec::new();
-        body.extend_from_slice(sql.as_bytes()); body.push(0);
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
         self.s.write_all(b"Q").await?;
         self.s.write_all(&((body.len() + 4) as i32).to_be_bytes()).await?;
         self.s.write_all(&body).await?;
@@ -100,8 +125,10 @@ impl PgClient {
     async fn send_parse(&mut self, stmt_name: &str, sql: &str) -> std::io::Result<()> {
         // Parse: 'P' + len + stmt_name\0 + sql\0 + n_params(0)
         let mut body = Vec::new();
-        body.extend_from_slice(stmt_name.as_bytes()); body.push(0);
-        body.extend_from_slice(sql.as_bytes()); body.push(0);
+        body.extend_from_slice(stmt_name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
         body.extend_from_slice(&0u16.to_be_bytes());
         self.s.write_all(b"P").await?;
         self.s.write_all(&((body.len() + 4) as i32).to_be_bytes()).await?;
@@ -111,8 +138,10 @@ impl PgClient {
     async fn send_bind(&mut self, portal_name: &str, stmt_name: &str) -> std::io::Result<()> {
         // Bind: 'B' + len + portal\0 + stmt\0 + 0 + 0 + 0
         let mut body = Vec::new();
-        body.extend_from_slice(portal_name.as_bytes()); body.push(0);
-        body.extend_from_slice(stmt_name.as_bytes()); body.push(0);
+        body.extend_from_slice(portal_name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(stmt_name.as_bytes());
+        body.push(0);
         body.extend_from_slice(&0u16.to_be_bytes()); // 0 param formats
         body.extend_from_slice(&0u16.to_be_bytes()); // 0 params
         body.extend_from_slice(&0u16.to_be_bytes()); // 0 result formats
@@ -125,7 +154,8 @@ impl PgClient {
         // Describe: 'D' + len + 'P' + portal\0
         let mut body = Vec::new();
         body.push(b'P');
-        body.extend_from_slice(portal_name.as_bytes()); body.push(0);
+        body.extend_from_slice(portal_name.as_bytes());
+        body.push(0);
         self.s.write_all(b"D").await?;
         self.s.write_all(&((body.len() + 4) as i32).to_be_bytes()).await?;
         self.s.write_all(&body).await?;
@@ -134,7 +164,8 @@ impl PgClient {
     async fn send_execute(&mut self, portal_name: &str, max_rows: i32) -> std::io::Result<()> {
         // Execute: 'E' + len + portal\0 + max_rows
         let mut body = Vec::new();
-        body.extend_from_slice(portal_name.as_bytes()); body.push(0);
+        body.extend_from_slice(portal_name.as_bytes());
+        body.push(0);
         body.extend_from_slice(&max_rows.to_be_bytes());
         self.s.write_all(b"E").await?;
         self.s.write_all(&((body.len() + 4) as i32).to_be_bytes()).await?;
@@ -150,7 +181,7 @@ impl PgClient {
         let mut h = [0u8; 5];
         self.s.read_exact(&mut h).await?;
         let t = h[0];
-        let len = i32::from_be_bytes([h[1],h[2],h[3],h[4]]) as usize;
+        let len = i32::from_be_bytes([h[1], h[2], h[3], h[4]]) as usize;
         let mut body = vec![0u8; len - 4];
         self.s.read_exact(&mut body).await?;
         Ok((t, body))
@@ -181,13 +212,18 @@ async fn pgwire_null_cell_emits_minus_one_length() {
                 let mut row: Vec<Option<String>> = Vec::with_capacity(ncols);
                 let mut off = 2;
                 for _ in 0..ncols {
-                    let len = i32::from_be_bytes([body[off], body[off+1], body[off+2], body[off+3]]);
+                    let len = i32::from_be_bytes([
+                        body[off],
+                        body[off + 1],
+                        body[off + 2],
+                        body[off + 3],
+                    ]);
                     off += 4;
                     if len < 0 {
                         row.push(None);
                     } else {
                         let len = len as usize;
-                        let s = String::from_utf8_lossy(&body[off..off+len]).into_owned();
+                        let s = String::from_utf8_lossy(&body[off..off + len]).into_owned();
                         row.push(Some(s));
                         off += len;
                     }
@@ -236,11 +272,15 @@ async fn pgwire_describe_does_not_execute() {
     loop {
         let (t, _body) = c.read_msg().await.unwrap();
         match t {
-            b'1' => {}    // ParseComplete
-            b'2' => {}    // BindComplete
-            b'n' => { saw_nodata = true; }    // NoData
-            b'T' => {}    // RowDescription (would mean query was executed)
-            b'D' => { saw_datarrow = true; }  // DataRow (would mean query was executed)
+            b'1' => {} // ParseComplete
+            b'2' => {} // BindComplete
+            b'n' => {
+                saw_nodata = true;
+            } // NoData
+            b'T' => {} // RowDescription (would mean query was executed)
+            b'D' => {
+                saw_datarrow = true;
+            } // DataRow (would mean query was executed)
             b'Z' => break,
             _ => {}
         }
@@ -273,9 +313,15 @@ async fn pgwire_max_rows_limits_data_rows() {
         let (t, _body) = c.read_msg().await.unwrap();
         match t {
             b'1' | b'2' => {} // ParseComplete, BindComplete
-            b'D' => { data_rows += 1; }
-            b's' => { saw_suspended = true; }  // PortalSuspended
-            b'C' => { saw_complete = true; }   // CommandComplete
+            b'D' => {
+                data_rows += 1;
+            }
+            b's' => {
+                saw_suspended = true;
+            } // PortalSuspended
+            b'C' => {
+                saw_complete = true;
+            } // CommandComplete
             b'Z' => break,
             _ => {}
         }
@@ -303,8 +349,12 @@ async fn pgwire_max_rows_zero_sends_all() {
         let (t, _body) = c.read_msg().await.unwrap();
         match t {
             b'1' | b'2' => {}
-            b'D' => { data_rows += 1; }
-            b'C' => { saw_complete = true; }
+            b'D' => {
+                data_rows += 1;
+            }
+            b'C' => {
+                saw_complete = true;
+            }
             b'Z' => break,
             _ => {}
         }
@@ -333,7 +383,9 @@ async fn pgwire_cursor_drains_remaining_rows() {
         let (t, _b) = c.read_msg().await.unwrap();
         match t {
             b'1' | b'2' => {}
-            b'D' => { batch1 += 1; }
+            b'D' => {
+                batch1 += 1;
+            }
             b's' => break,
             b'C' => panic!("should be suspended, not complete"),
             b'Z' => break,
@@ -343,7 +395,9 @@ async fn pgwire_cursor_drains_remaining_rows() {
     // Drain until ReadyForQuery.
     loop {
         let (t, _b) = c.read_msg().await.unwrap();
-        if t == b'Z' { break; }
+        if t == b'Z' {
+            break;
+        }
     }
     assert_eq!(batch1, 2, "first Execute(max_rows=2) must return 2 rows");
 
@@ -355,8 +409,12 @@ async fn pgwire_cursor_drains_remaining_rows() {
     loop {
         let (t, _b) = c.read_msg().await.unwrap();
         match t {
-            b'D' => { batch2 += 1; }
-            b's' => { suspended2 = true; }
+            b'D' => {
+                batch2 += 1;
+            }
+            b's' => {
+                suspended2 = true;
+            }
             b'Z' => break,
             _ => {}
         }
@@ -372,8 +430,12 @@ async fn pgwire_cursor_drains_remaining_rows() {
     loop {
         let (t, _b) = c.read_msg().await.unwrap();
         match t {
-            b'D' => { batch3 += 1; }
-            b'C' => { complete3 = true; }
+            b'D' => {
+                batch3 += 1;
+            }
+            b'C' => {
+                complete3 = true;
+            }
             b'Z' => break,
             _ => {}
         }

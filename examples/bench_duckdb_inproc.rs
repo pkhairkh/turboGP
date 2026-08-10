@@ -58,13 +58,8 @@ const LOG_OUT: &str = "/root/results/duckdb_inproc.run.log";
 
 /// Read ClickBench queries (one per line) from the verbatim file.
 fn load_clickbench_queries(path: &str) -> Vec<String> {
-    let content = fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {}", path, e));
-    content
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect()
+    let content = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {}", path, e));
+    content.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
 }
 
 /// Execute a query fully (drain all rows) and return the row count.
@@ -115,18 +110,13 @@ fn main() {
     println!("\nLoading TPC-H tables from {} ...", TPCH_DUCKDB);
     assert!(Path::new(TPCH_DUCKDB).exists(), "tpch duckdb missing");
     let t0 = Instant::now();
-    conn.execute_batch(&format!(
-        "ATTACH '{}' AS tpch (READ_ONLY);",
-        TPCH_DUCKDB
-    ))
-    .expect("attach tpch");
-    let tpch_tables = [
-        "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
-    ];
+    conn.execute_batch(&format!("ATTACH '{}' AS tpch (READ_ONLY);", TPCH_DUCKDB))
+        .expect("attach tpch");
+    let tpch_tables =
+        ["customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"];
     for tbl in &tpch_tables {
         let sql = format!("CREATE TABLE {} AS SELECT * FROM tpch.{};", tbl, tbl);
-        conn.execute_batch(&sql)
-            .unwrap_or_else(|e| panic!("create table {}: {}", tbl, e));
+        conn.execute_batch(&sql).unwrap_or_else(|e| panic!("create table {}: {}", tbl, e));
         // quick row-count log
         let n: i64 = conn
             .query_row(&format!("SELECT count(*) FROM {}", tbl), [], |r| r.get(0))
@@ -288,12 +278,15 @@ fn main() {
         let id = v["id"].as_str().unwrap_or("");
         let suite = v["suite"].as_str().unwrap_or("");
         let status = v["status"].as_str().unwrap_or("");
-        let runs = v["runs_ms"].as_array().map(|a| {
-            a.iter()
-                .map(|x| format!("{:.2}", x.as_f64().unwrap_or(0.0)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        }).unwrap_or_default();
+        let runs = v["runs_ms"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|x| format!("{:.2}", x.as_f64().unwrap_or(0.0)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
         let best = v["best_ms"].as_f64().map(|b| format!("{:.2}", b)).unwrap_or("null".into());
         let med = v["median_ms"].as_f64().map(|m| format!("{:.2}", m)).unwrap_or("null".into());
         let err = v["error"].as_str().unwrap_or("");

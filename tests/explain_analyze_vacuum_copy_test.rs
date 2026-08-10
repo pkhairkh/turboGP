@@ -1,7 +1,7 @@
 //! EXPLAIN, ANALYZE, VACUUM, COPY integration tests (Wave 68).
 
-use turbogp::engine::QueryEngine;
 use tempfile::TempDir;
+use turbogp::engine::QueryEngine;
 
 #[test]
 fn explain_basic() {
@@ -23,7 +23,8 @@ fn analyze_basic() {
     let r = e.execute("ANALYZE SELECT count(*) FROM t").unwrap();
     // ANALYZE returns the query result plus an execution_time_ms column.
     assert!(r.columns.len() >= 2, "ANALYZE must return result + timing column");
-    let timing_col = r.columns.iter().find(|c| c.name == "execution_time_ms").expect("timing column");
+    let timing_col =
+        r.columns.iter().find(|c| c.name == "execution_time_ms").expect("timing column");
     let timing_str = timing_col.string_values.as_ref().unwrap();
     let ms: f64 = timing_str[0].parse().unwrap();
     assert!(ms >= 0.0, "timing must be non-negative");

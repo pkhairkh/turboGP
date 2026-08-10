@@ -150,7 +150,7 @@ mod tests {
     fn push_null_and_non_null() {
         let mut bm = NullBitmap::new(0);
         bm.push_non_null(); // row 0: non-null
-        bm.push_null();     // row 1: null
+        bm.push_null(); // row 1: null
         bm.push_non_null(); // row 2: non-null
         assert_eq!(bm.len(), 3);
         assert!(!bm.is_null(0));

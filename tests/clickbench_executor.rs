@@ -5,7 +5,10 @@ use turbogp::engine::QueryEngine;
 
 fn make_engine() -> QueryEngine {
     let mut e = QueryEngine::new();
-    e.execute("CREATE TABLE hits (id INT, user_id INT, engine_id INT, url VARCHAR(100), region_id INT)").unwrap();
+    e.execute(
+        "CREATE TABLE hits (id INT, user_id INT, engine_id INT, url VARCHAR(100), region_id INT)",
+    )
+    .unwrap();
     e.execute("INSERT INTO hits (id, user_id, engine_id, url, region_id) VALUES (1, 100, 0, 'http://google.com', 1)").unwrap();
     e.execute("INSERT INTO hits (id, user_id, engine_id, url, region_id) VALUES (2, 200, 0, 'http://google.com/search', 1)").unwrap();
     e.execute("INSERT INTO hits (id, user_id, engine_id, url, region_id) VALUES (3, 100, 1, 'http://yahoo.com', 2)").unwrap();

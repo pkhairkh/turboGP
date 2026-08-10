@@ -21,7 +21,7 @@
 //! Implements: JSON_VALUE, JSON_QUERY, JSON_MODIFY, ISJSON, FOR JSON PATH.
 //! Uses serde_json for parsing and serialization.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Extract a scalar value from a JSON string at the given path.
 /// Path uses SQL/JSON path syntax: `$.field.subfield`.
@@ -57,11 +57,8 @@ pub fn json_modify(json_str: &str, path: &str, value: &str) -> String {
     let mut v: Value = serde_json::from_str(json_str).unwrap_or(json!({}));
 
     // Check for "append" prefix.
-    let (is_append, clean_path) = if path.to_lowercase().starts_with("append ") {
-        (true, &path[7..])
-    } else {
-        (false, path)
-    };
+    let (is_append, clean_path) =
+        if path.to_lowercase().starts_with("append ") { (true, &path[7..]) } else { (false, path) };
 
     // Parse the value: try as JSON, then as string, then as number/bool/null.
     let new_val: Value = if value.eq_ignore_ascii_case("null") {
@@ -113,81 +110,75 @@ pub fn openjson_default(json_str: &str) -> Vec<(String, String, String)> {
         Err(_) => return Vec::new(),
     };
     match v {
-        Value::Array(arr) => {
-            arr.iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let val_str = match v {
-                        Value::Object(_) | Value::Array(_) => v.to_string(),
-                        _ => v.to_string(),
-                    };
-                    let type_str = match v {
-                        Value::Null => "null".into(),
-                        Value::Bool(_) => "boolean".into(),
-                        Value::Number(n) if n.is_i64() => "int".into(),
-                        Value::Number(n) if n.is_u64() => "uint".into(),
-                        Value::Number(_) => "float".into(),
-                        Value::String(_) => "string".into(),
-                        Value::Array(_) => "array".into(),
-                        Value::Object(_) => "object".into(),
-                    };
-                    (i.to_string(), val_str, type_str)
-                })
-                .collect()
-        }
-        Value::Object(obj) => {
-            obj.iter()
-                .map(|(k, v)| {
-                    let val_str = match v {
-                        Value::Object(_) | Value::Array(_) => v.to_string(),
-                        _ => v.to_string(),
-                    };
-                    let type_str = match v {
-                        Value::Null => "null".into(),
-                        Value::Bool(_) => "boolean".into(),
-                        Value::Number(n) if n.is_i64() => "int".into(),
-                        Value::Number(n) if n.is_u64() => "uint".into(),
-                        Value::Number(_) => "float".into(),
-                        Value::String(_) => "string".into(),
-                        Value::Array(_) => "array".into(),
-                        Value::Object(_) => "object".into(),
-                    };
-                    (k.clone(), val_str, type_str)
-                })
-                .collect()
-        }
+        Value::Array(arr) => arr
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let val_str = match v {
+                    Value::Object(_) | Value::Array(_) => v.to_string(),
+                    _ => v.to_string(),
+                };
+                let type_str = match v {
+                    Value::Null => "null".into(),
+                    Value::Bool(_) => "boolean".into(),
+                    Value::Number(n) if n.is_i64() => "int".into(),
+                    Value::Number(n) if n.is_u64() => "uint".into(),
+                    Value::Number(_) => "float".into(),
+                    Value::String(_) => "string".into(),
+                    Value::Array(_) => "array".into(),
+                    Value::Object(_) => "object".into(),
+                };
+                (i.to_string(), val_str, type_str)
+            })
+            .collect(),
+        Value::Object(obj) => obj
+            .iter()
+            .map(|(k, v)| {
+                let val_str = match v {
+                    Value::Object(_) | Value::Array(_) => v.to_string(),
+                    _ => v.to_string(),
+                };
+                let type_str = match v {
+                    Value::Null => "null".into(),
+                    Value::Bool(_) => "boolean".into(),
+                    Value::Number(n) if n.is_i64() => "int".into(),
+                    Value::Number(n) if n.is_u64() => "uint".into(),
+                    Value::Number(_) => "float".into(),
+                    Value::String(_) => "string".into(),
+                    Value::Array(_) => "array".into(),
+                    Value::Object(_) => "object".into(),
+                };
+                (k.clone(), val_str, type_str)
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }
 
 /// OPENJSON with explicit schema: parse a JSON array and extract fields
 /// according to the provided (column_name, path) pairs.
-pub fn openjson_with_schema(
-    json_str: &str,
-    schema: &[(String, String)],
-) -> Vec<Vec<String>> {
+pub fn openjson_with_schema(json_str: &str, schema: &[(String, String)]) -> Vec<Vec<String>> {
     let v: Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
     match v {
-        Value::Array(arr) => {
-            arr.iter()
-                .map(|elem| {
-                    schema
-                        .iter()
-                        .map(|(_col, path)| {
-                            let val = navigate_path(elem, path);
-                            match val {
-                                Some(Value::Null) | None => "NULL".into(),
-                                Some(Value::String(s)) => s,
-                                Some(v) => v.to_string(),
-                            }
-                        })
-                        .collect()
-                })
-                .collect()
-        }
+        Value::Array(arr) => arr
+            .iter()
+            .map(|elem| {
+                schema
+                    .iter()
+                    .map(|(_col, path)| {
+                        let val = navigate_path(elem, path);
+                        match val {
+                            Some(Value::Null) | None => "NULL".into(),
+                            Some(Value::String(s)) => s,
+                            Some(v) => v.to_string(),
+                        }
+                    })
+                    .collect()
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -201,8 +192,8 @@ pub fn for_json_path(rows: &[Vec<(String, String)>]) -> String {
             let mut obj = serde_json::Map::new();
             for (col, val) in row {
                 // Try to parse the value as JSON; fall back to string.
-                let parsed: Value = serde_json::from_str(val)
-                    .unwrap_or_else(|_| Value::String(val.clone()));
+                let parsed: Value =
+                    serde_json::from_str(val).unwrap_or_else(|_| Value::String(val.clone()));
                 obj.insert(col.clone(), parsed);
             }
             Value::Object(obj)
@@ -436,10 +427,7 @@ mod tests {
         let j = r#"[{"name":"Alice","age":30},{"name":"Bob","age":25}]"#;
         let rows = openjson_with_schema(
             j,
-            &[
-                ("name".into(), "$.name".into()),
-                ("age".into(), "$.age".into()),
-            ],
+            &[("name".into(), "$.name".into()), ("age".into(), "$.age".into())],
         );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], "Alice");

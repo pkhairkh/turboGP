@@ -70,7 +70,9 @@ fn not_in_list() {
 #[test]
 fn combined_between_and_in() {
     let mut e = make_engine();
-    let r = e.execute("SELECT count(*) FROM hits WHERE val BETWEEN 10 AND 40 AND val IN (10, 20, 30)").unwrap();
+    let r = e
+        .execute("SELECT count(*) FROM hits WHERE val BETWEEN 10 AND 40 AND val IN (10, 20, 30)")
+        .unwrap();
     assert_eq!(r.scalar_u64(), Some(3));
 }
 

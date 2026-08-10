@@ -81,8 +81,14 @@ pub fn parse_window_spec(s: &str) -> Result<WindowSpec, String> {
                     let asc = if i < upper_tokens.len() {
                         let ut = upper_tokens[i].trim_end_matches(',');
                         match ut {
-                            "DESC" => { i += 1; false }
-                            "ASC" => { i += 1; true }
+                            "DESC" => {
+                                i += 1;
+                                false
+                            }
+                            "ASC" => {
+                                i += 1;
+                                true
+                            }
                             _ => true,
                         }
                     } else {
@@ -112,8 +118,7 @@ pub fn parse_window_spec(s: &str) -> Result<WindowSpec, String> {
                     if upper_tokens[i] == "UNBOUNDED" {
                         i += 1;
                         if i < upper_tokens.len() {
-                            spec.frame_start =
-                                Some(format!("UNBOUNDED {}", upper_tokens[i]));
+                            spec.frame_start = Some(format!("UNBOUNDED {}", upper_tokens[i]));
                             i += 1;
                         }
                     } else if upper_tokens[i] == "CURRENT" {
@@ -139,8 +144,7 @@ pub fn parse_window_spec(s: &str) -> Result<WindowSpec, String> {
                         if upper_tokens[i] == "UNBOUNDED" {
                             i += 1;
                             if i < upper_tokens.len() {
-                                spec.frame_end =
-                                    Some(format!("UNBOUNDED {}", upper_tokens[i]));
+                                spec.frame_end = Some(format!("UNBOUNDED {}", upper_tokens[i]));
                                 i += 1;
                             }
                         } else if upper_tokens[i] == "CURRENT" {
@@ -257,8 +261,8 @@ pub fn sum_over(result: &QueryResult, col_name: &str, spec: &WindowSpec) -> Vec<
         let mut running_sum = 0u64;
         for &row_idx in &sorted {
             if let Some(idx) = col_idx {
-                running_sum =
-                    running_sum.wrapping_add(result.columns[idx].values.get(row_idx).copied().unwrap_or(0));
+                running_sum = running_sum
+                    .wrapping_add(result.columns[idx].values.get(row_idx).copied().unwrap_or(0));
             }
             output[row_idx] = running_sum;
         }
@@ -295,7 +299,13 @@ pub fn count_over(result: &QueryResult, spec: &WindowSpec) -> Vec<u64> {
 
 /// Compute LAG(col, offset, default) OVER (...).
 /// Returns the value of `col` from the row `offset` rows before the current row.
-pub fn lag(result: &QueryResult, col_name: &str, offset: usize, default: u64, spec: &WindowSpec) -> Vec<u64> {
+pub fn lag(
+    result: &QueryResult,
+    col_name: &str,
+    offset: usize,
+    default: u64,
+    spec: &WindowSpec,
+) -> Vec<u64> {
     let n = result.row_count;
     if n == 0 {
         return Vec::new();
@@ -310,7 +320,8 @@ pub fn lag(result: &QueryResult, col_name: &str, offset: usize, default: u64, sp
             if i >= offset {
                 let prev_row = sorted[i - offset];
                 if let Some(idx) = col_idx {
-                    output[row_idx] = result.columns[idx].values.get(prev_row).copied().unwrap_or(default);
+                    output[row_idx] =
+                        result.columns[idx].values.get(prev_row).copied().unwrap_or(default);
                 }
             }
         }
@@ -319,7 +330,13 @@ pub fn lag(result: &QueryResult, col_name: &str, offset: usize, default: u64, sp
 }
 
 /// Compute LEAD(col, offset, default) OVER (...).
-pub fn lead(result: &QueryResult, col_name: &str, offset: usize, default: u64, spec: &WindowSpec) -> Vec<u64> {
+pub fn lead(
+    result: &QueryResult,
+    col_name: &str,
+    offset: usize,
+    default: u64,
+    spec: &WindowSpec,
+) -> Vec<u64> {
     let n = result.row_count;
     if n == 0 {
         return Vec::new();
@@ -334,7 +351,8 @@ pub fn lead(result: &QueryResult, col_name: &str, offset: usize, default: u64, s
             if i + offset < sorted.len() {
                 let next_row = sorted[i + offset];
                 if let Some(idx) = col_idx {
-                    output[row_idx] = result.columns[idx].values.get(next_row).copied().unwrap_or(default);
+                    output[row_idx] =
+                        result.columns[idx].values.get(next_row).copied().unwrap_or(default);
                 }
             }
         }
@@ -355,9 +373,8 @@ pub fn first_value(result: &QueryResult, col_name: &str, spec: &WindowSpec) -> V
         let mut sorted = row_idxs.clone();
         sort_rows(result, &mut sorted, &spec.order_by);
         if let Some(&first) = sorted.first() {
-            let val = col_idx
-                .and_then(|idx| result.columns[idx].values.get(first).copied())
-                .unwrap_or(0);
+            let val =
+                col_idx.and_then(|idx| result.columns[idx].values.get(first).copied()).unwrap_or(0);
             for &row_idx in row_idxs {
                 output[row_idx] = val;
             }
@@ -388,9 +405,7 @@ fn partition_rows(result: &QueryResult, partition_by: &[String]) -> Vec<(u64, Ve
     for row_idx in 0..result.row_count {
         let mut key = 0u64;
         for &idx in &col_indices {
-            let val = idx
-                .and_then(|i| result.columns[i].values.get(row_idx).copied())
-                .unwrap_or(0);
+            let val = idx.and_then(|i| result.columns[i].values.get(row_idx).copied()).unwrap_or(0);
             // Rotate and XOR to combine values into a single key.
             key = key.rotate_left(13) ^ val;
         }
@@ -408,8 +423,12 @@ fn sort_rows(result: &QueryResult, row_idxs: &mut Vec<usize>, order_by: &[(Strin
         order_by.iter().map(|(name, _)| find_col_idx(result, name)).collect();
     row_idxs.sort_by(|&a, &b| {
         for (i, &(_, asc)) in order_by.iter().enumerate() {
-            let va = col_indices[i].and_then(|idx| result.columns[idx].values.get(a).copied()).unwrap_or(0);
-            let vb = col_indices[i].and_then(|idx| result.columns[idx].values.get(b).copied()).unwrap_or(0);
+            let va = col_indices[i]
+                .and_then(|idx| result.columns[idx].values.get(a).copied())
+                .unwrap_or(0);
+            let vb = col_indices[i]
+                .and_then(|idx| result.columns[idx].values.get(b).copied())
+                .unwrap_or(0);
             let cmp = va.cmp(&vb);
             if cmp != std::cmp::Ordering::Equal {
                 return if asc { cmp } else { cmp.reverse() };
@@ -452,7 +471,10 @@ mod tests {
             r.push_column(ResultColumn {
                 name: name.to_string(),
                 values: cols[i].clone(),
-                string_values: None, type_oid: 0, null_mask: None })
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            })
             .unwrap();
         }
         r
@@ -604,7 +626,9 @@ mod tests {
 
     #[test]
     fn parse_spec_with_frame() {
-        let spec = parse_window_spec("ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW").unwrap();
+        let spec =
+            parse_window_spec("ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW")
+                .unwrap();
         assert_eq!(spec.order_by, vec![("ts".into(), true)]);
         assert_eq!(spec.frame_type, Some("ROWS".into()));
         assert_eq!(spec.frame_start, Some("UNBOUNDED PRECEDING".into()));

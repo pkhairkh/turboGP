@@ -15,7 +15,7 @@
 //! O(1) per row visibility check.
 
 pub mod mvcc;
-pub use mvcc::{MvccTxnManager, MvccTransaction, RowVersion, TxnState};
+pub use mvcc::{MvccTransaction, MvccTxnManager, RowVersion, TxnState};
 
 use crate::catalog::Catalog;
 use std::collections::HashMap;
@@ -50,7 +50,9 @@ impl TxnManager {
     /// already active.
     pub fn begin(&mut self, catalog: &Catalog) -> Result<u64, String> {
         if self.active.is_some() {
-            return Err("a transaction is already active (nested transactions not supported)".into());
+            return Err(
+                "a transaction is already active (nested transactions not supported)".into()
+            );
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -65,18 +67,13 @@ impl TxnManager {
     /// Commit the active transaction. The snapshot replaces the main
     /// catalog. Returns an error if no transaction is active.
     pub fn commit(&mut self) -> Result<Catalog, String> {
-        let txn = self
-            .active
-            .take()
-            .ok_or("no active transaction to commit")?;
+        let txn = self.active.take().ok_or("no active transaction to commit")?;
         Ok(txn.snapshot)
     }
 
     /// Rollback the active transaction. The snapshot is discarded.
     pub fn rollback(&mut self) -> Result<(), String> {
-        self.active
-            .take()
-            .ok_or("no active transaction to rollback")?;
+        self.active.take().ok_or("no active transaction to rollback")?;
         Ok(())
     }
 
@@ -120,7 +117,9 @@ mod tests {
                 name: "id".into(),
                 cells: vec![1, 2, 3],
                 row_count: 3,
-                string_search: None, null_bitmap: None }],
+                string_search: None,
+                null_bitmap: None,
+            }],
             row_count: 3,
         });
         c.register(t);

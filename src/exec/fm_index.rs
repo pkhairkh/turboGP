@@ -301,20 +301,23 @@ impl StringSearchColumn {
     /// This is fine because LIKE filters are applied to original columns
     /// during the initial scan, before any `filter_table` call.
     pub fn remap(&self, indices: &[usize]) -> Self {
-        let total_bytes: usize = indices.iter()
-            .map(|&i| {
-                if i + 1 < self.offsets.len() {
-                    self.offsets[i + 1] - self.offsets[i]
-                } else {
-                    0
-                }
-            })
-            .sum();
+        let total_bytes: usize =
+            indices
+                .iter()
+                .map(|&i| {
+                    if i + 1 < self.offsets.len() {
+                        self.offsets[i + 1] - self.offsets[i]
+                    } else {
+                        0
+                    }
+                })
+                .sum();
         let mut new_bytes: Vec<u8> = Vec::with_capacity(total_bytes);
         let mut new_offsets: Vec<usize> = Vec::with_capacity(indices.len() + 1);
         for &i in indices {
             let start = if i < self.offsets.len() { self.offsets[i] } else { self.bytes.len() };
-            let end = if i + 1 < self.offsets.len() { self.offsets[i + 1] } else { self.bytes.len() };
+            let end =
+                if i + 1 < self.offsets.len() { self.offsets[i + 1] } else { self.bytes.len() };
             new_offsets.push(new_bytes.len());
             new_bytes.extend_from_slice(&self.bytes[start..end]);
         }
@@ -377,8 +380,7 @@ impl StringSearchColumn {
             // Remapped column: derive string from the contiguous bytes buffer.
             // SAFETY: bytes were originally from valid UTF-8 Strings, so
             // from_utf8 always succeeds. unwrap_or("") is defensive.
-            std::str::from_utf8(&self.bytes[self.offsets[i]..self.offsets[i + 1]])
-                .unwrap_or("")
+            std::str::from_utf8(&self.bytes[self.offsets[i]..self.offsets[i + 1]]).unwrap_or("")
         } else {
             ""
         }
@@ -408,12 +410,16 @@ fn memchr_search(haystack: &[u8], needle: &[u8]) -> bool {
     let first = needle[0];
     let mut pos = 0;
     while pos + needle.len() <= haystack.len() {
-        if pos >= haystack.len() { return false; }
+        if pos >= haystack.len() {
+            return false;
+        }
         // Find the next occurrence of first byte
         match haystack[pos..].iter().position(|&b| b == first) {
             Some(offset) => {
                 let start = pos + offset;
-                if start + needle.len() <= haystack.len() && &haystack[start..start + needle.len()] == needle {
+                if start + needle.len() <= haystack.len()
+                    && &haystack[start..start + needle.len()] == needle
+                {
                     return true;
                 }
                 pos = start + 1;
@@ -463,7 +469,6 @@ mod tests {
         let mask = col.like_contains_mask("google");
         assert_eq!(mask, vec![true, false, true]);
     }
-
 
     #[test]
     fn test_remap_preserves_strings() {
@@ -518,10 +523,15 @@ mod tests {
     #[test]
     fn test_large_string_search() {
         let n = 100_000;
-        let strings: Vec<String> = (0..n).map(|i| {
-            if i % 10 == 0 { format!("https://google.com/{}", i) }
-            else { format!("https://example.com/{}", i) }
-        }).collect();
+        let strings: Vec<String> = (0..n)
+            .map(|i| {
+                if i % 10 == 0 {
+                    format!("https://google.com/{}", i)
+                } else {
+                    format!("https://example.com/{}", i)
+                }
+            })
+            .collect();
         let col = StringSearchColumn::new(strings);
         let count = col.count_like_contains("google");
         assert_eq!(count, 10000);

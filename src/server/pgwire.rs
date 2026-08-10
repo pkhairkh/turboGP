@@ -4,7 +4,7 @@
 //! (length includes itself, excludes type byte) + payload. Frontend messages
 //! have the same format (except startup, which has no type byte).
 
-use super::auth::{PasswordManager, ScramOutcome, TlsConfig, verify_scram};
+use super::auth::{verify_scram, PasswordManager, ScramOutcome, TlsConfig};
 use super::session::{Session, TxnStatus};
 use crate::engine::{QueryEngine, QueryResult, ResultColumn};
 use base64::Engine as _;
@@ -51,13 +51,7 @@ struct CachedResult {
 
 impl Portal {
     fn new(stmt_name: String, params: Vec<String>, result_formats: Vec<i16>) -> Self {
-        Self {
-            stmt_name,
-            params,
-            result_formats,
-            cached_result: None,
-            cached_offset: 0,
-        }
+        Self { stmt_name, params, result_formats, cached_result: None, cached_offset: 0 }
     }
 }
 
@@ -101,7 +95,11 @@ impl PgConn {
         result
     }
 
-    async fn run_loop(&mut self, engine: &Arc<RwLock<QueryEngine>>, auth_required: bool) -> io::Result<()> {
+    async fn run_loop(
+        &mut self,
+        engine: &Arc<RwLock<QueryEngine>>,
+        auth_required: bool,
+    ) -> io::Result<()> {
         self.handle_startup(auth_required).await?;
         loop {
             self.flush().await?;
@@ -112,7 +110,10 @@ impl PgConn {
             };
             let len = self.read_i32_be().await? as usize;
             if len < 4 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("msg {msg_type:#x} len {len} < 4")));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("msg {msg_type:#x} len {len} < 4"),
+                ));
             }
             let body_len = len - 4;
             match msg_type {
@@ -145,7 +146,9 @@ impl PgConn {
                     self.handle_close(&buf);
                     self.send_byte(b'3', &[]).await?;
                 }
-                b'H' => { self.flush().await?; }
+                b'H' => {
+                    self.flush().await?;
+                }
                 b'X' => return Ok(()),
                 other => {
                     if body_len > 0 {
@@ -164,12 +167,17 @@ impl PgConn {
         loop {
             let len = self.read_i32_be().await?;
             if !(4..=1_000_000).contains(&len) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("startup len {len}")));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("startup len {len}"),
+                ));
             }
             let body_len = (len - 4) as usize;
             let mut buf = vec![0u8; body_len];
             self.stream_read.read_exact(&mut buf).await?;
-            if buf.len() < 4 { return Err(io::Error::new(io::ErrorKind::InvalidData, "startup too short")); }
+            if buf.len() < 4 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "startup too short"));
+            }
             let magic = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
             match magic {
                 SSL_REQUEST_MAGIC | GSSAPI_REQUEST_MAGIC => {
@@ -187,7 +195,9 @@ impl PgConn {
                 CANCEL_REQUEST_MAGIC => return Ok(()),
                 m if (196608..=196620).contains(&m) => {
                     self.parse_startup_v3_params(&buf);
-                    if self.session.user.is_none() { self.session.user = Some("turboGP".into()); }
+                    if self.session.user.is_none() {
+                        self.session.user = Some("turboGP".into());
+                    }
                     if auth_required {
                         self.do_scram_auth().await?;
                     } else {
@@ -199,7 +209,10 @@ impl PgConn {
                 _ => {
                     let _ = self.send_error("08P01", "unsupported protocol").await;
                     self.flush().await?;
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("magic {magic}")));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("magic {magic}"),
+                    ));
                 }
             }
         }
@@ -272,7 +285,10 @@ impl PgConn {
             None => {
                 let _ = self.send_error("28000", "expected SASLInitialResponse").await;
                 self.flush().await?;
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected SASLInitialResponse"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected SASLInitialResponse",
+                ));
             }
         };
         if mech != "SCRAM-SHA-256" {
@@ -306,7 +322,8 @@ impl PgConn {
                 // Use a dummy salt + iteration count so the handshake
                 // proceeds and fails at the proof step. For simplicity we
                 // just reject now.
-                let _ = self.send_error("28000", &format!("user \"{username}\" does not exist")).await;
+                let _ =
+                    self.send_error("28000", &format!("user \"{username}\" does not exist")).await;
                 self.flush().await?;
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unknown user"));
             }
@@ -368,10 +385,15 @@ impl PgConn {
     async fn read_sasl_initial_response(&mut self) -> io::Result<Option<(String, Vec<u8>)>> {
         let tag = self.read_byte().await?;
         if tag != b'p' {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected 'p' msg, got {tag:#x}")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected 'p' msg, got {tag:#x}"),
+            ));
         }
         let len = self.read_i32_be().await? as usize;
-        if len < 4 { return Err(io::Error::new(io::ErrorKind::InvalidData, "sasl init len")); }
+        if len < 4 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "sasl init len"));
+        }
         let body_len = len - 4;
         let buf = self.read_body(body_len).await?;
         let mut c = 0;
@@ -379,7 +401,7 @@ impl PgConn {
         if c + 4 > buf.len() {
             return Ok(None);
         }
-        let ir_len = i32::from_be_bytes([buf[c], buf[c+1], buf[c+2], buf[c+3]]);
+        let ir_len = i32::from_be_bytes([buf[c], buf[c + 1], buf[c + 2], buf[c + 3]]);
         c += 4;
         if ir_len < 0 {
             // No initial response — not valid for SCRAM.
@@ -389,7 +411,7 @@ impl PgConn {
         if c + ir_len > buf.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "sasl init overflow"));
         }
-        let ir = buf[c..c+ir_len].to_vec();
+        let ir = buf[c..c + ir_len].to_vec();
         Ok(Some((mech, ir)))
     }
 
@@ -397,10 +419,15 @@ impl PgConn {
     async fn read_sasl_response(&mut self) -> io::Result<Option<Vec<u8>>> {
         let tag = self.read_byte().await?;
         if tag != b'p' {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("expected 'p' msg, got {tag:#x}")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected 'p' msg, got {tag:#x}"),
+            ));
         }
         let len = self.read_i32_be().await? as usize;
-        if len < 4 { return Err(io::Error::new(io::ErrorKind::InvalidData, "sasl resp len")); }
+        if len < 4 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "sasl resp len"));
+        }
         let body_len = len - 4;
         let buf = self.read_body(body_len).await?;
         Ok(Some(buf))
@@ -408,12 +435,18 @@ impl PgConn {
 
     // --- Simple query ---
 
-    async fn handle_simple_query(&mut self, engine: &Arc<RwLock<QueryEngine>>, sql: &str) -> io::Result<()> {
+    async fn handle_simple_query(
+        &mut self,
+        engine: &Arc<RwLock<QueryEngine>>,
+        sql: &str,
+    ) -> io::Result<()> {
         let stmts = split_sql_batch(sql);
         let was_txn = self.session.txn != TxnStatus::Idle;
         for stmt in stmts {
             let trimmed = stmt.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             let lower = trimmed.to_lowercase();
             if lower.starts_with("begin") || lower.starts_with("start transaction") {
                 self.session.txn = TxnStatus::InTransaction;
@@ -442,7 +475,9 @@ impl PgConn {
                     }
                     UserDdlOutcome::Err(msg) => {
                         let _ = self.send_error("42000", &msg).await;
-                        if was_txn { self.session.txn = TxnStatus::FailedTransaction; }
+                        if was_txn {
+                            self.session.txn = TxnStatus::FailedTransaction;
+                        }
                         break;
                     }
                 }
@@ -471,7 +506,9 @@ impl PgConn {
                 }
                 Err(e) => {
                     let _ = self.send_error("42000", &format!("{e}")).await;
-                    if was_txn { self.session.txn = TxnStatus::FailedTransaction; }
+                    if was_txn {
+                        self.session.txn = TxnStatus::FailedTransaction;
+                    }
                     break;
                 }
             }
@@ -485,13 +522,17 @@ impl PgConn {
         let mut c = 0;
         let name = read_cstring(buf, &mut c)?;
         let sql = read_cstring(buf, &mut c)?;
-        if c + 2 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Parse truncated")); }
-        let n = u16::from_be_bytes([buf[c], buf[c+1]]) as usize;
+        if c + 2 > buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Parse truncated"));
+        }
+        let n = u16::from_be_bytes([buf[c], buf[c + 1]]) as usize;
         c += 2;
         let mut oids = Vec::with_capacity(n);
         for _ in 0..n {
-            if c + 4 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Parse OID truncated")); }
-            oids.push(u32::from_be_bytes([buf[c],buf[c+1],buf[c+2],buf[c+3]]));
+            if c + 4 > buf.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Parse OID truncated"));
+            }
+            oids.push(u32::from_be_bytes([buf[c], buf[c + 1], buf[c + 2], buf[c + 3]]));
             c += 4;
         }
         self.statements.insert(name, PreparedStatement { sql, param_oids: oids });
@@ -502,79 +543,130 @@ impl PgConn {
         let mut c = 0;
         let portal_name = read_cstring(buf, &mut c)?;
         let stmt_name = read_cstring(buf, &mut c)?;
-        if c + 2 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind truncated")); }
-        let n_fmt = u16::from_be_bytes([buf[c], buf[c+1]]) as usize;
+        if c + 2 > buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind truncated"));
+        }
+        let n_fmt = u16::from_be_bytes([buf[c], buf[c + 1]]) as usize;
         c += 2;
         let mut pfmts = Vec::with_capacity(n_fmt);
         for _ in 0..n_fmt {
-            if c + 2 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind fmt truncated")); }
-            pfmts.push(i16::from_be_bytes([buf[c], buf[c+1]]));
+            if c + 2 > buf.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind fmt truncated"));
+            }
+            pfmts.push(i16::from_be_bytes([buf[c], buf[c + 1]]));
             c += 2;
         }
-        if c + 2 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind truncated")); }
-        let n_params = u16::from_be_bytes([buf[c], buf[c+1]]) as usize;
+        if c + 2 > buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind truncated"));
+        }
+        let n_params = u16::from_be_bytes([buf[c], buf[c + 1]]) as usize;
         c += 2;
         let mut params = Vec::with_capacity(n_params);
         for i in 0..n_params {
-            if c + 4 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind param truncated")); }
-            let plen = i32::from_be_bytes([buf[c],buf[c+1],buf[c+2],buf[c+3]]);
+            if c + 4 > buf.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind param truncated"));
+            }
+            let plen = i32::from_be_bytes([buf[c], buf[c + 1], buf[c + 2], buf[c + 3]]);
             c += 4;
-            let val = if plen < 0 { None }
-            else {
+            let val = if plen < 0 {
+                None
+            } else {
                 let plen = plen as usize;
-                if c + plen > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind param overflow")); }
-                let bytes = &buf[c..c+plen];
+                if c + plen > buf.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind param overflow"));
+                }
+                let bytes = &buf[c..c + plen];
                 c += plen;
-                let fmt = if pfmts.len() == 1 { pfmts[0] } else if pfmts.len() > i { pfmts[i] } else { 0 };
-                if fmt == 0 { Some(String::from_utf8_lossy(bytes).into_owned()) }
-                else { Some(format!("\\x{}", hex_encode(bytes))) }
+                let fmt = if pfmts.len() == 1 {
+                    pfmts[0]
+                } else if pfmts.len() > i {
+                    pfmts[i]
+                } else {
+                    0
+                };
+                if fmt == 0 {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                } else {
+                    Some(format!("\\x{}", hex_encode(bytes)))
+                }
             };
             params.push(val.unwrap_or_else(|| "NULL".into()));
         }
-        if c + 2 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind rfmt truncated")); }
-        let n_rfmt = u16::from_be_bytes([buf[c], buf[c+1]]) as usize;
+        if c + 2 > buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind rfmt truncated"));
+        }
+        let n_rfmt = u16::from_be_bytes([buf[c], buf[c + 1]]) as usize;
         c += 2;
         let mut rfmts = Vec::with_capacity(n_rfmt);
         for _ in 0..n_rfmt {
-            if c + 2 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind rfmt truncated")); }
-            rfmts.push(i16::from_be_bytes([buf[c], buf[c+1]]));
+            if c + 2 > buf.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind rfmt truncated"));
+            }
+            rfmts.push(i16::from_be_bytes([buf[c], buf[c + 1]]));
             c += 2;
         }
         if !self.statements.contains_key(&stmt_name) {
-            let _ = self.send_error("26000", &format!("prepared statement \"{stmt_name}\" does not exist")).await;
+            let _ = self
+                .send_error("26000", &format!("prepared statement \"{stmt_name}\" does not exist"))
+                .await;
             return Ok(());
         }
         self.portals.insert(portal_name, Portal::new(stmt_name, params, rfmts));
         self.send_byte(b'2', &[]).await // BindComplete
     }
 
-    async fn handle_describe(&mut self, engine: &Arc<RwLock<QueryEngine>>, buf: &[u8]) -> io::Result<()> {
-        if buf.is_empty() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Describe empty")); }
+    async fn handle_describe(
+        &mut self,
+        engine: &Arc<RwLock<QueryEngine>>,
+        buf: &[u8],
+    ) -> io::Result<()> {
+        if buf.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Describe empty"));
+        }
         let kind = buf[0];
         let mut c = 1;
         let name = read_cstring(buf, &mut c)?;
         match kind {
             b'S' => {
-                let stmt = match self.statements.get(&name) { Some(s) => s.clone(), None => {
-                    let _ = self.send_error("26000", &format!("statement \"{name}\" not found")).await;
-                    return Ok(());
-                }};
+                let stmt = match self.statements.get(&name) {
+                    Some(s) => s.clone(),
+                    None => {
+                        let _ = self
+                            .send_error("26000", &format!("statement \"{name}\" not found"))
+                            .await;
+                        return Ok(());
+                    }
+                };
                 let n = stmt.param_oids.len() as u16;
                 let mut body = Vec::with_capacity(2 + stmt.param_oids.len() * 4);
                 body.extend_from_slice(&n.to_be_bytes());
-                for oid in &stmt.param_oids { body.extend_from_slice(&oid.to_be_bytes()); }
+                for oid in &stmt.param_oids {
+                    body.extend_from_slice(&oid.to_be_bytes());
+                }
                 self.send_byte(b't', &body).await?; // ParameterDescription
                 self.send_byte(b'n', &[]).await?; // NoData (schema unknown until V-3)
             }
             b'P' => {
-                let portal = match self.portals.get(&name) { Some(p) => p.clone(), None => {
-                    let _ = self.send_error("34000", &format!("portal \"{name}\" not found")).await;
-                    return Ok(());
-                }};
-                let stmt = match self.statements.get(&portal.stmt_name) { Some(s) => s.clone(), None => {
-                    let _ = self.send_error("26000", &format!("statement \"{}\" not found", portal.stmt_name)).await;
-                    return Ok(());
-                }};
+                let portal = match self.portals.get(&name) {
+                    Some(p) => p.clone(),
+                    None => {
+                        let _ =
+                            self.send_error("34000", &format!("portal \"{name}\" not found")).await;
+                        return Ok(());
+                    }
+                };
+                let stmt = match self.statements.get(&portal.stmt_name) {
+                    Some(s) => s.clone(),
+                    None => {
+                        let _ = self
+                            .send_error(
+                                "26000",
+                                &format!("statement \"{}\" not found", portal.stmt_name),
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                };
                 // Wave 52 fix (Bug 12): Describe must NOT execute the query.
                 // The previous implementation called `try_readonly_select`
                 // to learn the result shape, which executed the query as a
@@ -589,29 +681,38 @@ impl PgConn {
                 let _ = &portal.params;
                 self.send_byte(b'n', &[]).await?; // NoData
             }
-            _ => { let _ = self.send_error("08P01", "unknown describe kind").await; }
+            _ => {
+                let _ = self.send_error("08P01", "unknown describe kind").await;
+            }
         }
         Ok(())
     }
 
-    async fn handle_execute(&mut self, engine: &Arc<RwLock<QueryEngine>>, buf: &[u8]) -> io::Result<()> {
+    async fn handle_execute(
+        &mut self,
+        engine: &Arc<RwLock<QueryEngine>>,
+        buf: &[u8],
+    ) -> io::Result<()> {
         let mut c = 0;
         let portal_name = read_cstring(buf, &mut c)?;
-        if c + 4 > buf.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "Execute truncated")); }
+        if c + 4 > buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Execute truncated"));
+        }
         // Wave 52 fix (Bug 13): respect max_rows. The previous implementation
         // read this field into `_max_rows` and discarded it. Now:
         // - max_rows = 0: send all rows + CommandComplete.
         // - max_rows > 0: send at most max_rows rows. If more rows remain,
         //   send PortalSuspended ('s') instead of CommandComplete; the
         //   client can call Execute again to drain more rows.
-        let max_rows = i32::from_be_bytes([buf[c],buf[c+1],buf[c+2],buf[c+3]]);
+        let max_rows = i32::from_be_bytes([buf[c], buf[c + 1], buf[c + 2], buf[c + 3]]);
 
         // Fast path: if the portal already has a cached result (from a
         // previous Execute with max_rows > 0), drain more rows from it
         // without re-executing the query.
-        let cached = self.portals.get(&portal_name).and_then(|p| {
-            p.cached_result.as_ref().map(|cr| (cr.clone(), p.cached_offset))
-        });
+        let cached = self
+            .portals
+            .get(&portal_name)
+            .and_then(|p| p.cached_result.as_ref().map(|cr| (cr.clone(), p.cached_offset)));
         if let Some((cr, offset)) = cached {
             // Drain the next batch from the cached result.
             let limit = if max_rows > 0 { max_rows as usize } else { cr.result.row_count };
@@ -635,14 +736,23 @@ impl PgConn {
             return Ok(());
         }
 
-        let portal = match self.portals.get(&portal_name).cloned() { Some(p) => p, None => {
-            let _ = self.send_error("34000", &format!("portal \"{portal_name}\" not found")).await;
-            return Ok(());
-        }};
-        let stmt = match self.statements.get(&portal.stmt_name).cloned() { Some(s) => s, None => {
-            let _ = self.send_error("26000", &format!("statement \"{}\" not found", portal.stmt_name)).await;
-            return Ok(());
-        }};
+        let portal = match self.portals.get(&portal_name).cloned() {
+            Some(p) => p,
+            None => {
+                let _ =
+                    self.send_error("34000", &format!("portal \"{portal_name}\" not found")).await;
+                return Ok(());
+            }
+        };
+        let stmt = match self.statements.get(&portal.stmt_name).cloned() {
+            Some(s) => s,
+            None => {
+                let _ = self
+                    .send_error("26000", &format!("statement \"{}\" not found", portal.stmt_name))
+                    .await;
+                return Ok(());
+            }
+        };
         let sql = substitute_params(&stmt.sql, &portal.params);
         // Wave 65: intercept CREATE USER / DROP USER in extended-query mode too.
         if let Some(outcome) = try_handle_user_ddl(&sql, &self.passwords) {
@@ -688,19 +798,27 @@ impl PgConn {
                     self.send_command_complete(&tag, r.row_count).await?;
                 }
             }
-            Err(e) => { let _ = self.send_error("42000", &format!("{e}")).await; }
+            Err(e) => {
+                let _ = self.send_error("42000", &format!("{e}")).await;
+            }
         }
         Ok(())
     }
 
     fn handle_close(&mut self, buf: &[u8]) {
-        if buf.is_empty() { return; }
+        if buf.is_empty() {
+            return;
+        }
         let kind = buf[0];
         let mut c = 1;
         if let Ok(name) = read_cstring(buf, &mut c) {
             match kind {
-                b'S' => { self.statements.remove(&name); }
-                b'P' => { self.portals.remove(&name); }
+                b'S' => {
+                    self.statements.remove(&name);
+                }
+                b'P' => {
+                    self.portals.remove(&name);
+                }
                 _ => {}
             }
         }
@@ -710,34 +828,40 @@ impl PgConn {
 
     async fn send_parameter_status(&mut self, key: &str, val: &str) -> io::Result<()> {
         let mut body = Vec::with_capacity(key.len() + 1 + val.len() + 1);
-        body.extend_from_slice(key.as_bytes()); body.push(0);
-        body.extend_from_slice(val.as_bytes()); body.push(0);
+        body.extend_from_slice(key.as_bytes());
+        body.push(0);
+        body.extend_from_slice(val.as_bytes());
+        body.push(0);
         self.send_byte(b'S', &body).await
     }
 
     async fn send_row_description(&mut self, r: &QueryResult) -> io::Result<()> {
-        if r.columns.is_empty() { self.send_byte(b'n', &[]).await?; return Ok(()); }
+        if r.columns.is_empty() {
+            self.send_byte(b'n', &[]).await?;
+            return Ok(());
+        }
         let mut body = Vec::new();
         body.extend_from_slice(&(r.columns.len() as u16).to_be_bytes());
         for col in &r.columns {
-            body.extend_from_slice(col.name.as_bytes()); body.push(0);
+            body.extend_from_slice(col.name.as_bytes());
+            body.push(0);
             body.extend_from_slice(&0u32.to_be_bytes()); // table OID
             body.extend_from_slice(&0u16.to_be_bytes()); // col attr
-            // Type OID: use col.type_oid if set (Wave 47), otherwise
-            // fall back to string_values heuristic (Wave 34).
+                                                         // Type OID: use col.type_oid if set (Wave 47), otherwise
+                                                         // fall back to string_values heuristic (Wave 34).
             let (type_oid, type_size) = if col.type_oid != 0 {
                 // Use the schema-provided type OID.
                 let size = match col.type_oid {
-                    25 => -1i16, // TEXT: variable size
+                    25 => -1i16,       // TEXT: variable size
                     701 | 700 => 8i16, // FLOAT8/FLOAT4
-                    16 => 1i16, // BOOL
-                    _ => 8i16, // default: 8 bytes (INT8)
+                    16 => 1i16,        // BOOL
+                    _ => 8i16,         // default: 8 bytes (INT8)
                 };
                 (col.type_oid, size)
             } else if col.has_strings() {
                 (25u32, -1i16) // TEXT
             } else {
-                (20u32, 8i16)  // INT8
+                (20u32, 8i16) // INT8
             };
             body.extend_from_slice(&type_oid.to_be_bytes());
             body.extend_from_slice(&type_size.to_be_bytes());
@@ -757,9 +881,8 @@ impl PgConn {
             body.extend_from_slice(&(r.columns.len() as u16).to_be_bytes());
             for col in &r.columns {
                 // Check NULL mask first.
-                let is_null = col.null_mask.as_ref()
-                    .and_then(|m| m.get(row_idx).copied())
-                    .unwrap_or(false);
+                let is_null =
+                    col.null_mask.as_ref().and_then(|m| m.get(row_idx).copied()).unwrap_or(false);
                 if is_null {
                     // Postgres wire protocol: NULL is encoded as a -1 i32
                     // length with no payload bytes.
@@ -796,7 +919,8 @@ impl PgConn {
 
     async fn send_command_complete(&mut self, tag: &str, _n: usize) -> io::Result<()> {
         let mut body = Vec::with_capacity(tag.len() + 1);
-        body.extend_from_slice(tag.as_bytes()); body.push(0);
+        body.extend_from_slice(tag.as_bytes());
+        body.push(0);
         self.send_byte(b'C', &body).await
     }
 
@@ -806,10 +930,18 @@ impl PgConn {
 
     async fn send_error(&mut self, code: &str, msg: &str) -> io::Result<()> {
         let mut body = Vec::new();
-        body.push(b'S'); body.extend_from_slice(b"ERROR"); body.push(0);
-        body.push(b'V'); body.extend_from_slice(b"ERROR"); body.push(0);
-        body.push(b'C'); body.extend_from_slice(code.as_bytes()); body.push(0);
-        body.push(b'M'); body.extend_from_slice(msg.as_bytes()); body.push(0);
+        body.push(b'S');
+        body.extend_from_slice(b"ERROR");
+        body.push(0);
+        body.push(b'V');
+        body.extend_from_slice(b"ERROR");
+        body.push(0);
+        body.push(b'C');
+        body.extend_from_slice(code.as_bytes());
+        body.push(0);
+        body.push(b'M');
+        body.extend_from_slice(msg.as_bytes());
+        body.push(0);
         body.push(0); // terminator
         self.send_byte(b'E', &body).await
     }
@@ -822,7 +954,9 @@ impl PgConn {
         Ok(())
     }
 
-    async fn flush(&mut self) -> io::Result<()> { self.stream_write.flush().await }
+    async fn flush(&mut self) -> io::Result<()> {
+        self.stream_write.flush().await
+    }
 
     async fn read_byte(&mut self) -> io::Result<u8> {
         let mut buf = [0u8; 1];
@@ -837,7 +971,9 @@ impl PgConn {
     async fn read_string(&mut self, body_len: usize) -> io::Result<String> {
         let mut buf = vec![0u8; body_len];
         self.stream_read.read_exact(&mut buf).await?;
-        while buf.last() == Some(&0) { buf.pop(); }
+        while buf.last() == Some(&0) {
+            buf.pop();
+        }
         String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
     async fn read_body(&mut self, body_len: usize) -> io::Result<Vec<u8>> {
@@ -860,31 +996,53 @@ fn split_sql_batch(sql: &str) -> Vec<String> {
         if in_str {
             current.push(c as char);
             if c == b'\'' {
-                if i + 1 < bytes.len() && bytes[i+1] == b'\'' { current.push('\''); i += 2; continue; }
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    current.push('\'');
+                    i += 2;
+                    continue;
+                }
                 in_str = false;
             }
-            i += 1; continue;
+            i += 1;
+            continue;
         }
-        if c == b'\'' { in_str = true; current.push('\''); i += 1; continue; }
+        if c == b'\'' {
+            in_str = true;
+            current.push('\'');
+            i += 1;
+            continue;
+        }
         // GO separator
-        if (c == b'G' || c == b'g') && i + 1 < bytes.len() && (bytes[i+1] == b'O' || bytes[i+1] == b'o')
-            && (i == 0 || bytes[i-1] == b'\n' || bytes[i-1] == b'\r')
+        if (c == b'G' || c == b'g')
+            && i + 1 < bytes.len()
+            && (bytes[i + 1] == b'O' || bytes[i + 1] == b'o')
+            && (i == 0 || bytes[i - 1] == b'\n' || bytes[i - 1] == b'\r')
         {
             let mut j = i + 2;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') { j += 1; }
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
             if j == bytes.len() || bytes[j] == b'\n' || bytes[j] == b'\r' {
-                if !current.trim().is_empty() { out.push(std::mem::take(&mut current)); }
-                i = j; continue;
+                if !current.trim().is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+                i = j;
+                continue;
             }
         }
         if c == b';' {
-            if !current.trim().is_empty() { out.push(std::mem::take(&mut current)); }
-            i += 1; continue;
+            if !current.trim().is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            i += 1;
+            continue;
         }
         current.push(c as char);
         i += 1;
     }
-    if !current.trim().is_empty() { out.push(current); }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
     out
 }
 
@@ -892,34 +1050,63 @@ fn parse_cstring_pairs(buf: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < buf.len() && buf[i] != 0 {
-        let k = match read_cstring(buf, &mut i) { Ok(s) => s, Err(_) => break };
-        if i >= buf.len() || buf[i] == 0 { out.push((k, String::new())); break; }
-        let v = match read_cstring(buf, &mut i) { Ok(s) => s, Err(_) => break };
+        let k = match read_cstring(buf, &mut i) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        if i >= buf.len() || buf[i] == 0 {
+            out.push((k, String::new()));
+            break;
+        }
+        let v = match read_cstring(buf, &mut i) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
         out.push((k, v));
     }
     out
 }
 
 fn read_cstring(buf: &[u8], cursor: &mut usize) -> io::Result<String> {
-    let end = buf[*cursor..].iter().position(|&b| b == 0)
+    let end = buf[*cursor..]
+        .iter()
+        .position(|&b| b == 0)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing NUL"))?;
     let start = *cursor;
     *cursor = start + end + 1;
-    String::from_utf8(buf[start..start+end].to_vec())
+    String::from_utf8(buf[start..start + end].to_vec())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 fn command_tag(r: &QueryResult, sql: &str) -> String {
     let lower = sql.trim_start().to_lowercase();
-    if lower.starts_with("select") || lower.starts_with("with") { return format!("SELECT {}", r.row_count); }
-    if lower.starts_with("insert") { return format!("INSERT 0 {}", r.row_count); }
-    if lower.starts_with("update") { return format!("UPDATE {}", r.row_count); }
-    if lower.starts_with("delete") { return format!("DELETE {}", r.row_count); }
-    if lower.starts_with("create") { return "CREATE".into(); }
-    if lower.starts_with("drop") { return "DROP".into(); }
-    if lower.starts_with("begin") || lower.starts_with("start transaction") { return "BEGIN".into(); }
-    if lower.starts_with("commit") { return "COMMIT".into(); }
-    if lower.starts_with("rollback") { return "ROLLBACK".into(); }
+    if lower.starts_with("select") || lower.starts_with("with") {
+        return format!("SELECT {}", r.row_count);
+    }
+    if lower.starts_with("insert") {
+        return format!("INSERT 0 {}", r.row_count);
+    }
+    if lower.starts_with("update") {
+        return format!("UPDATE {}", r.row_count);
+    }
+    if lower.starts_with("delete") {
+        return format!("DELETE {}", r.row_count);
+    }
+    if lower.starts_with("create") {
+        return "CREATE".into();
+    }
+    if lower.starts_with("drop") {
+        return "DROP".into();
+    }
+    if lower.starts_with("begin") || lower.starts_with("start transaction") {
+        return "BEGIN".into();
+    }
+    if lower.starts_with("commit") {
+        return "COMMIT".into();
+    }
+    if lower.starts_with("rollback") {
+        return "ROLLBACK".into();
+    }
     "OK".into()
 }
 
@@ -932,37 +1119,74 @@ fn slice_result(r: &QueryResult, start: usize, end: usize) -> QueryResult {
     let start = start.min(r.row_count);
     let end = end.min(r.row_count);
     let row_count = end.saturating_sub(start);
-    let columns: Vec<ResultColumn> = r.columns.iter().map(|c| {
-        let values: Vec<u64> = c.values[start..end].to_vec();
-        let string_values = c.string_values.as_ref().map(|sv| sv[start..end].to_vec());
-        let null_mask = c.null_mask.as_ref().map(|m| m[start..end].to_vec());
-        ResultColumn {
-            name: c.name.clone(),
-            values,
-            string_values,
-            type_oid: c.type_oid,
-            null_mask,
-        }
-    }).collect();
-    QueryResult {
-        columns,
-        row_count,
-        elapsed_us: r.elapsed_us,
-    }
+    let columns: Vec<ResultColumn> = r
+        .columns
+        .iter()
+        .map(|c| {
+            let values: Vec<u64> = c.values[start..end].to_vec();
+            let string_values = c.string_values.as_ref().map(|sv| sv[start..end].to_vec());
+            let null_mask = c.null_mask.as_ref().map(|m| m[start..end].to_vec());
+            ResultColumn {
+                name: c.name.clone(),
+                values,
+                string_values,
+                type_oid: c.type_oid,
+                null_mask,
+            }
+        })
+        .collect();
+    QueryResult { columns, row_count, elapsed_us: r.elapsed_us }
 }
 
-fn substitute_params(sql: &str, params: &[String]) -> String {
+/// Escape a bound parameter value for safe interpolation into SQL.
+///
+/// Numeric values (integers, floats) are passed through unquoted — they
+/// cannot contain SQL metacharacters. All other values are wrapped in
+/// single quotes with any internal single quotes doubled (`'` → `''`),
+/// which is the standard SQL string-literal escaping rule. This prevents
+/// SQL injection via the pgwire Bind/Execute path.
+///
+/// **Security note:** This is a defence-in-depth measure. The ideal fix
+/// threads typed parameters (`Vec<Option<Vec<u8>>>` + `&[Oid]`) through
+/// the engine rather than string-substituting, but that requires a
+/// deeper refactor of the executor's parameter handling. This escaping
+/// fix closes the injection vector with minimal disruption.
+pub fn escape_param_value(value: &str) -> String {
+    // Pure integers and floats are safe to interpolate unquoted.
+    if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+        return value.to_string();
+    }
+    // Booleans and NULL are also safe.
+    if value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("null")
+    {
+        return value.to_string();
+    }
+    // Everything else: wrap in single quotes and double internal quotes.
+    let escaped = value.replace('\'', "''");
+    format!("'{}'", escaped)
+}
+
+pub fn substitute_params(sql: &str, params: &[String]) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i+1].is_ascii_digit() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
             let mut j = i + 1;
             let mut n: usize = 0;
-            while j < bytes.len() && bytes[j].is_ascii_digit() { n = n * 10 + (bytes[j] - b'0') as usize; j += 1; }
-            if n >= 1 && n <= params.len() { out.push_str(&params[n-1]); }
-            else { out.push_str("NULL"); }
-            i = j; continue;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n * 10 + (bytes[j] - b'0') as usize;
+                j += 1;
+            }
+            if n >= 1 && n <= params.len() {
+                out.push_str(&escape_param_value(&params[n - 1]));
+            } else {
+                out.push_str("NULL");
+            }
+            i = j;
+            continue;
         }
         out.push(bytes[i] as char);
         i += 1;
@@ -970,11 +1194,15 @@ fn substitute_params(sql: &str, params: &[String]) -> String {
     out
 }
 
-fn hex_encode(b: &[u8]) -> String { b.iter().map(|b| format!("{:02x}", b)).collect() }
+fn hex_encode(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{:02x}", b)).collect()
+}
 
 fn rand_backend_key() -> i32 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as i32).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as i32)
+        .unwrap_or(0)
 }
 
 // -----------------------------------------------------------------------
@@ -1034,10 +1262,12 @@ fn random_server_nonce() -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::rng();
-    (0..18).map(|_| {
-        let idx = rng.random_range(0..CHARSET.len());
-        CHARSET[idx] as char
-    }).collect()
+    (0..18)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
 }
 
 /// Outcome of a CREATE USER / DROP USER intercept.
@@ -1057,7 +1287,10 @@ enum UserDdlOutcome {
 /// - `CREATE USER username PASSWORD 'password'`
 /// - `CREATE USER username WITH PASSWORD 'password'`
 /// - `DROP USER username [IF EXISTS]`
-fn try_handle_user_ddl(sql: &str, passwords: &Arc<RwLock<PasswordManager>>) -> Option<UserDdlOutcome> {
+fn try_handle_user_ddl(
+    sql: &str,
+    passwords: &Arc<RwLock<PasswordManager>>,
+) -> Option<UserDdlOutcome> {
     let trimmed = sql.trim();
     let lower = trimmed.to_lowercase();
     if lower.starts_with("create user ") {
@@ -1088,7 +1321,9 @@ fn handle_create_user(sql: &str, passwords: &Arc<RwLock<PasswordManager>>) -> Us
     let after_pw = rest[pw_start_idx..].trim_start();
     let password = match extract_string_literal(after_pw) {
         Some(s) => s,
-        None => return UserDdlOutcome::Err("expected 'password' string literal in CREATE USER".into()),
+        None => {
+            return UserDdlOutcome::Err("expected 'password' string literal in CREATE USER".into())
+        }
     };
     let mut mgr = passwords.write().expect("passwords lock");
     mgr.create_user(&username, &password);
@@ -1123,16 +1358,20 @@ fn handle_drop_user(sql: &str, passwords: &Arc<RwLock<PasswordManager>>) -> User
 /// double-quoted.
 fn split_username(s: &str) -> Option<(String, &str)> {
     let s = s.trim_start();
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
     if s.starts_with('"') {
         // Quoted identifier — read until the next `"`.
         let end = s[1..].find('"')?;
-        let name = s[1..1+end].to_string();
-        Some((name, &s[1+end+1..]))
+        let name = s[1..1 + end].to_string();
+        Some((name, &s[1 + end + 1..]))
     } else {
         let end = s.find(|c: char| c.is_whitespace()).unwrap_or(s.len());
         let name = s[..end].to_string();
-        if name.is_empty() { return None; }
+        if name.is_empty() {
+            return None;
+        }
         Some((name, &s[end..]))
     }
 }
@@ -1143,14 +1382,16 @@ fn split_username(s: &str) -> Option<(String, &str)> {
 fn extract_string_literal(s: &str) -> Option<String> {
     let s = s.trim_start();
     let bytes = s.as_bytes();
-    if bytes.is_empty() || bytes[0] != b'\'' { return None; }
+    if bytes.is_empty() || bytes[0] != b'\'' {
+        return None;
+    }
     let mut out = String::new();
     let mut i = 1;
     while i < bytes.len() {
         let c = bytes[i];
         if c == b'\'' {
             // Check for escaped ''.
-            if i + 1 < bytes.len() && bytes[i+1] == b'\'' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                 out.push('\'');
                 i += 2;
                 continue;
@@ -1207,7 +1448,10 @@ mod tests {
     }
     #[test]
     fn substitute_basic() {
-        assert_eq!(substitute_params("SELECT $1 + $2", &["42".into(), "100".into()]), "SELECT 42 + 100");
+        assert_eq!(
+            substitute_params("SELECT $1 + $2", &["42".into(), "100".into()]),
+            "SELECT 42 + 100"
+        );
     }
     #[test]
     fn substitute_oob_null() {
@@ -1218,5 +1462,7 @@ mod tests {
         assert_eq!(command_tag(&QueryResult::empty(), "SELECT 1"), "SELECT 0");
     }
     #[test]
-    fn hex_basic() { assert_eq!(hex_encode(&[0x01, 0xff]), "01ff"); }
+    fn hex_basic() {
+        assert_eq!(hex_encode(&[0x01, 0xff]), "01ff");
+    }
 }

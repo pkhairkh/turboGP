@@ -1,20 +1,65 @@
-use turbogp::engine::QueryEngine;
-use turbogp::datasource::table::Table;
-use turbogp::datasource::parquet::{LoadedColumn, LoadedTable};
-use std::time::Instant;
 use std::io::Write;
+use std::time::Instant;
+use turbogp::datasource::parquet::{LoadedColumn, LoadedTable};
+use turbogp::datasource::table::Table;
+use turbogp::engine::QueryEngine;
 
 fn make_clickbench(n: usize) -> LoadedTable {
     let mut cols = vec![
-        LoadedColumn { name: "WatchID".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "EventDate".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "UserID".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "AdvEngineID".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "RegionID".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "MobilePhone".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "SearchEngineID".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "TraficSourceID".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "URL".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
+        LoadedColumn {
+            name: "WatchID".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "EventDate".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "UserID".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "AdvEngineID".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "RegionID".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "MobilePhone".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "SearchEngineID".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "TraficSourceID".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "URL".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
     ];
     for i in 0..n {
         cols[0].cells.push(i as u64);
@@ -32,14 +77,54 @@ fn make_clickbench(n: usize) -> LoadedTable {
 
 fn make_tpch(engine: &mut QueryEngine, n: usize) {
     let mut li = vec![
-        LoadedColumn { name: "l_orderkey".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "l_partkey".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "l_suppkey".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "l_quantity".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "l_extendedprice".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "l_discount".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "l_shipdate".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
-        LoadedColumn { name: "l_returnflag".into(), cells: Vec::with_capacity(n), row_count: n, string_search: None },
+        LoadedColumn {
+            name: "l_orderkey".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "l_partkey".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "l_suppkey".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "l_quantity".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "l_extendedprice".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "l_discount".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "l_shipdate".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "l_returnflag".into(),
+            cells: Vec::with_capacity(n),
+            row_count: n,
+            string_search: None,
+        },
     ];
     for i in 0..n {
         li[0].cells.push((i / 5) as u64);
@@ -51,14 +136,38 @@ fn make_tpch(engine: &mut QueryEngine, n: usize) {
         li[6].cells.push(18489 + (i % 365) as u64);
         li[7].cells.push(if i % 3 == 0 { 1 } else { 2 });
     }
-    engine.register_table(Table::from_loaded(LoadedTable { name: "lineitem".into(), columns: li, row_count: n }));
+    engine.register_table(Table::from_loaded(LoadedTable {
+        name: "lineitem".into(),
+        columns: li,
+        row_count: n,
+    }));
 
     let on = n / 5;
     let mut ord = vec![
-        LoadedColumn { name: "o_orderkey".into(), cells: Vec::with_capacity(on), row_count: on, string_search: None },
-        LoadedColumn { name: "o_custkey".into(), cells: Vec::with_capacity(on), row_count: on, string_search: None },
-        LoadedColumn { name: "o_orderdate".into(), cells: Vec::with_capacity(on), row_count: on, string_search: None },
-        LoadedColumn { name: "o_totalprice".into(), cells: Vec::with_capacity(on), row_count: on, string_search: None },
+        LoadedColumn {
+            name: "o_orderkey".into(),
+            cells: Vec::with_capacity(on),
+            row_count: on,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "o_custkey".into(),
+            cells: Vec::with_capacity(on),
+            row_count: on,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "o_orderdate".into(),
+            cells: Vec::with_capacity(on),
+            row_count: on,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "o_totalprice".into(),
+            cells: Vec::with_capacity(on),
+            row_count: on,
+            string_search: None,
+        },
     ];
     for i in 0..on {
         ord[0].cells.push(i as u64);
@@ -66,14 +175,35 @@ fn make_tpch(engine: &mut QueryEngine, n: usize) {
         ord[2].cells.push(18489 + (i % 365) as u64);
         ord[3].cells.push((i * 1000) as u64);
     }
-    engine.register_table(Table::from_loaded(LoadedTable { name: "orders".into(), columns: ord, row_count: on }));
+    engine.register_table(Table::from_loaded(LoadedTable {
+        name: "orders".into(),
+        columns: ord,
+        row_count: on,
+    }));
 
     let mut cust = vec![
-        LoadedColumn { name: "c_custkey".into(), cells: Vec::with_capacity(1500), row_count: 1500, string_search: None },
-        LoadedColumn { name: "c_nationkey".into(), cells: Vec::with_capacity(1500), row_count: 1500, string_search: None },
+        LoadedColumn {
+            name: "c_custkey".into(),
+            cells: Vec::with_capacity(1500),
+            row_count: 1500,
+            string_search: None,
+        },
+        LoadedColumn {
+            name: "c_nationkey".into(),
+            cells: Vec::with_capacity(1500),
+            row_count: 1500,
+            string_search: None,
+        },
     ];
-    for i in 0..1500 { cust[0].cells.push(i as u64); cust[1].cells.push((i % 25) as u64); }
-    engine.register_table(Table::from_loaded(LoadedTable { name: "customer".into(), columns: cust, row_count: 1500 }));
+    for i in 0..1500 {
+        cust[0].cells.push(i as u64);
+        cust[1].cells.push((i % 25) as u64);
+    }
+    engine.register_table(Table::from_loaded(LoadedTable {
+        name: "customer".into(),
+        columns: cust,
+        row_count: 1500,
+    }));
 }
 
 fn main() {
@@ -142,7 +272,8 @@ fn main() {
         match engine.execute(sql) {
             Ok(_) => {
                 let ms = start.elapsed().as_micros() as f64 / 1000.0;
-                cb_total += ms; cb_pass += 1;
+                cb_total += ms;
+                cb_pass += 1;
                 println!("  {}: {:.3} ms", name, ms);
                 writeln!(f, "clickbench,{}, {:.3},ok", name, ms).unwrap();
             }
@@ -190,7 +321,8 @@ fn main() {
         match engine.execute(sql) {
             Ok(_) => {
                 let ms = start.elapsed().as_micros() as f64 / 1000.0;
-                tp_total += ms; tp_pass += 1;
+                tp_total += ms;
+                tp_pass += 1;
                 println!("  TPCH {}: {:.3} ms", name, ms);
                 writeln!(f, "tpch,{}, {:.3},ok", name, ms).unwrap();
             }

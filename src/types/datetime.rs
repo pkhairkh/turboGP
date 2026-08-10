@@ -6,8 +6,8 @@
 //! Research: Zeller's congruence for branchless day-of-week computation.
 
 use crate::Error;
-use time::{Date as TimeDate, Month, PrimitiveDateTime, Time as TimeTime};
 use time::format_description::well_known::Iso8601;
+use time::{Date as TimeDate, Month, PrimitiveDateTime, Time as TimeTime};
 
 /// Convert days-since-epoch (1970-01-01) to Gregorian year using
 /// Howard Hinnant's `civil_from_days` algorithm (O(1) integer math).
@@ -29,12 +29,16 @@ use time::format_description::well_known::Iso8601;
 pub fn days_since_epoch_to_year(d: i64) -> i32 {
     let z = d + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;                                       // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;  // [0, 399]
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
     let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);                // [0, 365]
-    // January or February (doy >= 306) → Gregorian year is y + 1
-    if doy >= 306 { (y + 1) as i32 } else { y as i32 }
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+                                                       // January or February (doy >= 306) → Gregorian year is y + 1
+    if doy >= 306 {
+        (y + 1) as i32
+    } else {
+        y as i32
+    }
 }
 
 /// A calendar date stored as days-since-epoch (i32 in low 32 bits of u64).
@@ -68,14 +72,17 @@ impl Date {
         days_since_epoch_to_year(self.0 as i64)
     }
 
-    pub fn to_u64(&self) -> u64 { self.0 as u32 as u64 }
-    pub fn from_u64(v: u64) -> Self { Date(v as u32 as i32) }
+    pub fn to_u64(&self) -> u64 {
+        self.0 as u32 as u64
+    }
+    pub fn from_u64(v: u64) -> Self {
+        Date(v as u32 as i32)
+    }
 
     pub fn from_str(s: &str) -> Result<Self, Error> {
         let fmt = time::format_description::parse_borrowed::<2>("[year]-[month]-[day]")
             .map_err(|e| Error::Parse(format!("date fmt: {e}")))?;
-        let d = TimeDate::parse(s, &fmt)
-            .map_err(|e| Error::Parse(format!("date '{s}': {e}")))?;
+        let d = TimeDate::parse(s, &fmt).map_err(|e| Error::Parse(format!("date '{s}': {e}")))?;
         Ok(Self(d.to_julian_day() - 2_440_588))
     }
 
@@ -154,15 +161,23 @@ impl Time {
         (h, m, s, us)
     }
 
-    pub fn to_u64(&self) -> u64 { self.0 }
-    pub fn from_u64(v: u64) -> Self { Time(v) }
+    pub fn to_u64(&self) -> u64 {
+        self.0
+    }
+    pub fn from_u64(v: u64) -> Self {
+        Time(v)
+    }
 
     pub fn from_str(s: &str) -> Result<Self, Error> {
         let fmt = time::format_description::parse_borrowed::<2>("[hour]:[minute]:[second]")
             .map_err(|e| Error::Parse(format!("time fmt: {e}")))?;
-        let t = TimeTime::parse(s, &fmt)
-            .map_err(|e| Error::Parse(format!("time '{s}': {e}")))?;
-        Self::from_hms_nano(t.hour() as u32, t.minute() as u32, t.second() as u32, t.nanosecond() as u32)
+        let t = TimeTime::parse(s, &fmt).map_err(|e| Error::Parse(format!("time '{s}': {e}")))?;
+        Self::from_hms_nano(
+            t.hour() as u32,
+            t.minute() as u32,
+            t.second() as u32,
+            t.nanosecond() as u32,
+        )
     }
 
     pub fn to_iso(&self) -> String {
@@ -178,8 +193,12 @@ pub struct Timestamp(pub i64);
 impl Timestamp {
     pub const EPOCH: Timestamp = Timestamp(0);
 
-    pub fn to_u64(&self) -> u64 { self.0 as u64 }
-    pub fn from_u64(v: u64) -> Self { Timestamp(v as i64) }
+    pub fn to_u64(&self) -> u64 {
+        self.0 as u64
+    }
+    pub fn from_u64(v: u64) -> Self {
+        Timestamp(v as i64)
+    }
 
     pub fn from_date(d: Date) -> Self {
         Timestamp(d.0 as i64 * 86_400_000_000)
@@ -228,9 +247,15 @@ pub struct Interval {
 impl Interval {
     pub const ZERO: Interval = Interval { months: 0, micros: 0 };
 
-    pub fn from_months(m: i32) -> Self { Interval { months: m, micros: 0 } }
-    pub fn from_days(d: i32) -> Self { Interval { months: 0, micros: (d as i64) * 86_400_000_000 } }
-    pub fn from_micros(m: i64) -> Self { Interval { months: 0, micros: m } }
+    pub fn from_months(m: i32) -> Self {
+        Interval { months: m, micros: 0 }
+    }
+    pub fn from_days(d: i32) -> Self {
+        Interval { months: 0, micros: (d as i64) * 86_400_000_000 }
+    }
+    pub fn from_micros(m: i64) -> Self {
+        Interval { months: 0, micros: m }
+    }
 
     pub fn to_u64_pair(&self) -> [u64; 2] {
         [(self.months as u32) as u64, self.micros as u64]
@@ -243,10 +268,11 @@ impl Interval {
     pub fn from_sql_str(s: &str) -> Result<Self, Error> {
         let s = s.trim().trim_matches('\'');
         let lower = s.to_lowercase();
-        let (n_str, unit) = lower.split_once(char::is_whitespace)
+        let (n_str, unit) = lower
+            .split_once(char::is_whitespace)
             .ok_or_else(|| Error::Parse(format!("interval '{s}': missing unit")))?;
-        let n: i64 = n_str.parse()
-            .map_err(|e| Error::Parse(format!("interval number '{n_str}': {e}")))?;
+        let n: i64 =
+            n_str.parse().map_err(|e| Error::Parse(format!("interval number '{n_str}': {e}")))?;
         let iv = match unit {
             "year" | "years" => Interval::from_months((n * 12) as i32),
             "month" | "months" => Interval::from_months(n as i32),
@@ -290,7 +316,8 @@ fn days_in_month(year: i32, month: u32) -> u8 {
 
 fn day_of_year(year: i32, month: u32, day: u32) -> u32 {
     let leap = is_leap_year(year);
-    let days_in_months: [u32; 12] = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let days_in_months: [u32; 12] =
+        [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut doy = day;
     for m in 1..month {
         doy += days_in_months[(m - 1) as usize];
@@ -310,9 +337,11 @@ mod tests {
         let date = Date::from_ymd(year, month, day).unwrap();
         let slow = date.to_ymd().0;
         let fast = days_since_epoch_to_year(date.0 as i64);
-        assert_eq!(fast, slow,
-                   "mismatch for {year:04}-{month:02}-{day:02}: fast={fast}, slow={slow}, d={}",
-                   date.0);
+        assert_eq!(
+            fast, slow,
+            "mismatch for {year:04}-{month:02}-{day:02}: fast={fast}, slow={slow}, d={}",
+            date.0
+        );
     }
 
     #[test]
@@ -402,9 +431,9 @@ mod tests {
         for _ in 0..100 {
             // LCG step (Numerical Recipes constants).
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let year = 1970 + (state % 61) as i32;             // 1970..=2030
+            let year = 1970 + (state % 61) as i32; // 1970..=2030
             let month = 1 + ((state >> 32) % 12) as u32;
-            let day = 1 + ((state >> 48) % 28) as u32;         // safe for any month
+            let day = 1 + ((state >> 48) % 28) as u32; // safe for any month
             check_year_against_time(year, month, day);
         }
     }

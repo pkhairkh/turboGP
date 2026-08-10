@@ -9,14 +9,14 @@
 //! it exercises the full NULL-handling pipeline: arrow → parquet → u64 cells
 //! + null_bitmap → executor COUNT(col) → NULL exclusion.
 
-use turbogp::engine::QueryEngine;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_writer::ArrowWriter;
-use std::sync::Arc;
 use std::fs::File;
+use std::sync::Arc;
 use tempfile::NamedTempFile;
+use turbogp::engine::QueryEngine;
 
 /// Write a RecordBatch to a Parquet file at the given path.
 fn write_parquet(path: &str, batch: &RecordBatch) -> Result<(), Box<dyn std::error::Error>> {
@@ -34,9 +34,7 @@ fn batch_with_nulls() -> RecordBatch {
     // Use Option<i64> to represent nullable Int64 values.
     let values: Vec<Option<i64>> = vec![Some(1), None, Some(3), None, Some(5)];
     let arr = Arc::new(Int64Array::from(values));
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("v", DataType::Int64, true),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
     RecordBatch::try_new(schema, vec![arr]).expect("build batch")
 }
 
@@ -53,11 +51,21 @@ fn count_excludes_nulls() {
 
     // count(v) must exclude NULLs: 3 non-NULL values (1, 3, 5).
     let r = e.execute("SELECT count(v) FROM t").expect("count query");
-    assert_eq!(r.scalar_u64(), Some(3), "count(v) must exclude NULLs — expected 3, got: {:?}", r.scalar_u64());
+    assert_eq!(
+        r.scalar_u64(),
+        Some(3),
+        "count(v) must exclude NULLs — expected 3, got: {:?}",
+        r.scalar_u64()
+    );
 
     // count(*) must include NULLs: 5 rows total.
     let r = e.execute("SELECT count(*) FROM t").expect("count(*) query");
-    assert_eq!(r.scalar_u64(), Some(5), "count(*) must include NULLs — expected 5, got: {:?}", r.scalar_u64());
+    assert_eq!(
+        r.scalar_u64(),
+        Some(5),
+        "count(*) must include NULLs — expected 5, got: {:?}",
+        r.scalar_u64()
+    );
 }
 
 /// Verify that SUM and AVG also exclude NULLs.
@@ -74,10 +82,18 @@ fn sum_and_avg_exclude_nulls() {
     // SUM(v) = 1 + 3 + 5 = 9 (NULLs excluded).
     let r = e.execute("SELECT sum(v) FROM t").expect("sum query");
     let sum_val = r.scalar_f64().expect("expected f64 result");
-    assert!((sum_val - 9.0).abs() < 0.01, "sum(v) must exclude NULLs — expected 9.0, got: {}", sum_val);
+    assert!(
+        (sum_val - 9.0).abs() < 0.01,
+        "sum(v) must exclude NULLs — expected 9.0, got: {}",
+        sum_val
+    );
 
     // AVG(v) = 9 / 3 = 3.0 (NULLs excluded from both numerator and denominator).
     let r = e.execute("SELECT avg(v) FROM t").expect("avg query");
     let avg_val = r.scalar_f64().expect("expected f64 result");
-    assert!((avg_val - 3.0).abs() < 0.01, "avg(v) must exclude NULLs — expected 3.0, got: {}", avg_val);
+    assert!(
+        (avg_val - 3.0).abs() < 0.01,
+        "avg(v) must exclude NULLs — expected 3.0, got: {}",
+        avg_val
+    );
 }

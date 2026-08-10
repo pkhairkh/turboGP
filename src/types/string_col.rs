@@ -20,7 +20,9 @@ pub struct StringHeap {
 impl StringHeap {
     pub fn append(&mut self, s: &[u8]) -> u64 {
         let len = s.len();
-        if len > u32::MAX as usize { return 0; }
+        if len > u32::MAX as usize {
+            return 0;
+        }
         let offset = self.bytes.len() as u64;
         self.bytes.extend_from_slice(&(len as u32).to_le_bytes());
         self.bytes.extend_from_slice(s);
@@ -29,11 +31,16 @@ impl StringHeap {
 
     pub fn get(&self, offset: u64) -> &str {
         let start = offset as usize;
-        if start + 4 > self.bytes.len() { return ""; }
-        let len = u32::from_le_bytes(self.bytes[start..start+4].try_into().unwrap_or([0;4])) as usize;
+        if start + 4 > self.bytes.len() {
+            return "";
+        }
+        let len =
+            u32::from_le_bytes(self.bytes[start..start + 4].try_into().unwrap_or([0; 4])) as usize;
         let str_start = start + 4;
-        if str_start + len > self.bytes.len() { return ""; }
-        std::str::from_utf8(&self.bytes[str_start..str_start+len]).unwrap_or("")
+        if str_start + len > self.bytes.len() {
+            return "";
+        }
+        std::str::from_utf8(&self.bytes[str_start..str_start + len]).unwrap_or("")
     }
 }
 
@@ -44,7 +51,9 @@ pub struct StringColumn {
 }
 
 impl StringColumn {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn push(&mut self, s: &str) {
         let heap = Arc::make_mut(&mut self.heap);
@@ -52,12 +61,18 @@ impl StringColumn {
     }
 
     pub fn get_owned(&self, i: usize) -> String {
-        if i >= self.handles.len() { return String::new(); }
+        if i >= self.handles.len() {
+            return String::new();
+        }
         unpack_string_owned(self.handles[i], &self.heap)
     }
 
-    pub fn len(&self) -> usize { self.handles.len() }
-    pub fn is_empty(&self) -> bool { self.handles.is_empty() }
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
 
     pub fn count_inline(&self) -> usize {
         self.handles.iter().filter(|h| ((**h >> 60) & 0xF) as u8 != LONG_TAG).count()
@@ -67,7 +82,9 @@ impl StringColumn {
 pub fn pack_string(heap: &mut StringHeap, s: &str) -> u64 {
     let bytes = s.as_bytes();
     let len = bytes.len();
-    if len == 0 { return 0; }
+    if len == 0 {
+        return 0;
+    }
     if len <= 7 {
         let mut h = (len as u64) << 60;
         for (i, &b) in bytes.iter().enumerate() {
@@ -76,13 +93,17 @@ pub fn pack_string(heap: &mut StringHeap, s: &str) -> u64 {
         h
     } else {
         let offset = heap.append(bytes);
-        if offset >= (1 << 60) { return 0; }
+        if offset >= (1 << 60) {
+            return 0;
+        }
         (LONG_TAG as u64) << 60 | offset
     }
 }
 
 pub fn unpack_string_owned(handle: u64, heap: &StringHeap) -> String {
-    if handle == 0 { return String::new(); }
+    if handle == 0 {
+        return String::new();
+    }
     let tag = ((handle >> 60) & 0xF) as u8;
     if tag == LONG_TAG {
         let offset = handle & ((1 << 60) - 1);
@@ -217,7 +238,9 @@ mod tests {
     fn thousand_strings_round_trip() {
         let mut col = StringColumn::new();
         let strings: Vec<String> = (0..1000).map(|i| format!("string_{i}")).collect();
-        for s in &strings { col.push(s); }
+        for s in &strings {
+            col.push(s);
+        }
         for (i, expected) in strings.iter().enumerate() {
             assert_eq!(col.get_owned(i), *expected, "mismatch at index {i}");
         }

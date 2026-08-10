@@ -11,7 +11,8 @@ use turbogp::engine::QueryEngine;
 
 fn make_hits_engine() -> QueryEngine {
     let mut e = QueryEngine::new();
-    e.execute("CREATE TABLE hits (
+    e.execute(
+        "CREATE TABLE hits (
         WatchID BIGINT,
         JavaEnable INT,
         Title VARCHAR(200),
@@ -125,7 +126,9 @@ fn make_hits_engine() -> QueryEngine {
         ParamsPrice INT,
        ParamsOrderID INT,
         ParamsSource VARCHAR(50)
-    )").expect("create hits table");
+    )",
+    )
+    .expect("create hits table");
 
     // Insert a few rows of synthetic data.
     e.execute("INSERT INTO hits (CounterID, UserID, EventDate, AdvEngineID, RegionID, URL, SearchPhrase, SearchEngineID, MobilePhone, MobilePhoneModel, TraficSourceID) VALUES (1, 100, 18500, 0, 1, 'http://google.com/search', '', 0, 0, '', 1)").unwrap();

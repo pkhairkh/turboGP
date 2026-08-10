@@ -15,8 +15,20 @@ fn make_engine() -> QueryEngine {
     let t = DS::from_loaded(LoadedTable {
         name: "t".into(),
         columns: vec![
-            LoadedColumn { name: "id".into(), cells: vec![1,2,3], row_count: 3, string_search: None, null_bitmap: None },
-            LoadedColumn { name: "v".into(), cells: vec![10,20,30], row_count: 3, string_search: None, null_bitmap: None },
+            LoadedColumn {
+                name: "id".into(),
+                cells: vec![1, 2, 3],
+                row_count: 3,
+                string_search: None,
+                null_bitmap: None,
+            },
+            LoadedColumn {
+                name: "v".into(),
+                cells: vec![10, 20, 30],
+                row_count: 3,
+                string_search: None,
+                null_bitmap: None,
+            },
         ],
         row_count: 3,
     });
@@ -27,13 +39,17 @@ fn make_engine() -> QueryEngine {
 
 async fn boot(e: QueryEngine) -> std::net::SocketAddr {
     let e = Arc::new(RwLock::new(e));
-    let s = Server::bind(e, ServerConfig::default()).await.unwrap();
+    let mut cfg = ServerConfig::default();
+    cfg.auth_required = false;
+    let s = Server::bind(e, cfg).await.unwrap();
     let a = s.local_addr;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     a
 }
 
-struct PgClient { s: TcpStream }
+struct PgClient {
+    s: TcpStream,
+}
 impl PgClient {
     async fn connect(addr: std::net::SocketAddr) -> std::io::Result<Self> {
         Ok(PgClient { s: TcpStream::connect(addr).await? })
@@ -49,8 +65,12 @@ impl PgClient {
         // StartupMessage
         let mut body = Vec::new();
         body.extend_from_slice(&196608i32.to_be_bytes());
-        body.extend_from_slice(b"user\0"); body.extend_from_slice(user.as_bytes()); body.push(0);
-        body.extend_from_slice(b"database\0"); body.extend_from_slice(db.as_bytes()); body.push(0);
+        body.extend_from_slice(b"user\0");
+        body.extend_from_slice(user.as_bytes());
+        body.push(0);
+        body.extend_from_slice(b"database\0");
+        body.extend_from_slice(db.as_bytes());
+        body.push(0);
         body.push(0);
         self.s.write_all(&((body.len() + 4) as i32).to_be_bytes()).await?;
         self.s.write_all(&body).await?;
@@ -60,17 +80,23 @@ impl PgClient {
         loop {
             let (t, body) = self.read_msg().await?;
             match t {
-                b'R' => { assert_eq!(body.len(), 4); assert_eq!(&body[..], &[0,0,0,0]); }
+                b'R' => {
+                    assert_eq!(body.len(), 4);
+                    assert_eq!(&body[..], &[0, 0, 0, 0]);
+                }
                 b'S' | b'K' => {}
                 b'Z' => return Ok(()),
-                b'E' => return Err(std::io::Error::new(std::io::ErrorKind::Other, parse_err(&body))),
+                b'E' => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, parse_err(&body)))
+                }
                 _ => {}
             }
         }
     }
     async fn send_query(&mut self, sql: &str) -> std::io::Result<()> {
         let mut body = Vec::new();
-        body.extend_from_slice(sql.as_bytes()); body.push(0);
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
         self.s.write_all(b"Q").await?;
         self.s.write_all(&((body.len() + 4) as i32).to_be_bytes()).await?;
         self.s.write_all(&body).await?;
@@ -80,7 +106,7 @@ impl PgClient {
         let mut h = [0u8; 5];
         self.s.read_exact(&mut h).await?;
         let t = h[0];
-        let len = i32::from_be_bytes([h[1],h[2],h[3],h[4]]) as usize;
+        let len = i32::from_be_bytes([h[1], h[2], h[3], h[4]]) as usize;
         let mut body = vec![0u8; len - 4];
         self.s.read_exact(&mut body).await?;
         Ok((t, body))
@@ -91,9 +117,12 @@ fn parse_err(body: &[u8]) -> String {
     let mut i = 0;
     let mut msg = String::new();
     while i < body.len() && body[i] != 0 {
-        let f = body[i] as char; i += 1;
+        let f = body[i] as char;
+        i += 1;
         let end = body[i..].iter().position(|&b| b == 0).unwrap_or(body.len() - i);
-        if f == 'M' { msg = String::from_utf8_lossy(&body[i..i+end]).into_owned(); }
+        if f == 'M' {
+            msg = String::from_utf8_lossy(&body[i..i + end]).into_owned();
+        }
         i += end + 1;
     }
     msg
@@ -114,8 +143,8 @@ async fn count_star() {
             b'D' => {
                 let n = u16::from_be_bytes([body[0], body[1]]) as usize;
                 assert_eq!(n, 1);
-                let cl = i32::from_be_bytes([body[2],body[3],body[4],body[5]]) as usize;
-                assert_eq!(std::str::from_utf8(&body[6..6+cl]).unwrap(), "3");
+                let cl = i32::from_be_bytes([body[2], body[3], body[4], body[5]]) as usize;
+                assert_eq!(std::str::from_utf8(&body[6..6 + cl]).unwrap(), "3");
                 got_data = true;
             }
             b'C' => {}
@@ -136,7 +165,10 @@ async fn error_on_missing_table() {
     let (t, body) = c.read_msg().await.unwrap();
     assert_eq!(t, b'E');
     let msg = parse_err(&body);
-    assert!(msg.to_lowercase().contains("not found") || msg.to_lowercase().contains("nope"), "got: {msg}");
+    assert!(
+        msg.to_lowercase().contains("not found") || msg.to_lowercase().contains("nope"),
+        "got: {msg}"
+    );
     let (t, _) = c.read_msg().await.unwrap();
     assert_eq!(t, b'Z');
 }
@@ -152,7 +184,12 @@ async fn multi_statement_batch() {
     let mut completes = 0;
     loop {
         let (t, _) = c.read_msg().await.unwrap();
-        match t { b'D' => rows += 1, b'C' => completes += 1, b'Z' => break, _ => {} }
+        match t {
+            b'D' => rows += 1,
+            b'C' => completes += 1,
+            b'Z' => break,
+            _ => {}
+        }
     }
     assert!(rows >= 1 && completes >= 1);
 }
@@ -169,8 +206,8 @@ async fn select_with_where() {
         let (t, body) = c.read_msg().await.unwrap();
         match t {
             b'D' => {
-                let cl = i32::from_be_bytes([body[2],body[3],body[4],body[5]]) as usize;
-                assert_eq!(std::str::from_utf8(&body[6..6+cl]).unwrap(), "2");
+                let cl = i32::from_be_bytes([body[2], body[3], body[4], body[5]]) as usize;
+                assert_eq!(std::str::from_utf8(&body[6..6 + cl]).unwrap(), "2");
                 got = true;
             }
             b'T' | b'C' => {}

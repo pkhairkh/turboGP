@@ -3,7 +3,7 @@
 //! Research: Subquery decorrelation (Neumann-Kemper 2018 UNNEST).
 
 use crate::datasource::table::Table;
-use crate::exec::join::{semi_join, anti_join, JoinKey};
+use crate::exec::join::{anti_join, semi_join, JoinKey};
 use crate::Error;
 use std::collections::HashSet;
 
@@ -14,7 +14,8 @@ pub fn exists(left: &Table, right: &Table, keys: &[JoinKey]) -> Vec<bool> {
         column_names: vec![],
         row_count: 0,
     });
-    let matched: HashSet<u64> = result.columns.first().map(|c| c.iter().copied().collect()).unwrap_or_default();
+    let matched: HashSet<u64> =
+        result.columns.first().map(|c| c.iter().copied().collect()).unwrap_or_default();
     (0..left.row_count).map(|i| matched.contains(&left.columns[0][i])).collect()
 }
 
@@ -30,7 +31,9 @@ pub fn union_all(left: &Table, right: &Table) -> Result<Table, Error> {
     }
     let mut columns = left.columns.clone();
     for (i, col) in right.columns.iter().enumerate() {
-        if i < columns.len() { std::sync::Arc::make_mut(&mut columns[i]).extend(col.iter().copied()); }
+        if i < columns.len() {
+            std::sync::Arc::make_mut(&mut columns[i]).extend(col.iter().copied());
+        }
     }
     Ok(Table {
         name: format!("{}_union_{}", left.name, right.name),
@@ -39,7 +42,7 @@ pub fn union_all(left: &Table, right: &Table) -> Result<Table, Error> {
         row_count: left.row_count + right.row_count,
         string_columns: vec![],
         null_bitmaps: vec![],
-            schema: None,
+        schema: None,
     })
 }
 
@@ -63,15 +66,14 @@ pub fn union_distinct(left: &Table, right: &Table) -> Result<Table, Error> {
         row_count: out_cols[0].len(),
         string_columns: vec![],
         null_bitmaps: vec![],
-            schema: None,
+        schema: None,
     })
 }
 
 /// INTERSECT: rows in both.
 pub fn intersect(left: &Table, right: &Table) -> Result<Table, Error> {
-    let right_keys: HashSet<Vec<u64>> = (0..right.row_count)
-        .map(|i| right.columns.iter().map(|c| c[i]).collect())
-        .collect();
+    let right_keys: HashSet<Vec<u64>> =
+        (0..right.row_count).map(|i| right.columns.iter().map(|c| c[i]).collect()).collect();
     let mut out_cols: Vec<Vec<u64>> = vec![Vec::new(); left.columns.len()];
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
     for i in 0..left.row_count {
@@ -89,15 +91,14 @@ pub fn intersect(left: &Table, right: &Table) -> Result<Table, Error> {
         row_count: out_cols[0].len(),
         string_columns: vec![],
         null_bitmaps: vec![],
-            schema: None,
+        schema: None,
     })
 }
 
 /// EXCEPT: rows in left not in right.
 pub fn except(left: &Table, right: &Table) -> Result<Table, Error> {
-    let right_keys: HashSet<Vec<u64>> = (0..right.row_count)
-        .map(|i| right.columns.iter().map(|c| c[i]).collect())
-        .collect();
+    let right_keys: HashSet<Vec<u64>> =
+        (0..right.row_count).map(|i| right.columns.iter().map(|c| c[i]).collect()).collect();
     let mut out_cols: Vec<Vec<u64>> = vec![Vec::new(); left.columns.len()];
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
     for i in 0..left.row_count {
@@ -115,7 +116,7 @@ pub fn except(left: &Table, right: &Table) -> Result<Table, Error> {
         row_count: out_cols[0].len(),
         string_columns: vec![],
         null_bitmaps: vec![],
-            schema: None,
+        schema: None,
     })
 }
 

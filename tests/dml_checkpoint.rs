@@ -203,7 +203,10 @@ fn checkpoint_preserves_float_type() {
     assert_eq!(count, 1);
 
     let content = std::fs::read_to_string(tmp.path()).unwrap();
-    assert!(content.contains("CREATE TABLE metrics (price FLOAT)"), "checkpoint must declare FLOAT, got: {content}");
+    assert!(
+        content.contains("CREATE TABLE metrics (price FLOAT)"),
+        "checkpoint must declare FLOAT, got: {content}"
+    );
     assert!(content.contains("INSERT INTO metrics VALUES (1.5)"));
     assert!(content.contains("INSERT INTO metrics VALUES (2.5)"));
     assert!(content.contains("INSERT INTO metrics VALUES (3.5)"));
@@ -220,7 +223,8 @@ fn checkpoint_preserves_varchar_type() {
 
     let mut cat = Catalog::new();
     let strings = vec!["alice".to_string(), "bo'b".to_string(), "carol".to_string()];
-    let cells: Vec<u64> = strings.iter().map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes())).collect();
+    let cells: Vec<u64> =
+        strings.iter().map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes())).collect();
     let sc = StringSearchColumn::new(strings.clone());
     let mut t = DS::from_loaded(LoadedTable {
         name: "users".into(),
@@ -247,9 +251,15 @@ fn checkpoint_preserves_varchar_type() {
     Checkpoint::save(&cat, tmp.path()).unwrap();
 
     let content = std::fs::read_to_string(tmp.path()).unwrap();
-    assert!(content.contains("CREATE TABLE users (name VARCHAR(50))"), "checkpoint must declare VARCHAR(50), got: {content}");
+    assert!(
+        content.contains("CREATE TABLE users (name VARCHAR(50))"),
+        "checkpoint must declare VARCHAR(50), got: {content}"
+    );
     assert!(content.contains("INSERT INTO users VALUES ('alice')"));
-    assert!(content.contains("INSERT INTO users VALUES ('bo''b')"), "single quote must be doubled: {content}");
+    assert!(
+        content.contains("INSERT INTO users VALUES ('bo''b')"),
+        "single quote must be doubled: {content}"
+    );
     assert!(content.contains("INSERT INTO users VALUES ('carol')"));
 }
 
@@ -278,7 +288,10 @@ fn checkpoint_emits_null_for_null_cells() {
 
     let content = std::fs::read_to_string(tmp.path()).unwrap();
     assert!(content.contains("INSERT INTO t VALUES (10)"));
-    assert!(content.contains("INSERT INTO t VALUES (NULL)"), "NULL cell must be emitted as NULL, not 0: {content}");
+    assert!(
+        content.contains("INSERT INTO t VALUES (NULL)"),
+        "NULL cell must be emitted as NULL, not 0: {content}"
+    );
     assert!(content.contains("INSERT INTO t VALUES (30)"));
 }
 
@@ -300,21 +313,44 @@ fn checkpoint_roundtrip_floats_and_varchars() {
 
     let mut cat = Catalog::new();
     let strings = vec!["alpha".to_string(), "beta".to_string()];
-    let str_cells: Vec<u64> = strings.iter().map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes())).collect();
+    let str_cells: Vec<u64> =
+        strings.iter().map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes())).collect();
     let float_cells = vec![1.25f64.to_bits(), 9.75f64.to_bits()];
     let sc = StringSearchColumn::new(strings.clone());
     let mut t = DS::from_loaded(LoadedTable {
         name: "mix".into(),
         columns: vec![
-            LoadedColumn { name: "name".into(), cells: str_cells, row_count: 2, string_search: Some(sc), null_bitmap: None },
-            LoadedColumn { name: "price".into(), cells: float_cells, row_count: 2, string_search: None, null_bitmap: None },
+            LoadedColumn {
+                name: "name".into(),
+                cells: str_cells,
+                row_count: 2,
+                string_search: Some(sc),
+                null_bitmap: None,
+            },
+            LoadedColumn {
+                name: "price".into(),
+                cells: float_cells,
+                row_count: 2,
+                string_search: None,
+                null_bitmap: None,
+            },
         ],
         row_count: 2,
     });
     t.schema = Some(TableSchema {
         columns: vec![
-            ColumnSchema { name: "name".into(), col_type: ColumnType::Varchar(None), not_null: false, primary_key: false },
-            ColumnSchema { name: "price".into(), col_type: ColumnType::Float, not_null: false, primary_key: false },
+            ColumnSchema {
+                name: "name".into(),
+                col_type: ColumnType::Varchar(None),
+                not_null: false,
+                primary_key: false,
+            },
+            ColumnSchema {
+                name: "price".into(),
+                col_type: ColumnType::Float,
+                not_null: false,
+                primary_key: false,
+            },
         ],
     });
     cat.register(t);
@@ -324,11 +360,15 @@ fn checkpoint_roundtrip_floats_and_varchars() {
     let sql = std::fs::read_to_string(tmp.path()).unwrap();
 
     // Verify the SQL output preserves types correctly.
-    assert!(sql.contains("CREATE TABLE mix (name VARCHAR, price FLOAT)"),
-        "CREATE TABLE must preserve VARCHAR/FLOAT types, got: {sql}");
+    assert!(
+        sql.contains("CREATE TABLE mix (name VARCHAR, price FLOAT)"),
+        "CREATE TABLE must preserve VARCHAR/FLOAT types, got: {sql}"
+    );
     assert!(sql.contains("INSERT INTO mix VALUES ('alpha', 1.25)"));
-    assert!(sql.contains("INSERT INTO mix VALUES ('beta', 9.75)"),
-        "INSERT must emit quoted string + decoded float, got: {sql}");
+    assert!(
+        sql.contains("INSERT INTO mix VALUES ('beta', 9.75)"),
+        "INSERT must emit quoted string + decoded float, got: {sql}"
+    );
 
     let mut e = QueryEngine::new();
     // Re-execute the checkpoint file statement by statement.
@@ -357,9 +397,30 @@ fn wal_replays_after_wave50_changes() {
     use tempfile::NamedTempFile;
     let tmp = NamedTempFile::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
-    wal.append(&WalRecord { txn_id: 0, sql: "CREATE TABLE t (id INT)".into(), is_commit: false, is_rollback: false, physical_change: None }).unwrap();
-    wal.append(&WalRecord { txn_id: 0, sql: "INSERT INTO t VALUES (1)".into(), is_commit: false, is_rollback: false, physical_change: None }).unwrap();
-    wal.append(&WalRecord { txn_id: 0, sql: "INSERT INTO t VALUES (2)".into(), is_commit: false, is_rollback: false, physical_change: None }).unwrap();
+    wal.append(&WalRecord {
+        txn_id: 0,
+        sql: "CREATE TABLE t (id INT)".into(),
+        is_commit: false,
+        is_rollback: false,
+        physical_change: None,
+    })
+    .unwrap();
+    wal.append(&WalRecord {
+        txn_id: 0,
+        sql: "INSERT INTO t VALUES (1)".into(),
+        is_commit: false,
+        is_rollback: false,
+        physical_change: None,
+    })
+    .unwrap();
+    wal.append(&WalRecord {
+        txn_id: 0,
+        sql: "INSERT INTO t VALUES (2)".into(),
+        is_commit: false,
+        is_rollback: false,
+        physical_change: None,
+    })
+    .unwrap();
     wal.sync().unwrap();
 
     let mut e = QueryEngine::new();

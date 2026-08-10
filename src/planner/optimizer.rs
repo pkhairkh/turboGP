@@ -4,8 +4,8 @@
 //! The cost model estimates per-tier throughput for each operator and
 //! chooses the cheapest execution plan.
 
-use crate::planner::CostModel;
 use crate::kernel::Operator;
+use crate::planner::CostModel;
 
 /// A query plan chosen by the cost-based optimizer.
 #[derive(Debug, Clone)]

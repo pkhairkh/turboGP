@@ -35,8 +35,10 @@ fn drop_view_removes_it() {
     let r = e.execute("SELECT id FROM v1");
     // Either the catalog lookup fails or the dispatcher returns an error.
     // (The behaviour depends on the view-expansion path.)
-    assert!(r.is_err() || r.unwrap().row_count == 0,
-        "after DROP VIEW, SELECT from the view should error or return empty");
+    assert!(
+        r.is_err() || r.unwrap().row_count == 0,
+        "after DROP VIEW, SELECT from the view should error or return empty"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -152,8 +154,10 @@ fn json_value_through_engine_execute() {
     // Create a table with a VARCHAR column to hold JSON strings.
     e.execute("CREATE TABLE docs (id INT, payload VARCHAR)").unwrap();
     // Insert two rows with JSON payloads.
-    e.execute("INSERT INTO docs (id, payload) VALUES (1, '{\"name\":\"Alice\",\"age\":30}')").unwrap();
-    e.execute("INSERT INTO docs (id, payload) VALUES (2, '{\"name\":\"Bob\",\"age\":25}')").unwrap();
+    e.execute("INSERT INTO docs (id, payload) VALUES (1, '{\"name\":\"Alice\",\"age\":30}')")
+        .unwrap();
+    e.execute("INSERT INTO docs (id, payload) VALUES (2, '{\"name\":\"Bob\",\"age\":25}')")
+        .unwrap();
 
     // SELECT JSON_VALUE(payload, '$.name') FROM docs — should return
     // a single column with values "Alice" and "Bob".
@@ -166,8 +170,16 @@ fn json_value_through_engine_execute() {
     // The column must carry string_values with the extracted JSON scalars.
     let strings = col.string_values.as_ref().expect("JSON_VALUE column must have string_values");
     assert_eq!(strings.len(), 2, "string_values must have one entry per row");
-    assert!(strings.iter().any(|s| s == "Alice"), "string_values must contain 'Alice' — got: {:?}", strings);
-    assert!(strings.iter().any(|s| s == "Bob"), "string_values must contain 'Bob' — got: {:?}", strings);
+    assert!(
+        strings.iter().any(|s| s == "Alice"),
+        "string_values must contain 'Alice' — got: {:?}",
+        strings
+    );
+    assert!(
+        strings.iter().any(|s| s == "Bob"),
+        "string_values must contain 'Bob' — got: {:?}",
+        strings
+    );
 }
 
 /// Wave 56c: JSON_VALUE with an explicit AS alias — the alias should
@@ -192,14 +204,19 @@ fn json_value_with_alias_through_engine_execute() {
 fn json_query_through_engine_execute() {
     let mut e = QueryEngine::new();
     e.execute("CREATE TABLE docs (id INT, payload VARCHAR)").unwrap();
-    e.execute("INSERT INTO docs (id, payload) VALUES (1, '{\"user\":{\"name\":\"Alice\"}}')").unwrap();
+    e.execute("INSERT INTO docs (id, payload) VALUES (1, '{\"user\":{\"name\":\"Alice\"}}')")
+        .unwrap();
 
     let r = e.execute("SELECT JSON_QUERY(payload, '$.user') FROM docs").unwrap();
     assert_eq!(r.row_count, 1);
     let col = &r.columns[0];
     let strings = col.string_values.as_ref().expect("string_values");
     // The extracted object should contain "Alice".
-    assert!(strings[0].contains("Alice"), "JSON_QUERY must return the object containing 'Alice' — got: {}", strings[0]);
+    assert!(
+        strings[0].contains("Alice"),
+        "JSON_QUERY must return the object containing 'Alice' — got: {}",
+        strings[0]
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -222,7 +239,8 @@ fn temporal_query_as_of_through_engine() {
     t.update(|row| row[0] == 1, vec![1, 150]);
     e.temporals.insert("history_t".to_string(), t);
 
-    let r = e.execute("SELECT * FROM history_t FOR SYSTEM_TIME AS OF 18446744073709551615").unwrap();
+    let r =
+        e.execute("SELECT * FROM history_t FOR SYSTEM_TIME AS OF 18446744073709551615").unwrap();
     assert!(r.row_count >= 1, "temporal query must return rows");
     let id_col = r.columns.iter().find(|c| c.name == "id").expect("id column");
     let v_col = r.columns.iter().find(|c| c.name == "v").expect("v column");
@@ -247,17 +265,18 @@ fn temporal_table_created_via_ddl() {
     // Create a temporal table via DDL.
     e.execute("CREATE TABLE t_hist (id INT, v INT) WITH (SYSTEM_VERSIONING = ON)").unwrap();
     // The table must be registered in self.temporals.
-    assert!(e.temporals.contains_key("t_hist"), "CREATE TABLE WITH SYSTEM_VERSIONING must register the temporal table");
+    assert!(
+        e.temporals.contains_key("t_hist"),
+        "CREATE TABLE WITH SYSTEM_VERSIONING must register the temporal table"
+    );
 
     // Insert two rows.
     e.execute("INSERT INTO t_hist (id, v) VALUES (1, 100)").unwrap();
     e.execute("INSERT INTO t_hist (id, v) VALUES (2, 200)").unwrap();
 
     // Capture the timestamp BEFORE the update.
-    let ts_before_update = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let ts_before_update =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     // Sleep briefly so the update's timestamp is strictly greater.
     std::thread::sleep(std::time::Duration::from_millis(20));
 
@@ -265,7 +284,9 @@ fn temporal_table_created_via_ddl() {
     e.execute("UPDATE t_hist SET v = 150 WHERE id = 1").unwrap();
 
     // Query as of ts_before_update — should see the OLD value (v=100 for id=1).
-    let r = e.execute(&format!("SELECT * FROM t_hist FOR SYSTEM_TIME AS OF {}", ts_before_update)).unwrap();
+    let r = e
+        .execute(&format!("SELECT * FROM t_hist FOR SYSTEM_TIME AS OF {}", ts_before_update))
+        .unwrap();
     assert!(r.row_count >= 1, "temporal AS OF query must return rows");
     let id_col = r.columns.iter().find(|c| c.name == "id").expect("id column");
     let v_col = r.columns.iter().find(|c| c.name == "v").expect("v column");
@@ -302,7 +323,9 @@ fn window_row_number_through_engine() {
     e.execute("CREATE TABLE t (dept INT, salary INT)").unwrap();
     e.execute("INSERT INTO t (dept, salary) VALUES (1, 100), (1, 200), (2, 150)").unwrap();
     // ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC)
-    let r = e.execute("SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) FROM t").unwrap();
+    let r = e
+        .execute("SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) FROM t")
+        .unwrap();
     // The window function column is appended after the base SELECT.
     // We expect 3 rows; the row_number column should have values 1, 2, 1
     // (rank within each partition).
@@ -344,9 +367,27 @@ fn pivot_function_callable_via_engine() {
     use turbogp::engine::{QueryResult, ResultColumn};
     let input = QueryResult {
         columns: vec![
-            ResultColumn { name: "dept".into(), values: vec![1, 1, 2], string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "qtr".into(), values: vec![1, 2, 1], string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "amt".into(), values: vec![100, 200, 150], string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn {
+                name: "dept".into(),
+                values: vec![1, 1, 2],
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "qtr".into(),
+                values: vec![1, 2, 1],
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "amt".into(),
+                values: vec![100, 200, 150],
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: 3,
         elapsed_us: 0,
@@ -365,7 +406,8 @@ fn pivot_function_callable_via_engine() {
 fn pivot_clause_through_engine_execute() {
     let mut e = QueryEngine::new();
     e.execute("CREATE TABLE sales (dept INT, qtr INT, amt INT)").unwrap();
-    e.execute("INSERT INTO sales (dept, qtr, amt) VALUES (1, 1, 100), (1, 2, 200), (2, 1, 150)").unwrap();
+    e.execute("INSERT INTO sales (dept, qtr, amt) VALUES (1, 1, 100), (1, 2, 200), (2, 1, 150)")
+        .unwrap();
 
     // PIVOT (SUM(amt) FOR qtr IN (1, 2)) — produces one row per dept with
     // columns: dept, "1", "2" (the summed amt for each quarter).

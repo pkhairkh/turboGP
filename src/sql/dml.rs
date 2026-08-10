@@ -88,7 +88,10 @@ fn parse_insert(tokens: &[Token]) -> Result<Insert, String> {
                 }
                 match &tokens[pos] {
                     Token::Ident(s) => cols.push(s.clone()),
-                    Token::RParen => { pos += 1; break; }
+                    Token::RParen => {
+                        pos += 1;
+                        break;
+                    }
                     other => return Err(format!("expected column or ), got {other:?}")),
                 }
                 pos += 1;
@@ -97,7 +100,10 @@ fn parse_insert(tokens: &[Token]) -> Result<Insert, String> {
                 }
                 match &tokens[pos] {
                     Token::Comma => pos += 1,
-                    Token::RParen => { pos += 1; break; }
+                    Token::RParen => {
+                        pos += 1;
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -133,7 +139,10 @@ fn parse_insert(tokens: &[Token]) -> Result<Insert, String> {
                 return Err("unterminated value list".into());
             }
             match &tokens[pos] {
-                Token::RParen => { pos += 1; break; }
+                Token::RParen => {
+                    pos += 1;
+                    break;
+                }
                 Token::Comma => pos += 1,
                 _ => {
                     let v = token_to_value_string(tokens, &mut pos)?;
@@ -190,7 +199,10 @@ fn parse_update(tokens: &[Token]) -> Result<Update, String> {
         // Check for another assignment
         if pos < tokens.len() {
             match &tokens[pos] {
-                Token::Comma => { pos += 1; continue; }
+                Token::Comma => {
+                    pos += 1;
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -275,7 +287,9 @@ fn token_to_value_string(tokens: &[Token], pos: &mut usize) -> Result<String, St
         Token::Int(n) => n.to_string(),
         Token::Float(f) => f.to_string(),
         Token::String(s) => format!("'{s}'"),
-        Token::Hex(b) => format!("x'{}'", b.iter().map(|b| format!("{:02x}", b)).collect::<String>()),
+        Token::Hex(b) => {
+            format!("x'{}'", b.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+        }
         Token::Keyword(k) if k == "NULL" => "NULL".into(),
         Token::Keyword(k) => k.clone(),
         Token::Ident(s) => s.clone(),
@@ -286,7 +300,11 @@ fn token_to_value_string(tokens: &[Token], pos: &mut usize) -> Result<String, St
     Ok(s)
 }
 
-fn collect_expression(tokens: &[Token], pos: &mut usize, stop_keywords: &[&str]) -> Result<String, String> {
+fn collect_expression(
+    tokens: &[Token],
+    pos: &mut usize,
+    stop_keywords: &[&str],
+) -> Result<String, String> {
     let mut parts = Vec::new();
     while *pos < tokens.len() {
         match &tokens[*pos] {
@@ -301,7 +319,8 @@ fn collect_expression(tokens: &[Token], pos: &mut usize, stop_keywords: &[&str])
             Token::Op(op) => parts.push(op.clone()),
             Token::LParen => parts.push("(".into()),
             Token::RParen => parts.push(")".into()),
-            Token::Hex(b) => parts.push(format!("x'{}'", b.iter().map(|b| format!("{:02x}", b)).collect::<String>())),
+            Token::Hex(b) => parts
+                .push(format!("x'{}'", b.iter().map(|b| format!("{:02x}", b)).collect::<String>())),
             _ => {}
         }
         *pos += 1;
@@ -323,7 +342,8 @@ fn collect_rest(tokens: &[Token], pos: &mut usize) -> String {
             Token::LParen => parts.push("(".into()),
             Token::RParen => parts.push(")".into()),
             Token::Comma => parts.push(",".into()),
-            Token::Hex(b) => parts.push(format!("x'{}'", b.iter().map(|b| format!("{:02x}", b)).collect::<String>())),
+            Token::Hex(b) => parts
+                .push(format!("x'{}'", b.iter().map(|b| format!("{:02x}", b)).collect::<String>())),
             _ => {}
         }
         *pos += 1;

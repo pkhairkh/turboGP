@@ -286,7 +286,9 @@ unsafe fn dot_one_minus_f64_bf16_inner(a: &[u64], b: &[u64], mask: &[bool]) -> f
 }
 
 /// Alias for has_bf16 (used by the grouped dispatch integration).
-pub fn has_avx512_bf16() -> bool { has_bf16() }
+pub fn has_avx512_bf16() -> bool {
+    has_bf16()
+}
 
 /// Grouped BF16 dot-product dispatch: computes sum(a[i] * b[i]) per group.
 /// Single pass over all rows, accumulating into per-group f64 sums.
@@ -326,11 +328,15 @@ unsafe fn dot_f64_bf16_grouped_inner(
         let mut any_active = false;
         for j in 0..16 {
             groups[j] = row_to_group[i + j];
-            if groups[j] != u16::MAX { any_active = true; }
+            if groups[j] != u16::MAX {
+                any_active = true;
+            }
         }
         if any_active {
             let mut mask = [false; 16];
-            for j in 0..16 { mask[j] = groups[j] != u16::MAX; }
+            for j in 0..16 {
+                mask[j] = groups[j] != u16::MAX;
+            }
             let av = load_f64_as_bf16(&col_a[i..i + 16], &mask);
             let bv = load_f64_as_bf16(&col_b[i..i + 16], &mask);
             let acc = _mm512_dpbf16_ps(_mm512_setzero_ps(), av, bv);
@@ -366,7 +372,9 @@ mod tests {
 
     #[test]
     fn test_vnni_small_values() {
-        if !has_vnni() { return; }
+        if !has_vnni() {
+            return;
+        }
         let col: Vec<u64> = (0..128).collect();
         let mask = vec![true; 128];
         let sum = sum_i64_vnni(&col, &mask);
@@ -375,7 +383,9 @@ mod tests {
 
     #[test]
     fn test_vnni_with_mask() {
-        if !has_vnni() { return; }
+        if !has_vnni() {
+            return;
+        }
         let col: Vec<u64> = (0..128).collect();
         let mask: Vec<bool> = (0..128).map(|i| i % 2 == 0).collect();
         let sum = sum_i64_vnni(&col, &mask);
@@ -385,7 +395,9 @@ mod tests {
 
     #[test]
     fn test_bf16_dot_product() {
-        if !has_bf16() { return; }
+        if !has_bf16() {
+            return;
+        }
         let a: Vec<u64> = (0..64).map(|i| (i as f64 * 10.0).to_bits()).collect();
         let b: Vec<u64> = (0..64).map(|i| (i as f64 * 0.5).to_bits()).collect();
         let mask = vec![true; 64];
@@ -393,22 +405,38 @@ mod tests {
         let expected: f64 = (0..64).map(|i| (i as f64 * 10.0) * (i as f64 * 0.5)).sum();
         // bf16 precision: allow 5% error
         let rel_err = (result - expected).abs() / expected.max(1.0);
-        assert!(rel_err < 0.05, "bf16 dot product error too high: {} vs {} ({}%)", result, expected, rel_err * 100.0);
+        assert!(
+            rel_err < 0.05,
+            "bf16 dot product error too high: {} vs {} ({}%)",
+            result,
+            expected,
+            rel_err * 100.0
+        );
     }
 
     #[test]
     fn test_bf16_one_minus_dot() {
-        if !has_bf16() { return; }
+        if !has_bf16() {
+            return;
+        }
         let a: Vec<u64> = (0..64).map(|i| ((i + 1) as f64 * 100.0).to_bits()).collect();
         let b: Vec<u64> = (0..64).map(|i| (0.01 + (i as f64 * 0.001)).to_bits()).collect();
         let mask = vec![true; 64];
         let result = dot_one_minus_f64_bf16(&a, &b, &mask);
-        let expected: f64 = (0..64).map(|i| {
-            let av = (i + 1) as f64 * 100.0;
-            let bv = 0.01 + i as f64 * 0.001;
-            av * (1.0 - bv)
-        }).sum();
+        let expected: f64 = (0..64)
+            .map(|i| {
+                let av = (i + 1) as f64 * 100.0;
+                let bv = 0.01 + i as f64 * 0.001;
+                av * (1.0 - bv)
+            })
+            .sum();
         let rel_err = (result - expected).abs() / expected.max(1.0);
-        assert!(rel_err < 0.05, "bf16 one-minus dot error: {} vs {} ({}%)", result, expected, rel_err * 100.0);
+        assert!(
+            rel_err < 0.05,
+            "bf16 one-minus dot error: {} vs {} ({}%)",
+            result,
+            expected,
+            rel_err * 100.0
+        );
     }
 }

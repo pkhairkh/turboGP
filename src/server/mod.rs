@@ -18,6 +18,7 @@ use crate::engine::QueryEngine;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 /// Server configuration.
@@ -28,9 +29,8 @@ pub struct ServerConfig {
     /// Server name reported in ParameterStatus.
     pub server_name: String,
     /// When true, the server requires SCRAM-SHA-256 authentication on
-    /// every connection (Wave 65). When false (default), the server
-    /// accepts any connection (backward compatible — the pre-Wave-65
-    /// behavior).
+    /// every connection (Wave 65). When false, the server accepts any
+    /// connection. Defaults to `true` (Wave 1 security hardening).
     pub auth_required: bool,
     /// Optional TLS configuration (Wave 65). When `Some`, the server
     /// should respond 'S' to an SSLRequest and upgrade the connection.
@@ -41,6 +41,10 @@ pub struct ServerConfig {
     /// ignored otherwise. Mutated by `CREATE USER` / `DROP USER` SQL
     /// statements routed through the pgwire layer.
     pub passwords: Arc<RwLock<PasswordManager>>,
+    /// Maximum number of concurrent connections (Wave 1 DoS hardening).
+    /// New connections beyond this limit receive a pgwire error and are
+    /// closed. Defaults to 128.
+    pub max_connections: usize,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -50,7 +54,11 @@ impl std::fmt::Debug for ServerConfig {
             .field("server_name", &self.server_name)
             .field("auth_required", &self.auth_required)
             .field("tls", &self.tls)
-            .field("passwords", &format!("<{} users>", self.passwords.read().map(|m| m.len()).unwrap_or(0)))
+            .field("max_connections", &self.max_connections)
+            .field(
+                "passwords",
+                &format!("<{} users>", self.passwords.read().map(|m| m.len()).unwrap_or(0)),
+            )
             .finish()
     }
 }
@@ -60,9 +68,12 @@ impl Default for ServerConfig {
         Self {
             addr: "127.0.0.1:0".parse().unwrap(),
             server_name: "turboGP".into(),
-            auth_required: false,
+            // Auth is ON by default (Wave 1 security hardening).
+            // Tests that don't want auth must explicitly set this to false.
+            auth_required: true,
             tls: None,
             passwords: Arc::new(RwLock::new(PasswordManager::new())),
+            max_connections: 128,
         }
     }
 }
@@ -88,23 +99,55 @@ impl Server {
         let auth_required = config.auth_required;
         let tls = config.tls.clone();
         let passwords = Arc::clone(&config.passwords);
+        let max_connections = config.max_connections;
+        let conn_semaphore = Arc::new(Semaphore::new(max_connections));
 
         let handle = tokio::spawn(async move {
-            log::debug!("turboGP listening on {local_addr} (auth_required={auth_required}, tls={})", tls.is_some());
+            log::debug!(
+                "turboGP listening on {local_addr} (auth_required={auth_required}, tls={}, max_connections={max_connections})",
+                tls.is_some()
+            );
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
-                        let engine = Arc::clone(&engine);
-                        let name = server_name.clone();
-                        let passwords = Arc::clone(&passwords);
-                        let tls = tls.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = PgConn::handle(stream, peer, engine, name, auth_required, tls, passwords).await {
-                                log::debug!("conn {peer}: {e}");
+                        // Acquire a connection permit; if the pool is
+                        // exhausted, the client gets a pgwire error.
+                        let permit = conn_semaphore.clone().acquire_owned().await;
+                        match permit {
+                            Ok(_permit) => {
+                                let engine = Arc::clone(&engine);
+                                let name = server_name.clone();
+                                let passwords = Arc::clone(&passwords);
+                                let tls = tls.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = PgConn::handle(
+                                        stream,
+                                        peer,
+                                        engine,
+                                        name,
+                                        auth_required,
+                                        tls,
+                                        passwords,
+                                    )
+                                    .await
+                                    {
+                                        log::debug!("conn {peer}: {e}");
+                                    }
+                                    // _permit is dropped here, releasing the slot.
+                                    drop(_permit);
+                                });
                             }
-                        });
+                            Err(e) => {
+                                log::warn!("connection limit reached, rejecting {peer}: {e}");
+                                // The stream is dropped, closing the connection.
+                                drop(stream);
+                            }
+                        }
                     }
-                    Err(e) => { log::error!("accept: {e}"); break; }
+                    Err(e) => {
+                        log::error!("accept: {e}");
+                        break;
+                    }
                 }
             }
         });
@@ -113,7 +156,9 @@ impl Server {
     }
 
     /// Wait for the server task to finish (normally never).
-    pub async fn join(self) -> Result<(), tokio::task::JoinError> { self.handle.await }
+    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
+        self.handle.await
+    }
 }
 
 #[cfg(test)]
@@ -124,13 +169,17 @@ mod tests {
         let c = ServerConfig::default();
         assert_eq!(c.addr.port(), 0);
         assert_eq!(c.server_name, "turboGP");
-        assert!(!c.auth_required);
+        // Auth is ON by default (Wave 1).
+        assert!(c.auth_required);
         assert!(c.tls.is_none());
     }
     #[tokio::test]
     async fn bind_returns_local_addr() {
         let engine = Arc::new(RwLock::new(QueryEngine::new()));
-        let s = Server::bind(engine, ServerConfig::default()).await.unwrap();
+        let mut config = ServerConfig::default();
+        // Tests opt out of auth.
+        config.auth_required = false;
+        let s = Server::bind(engine, config).await.unwrap();
         assert_ne!(s.local_addr.port(), 0);
     }
 }

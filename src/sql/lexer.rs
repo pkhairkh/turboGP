@@ -65,7 +65,6 @@ pub const KEYWORDS: &[&str] = &[
     "CONSISTENCY",
     "SCOPE",
     "RACK",
-
     "GLOBAL",
     "ASYNC",
     "USING",
@@ -79,7 +78,6 @@ pub const KEYWORDS: &[&str] = &[
     "LEFT",
     "INNER",
     "QUERY",
-
     // DDL keywords (Wave 3)
     "CREATE",
     "TABLE",
@@ -128,13 +126,11 @@ pub const KEYWORDS: &[&str] = &[
     "HOUR",
     "MINUTE",
     "SECOND",
-
     // DML keywords (Wave 4)
     "VALUES",
     "SET",
     "INTO",
     "OUTPUT",
-
     // CTE keywords (Wave 6)
     "WITH",
     "UNION",
@@ -142,7 +138,6 @@ pub const KEYWORDS: &[&str] = &[
     "ALL",
     "OPTION",
     "MAXRECURSION",
-
     // Window function keywords (Wave 7)
     "OVER",
     "PARTITION",
@@ -153,7 +148,6 @@ pub const KEYWORDS: &[&str] = &[
     "CURRENT",
     "ROW",
     "NUMBER",
-
     // ClickBench parser fixes (Wave 16)
     "BETWEEN",
     "IN",

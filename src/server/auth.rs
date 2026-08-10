@@ -84,7 +84,9 @@ pub struct PasswordManager {
 
 impl PasswordManager {
     /// Create an empty password manager.
-    pub fn new() -> Self { Self { users: std::collections::HashMap::new() } }
+    pub fn new() -> Self {
+        Self { users: std::collections::HashMap::new() }
+    }
 
     /// Create (or replace) a user with the given cleartext password.
     /// A fresh random salt is generated so re-creating a user with the
@@ -117,11 +119,17 @@ impl PasswordManager {
     }
 
     /// True if a user exists.
-    pub fn exists(&self, username: &str) -> bool { self.users.contains_key(username) }
+    pub fn exists(&self, username: &str) -> bool {
+        self.users.contains_key(username)
+    }
 
     /// Number of registered users.
-    pub fn len(&self) -> usize { self.users.len() }
-    pub fn is_empty(&self) -> bool { self.users.is_empty() }
+    pub fn len(&self) -> usize {
+        self.users.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.users.is_empty()
+    }
 }
 
 /// Generate a 16-byte random salt using the OS RNG via `rand`.
@@ -292,10 +300,7 @@ mod tests {
         let server_nonce = "3rfcNHYJY1ZVvWVs7jJnoNew";
         let combined_nonce = format!("{client_nonce}{server_nonce}");
         let client_first_bare = format!("n=alice,r={client_nonce}");
-        let server_first = format!(
-            "r={combined_nonce},s={},i={iterations}",
-            B64.encode(&salt)
-        );
+        let server_first = format!("r={combined_nonce},s={},i={iterations}", B64.encode(&salt));
         // Compute client proof.
         let mut salted = [0u8; 32];
         pbkdf2::<HmacSha256>(password.as_bytes(), &salt, iterations, &mut salted);
@@ -303,9 +308,8 @@ mod tests {
         cmac.update(b"Client Key");
         let client_key: [u8; 32] = cmac.finalize().into_bytes().into();
         let client_final_without_proof = format!("c=biws,r={combined_nonce}");
-        let auth_message = format!(
-            "{client_first_bare},{server_first},{client_final_without_proof}"
-        );
+        let auth_message =
+            format!("{client_first_bare},{server_first},{client_final_without_proof}");
         let mut smac = <HmacSha256 as Mac>::new_from_slice(&cred.stored_key).unwrap();
         smac.update(auth_message.as_bytes());
         let client_sig: [u8; 32] = smac.finalize().into_bytes().into();
@@ -313,10 +317,7 @@ mod tests {
         for i in 0..32 {
             client_proof[i] = client_key[i] ^ client_sig[i];
         }
-        let client_final = format!(
-            "{client_final_without_proof},p={}",
-            B64.encode(client_proof)
-        );
+        let client_final = format!("{client_final_without_proof},p={}", B64.encode(client_proof));
 
         match verify_scram(&cred, &client_first_bare, &server_first, &client_final) {
             ScramOutcome::Ok { server_signature_b64 } => {
@@ -344,10 +345,7 @@ mod tests {
         let server_nonce = "def456";
         let combined_nonce = format!("{client_nonce}{server_nonce}");
         let client_first_bare = format!("n=alice,r={client_nonce}");
-        let server_first = format!(
-            "r={combined_nonce},s={},i={iterations}",
-            B64.encode(&salt)
-        );
+        let server_first = format!("r={combined_nonce},s={},i={iterations}", B64.encode(&salt));
 
         // Derive client proof using the WRONG password.
         let wrong_password = "wrong-password";
@@ -357,9 +355,8 @@ mod tests {
         cmac.update(b"Client Key");
         let client_key: [u8; 32] = cmac.finalize().into_bytes().into();
         let client_final_without_proof = format!("c=biws,r={combined_nonce}");
-        let auth_message = format!(
-            "{client_first_bare},{server_first},{client_final_without_proof}"
-        );
+        let auth_message =
+            format!("{client_first_bare},{server_first},{client_final_without_proof}");
         let mut smac = <HmacSha256 as Mac>::new_from_slice(&cred.stored_key).unwrap();
         smac.update(auth_message.as_bytes());
         let client_sig: [u8; 32] = smac.finalize().into_bytes().into();
@@ -367,10 +364,7 @@ mod tests {
         for i in 0..32 {
             client_proof[i] = client_key[i] ^ client_sig[i];
         }
-        let client_final = format!(
-            "{client_final_without_proof},p={}",
-            B64.encode(client_proof)
-        );
+        let client_final = format!("{client_final_without_proof},p={}", B64.encode(client_proof));
 
         match verify_scram(&cred, &client_first_bare, &server_first, &client_final) {
             ScramOutcome::Ok { .. } => panic!("wrong password must NOT verify"),

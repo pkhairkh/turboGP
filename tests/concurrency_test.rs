@@ -20,8 +20,20 @@ fn make_engine() -> QueryEngine {
     let t = DS::from_loaded(LoadedTable {
         name: "t".into(),
         columns: vec![
-            LoadedColumn { name: "id".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None, null_bitmap: None },
-            LoadedColumn { name: "v".into(), cells: vec![10, 20, 30], row_count: 3, string_search: None, null_bitmap: None },
+            LoadedColumn {
+                name: "id".into(),
+                cells: vec![1, 2, 3],
+                row_count: 3,
+                string_search: None,
+                null_bitmap: None,
+            },
+            LoadedColumn {
+                name: "v".into(),
+                cells: vec![10, 20, 30],
+                row_count: 3,
+                string_search: None,
+                null_bitmap: None,
+            },
         ],
         row_count: 3,
     });
@@ -32,13 +44,17 @@ fn make_engine() -> QueryEngine {
 
 async fn boot(e: QueryEngine) -> std::net::SocketAddr {
     let e = Arc::new(RwLock::new(e));
-    let s = Server::bind(e, ServerConfig::default()).await.unwrap();
+    let mut cfg = ServerConfig::default();
+    cfg.auth_required = false;
+    let s = Server::bind(e, cfg).await.unwrap();
     let a = s.local_addr;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     a
 }
 
-struct PgClient { s: TcpStream }
+struct PgClient {
+    s: TcpStream,
+}
 
 impl PgClient {
     async fn connect(addr: std::net::SocketAddr) -> std::io::Result<Self> {
@@ -55,8 +71,12 @@ impl PgClient {
         // StartupMessage
         let mut body = Vec::new();
         body.extend_from_slice(&196608i32.to_be_bytes());
-        body.extend_from_slice(b"user\0"); body.extend_from_slice(user.as_bytes()); body.push(0);
-        body.extend_from_slice(b"database\0"); body.extend_from_slice(db.as_bytes()); body.push(0);
+        body.extend_from_slice(b"user\0");
+        body.extend_from_slice(user.as_bytes());
+        body.push(0);
+        body.extend_from_slice(b"database\0");
+        body.extend_from_slice(db.as_bytes());
+        body.push(0);
         body.push(0);
         self.s.write_all(&((body.len() + 4) as i32).to_be_bytes()).await?;
         self.s.write_all(&body).await?;
@@ -68,14 +88,17 @@ impl PgClient {
             match t {
                 b'R' | b'S' | b'K' => {}
                 b'Z' => return Ok(()),
-                b'E' => return Err(std::io::Error::new(std::io::ErrorKind::Other, "startup error")),
+                b'E' => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "startup error"))
+                }
                 _ => {}
             }
         }
     }
     async fn send_query(&mut self, sql: &str) -> std::io::Result<()> {
         let mut body = Vec::new();
-        body.extend_from_slice(sql.as_bytes()); body.push(0);
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
         self.s.write_all(b"Q").await?;
         self.s.write_all(&((body.len() + 4) as i32).to_be_bytes()).await?;
         self.s.write_all(&body).await?;
@@ -130,8 +153,14 @@ async fn two_concurrent_selects_complete() {
     // Both must complete without deadlock.
     let r1 = tokio::time::timeout(std::time::Duration::from_secs(10), h1).await;
     let r2 = tokio::time::timeout(std::time::Duration::from_secs(10), h2).await;
-    let r1 = r1.expect("client 1 timed out").expect("client 1 join failed").expect("client 1 query failed");
-    let r2 = r2.expect("client 2 timed out").expect("client 2 join failed").expect("client 2 query failed");
+    let r1 = r1
+        .expect("client 1 timed out")
+        .expect("client 1 join failed")
+        .expect("client 1 query failed");
+    let r2 = r2
+        .expect("client 2 timed out")
+        .expect("client 2 join failed")
+        .expect("client 2 query failed");
     // Each SELECT count(*) returns exactly one row.
     assert_eq!(r1, 1, "client 1 must receive 1 row");
     assert_eq!(r2, 1, "client 2 must receive 1 row");

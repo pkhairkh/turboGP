@@ -41,7 +41,9 @@ impl NullBitmap {
     }
 
     pub fn is_null(&self, i: usize) -> bool {
-        if i >= self.len { return false; }
+        if i >= self.len {
+            return false;
+        }
         (self.bits[i / 64] >> (i % 64)) & 1 == 1
     }
 
@@ -55,8 +57,12 @@ impl NullBitmap {
         count as usize
     }
 
-    pub fn len(&self) -> usize { self.len }
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -67,33 +73,57 @@ pub enum TriBool {
 }
 
 impl TriBool {
-    pub fn passes_where(&self) -> bool { matches!(self, TriBool::True) }
+    pub fn passes_where(&self) -> bool {
+        matches!(self, TriBool::True)
+    }
 
     pub fn not(self) -> TriBool {
-        match self { TriBool::True => TriBool::False, TriBool::False => TriBool::True, TriBool::Null => TriBool::Null }
+        match self {
+            TriBool::True => TriBool::False,
+            TriBool::False => TriBool::True,
+            TriBool::Null => TriBool::Null,
+        }
     }
 
     pub fn and(self, other: TriBool) -> TriBool {
-        if matches!(self, TriBool::False) || matches!(other, TriBool::False) { return TriBool::False; }
-        if matches!(self, TriBool::Null) || matches!(other, TriBool::Null) { return TriBool::Null; }
+        if matches!(self, TriBool::False) || matches!(other, TriBool::False) {
+            return TriBool::False;
+        }
+        if matches!(self, TriBool::Null) || matches!(other, TriBool::Null) {
+            return TriBool::Null;
+        }
         TriBool::True
     }
 
     pub fn or(self, other: TriBool) -> TriBool {
-        if matches!(self, TriBool::True) || matches!(other, TriBool::True) { return TriBool::True; }
-        if matches!(self, TriBool::Null) || matches!(other, TriBool::Null) { return TriBool::Null; }
+        if matches!(self, TriBool::True) || matches!(other, TriBool::True) {
+            return TriBool::True;
+        }
+        if matches!(self, TriBool::Null) || matches!(other, TriBool::Null) {
+            return TriBool::Null;
+        }
         TriBool::False
     }
 
     pub fn eq_with_null<T: PartialEq>(a: Option<&T>, b: Option<&T>) -> TriBool {
         match (a, b) {
-            (Some(x), Some(y)) => if x == y { TriBool::True } else { TriBool::False },
+            (Some(x), Some(y)) => {
+                if x == y {
+                    TriBool::True
+                } else {
+                    TriBool::False
+                }
+            }
             _ => TriBool::Null,
         }
     }
 
     pub fn is_null<T>(a: Option<&T>) -> TriBool {
-        if a.is_none() { TriBool::True } else { TriBool::False }
+        if a.is_none() {
+            TriBool::True
+        } else {
+            TriBool::False
+        }
     }
 
     pub fn is_not_null<T>(a: Option<&T>) -> TriBool {
@@ -102,7 +132,13 @@ impl TriBool {
 
     pub fn is_distinct_from<T: PartialEq>(a: Option<&T>, b: Option<&T>) -> TriBool {
         match (a, b) {
-            (Some(x), Some(y)) => if x != y { TriBool::True } else { TriBool::False },
+            (Some(x), Some(y)) => {
+                if x != y {
+                    TriBool::True
+                } else {
+                    TriBool::False
+                }
+            }
             (None, None) => TriBool::False,
             _ => TriBool::True,
         }
@@ -120,7 +156,13 @@ impl fmt::Display for TriBool {
 }
 
 impl From<bool> for TriBool {
-    fn from(b: bool) -> Self { if b { TriBool::True } else { TriBool::False } }
+    fn from(b: bool) -> Self {
+        if b {
+            TriBool::True
+        } else {
+            TriBool::False
+        }
+    }
 }
 
 #[cfg(test)]
@@ -130,14 +172,18 @@ mod tests {
     #[test]
     fn bitmap_new_none_null() {
         let bm = NullBitmap::new_none_null(100);
-        for i in 0..100 { assert!(!bm.is_null(i)); }
+        for i in 0..100 {
+            assert!(!bm.is_null(i));
+        }
         assert_eq!(bm.count_nulls(), 0);
     }
 
     #[test]
     fn bitmap_new_all_null() {
         let bm = NullBitmap::new_all_null(100);
-        for i in 0..100 { assert!(bm.is_null(i)); }
+        for i in 0..100 {
+            assert!(bm.is_null(i));
+        }
         assert_eq!(bm.count_nulls(), 100);
     }
 
@@ -163,7 +209,9 @@ mod tests {
     #[test]
     fn bitmap_word_boundary() {
         let mut bm = NullBitmap::new_none_null(130);
-        for i in [0, 63, 64, 127, 128, 129] { bm.set_null(i); }
+        for i in [0, 63, 64, 127, 128, 129] {
+            bm.set_null(i);
+        }
         assert_eq!(bm.count_nulls(), 6);
     }
 

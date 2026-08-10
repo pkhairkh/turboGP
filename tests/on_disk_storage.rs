@@ -7,8 +7,8 @@
 //! 4. The page-level WAL records physical changes (not just SQL strings).
 //! 5. Crash recovery: unflushed data is lost, flushed data survives.
 
-use turbogp::engine::QueryEngine;
 use tempfile::TempDir;
+use turbogp::engine::QueryEngine;
 
 #[test]
 fn on_disk_table_survives_restart() {
@@ -73,17 +73,19 @@ fn wal_records_physical_changes() {
     // Write a physical change record.
     {
         let mut wal = Wal::open(&wal_path).unwrap();
-        wal.append(&WalRecord::physical(1, PhysicalChange::PageAlloc {
-            table_id: 1,
-            page_num: 0,
-        })).unwrap();
-        wal.append(&WalRecord::physical(1, PhysicalChange::CellUpdate {
-            table_id: 1,
-            page_num: 0,
-            cell_index: 0,
-            old_value: 0,
-            new_value: 42,
-        })).unwrap();
+        wal.append(&WalRecord::physical(1, PhysicalChange::PageAlloc { table_id: 1, page_num: 0 }))
+            .unwrap();
+        wal.append(&WalRecord::physical(
+            1,
+            PhysicalChange::CellUpdate {
+                table_id: 1,
+                page_num: 0,
+                cell_index: 0,
+                old_value: 0,
+                new_value: 42,
+            },
+        ))
+        .unwrap();
         wal.append(&WalRecord::commit(1)).unwrap();
         wal.sync().unwrap();
     }

@@ -137,7 +137,9 @@ impl BufferPool {
         match file.read_exact(&mut buf) {
             Ok(()) => {
                 // Deserialize the page from the buffer.
-                Page::from_bytes(&buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+                Page::from_bytes(&buf).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })
             }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Page doesn't exist on disk yet — allocate a fresh page.

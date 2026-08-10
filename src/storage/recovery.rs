@@ -54,62 +54,80 @@ pub struct WalRecord {
 #[serde(tag = "type")]
 pub enum PhysicalChange {
     /// A new page was allocated for a table.
-    PageAlloc {
-        table_id: u64,
-        page_num: u32,
-    },
+    PageAlloc { table_id: u64, page_num: u32 },
     /// A cell in a page was updated.
-    CellUpdate {
-        table_id: u64,
-        page_num: u32,
-        cell_index: usize,
-        old_value: u64,
-        new_value: u64,
-    },
+    CellUpdate { table_id: u64, page_num: u32, cell_index: usize, old_value: u64, new_value: u64 },
     /// A row was inserted (appended to a page).
-    RowInsert {
-        table_id: u64,
-        page_num: u32,
-        row_offset: usize,
-        values: Vec<u64>,
-    },
+    RowInsert { table_id: u64, page_num: u32, row_offset: usize, values: Vec<u64> },
     /// A row was deleted.
-    RowDelete {
-        table_id: u64,
-        page_num: u32,
-        row_offset: usize,
-    },
+    RowDelete { table_id: u64, page_num: u32, row_offset: usize },
 }
 
 impl WalRecord {
     /// Construct an autocommit DML record (txn_id = 0).
     pub fn autocommit(sql: impl Into<String>) -> Self {
-        Self { txn_id: 0, sql: sql.into(), is_commit: false, is_rollback: false, physical_change: None }
+        Self {
+            txn_id: 0,
+            sql: sql.into(),
+            is_commit: false,
+            is_rollback: false,
+            physical_change: None,
+        }
     }
 
     /// Construct a BEGIN marker for the given transaction ID.
     pub fn begin(txn_id: u64) -> Self {
-        Self { txn_id, sql: String::new(), is_commit: false, is_rollback: false, physical_change: None }
+        Self {
+            txn_id,
+            sql: String::new(),
+            is_commit: false,
+            is_rollback: false,
+            physical_change: None,
+        }
     }
 
     /// Construct a COMMIT marker for the given transaction ID.
     pub fn commit(txn_id: u64) -> Self {
-        Self { txn_id, sql: String::new(), is_commit: true, is_rollback: false, physical_change: None }
+        Self {
+            txn_id,
+            sql: String::new(),
+            is_commit: true,
+            is_rollback: false,
+            physical_change: None,
+        }
     }
 
     /// Construct a ROLLBACK marker for the given transaction ID.
     pub fn rollback(txn_id: u64) -> Self {
-        Self { txn_id, sql: String::new(), is_commit: false, is_rollback: true, physical_change: None }
+        Self {
+            txn_id,
+            sql: String::new(),
+            is_commit: false,
+            is_rollback: true,
+            physical_change: None,
+        }
     }
 
     /// Construct a DML record inside an explicit transaction.
     pub fn txn_dml(txn_id: u64, sql: impl Into<String>) -> Self {
-        Self { txn_id, sql: sql.into(), is_commit: false, is_rollback: false, physical_change: None }
+        Self {
+            txn_id,
+            sql: sql.into(),
+            is_commit: false,
+            is_rollback: false,
+            physical_change: None,
+        }
     }
 
     /// Construct a page-level physical change record (Wave 63).
     pub fn physical(txn_id: u64, change: PhysicalChange) -> Self {
-        Self { txn_id, sql: String::new(), is_commit: false, is_rollback: false, physical_change: Some(change) }
+        Self {
+            txn_id,
+            sql: String::new(),
+            is_commit: false,
+            is_rollback: false,
+            physical_change: Some(change),
+        }
     }
 }
 
@@ -123,11 +141,7 @@ impl Wal {
     /// Open (or create) a WAL at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let path_str = path.as_ref().to_string_lossy().to_string();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).read(true).open(&path)?;
         Ok(Wal { path: path_str, file: Some(file) })
     }
 
@@ -224,18 +238,10 @@ impl Wal {
         self.file = None;
         // First truncate: open with write+truncate.
         {
-            let _ = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&self.path)?;
+            let _ = OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)?;
         }
         // Then reopen for append+read.
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&self.path)?;
+        let file = OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
         self.file = Some(file);
         Ok(())
     }
@@ -270,7 +276,10 @@ fn parse_legacy_record(line: &str) -> std::io::Result<WalRecord> {
 
 /// Replay WAL records against an engine. Only committed transactions
 /// are replayed; rolled-back or incomplete transactions are skipped.
-pub fn replay_wal(engine: &mut crate::engine::QueryEngine, wal: &Wal) -> std::io::Result<ReplayStats> {
+pub fn replay_wal(
+    engine: &mut crate::engine::QueryEngine,
+    wal: &Wal,
+) -> std::io::Result<ReplayStats> {
     let records = wal.read_all()?;
     let mut stats = ReplayStats::default();
 
@@ -383,73 +392,99 @@ impl Checkpoint {
             if let Some(table) = catalog.get(name) {
                 // Resolve column types: prefer `table.schema`, fall back to INT.
                 let col_types: Vec<ColumnType> = if let Some(ref schema) = table.schema {
-                    table.column_names.iter().enumerate().map(|(i, _)| {
-                        schema.col_type_at(i).cloned().unwrap_or(ColumnType::BigInt)
-                    }).collect()
+                    table
+                        .column_names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| schema.col_type_at(i).cloned().unwrap_or(ColumnType::BigInt))
+                        .collect()
                 } else {
                     // No schema — infer from sidecars.
-                    table.column_names.iter().enumerate().map(|(i, _)| {
-                        if i < table.string_columns.len() && table.string_columns[i].is_some() {
-                            ColumnType::Varchar(None)
-                        } else {
-                            ColumnType::BigInt
-                        }
-                    }).collect()
+                    table
+                        .column_names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| {
+                            if i < table.string_columns.len() && table.string_columns[i].is_some() {
+                                ColumnType::Varchar(None)
+                            } else {
+                                ColumnType::BigInt
+                            }
+                        })
+                        .collect()
                 };
 
                 // Write CREATE TABLE with the correct types.
-                let cols: Vec<String> = table.column_names.iter().enumerate().map(|(i, c)| {
-                    let ty = col_types[i].type_name();
-                    // Emit VARCHAR(n) when a length was specified.
-                    match &col_types[i] {
-                        ColumnType::Varchar(Some(n)) => format!("{c} VARCHAR({n})"),
-                        ColumnType::Nvarchar(Some(n)) => format!("{c} NVARCHAR({n})"),
-                        ColumnType::Decimal(Some(p), Some(s)) => format!("{c} DECIMAL({p},{s})"),
-                        ColumnType::Decimal(Some(p), None) => format!("{c} DECIMAL({p})"),
-                        ColumnType::Numeric(Some(p), Some(s)) => format!("{c} NUMERIC({p},{s})"),
-                        ColumnType::Numeric(Some(p), None) => format!("{c} NUMERIC({p})"),
-                        _ => format!("{c} {ty}"),
-                    }
-                }).collect();
+                let cols: Vec<String> = table
+                    .column_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let ty = col_types[i].type_name();
+                        // Emit VARCHAR(n) when a length was specified.
+                        match &col_types[i] {
+                            ColumnType::Varchar(Some(n)) => format!("{c} VARCHAR({n})"),
+                            ColumnType::Nvarchar(Some(n)) => format!("{c} NVARCHAR({n})"),
+                            ColumnType::Decimal(Some(p), Some(s)) => {
+                                format!("{c} DECIMAL({p},{s})")
+                            }
+                            ColumnType::Decimal(Some(p), None) => format!("{c} DECIMAL({p})"),
+                            ColumnType::Numeric(Some(p), Some(s)) => {
+                                format!("{c} NUMERIC({p},{s})")
+                            }
+                            ColumnType::Numeric(Some(p), None) => format!("{c} NUMERIC({p})"),
+                            _ => format!("{c} {ty}"),
+                        }
+                    })
+                    .collect();
                 writeln!(file, "CREATE TABLE {name} ({});", cols.join(", "))?;
                 table_count += 1;
 
                 // Write INSERT statements. NULL cells become the literal
                 // `NULL`, not a 0 u64.
                 for row in 0..table.row_count {
-                    let vals: Vec<String> = table.columns.iter().enumerate().map(|(col_idx, col)| {
-                        // Check NULL bitmap first.
-                        if col_idx < table.null_bitmaps.len() {
-                            if let Some(ref bm) = table.null_bitmaps[col_idx] {
-                                if bm.is_null(row) {
-                                    return "NULL".to_string();
+                    let vals: Vec<String> = table
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(col_idx, col)| {
+                            // Check NULL bitmap first.
+                            if col_idx < table.null_bitmaps.len() {
+                                if let Some(ref bm) = table.null_bitmaps[col_idx] {
+                                    if bm.is_null(row) {
+                                        return "NULL".to_string();
+                                    }
                                 }
                             }
-                        }
-                        let cell = col.get(row).copied().unwrap_or(0);
-                        // String column with sidecar: emit the original string.
-                        if col_idx < table.string_columns.len() {
-                            if let Some(ref sc) = table.string_columns[col_idx] {
-                                if row < sc.len() {
-                                    let s = sc.get(row);
-                                    // Double single quotes to escape them.
-                                    let escaped = s.replace('\'', "''");
-                                    return format!("'{escaped}'");
+                            let cell = col.get(row).copied().unwrap_or(0);
+                            // String column with sidecar: emit the original string.
+                            if col_idx < table.string_columns.len() {
+                                if let Some(ref sc) = table.string_columns[col_idx] {
+                                    if row < sc.len() {
+                                        let s = sc.get(row);
+                                        // Double single quotes to escape them.
+                                        let escaped = s.replace('\'', "''");
+                                        return format!("'{escaped}'");
+                                    }
                                 }
                             }
-                        }
-                        // Float column: emit the decoded f64.
-                        if matches!(col_types[col_idx],
-                            ColumnType::Float | ColumnType::Real
-                            | ColumnType::Decimal(_, _) | ColumnType::Numeric(_, _)) {
-                            let f = f64::from_bits(cell);
-                            if f.is_finite() {
-                                return format!("{f}");
+                            // Float column: emit the decoded f64.
+                            if matches!(
+                                col_types[col_idx],
+                                ColumnType::Float
+                                    | ColumnType::Real
+                                    | ColumnType::Decimal(_, _)
+                                    | ColumnType::Numeric(_, _)
+                            ) {
+                                let f = f64::from_bits(cell);
+                                if f.is_finite() {
+                                    return format!("{f}");
+                                }
                             }
-                        }
-                        // Default: raw u64.
-                        cell.to_string()
-                    }).collect();
+                            // Default: raw u64.
+                            cell.to_string()
+                        })
+                        .collect();
                     writeln!(file, "INSERT INTO {name} VALUES ({});", vals.join(", "))?;
                 }
             }
@@ -475,20 +510,26 @@ mod tests {
             txn_id: 0,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         wal.append(&WalRecord {
             txn_id: 1,
             sql: "INSERT INTO t VALUES (2)".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         wal.append(&WalRecord {
             txn_id: 1,
             sql: "".into(),
             is_commit: true,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         wal.sync().unwrap();
 
         let records = wal.read_all().unwrap();
@@ -506,8 +547,10 @@ mod tests {
             txn_id: 0,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         wal.sync().unwrap();
         assert_eq!(wal.read_all().unwrap().len(), 1);
 
@@ -523,8 +566,10 @@ mod tests {
             txn_id: 0,
             sql: "INSERT INTO t VALUES ('a|b\nc')".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         wal.sync().unwrap();
 
         let records = wal.read_all().unwrap();
@@ -540,20 +585,26 @@ mod tests {
             txn_id: 0,
             sql: "CREATE TABLE t (id INT)".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         wal.append(&WalRecord {
             txn_id: 0,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         wal.append(&WalRecord {
             txn_id: 0,
             sql: "INSERT INTO t VALUES (2)".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         wal.sync().unwrap();
 
         let mut engine = crate::engine::QueryEngine::new();
@@ -574,15 +625,19 @@ mod tests {
             txn_id: 0,
             sql: "CREATE TABLE t (id INT)".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         // Transaction 1: INSERT but no COMMIT.
         wal.append(&WalRecord {
             txn_id: 1,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         wal.sync().unwrap();
 
         let mut engine = crate::engine::QueryEngine::new();
@@ -599,21 +654,27 @@ mod tests {
             txn_id: 0,
             sql: "CREATE TABLE t (id INT)".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         // Transaction 1: INSERT + ROLLBACK.
         wal.append(&WalRecord {
             txn_id: 1,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
-            is_rollback: false, physical_change: None,
-        }).unwrap();
+            is_rollback: false,
+            physical_change: None,
+        })
+        .unwrap();
         wal.append(&WalRecord {
             txn_id: 1,
             sql: "".into(),
             is_commit: false,
-            is_rollback: true, physical_change: None,
-        }).unwrap();
+            is_rollback: true,
+            physical_change: None,
+        })
+        .unwrap();
         wal.sync().unwrap();
 
         let mut engine = crate::engine::QueryEngine::new();
@@ -633,7 +694,9 @@ mod tests {
                 name: "id".into(),
                 cells: vec![1, 2, 3],
                 row_count: 3,
-                string_search: None, null_bitmap: None }],
+                string_search: None,
+                null_bitmap: None,
+            }],
             row_count: 3,
         });
         cat.register(t);

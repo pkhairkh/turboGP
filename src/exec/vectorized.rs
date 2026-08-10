@@ -103,7 +103,9 @@ fn eval_where(
                 or_mask(&left_mask, &right_mask, mask);
             } else {
                 // col OP literal
-                if let (Some(col_idx), Some(val)) = extract_col_and_value_batch(left, right, column_names) {
+                if let (Some(col_idx), Some(val)) =
+                    extract_col_and_value_batch(left, right, column_names)
+                {
                     let col = &columns[col_idx];
                     match op_upper.as_str() {
                         "=" => filter_eq(col, val, mask),
@@ -116,7 +118,9 @@ fn eval_where(
                     }
                 } else if op_upper == "LIKE" || op_upper == "NOT LIKE" {
                     // LIKE: compile pattern, match against u64 values as if they were string hashes
-                    if let (Some(col_idx), Some(pattern_str)) = extract_col_and_string(left, right, column_names) {
+                    if let (Some(col_idx), Some(pattern_str)) =
+                        extract_col_and_string(left, right, column_names)
+                    {
                         // For u64 columns: compare against the hash of the pattern
                         // This is an approximation — real string matching needs StringColumn
                         let col = &columns[col_idx];
@@ -126,12 +130,15 @@ fn eval_where(
                                 mask[i] = true;
                             } else {
                                 // Hash the pattern and compare (works for exact match on hashed strings)
-                                let pattern_hash = xxhash_rust::xxh3::xxh3_64(pattern_str.as_bytes());
+                                let pattern_hash =
+                                    xxhash_rust::xxh3::xxh3_64(pattern_str.as_bytes());
                                 mask[i] = col[i] == pattern_hash;
                             }
                         }
                         if op_upper == "NOT LIKE" {
-                            for i in 0..mask.len() { mask[i] = !mask[i]; }
+                            for i in 0..mask.len() {
+                                mask[i] = !mask[i];
+                            }
                         }
                     }
                 }
@@ -229,7 +236,11 @@ pub fn min_masked(col: &[u64], mask: &[bool]) -> u64 {
             min = v;
         }
     }
-    if min == u64::MAX { 0 } else { min }
+    if min == u64::MAX {
+        0
+    } else {
+        min
+    }
 }
 
 /// Compute max where mask is true.
@@ -253,7 +264,11 @@ pub fn avg_masked(col: &[u64], mask: &[bool]) -> u64 {
             count += 1;
         }
     }
-    if count == 0 { 0 } else { (sum as f64 / count as f64).to_bits() }
+    if count == 0 {
+        0
+    } else {
+        (sum as f64 / count as f64).to_bits()
+    }
 }
 
 /// Count distinct values where mask is true.
@@ -357,7 +372,6 @@ mod tests {
         assert!(elapsed.as_millis() < 30, "filter_eq took {}ms (debug mode)", elapsed.as_millis());
     }
 }
-
 
 fn extract_col_and_string(
     left: &crate::sql::parser::Expr,

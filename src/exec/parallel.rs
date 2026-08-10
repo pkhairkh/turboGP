@@ -90,12 +90,17 @@ pub fn parallel_sum_masked(col: &[u64], mask: &[bool]) -> u64 {
     }
     let morsel_size = (col.len() / rayon::current_num_threads().max(1)).max(1024);
     let morsels = split_morsels(col.len(), morsel_size);
-    morsels.par_iter().map(|m| {
-        col[m.start..m.end].iter().zip(mask[m.start..m.end].iter())
-            .filter(|(_, &b)| b)
-            .map(|(&c, _)| c)
-            .sum::<u64>()
-    }).sum()
+    morsels
+        .par_iter()
+        .map(|m| {
+            col[m.start..m.end]
+                .iter()
+                .zip(mask[m.start..m.end].iter())
+                .filter(|(_, &b)| b)
+                .map(|(&c, _)| c)
+                .sum::<u64>()
+        })
+        .sum()
 }
 
 // -----------------------------------------------------------------------

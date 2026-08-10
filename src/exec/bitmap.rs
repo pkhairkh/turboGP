@@ -66,8 +66,12 @@ impl Bitmap {
         Self { bits, len }
     }
 
-    pub fn len(&self) -> usize { self.len }
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     /// Set bit `i` to 1.
     #[inline]
@@ -145,7 +149,9 @@ impl Bitmap {
     pub fn from_bool_slice(bools: &[bool]) -> Bitmap {
         let mut bm = Bitmap::new(bools.len());
         for (i, &b) in bools.iter().enumerate() {
-            if b { bm.set(i); }
+            if b {
+                bm.set(i);
+            }
         }
         bm
     }
@@ -157,7 +163,9 @@ impl Bitmap {
         let n = self.bits.len().min(other.bits.len());
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
-            unsafe { and_inplace_avx512(&mut self.bits[..n], &other.bits[..n]); }
+            unsafe {
+                and_inplace_avx512(&mut self.bits[..n], &other.bits[..n]);
+            }
             return;
         }
         for i in 0..n {
@@ -172,7 +180,9 @@ impl Bitmap {
         let n = self.bits.len().min(other.bits.len());
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
-            unsafe { or_inplace_avx512(&mut self.bits[..n], &other.bits[..n]); }
+            unsafe {
+                or_inplace_avx512(&mut self.bits[..n], &other.bits[..n]);
+            }
             return;
         }
         for i in 0..n {
@@ -192,11 +202,15 @@ impl Bitmap {
     }
 
     /// Read-only access to the packed byte buffer.
-    pub fn as_bytes(&self) -> &[u8] { &self.bits }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bits
+    }
 
     /// Mutable access to the packed byte buffer (used by AVX-512
     /// filter loops to write mask bytes directly).
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] { &mut self.bits }
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bits
+    }
 }
 
 // =============================================================================
@@ -210,7 +224,11 @@ pub fn filter_eq_u64(col: &[u64], val: u64) -> Bitmap {
         return unsafe { filter_u64_avx512_inner(col, val, |v, t| _mm512_cmpeq_epi64_mask(v, t)) };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if c == val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if c == val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -218,12 +236,14 @@ pub fn filter_eq_u64(col: &[u64], val: u64) -> Bitmap {
 pub fn filter_ne_u64(col: &[u64], val: u64) -> Bitmap {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx512f") {
-        return unsafe {
-            filter_u64_avx512_inner(col, val, |v, t| !_mm512_cmpeq_epi64_mask(v, t))
-        };
+        return unsafe { filter_u64_avx512_inner(col, val, |v, t| !_mm512_cmpeq_epi64_mask(v, t)) };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if c != val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if c != val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -231,12 +251,14 @@ pub fn filter_ne_u64(col: &[u64], val: u64) -> Bitmap {
 pub fn filter_lt_u64(col: &[u64], val: u64) -> Bitmap {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx512f") {
-        return unsafe {
-            filter_u64_avx512_inner(col, val, |v, t| _mm512_cmplt_epu64_mask(v, t))
-        };
+        return unsafe { filter_u64_avx512_inner(col, val, |v, t| _mm512_cmplt_epu64_mask(v, t)) };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if c < val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if c < val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -244,12 +266,14 @@ pub fn filter_lt_u64(col: &[u64], val: u64) -> Bitmap {
 pub fn filter_gt_u64(col: &[u64], val: u64) -> Bitmap {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx512f") {
-        return unsafe {
-            filter_u64_avx512_inner(col, val, |v, t| _mm512_cmpgt_epu64_mask(v, t))
-        };
+        return unsafe { filter_u64_avx512_inner(col, val, |v, t| _mm512_cmpgt_epu64_mask(v, t)) };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if c > val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if c > val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -257,12 +281,14 @@ pub fn filter_gt_u64(col: &[u64], val: u64) -> Bitmap {
 pub fn filter_le_u64(col: &[u64], val: u64) -> Bitmap {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx512f") {
-        return unsafe {
-            filter_u64_avx512_inner(col, val, |v, t| _mm512_cmple_epu64_mask(v, t))
-        };
+        return unsafe { filter_u64_avx512_inner(col, val, |v, t| _mm512_cmple_epu64_mask(v, t)) };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if c <= val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if c <= val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -270,12 +296,14 @@ pub fn filter_le_u64(col: &[u64], val: u64) -> Bitmap {
 pub fn filter_ge_u64(col: &[u64], val: u64) -> Bitmap {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx512f") {
-        return unsafe {
-            filter_u64_avx512_inner(col, val, |v, t| _mm512_cmpge_epu64_mask(v, t))
-        };
+        return unsafe { filter_u64_avx512_inner(col, val, |v, t| _mm512_cmpge_epu64_mask(v, t)) };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if c >= val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if c >= val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -289,7 +317,11 @@ pub fn filter_lt_i64(col: &[u64], val: i64) -> Bitmap {
         };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if (c as i64) < val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if (c as i64) < val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -302,7 +334,11 @@ pub fn filter_le_i64(col: &[u64], val: i64) -> Bitmap {
         };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if (c as i64) <= val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if (c as i64) <= val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -315,7 +351,11 @@ pub fn filter_gt_i64(col: &[u64], val: i64) -> Bitmap {
         };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if (c as i64) > val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if (c as i64) > val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -328,7 +368,11 @@ pub fn filter_ge_i64(col: &[u64], val: i64) -> Bitmap {
         };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if (c as i64) >= val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if (c as i64) >= val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -342,7 +386,11 @@ pub fn filter_eq_f64(col: &[u64], val: f64) -> Bitmap {
     }
     let vb = val.to_bits();
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if c == vb { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if c == vb {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -379,7 +427,11 @@ pub fn filter_lt_f64(col: &[u64], val: f64) -> Bitmap {
         return unsafe { filter_f64_avx512_inner::<_CMP_LT_OQ>(col, val) };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if f64::from_bits(c) < val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if f64::from_bits(c) < val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -390,7 +442,11 @@ pub fn filter_gt_f64(col: &[u64], val: f64) -> Bitmap {
         return unsafe { filter_f64_avx512_inner::<_CMP_GT_OQ>(col, val) };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if f64::from_bits(c) > val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if f64::from_bits(c) > val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -401,7 +457,11 @@ pub fn filter_le_f64(col: &[u64], val: f64) -> Bitmap {
         return unsafe { filter_f64_avx512_inner::<_CMP_LE_OQ>(col, val) };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if f64::from_bits(c) <= val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if f64::from_bits(c) <= val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -412,7 +472,11 @@ pub fn filter_ge_f64(col: &[u64], val: f64) -> Bitmap {
         return unsafe { filter_f64_avx512_inner::<_CMP_GE_OQ>(col, val) };
     }
     let mut bm = Bitmap::new(col.len());
-    for (i, &c) in col.iter().enumerate() { if f64::from_bits(c) >= val { bm.set(i); } }
+    for (i, &c) in col.iter().enumerate() {
+        if f64::from_bits(c) >= val {
+            bm.set(i);
+        }
+    }
     bm
 }
 
@@ -429,13 +493,17 @@ pub fn and_into_bool(bm: &Bitmap, mask: &mut [bool]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
-            unsafe { and_into_bool_avx512(bm, mask); }
+            unsafe {
+                and_into_bool_avx512(bm, mask);
+            }
             return;
         }
     }
     let bits = bm.as_bytes();
     for i in 0..mask.len() {
-        if (bits[i >> 3] >> (i & 7)) & 1 == 0 { mask[i] = false; }
+        if (bits[i >> 3] >> (i & 7)) & 1 == 0 {
+            mask[i] = false;
+        }
     }
 }
 
@@ -445,13 +513,17 @@ pub fn or_into_bool(bm: &Bitmap, mask: &mut [bool]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
-            unsafe { or_into_bool_avx512(bm, mask); }
+            unsafe {
+                or_into_bool_avx512(bm, mask);
+            }
             return;
         }
     }
     let bits = bm.as_bytes();
     for i in 0..mask.len() {
-        if (bits[i >> 3] >> (i & 7)) & 1 != 0 { mask[i] = true; }
+        if (bits[i >> 3] >> (i & 7)) & 1 != 0 {
+            mask[i] = true;
+        }
     }
 }
 
@@ -480,8 +552,8 @@ where
     let mut byte_idx = 0usize;
     // 4-way unrolled: 4 independent loads + compares per iteration.
     while i + 32 <= n {
-        let v0 = _mm512_loadu_epi64(col.as_ptr().add(i)      as *const i64);
-        let v1 = _mm512_loadu_epi64(col.as_ptr().add(i + 8)  as *const i64);
+        let v0 = _mm512_loadu_epi64(col.as_ptr().add(i) as *const i64);
+        let v1 = _mm512_loadu_epi64(col.as_ptr().add(i + 8) as *const i64);
         let v2 = _mm512_loadu_epi64(col.as_ptr().add(i + 16) as *const i64);
         let v3 = _mm512_loadu_epi64(col.as_ptr().add(i + 24) as *const i64);
         // 4 independent compares — no accumulator dependency chain.
@@ -490,7 +562,7 @@ where
         let m2 = cmp(v2, target);
         let m3 = cmp(v3, target);
         // Pack 4 mask bytes (32 bits) into 4 consecutive bitmap bytes.
-        *bytes.get_unchecked_mut(byte_idx)     = m0;
+        *bytes.get_unchecked_mut(byte_idx) = m0;
         *bytes.get_unchecked_mut(byte_idx + 1) = m1;
         *bytes.get_unchecked_mut(byte_idx + 2) = m2;
         *bytes.get_unchecked_mut(byte_idx + 3) = m3;
@@ -539,15 +611,15 @@ unsafe fn filter_f64_avx512_inner<const PRED: i32>(col: &[u64], val: f64) -> Bit
     // 4-way unrolled.
     while i + 32 <= n {
         // Reinterpret u64 bits as f64 via cast intrinsic.
-        let v0 = _mm512_castsi512_pd(_mm512_loadu_epi64(col.as_ptr().add(i)      as *const i64));
-        let v1 = _mm512_castsi512_pd(_mm512_loadu_epi64(col.as_ptr().add(i + 8)  as *const i64));
+        let v0 = _mm512_castsi512_pd(_mm512_loadu_epi64(col.as_ptr().add(i) as *const i64));
+        let v1 = _mm512_castsi512_pd(_mm512_loadu_epi64(col.as_ptr().add(i + 8) as *const i64));
         let v2 = _mm512_castsi512_pd(_mm512_loadu_epi64(col.as_ptr().add(i + 16) as *const i64));
         let v3 = _mm512_castsi512_pd(_mm512_loadu_epi64(col.as_ptr().add(i + 24) as *const i64));
         let m0 = _mm512_cmp_pd_mask(v0, target, PRED);
         let m1 = _mm512_cmp_pd_mask(v1, target, PRED);
         let m2 = _mm512_cmp_pd_mask(v2, target, PRED);
         let m3 = _mm512_cmp_pd_mask(v3, target, PRED);
-        *bytes.get_unchecked_mut(byte_idx)     = m0;
+        *bytes.get_unchecked_mut(byte_idx) = m0;
         *bytes.get_unchecked_mut(byte_idx + 1) = m1;
         *bytes.get_unchecked_mut(byte_idx + 2) = m2;
         *bytes.get_unchecked_mut(byte_idx + 3) = m3;
@@ -615,7 +687,9 @@ unsafe fn and_into_bool_avx512(bm: &Bitmap, mask: &mut [bool]) {
         i += 8;
     }
     while i < n {
-        if (bits[i >> 3] >> (i & 7)) & 1 == 0 { *mask.get_unchecked_mut(i) = false; }
+        if (bits[i >> 3] >> (i & 7)) & 1 == 0 {
+            *mask.get_unchecked_mut(i) = false;
+        }
         i += 1;
     }
 }
@@ -649,7 +723,9 @@ unsafe fn or_into_bool_avx512(bm: &Bitmap, mask: &mut [bool]) {
         i += 8;
     }
     while i < n {
-        if (bits[i >> 3] >> (i & 7)) & 1 != 0 { *mask.get_unchecked_mut(i) = true; }
+        if (bits[i >> 3] >> (i & 7)) & 1 != 0 {
+            *mask.get_unchecked_mut(i) = true;
+        }
         i += 1;
     }
 }
@@ -740,8 +816,12 @@ mod tests {
     fn test_bitmap_and() {
         let mut a = Bitmap::new(16);
         let mut b = Bitmap::new(16);
-        for i in [0, 1, 2, 3, 4] { a.set(i); }
-        for i in [2, 3, 4, 5, 6] { b.set(i); }
+        for i in [0, 1, 2, 3, 4] {
+            a.set(i);
+        }
+        for i in [2, 3, 4, 5, 6] {
+            b.set(i);
+        }
         let c = a.and(&b);
         assert!(c.get(2) && c.get(3) && c.get(4));
         assert!(!c.get(0) && !c.get(1) && !c.get(5));
@@ -750,7 +830,9 @@ mod tests {
     #[test]
     fn test_bitmap_count_ones() {
         let mut bm = Bitmap::new(32);
-        for i in [0, 5, 7, 8, 15, 16, 31] { bm.set(i); }
+        for i in [0, 5, 7, 8, 15, 16, 31] {
+            bm.set(i);
+        }
         assert_eq!(bm.count_ones(), 7);
     }
 
@@ -813,7 +895,9 @@ mod tests {
     #[test]
     fn test_filter_lt_f64() {
         let col: Vec<u64> = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
-            .iter().map(|f| f.to_bits()).collect();
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
         let bm = filter_lt_f64(&col, 5.0);
         assert_bits(&bm, &[true, true, true, true, false, false, false, false, false, false]);
     }
@@ -821,7 +905,9 @@ mod tests {
     #[test]
     fn test_filter_le_f64() {
         let col: Vec<u64> = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
-            .iter().map(|f| f.to_bits()).collect();
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
         let bm = filter_le_f64(&col, 5.0);
         assert_bits(&bm, &[true, true, true, true, true, false, false, false, false, false]);
     }
@@ -829,7 +915,9 @@ mod tests {
     #[test]
     fn test_filter_ge_f64() {
         let col: Vec<u64> = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
-            .iter().map(|f| f.to_bits()).collect();
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
         let bm = filter_ge_f64(&col, 5.0);
         assert_bits(&bm, &[false, false, false, false, true, true, true, true, true, true]);
     }
@@ -837,7 +925,9 @@ mod tests {
     #[test]
     fn test_filter_gt_f64() {
         let col: Vec<u64> = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
-            .iter().map(|f| f.to_bits()).collect();
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
         let bm = filter_gt_f64(&col, 5.0);
         assert_bits(&bm, &[false, false, false, false, false, true, true, true, true, true]);
     }
@@ -888,7 +978,8 @@ mod tests {
     #[test]
     fn test_large_filter_f64() {
         let n = 1_000_000usize;
-        let col: Vec<u64> = (0..n as u64).map(|i| (i as f64) * 0.001).map(|f| f.to_bits()).collect();
+        let col: Vec<u64> =
+            (0..n as u64).map(|i| (i as f64) * 0.001).map(|f| f.to_bits()).collect();
         let bm = filter_lt_f64(&col, 50.0);
         assert_eq!(bm.count_ones(), 50_000);
     }
@@ -910,7 +1001,9 @@ mod tests {
     #[test]
     fn test_to_bool_vec_roundtrip() {
         let mut bm = Bitmap::new(20);
-        for i in [0, 3, 7, 15, 19] { bm.set(i); }
+        for i in [0, 3, 7, 15, 19] {
+            bm.set(i);
+        }
         let bools = bm.to_bool_vec();
         let bm2 = Bitmap::from_bool_slice(&bools);
         for i in 0..20 {
@@ -921,7 +1014,9 @@ mod tests {
     #[test]
     fn test_not() {
         let mut bm = Bitmap::new(10);
-        for i in [0, 3, 7] { bm.set(i); }
+        for i in [0, 3, 7] {
+            bm.set(i);
+        }
         let n = bm.not();
         for i in 0..10 {
             assert_eq!(n.get(i), !bm.get(i), "bit {} mismatch", i);

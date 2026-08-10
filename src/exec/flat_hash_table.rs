@@ -37,16 +37,40 @@ impl AggState {
     pub fn update(&mut self, value: u64) {
         self.count += 1;
         self.sum = self.sum.wrapping_add(value);
-        if value < self.min { self.min = value; }
-        if value > self.max { self.max = value; }
+        if value < self.min {
+            self.min = value;
+        }
+        if value > self.max {
+            self.max = value;
+        }
     }
 
-    pub fn finalize_count(&self) -> u64 { self.count }
-    pub fn finalize_sum(&self) -> u64 { (self.sum as f64).to_bits() }
-    pub fn finalize_min(&self) -> u64 { if self.count == 0 { 0 } else { self.min } }
-    pub fn finalize_max(&self) -> u64 { if self.count == 0 { 0 } else { self.max } }
+    pub fn finalize_count(&self) -> u64 {
+        self.count
+    }
+    pub fn finalize_sum(&self) -> u64 {
+        (self.sum as f64).to_bits()
+    }
+    pub fn finalize_min(&self) -> u64 {
+        if self.count == 0 {
+            0
+        } else {
+            self.min
+        }
+    }
+    pub fn finalize_max(&self) -> u64 {
+        if self.count == 0 {
+            0
+        } else {
+            self.max
+        }
+    }
     pub fn finalize_avg(&self) -> u64 {
-        if self.count == 0 { 0 } else { (self.sum as f64 / self.count as f64).to_bits() }
+        if self.count == 0 {
+            0
+        } else {
+            (self.sum as f64 / self.count as f64).to_bits()
+        }
     }
 }
 
@@ -116,11 +140,17 @@ impl FlatHashTable {
         }
     }
 
-    pub fn len(&self) -> usize { self.len }
+    pub fn len(&self) -> usize {
+        self.len
+    }
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, &AggState)> {
         self.occupied.iter().enumerate().filter_map(move |(i, &occ)| {
-            if occ { Some((self.keys[i], &self.states[i])) } else { None }
+            if occ {
+                Some((self.keys[i], &self.states[i]))
+            } else {
+                None
+            }
         })
     }
 }
@@ -187,17 +217,20 @@ pub fn hash_group_by_flat(
         }
     }
 
-    table.iter().map(|(key, state)| {
-        let result = match agg_func {
-            AggFunc::Count => state.finalize_count(),
-            AggFunc::Sum => state.finalize_sum(),
-            AggFunc::Avg => state.finalize_avg(),
-            AggFunc::Min => state.finalize_min(),
-            AggFunc::Max => state.finalize_max(),
-            AggFunc::CountDistinct => unreachable!(),
-        };
-        (key, result)
-    }).collect()
+    table
+        .iter()
+        .map(|(key, state)| {
+            let result = match agg_func {
+                AggFunc::Count => state.finalize_count(),
+                AggFunc::Sum => state.finalize_sum(),
+                AggFunc::Avg => state.finalize_avg(),
+                AggFunc::Min => state.finalize_min(),
+                AggFunc::Max => state.finalize_max(),
+                AggFunc::CountDistinct => unreachable!(),
+            };
+            (key, result)
+        })
+        .collect()
 }
 
 #[cfg(test)]

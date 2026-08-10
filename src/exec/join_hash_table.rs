@@ -107,7 +107,7 @@ impl JoinHashTable {
     /// Uses bits 16-31 of the hash (lower bits are used for slot indexing).
     #[inline]
     fn bloom_tag(hash: u64) -> u16 {
-        ((hash >> 16) as u16) | 1  // |1 ensures non-zero for non-empty
+        ((hash >> 16) as u16) | 1 // |1 ensures non-zero for non-empty
     }
 
     /// Check if an entry's tag could contain the hash.
@@ -134,11 +134,7 @@ impl JoinHashTable {
         if (entry_idx as usize) >= self.entries.len() {
             self.entries.push(JoinEntry { key: 0, row_idx: 0, next: 0 });
         }
-        self.entries[entry_idx as usize] = JoinEntry {
-            key,
-            row_idx,
-            next: 0,
-        };
+        self.entries[entry_idx as usize] = JoinEntry { key, row_idx, next: 0 };
         self.len += 1;
 
         // Link into bucket head (single-threaded: direct store)

@@ -22,12 +22,12 @@
 //! makes the engine tier-aware rather than tier-blind.
 
 pub mod aggregate;
-pub mod vnni_agg;
 pub mod cpu;
 pub mod hash;
 pub mod leapfrog;
 pub mod scan;
 pub mod similarity;
+pub mod vnni_agg;
 
 pub use crate::memory::tier::MemoryTier;
 pub use cpu::{detect_cpu, CpuTarget, CpuVendor};

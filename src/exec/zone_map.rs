@@ -47,8 +47,12 @@ impl ZoneMap {
             let mut max = u64::MIN;
             for i in start..end {
                 let v = col[i];
-                if v < min { min = v; }
-                if v > max { max = v; }
+                if v < min {
+                    min = v;
+                }
+                if v > max {
+                    max = v;
+                }
             }
             mins.push(min);
             maxs.push(max);
@@ -61,7 +65,9 @@ impl ZoneMap {
     /// Returns false if the page's [min, max] doesn't overlap [lo, hi].
     #[inline]
     pub fn page_might_contain_range(&self, page_idx: usize, lo: u64, hi: u64) -> bool {
-        if page_idx >= self.num_pages { return false; }
+        if page_idx >= self.num_pages {
+            return false;
+        }
         // Overlap test: page_max >= lo AND page_min <= hi
         self.maxs[page_idx] >= lo && self.mins[page_idx] <= hi
     }
@@ -69,7 +75,9 @@ impl ZoneMap {
     /// Check if a page MIGHT contain a specific value.
     #[inline]
     pub fn page_might_contain_value(&self, page_idx: usize, val: u64) -> bool {
-        if page_idx >= self.num_pages { return false; }
+        if page_idx >= self.num_pages {
+            return false;
+        }
         self.mins[page_idx] <= val && val <= self.maxs[page_idx]
     }
 
@@ -86,10 +94,14 @@ impl ZoneMap {
     }
 
     /// Number of pages.
-    pub fn num_pages(&self) -> usize { self.num_pages }
+    pub fn num_pages(&self) -> usize {
+        self.num_pages
+    }
 
     /// Total rows covered.
-    pub fn total_rows(&self) -> usize { self.total_rows }
+    pub fn total_rows(&self) -> usize {
+        self.total_rows
+    }
 
     /// Get the row range for a page: [start, end).
     pub fn page_row_range(&self, page_idx: usize) -> (usize, usize) {
@@ -107,9 +119,7 @@ pub struct TableZoneMaps {
 impl TableZoneMaps {
     /// Build zone maps for all columns in a table.
     pub fn build(columns: &[Arc<Vec<u64>>]) -> Self {
-        let maps = columns.iter()
-            .map(|col| Some(ZoneMap::build(col)))
-            .collect();
+        let maps = columns.iter().map(|col| Some(ZoneMap::build(col))).collect();
         TableZoneMaps { maps }
     }
 
@@ -129,7 +139,7 @@ mod tests {
         let col: Vec<u64> = (0..4096).collect();
         let zm = ZoneMap::build(&col);
         assert_eq!(zm.num_pages(), 4); // 4096 / 1024
-        // Page 0 covers [0, 1023]
+                                       // Page 0 covers [0, 1023]
         assert!(zm.page_might_contain_range(0, 500, 600));
         assert!(zm.page_might_contain_range(0, 0, 1023));
         assert!(!zm.page_might_contain_range(0, 1024, 2000));

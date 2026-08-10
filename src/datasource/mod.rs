@@ -46,5 +46,7 @@ pub mod projection;
 pub mod table;
 
 pub use csv::read_csv;
-pub use parquet::{read_parquet, read_parquet_column, read_parquet_column_names, LoadedColumn, LoadedTable};
+pub use parquet::{
+    read_parquet, read_parquet_column, read_parquet_column_names, LoadedColumn, LoadedTable,
+};
 pub use table::Table;

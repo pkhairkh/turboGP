@@ -49,8 +49,8 @@
 //! at FPR=1%.
 
 use core::arch::x86_64::{
-    _mm512_conflict_epi64, _mm512_loadu_epi64, _mm512_set1_epi64, _mm512_sllv_epi64,
-    _mm512_cmpeq_epi64_mask, _mm512_and_si512, _mm512_storeu_epi64,
+    _mm512_and_si512, _mm512_cmpeq_epi64_mask, _mm512_conflict_epi64, _mm512_loadu_epi64,
+    _mm512_set1_epi64, _mm512_sllv_epi64, _mm512_storeu_epi64,
 };
 
 /// AVX-512 bloom filter for join semi-join pre-filtering.
@@ -83,12 +83,7 @@ impl BloomFilter {
         let min_words = (expected_items * 10 + 63) / 64;
         // Round up to power of 2, minimum 1
         let nwords = (min_words.max(1)).next_power_of_two();
-        BloomFilter {
-            bits: vec![0u64; nwords],
-            word_mask: nwords - 1,
-            num_hashes: 3,
-            num_items: 0,
-        }
+        BloomFilter { bits: vec![0u64; nwords], word_mask: nwords - 1, num_hashes: 3, num_items: 0 }
     }
 
     /// Create with a custom number of hash functions (for testing).
@@ -188,9 +183,7 @@ impl BloomFilter {
         let word_idx = ((bit_idx as usize) >> 6) & self.word_mask;
         let bit_in_word = (bit_idx & 63) as u64;
         // SAFETY: word_idx is masked to bits.len()-1.
-        unsafe {
-            (*self.bits.get_unchecked(word_idx) >> bit_in_word) & 1 != 0
-        }
+        unsafe { (*self.bits.get_unchecked(word_idx) >> bit_in_word) & 1 != 0 }
     }
 
     /// Insert a key. Uses double hashing: bit positions are
@@ -467,14 +460,14 @@ mod tests {
         }
         // 8 keys: 4 present, 4 absent.
         let keys: [u64; 8] = [
-            0 * 13,         // present
-            100 * 13,       // present
-            500 * 13,       // present
-            999 * 13,       // present
-            1,              // absent
-            2,              // absent
-            3,              // absent
-            4,              // absent (might FP at ~1%)
+            0 * 13,   // present
+            100 * 13, // present
+            500 * 13, // present
+            999 * 13, // present
+            1,        // absent
+            2,        // absent
+            3,        // absent
+            4,        // absent (might FP at ~1%)
         ];
         let batch_mask = unsafe { bf.might_contain_batch(&keys) };
         for (i, &k) in keys.iter().enumerate() {
@@ -503,7 +496,9 @@ mod tests {
         }
 
         let mut bf_batch = BloomFilter::new(n);
-        unsafe { bf_batch.insert_batch(&keys); }
+        unsafe {
+            bf_batch.insert_batch(&keys);
+        }
 
         // Both filters must agree on all probe keys.
         for &k in &keys {

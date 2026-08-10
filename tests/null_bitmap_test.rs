@@ -70,9 +70,9 @@ fn null_bitmap_non_null_mask() {
     let mask = bm.non_null_mask();
     assert_eq!(mask.len(), 4);
     assert!(!mask[0]); // non-null
-    assert!(mask[1]);  // null
+    assert!(mask[1]); // null
     assert!(!mask[2]); // non-null
-    assert!(mask[3]);  // null
+    assert!(mask[3]); // null
 }
 
 #[test]

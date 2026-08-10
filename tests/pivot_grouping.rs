@@ -6,8 +6,14 @@ use turbogp::exec::pivot::*;
 fn make_result(names: &[&str], cols: &[Vec<u64>]) -> QueryResult {
     let mut r = QueryResult::empty();
     for (i, name) in names.iter().enumerate() {
-        r.push_column(ResultColumn { name: name.to_string(), values: cols[i].clone(), string_values: None, type_oid: 0, null_mask: None })
-            .unwrap();
+        r.push_column(ResultColumn {
+            name: name.to_string(),
+            values: cols[i].clone(),
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        })
+        .unwrap();
     }
     r
 }
@@ -37,10 +43,7 @@ fn pivot_count() {
 
 #[test]
 fn unpivot_columns_to_rows() {
-    let r = make_result(
-        &["dept", "Q1", "Q2"],
-        &[vec![1, 2], vec![100, 150], vec![200, 250]],
-    );
+    let r = make_result(&["dept", "Q1", "Q2"], &[vec![1, 2], vec![100, 150], vec![200, 250]]);
     let u = unpivot(&r, &["dept".into()], "amount", "quarter", &["Q1".into(), "Q2".into()]);
     assert_eq!(u.row_count, 4);
     assert_eq!(u.columns[0].values, vec![1, 1, 2, 2]);
@@ -54,22 +57,14 @@ fn grouping_sets_multiple_levels() {
         &[vec![1, 1, 2], vec![1, 2, 1], vec![100, 50, 200]],
     );
     // Group by dept only (set = [0]), then by team only (set = [1]).
-    let gs = grouping_sets(
-        &r,
-        &["dept".into(), "team".into()],
-        "amount",
-        "SUM",
-        &[vec![0], vec![1]],
-    );
+    let gs =
+        grouping_sets(&r, &["dept".into(), "team".into()], "amount", "SUM", &[vec![0], vec![1]]);
     assert!(gs.row_count >= 2);
 }
 
 #[test]
 fn cube_all_combinations() {
-    let r = make_result(
-        &["dept", "amount"],
-        &[vec![1, 1, 2], vec![100, 200, 150]],
-    );
+    let r = make_result(&["dept", "amount"], &[vec![1, 1, 2], vec![100, 200, 150]]);
     let c = cube(&r, &["dept".into()], "amount", "SUM");
     // CUBE with 1 column: {dept}, {} = 2 + 1 = 3 groups minimum.
     assert!(c.row_count >= 2);
@@ -77,10 +72,7 @@ fn cube_all_combinations() {
 
 #[test]
 fn rollup_hierarchy() {
-    let r = make_result(
-        &["dept", "amount"],
-        &[vec![1, 1, 2], vec![100, 200, 150]],
-    );
+    let r = make_result(&["dept", "amount"], &[vec![1, 1, 2], vec![100, 200, 150]]);
     let ru = rollup(&r, &["dept".into()], "amount", "SUM");
     // ROLLUP with 1 column: {dept}, {} = 2 + 1 = 3 groups.
     assert!(ru.row_count >= 2);

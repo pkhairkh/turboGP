@@ -56,8 +56,8 @@
 //! Both return the row count so the caller can sanity-check the load.
 
 pub mod executor;
-pub mod tpch;
 pub mod result;
+pub mod tpch;
 
 pub use executor::execute_select;
 pub use result::{QueryResult, ResultColumn};
@@ -287,7 +287,12 @@ impl QueryEngine {
 
     /// Execute a SQL statement WITHOUT appending to the WAL (Wave 63).
     /// Used during WAL replay to avoid duplicating records.
-    fn execute_inner_no_wal(&mut self, sql: &str, start: &Instant, txn_id: Option<u64>) -> Result<QueryResult> {
+    fn execute_inner_no_wal(
+        &mut self,
+        sql: &str,
+        start: &Instant,
+        txn_id: Option<u64>,
+    ) -> Result<QueryResult> {
         // Temporarily take the WAL out of self so we don't append during replay.
         let wal = self.wal.take();
         let result = self.execute_inner(sql, start, txn_id);
@@ -296,7 +301,10 @@ impl QueryEngine {
     }
 
     /// Apply a physical page-level change to the buffer pool (Wave 63).
-    fn apply_physical_change(&mut self, change: &crate::storage::recovery::PhysicalChange) -> Result<()> {
+    fn apply_physical_change(
+        &mut self,
+        change: &crate::storage::recovery::PhysicalChange,
+    ) -> Result<()> {
         use crate::storage::recovery::PhysicalChange;
         if self.buffer_pool.is_none() {
             return Ok(());
@@ -309,7 +317,8 @@ impl QueryEngine {
             PhysicalChange::CellUpdate { table_id, page_num, cell_index, new_value, .. } => {
                 let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
                 let bp = self.buffer_pool.as_mut().unwrap();
-                let idx = bp.fetch_page(page_id).map_err(|e| Error::Other(format!("page fetch: {e}")))?;
+                let idx =
+                    bp.fetch_page(page_id).map_err(|e| Error::Other(format!("page fetch: {e}")))?;
                 {
                     let page = bp.get_page_mut(idx);
                     page.set_cell(*cell_index, *new_value);
@@ -319,7 +328,8 @@ impl QueryEngine {
             PhysicalChange::RowInsert { table_id, page_num, row_offset, values } => {
                 let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
                 let bp = self.buffer_pool.as_mut().unwrap();
-                let idx = bp.fetch_page(page_id).map_err(|e| Error::Other(format!("page fetch: {e}")))?;
+                let idx =
+                    bp.fetch_page(page_id).map_err(|e| Error::Other(format!("page fetch: {e}")))?;
                 {
                     let page = bp.get_page_mut(idx);
                     for (i, &val) in values.iter().enumerate() {
@@ -358,8 +368,12 @@ impl QueryEngine {
         let wal = crate::storage::recovery::Wal::open(&wal_path)?;
         // Replay committed transactions.
         let stats = crate::storage::recovery::replay_wal(&mut engine, &wal)?;
-        log::info!("WAL replay: {} records replayed, {} skipped, {} errors",
-            stats.replayed, stats.skipped, stats.errors);
+        log::info!(
+            "WAL replay: {} records replayed, {} skipped, {} errors",
+            stats.replayed,
+            stats.skipped,
+            stats.errors
+        );
         engine.wal = Some(wal);
         Ok(engine)
     }
@@ -474,14 +488,17 @@ impl QueryEngine {
         sql: &str,
     ) -> Result<usize> {
         // Step 1: Read all column names from the Parquet file (metadata only, no data).
-        let all_columns = read_parquet_column_names(path)
-            .map_err(|e| Error::Other(e.to_string()))?;
+        let all_columns =
+            read_parquet_column_names(path).map_err(|e| Error::Other(e.to_string()))?;
 
         // Step 2: Determine which columns are needed.
-        let (needed_cols, pruned_count) = crate::datasource::projection::prune_columns(sql, &all_columns);
+        let (needed_cols, pruned_count) =
+            crate::datasource::projection::prune_columns(sql, &all_columns);
         log::debug!(
             "load_parquet_with_projection: {} of {} columns needed ({} pruned)",
-            needed_cols.len(), all_columns.len(), pruned_count
+            needed_cols.len(),
+            all_columns.len(),
+            pruned_count
         );
 
         // Step 3: If SELECT * or all columns needed, just load everything.
@@ -503,11 +520,8 @@ impl QueryEngine {
             return self.load_parquet(path, table_name);
         }
 
-        let loaded = crate::datasource::parquet::LoadedTable {
-            name: table_name.into(),
-            columns,
-            row_count,
-        };
+        let loaded =
+            crate::datasource::parquet::LoadedTable { name: table_name.into(), columns, row_count };
         let mut table = Table::from_loaded(loaded);
         table.name = table_name.to_string();
         self.catalog.register(table);
@@ -536,9 +550,7 @@ impl QueryEngine {
                 // The cells are already xxh3 hashes (computed by the CSV reader).
                 // Register them as a HashColumn so GROUP BY can use the pre-computed
                 // hashes instead of re-hashing per query.
-                let hash_col = crate::exec::hash_column::HashColumn {
-                    hashes: col.cells.clone(),
-                };
+                let hash_col = crate::exec::hash_column::HashColumn { hashes: col.cells.clone() };
                 self.hash_registry.register(table_name, &col.name, hash_col);
             }
         }
@@ -611,20 +623,14 @@ impl QueryEngine {
         // transaction's catalog, not the main catalog.
 
         if lower.starts_with("begin") || lower.starts_with("start transaction") {
-            let id = self
-                .txn_manager
-                .begin(&self.catalog)
-                .map_err(Error::Other)?;
+            let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
             self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
             return Ok(QueryResult::empty());
         }
         if lower.starts_with("commit") {
             // Capture the txn_id before we drain the transaction.
             let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
-            let committed = self
-                .txn_manager
-                .commit()
-                .map_err(Error::Other)?;
+            let committed = self.txn_manager.commit().map_err(Error::Other)?;
             self.catalog = committed;
             self.savepoints.clear(); // Wave 69: clear savepoints on commit.
             self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id));
@@ -632,9 +638,7 @@ impl QueryEngine {
         }
         if lower.starts_with("rollback") && !lower.starts_with("rollback to ") {
             let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
-            self.txn_manager
-                .rollback()
-                .map_err(Error::Other)?;
+            self.txn_manager.rollback().map_err(Error::Other)?;
             self.savepoints.clear(); // Wave 69: clear savepoints on rollback.
             self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id));
             return Ok(QueryResult::empty());
@@ -675,7 +679,12 @@ impl QueryEngine {
     /// `execute_ddl` / `execute_dml`, so a failed execute (e.g. INSERT
     /// INTO nonexistent) would still leave a record in the WAL — and
     /// replay would fail on restart.
-    fn execute_inner(&mut self, sql: &str, start: &Instant, txn_id: Option<u64>) -> Result<QueryResult> {
+    fn execute_inner(
+        &mut self,
+        sql: &str,
+        start: &Instant,
+        txn_id: Option<u64>,
+    ) -> Result<QueryResult> {
         // Wave 69: SAVEPOINT / ROLLBACK TO / RELEASE — handle these here
         // (after the txn snapshot is swapped in by the caller) so they
         // operate on the transaction's catalog.
@@ -742,7 +751,9 @@ impl QueryEngine {
         // Wave 53: EXEC procedure_name [args].
         if let Some(parsed) = crate::exec::procedure::parse_exec(sql) {
             let (proc_name, args) = parsed.map_err(Error::Other)?;
-            let proc_def = self.procedures.get(&proc_name)
+            let proc_def = self
+                .procedures
+                .get(&proc_name)
                 .ok_or_else(|| Error::NotFound(format!("procedure \"{proc_name}\"")))?
                 .clone();
             // Substitute @param references in the body with the arg values.
@@ -787,10 +798,14 @@ impl QueryEngine {
             let input = self.execute_inner(&stripped, start, txn_id)?;
             // Auto-detect the group_col: the first column in the input that's
             // neither the pivot_col nor the value_col.
-            let group_col = input.columns.iter()
+            let group_col = input
+                .columns
+                .iter()
                 .find(|c| c.name != pivot_spec.pivot_col && c.name != pivot_spec.value_col)
                 .map(|c| c.name.clone())
-                .unwrap_or_else(|| input.columns.first().map(|c| c.name.clone()).unwrap_or_default());
+                .unwrap_or_else(|| {
+                    input.columns.first().map(|c| c.name.clone()).unwrap_or_default()
+                });
             let spec = PivotSpec {
                 group_col,
                 pivot_col: pivot_spec.pivot_col,
@@ -862,7 +877,8 @@ impl QueryEngine {
                 // The basic parser failed — try the TPC-H interpreter
                 // which has a richer parser (CASE, EXTRACT, subqueries,
                 // HAVING, arithmetic in aggregates, etc.).
-                let mut tpch_result = crate::engine::tpch::parse_and_execute(&expanded_sql, &self.catalog)?;
+                let mut tpch_result =
+                    crate::engine::tpch::parse_and_execute(&expanded_sql, &self.catalog)?;
                 tpch_result.elapsed_us = start.elapsed().as_micros() as u64;
                 return Ok(tpch_result);
             }
@@ -891,7 +907,11 @@ impl QueryEngine {
             Ok(mut result) => {
                 // Wave 53: apply window functions if any SelectItem::Window
                 // is present in the query.
-                if query.select.iter().any(|s| matches!(s, crate::sql::parser::SelectItem::Window { .. })) {
+                if query
+                    .select
+                    .iter()
+                    .any(|s| matches!(s, crate::sql::parser::SelectItem::Window { .. }))
+                {
                     result = apply_window_functions(&result, &query);
                 }
                 // Wave 53: apply PIVOT if the extensions carry a pivot spec.
@@ -910,8 +930,9 @@ impl QueryEngine {
                 // as a fallback. This handles queries with features the
                 // basic executor doesn't support (multi-aggregate, HAVING,
                 // CASE WHEN, subqueries, etc.).
-                let mut tpch_result = crate::engine::tpch::parse_and_execute(&expanded_sql, &self.catalog)
-                    .map_err(|_| exec_err)?;
+                let mut tpch_result =
+                    crate::engine::tpch::parse_and_execute(&expanded_sql, &self.catalog)
+                        .map_err(|_| exec_err)?;
                 // Wave 60d: apply DISTINCT deduplication even on the tpch
                 // fallback path (the tpch parser skips DISTINCT but doesn't
                 // deduplicate).
@@ -1029,7 +1050,9 @@ impl QueryEngine {
         match direction.as_str() {
             "TO" => {
                 // Export the table to a CSV file.
-                let table = self.catalog.get(table_name)
+                let table = self
+                    .catalog
+                    .get(table_name)
                     .ok_or_else(|| Error::NotFound(format!("table '{}'", table_name)))?
                     .clone();
                 let mut csv = String::new();
@@ -1065,15 +1088,23 @@ impl QueryEngine {
                         continue;
                     }
                     let vals: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
-                    let val_strs: Vec<String> = vals.iter().map(|v| {
-                        // If it's a number, use it directly; otherwise quote it.
-                        if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
-                            v.clone()
-                        } else {
-                            format!("'{}'", v)
-                        }
-                    }).collect();
-                    let insert_sql = format!("INSERT INTO {} VALUES ({})", table_name, val_strs.join(", "));
+                    let val_strs: Vec<String> = vals
+                        .iter()
+                        .map(|v| {
+                            // If it's a number, use it directly; otherwise quote it
+                            // with single-quote doubling to prevent SQL injection.
+                            if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
+                                v.clone()
+                            } else {
+                                // Double internal single quotes to prevent injection
+                                // from malicious CSV cell values.
+                                let escaped = v.replace('\'', "''");
+                                format!("'{}'", escaped)
+                            }
+                        })
+                        .collect();
+                    let insert_sql =
+                        format!("INSERT INTO {} VALUES ({})", table_name, val_strs.join(", "));
                     self.execute_inner(&insert_sql, start, None)?;
                     count += 1;
                 }
@@ -1082,7 +1113,9 @@ impl QueryEngine {
                 result.elapsed_us = start.elapsed().as_micros() as u64;
                 Ok(result)
             }
-            _ => Err(Error::Other(format!("COPY direction must be TO or FROM, got: {}", direction))),
+            _ => {
+                Err(Error::Other(format!("COPY direction must be TO or FROM, got: {}", direction)))
+            }
         }
     }
 
@@ -1109,7 +1142,10 @@ impl QueryEngine {
     /// discarded.
     fn execute_rollback_to(&mut self, name: &str, start: &Instant) -> Result<QueryResult> {
         // Find the savepoint by name (search from the end — most recent first).
-        let pos = self.savepoints.iter().rposition(|(n, _)| n == name)
+        let pos = self
+            .savepoints
+            .iter()
+            .rposition(|(n, _)| n == name)
             .ok_or_else(|| Error::NotFound(format!("savepoint '{}'", name)))?;
         // Restore the catalog from the savepoint.
         let (_, snapshot) = &self.savepoints[pos];
@@ -1124,7 +1160,10 @@ impl QueryEngine {
     /// Execute RELEASE <name>: discard a savepoint (Wave 69).
     /// The savepoint is removed; ROLLBACK TO can no longer target it.
     fn execute_release_savepoint(&mut self, name: &str, start: &Instant) -> Result<QueryResult> {
-        let pos = self.savepoints.iter().rposition(|(n, _)| n == name)
+        let pos = self
+            .savepoints
+            .iter()
+            .rposition(|(n, _)| n == name)
             .ok_or_else(|| Error::NotFound(format!("savepoint '{}'", name)))?;
         // Remove the savepoint and all savepoints after it.
         self.savepoints.truncate(pos);
@@ -1150,11 +1189,8 @@ impl QueryEngine {
                 }
                 // Build an empty Table with the right column names.
                 let column_names: Vec<String> = ct.columns.iter().map(|c| c.name.clone()).collect();
-                let columns: Vec<std::sync::Arc<Vec<u64>>> = ct
-                    .columns
-                    .iter()
-                    .map(|_| std::sync::Arc::new(Vec::new()))
-                    .collect();
+                let columns: Vec<std::sync::Arc<Vec<u64>>> =
+                    ct.columns.iter().map(|_| std::sync::Arc::new(Vec::new())).collect();
                 let table = Table {
                     name: full_name.clone(),
                     columns,
@@ -1203,11 +1239,8 @@ impl QueryEngine {
     ///   the schema (a no-op for data, since all cells are u64).
     fn execute_alter_table(&mut self, at: crate::sql::AlterTable) -> Result<QueryResult> {
         use crate::sql::AlterAction;
-        let full_name = if at.schema == "dbo" {
-            at.name.clone()
-        } else {
-            format!("{}.{}", at.schema, at.name)
-        };
+        let full_name =
+            if at.schema == "dbo" { at.name.clone() } else { format!("{}.{}", at.schema, at.name) };
         match at.action {
             AlterAction::AddColumn(col_def) => {
                 let table = self
@@ -1309,7 +1342,9 @@ impl QueryEngine {
         let values: Vec<u64> = table.columns[col_idx].as_ref().clone();
         let cardinality = {
             let mut distinct = std::collections::HashSet::new();
-            for &v in &values { distinct.insert(v); }
+            for &v in &values {
+                distinct.insert(v);
+            }
             distinct.len() as u64
         };
         // Register the index.
@@ -1445,10 +1480,7 @@ impl QueryEngine {
                         .collect();
                     let string_values = if idx < table.string_columns.len() {
                         table.string_columns[idx].as_ref().map(|sc| {
-                            row_indices
-                                .iter()
-                                .map(|&r| sc.get(r).to_string())
-                                .collect::<Vec<_>>()
+                            row_indices.iter().map(|&r| sc.get(r).to_string()).collect::<Vec<_>>()
                         })
                     } else {
                         None
@@ -1478,11 +1510,7 @@ impl QueryEngine {
             }
         }
 
-        Some(Ok(QueryResult {
-            columns: cols,
-            row_count: row_indices.len(),
-            elapsed_us: 0,
-        }))
+        Some(Ok(QueryResult { columns: cols, row_count: row_indices.len(), elapsed_us: 0 }))
     }
 
     /// Execute a DML statement (INSERT, UPDATE, DELETE).
@@ -1537,7 +1565,8 @@ impl QueryEngine {
         // can update their string_columns sidecar after the loop. We collect
         // the string values into a per-column Vec<String> and rebuild the
         // StringSearchColumn at the end.
-        let mut string_inserts: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
+        let mut string_inserts: std::collections::HashMap<usize, Vec<String>> =
+            std::collections::HashMap::new();
         // Determine which columns are string-typed (VARCHAR / NVARCHAR / TEXT).
         let string_cols: std::collections::HashSet<usize> = (0..table.columns.len())
             .filter(|&i| table.schema.as_ref().map(|s| s.is_string(i)).unwrap_or(false))
@@ -1765,9 +1794,8 @@ impl QueryEngine {
                 }
                 // Get the old PK (first column) — used to find the row in the
                 // TemporalTable.
-                let old_pk = table.columns.first()
-                    .and_then(|c| c.get(row_idx).copied())
-                    .unwrap_or(0);
+                let old_pk =
+                    table.columns.first().and_then(|c| c.get(row_idx).copied()).unwrap_or(0);
                 // Build the new row values: copy the current row, then apply
                 // the assignments.
                 let mut new_row: Vec<u64> = (0..table.columns.len())
@@ -1824,9 +1852,8 @@ impl QueryEngine {
             let mut pks_to_delete: Vec<u64> = Vec::new();
             for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
                 if delete_flag {
-                    let pk = table.columns.first()
-                        .and_then(|c| c.get(row_idx).copied())
-                        .unwrap_or(0);
+                    let pk =
+                        table.columns.first().and_then(|c| c.get(row_idx).copied()).unwrap_or(0);
                     pks_to_delete.push(pk);
                 }
             }
@@ -1888,7 +1915,11 @@ impl QueryEngine {
     ///
     /// `txn_id` is threaded through so DML inside a CTE (rare but
     /// possible) still gets the right transaction marker in the WAL.
-    fn execute_with(&mut self, with: crate::sql::WithClause, txn_id: Option<u64>) -> Result<QueryResult> {
+    fn execute_with(
+        &mut self,
+        with: crate::sql::WithClause,
+        txn_id: Option<u64>,
+    ) -> Result<QueryResult> {
         let mut temp_tables: Vec<String> = Vec::new();
 
         for cte in &with.ctes {
@@ -1917,16 +1948,14 @@ impl QueryEngine {
                     // in the CTE table. For simplicity, we compare by row
                     // content (all columns must match).
                     let new_rows = compute_new_rows(
-                        &self.catalog.get(&temp_name).cloned().unwrap_or_else(|| {
-                            Table {
-                                name: temp_name.clone(),
-                                columns: vec![],
-                                column_names: vec![],
-                                row_count: 0,
-                                string_columns: vec![],
-            null_bitmaps: vec![],
-            schema: None,
-                            }
+                        &self.catalog.get(&temp_name).cloned().unwrap_or_else(|| Table {
+                            name: temp_name.clone(),
+                            columns: vec![],
+                            column_names: vec![],
+                            row_count: 0,
+                            string_columns: vec![],
+                            null_bitmaps: vec![],
+                            schema: None,
                         }),
                         &rec_result,
                     );
@@ -2069,17 +2098,19 @@ fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bool>> {
 
     // Tokenize the WHERE clause so string literals with spaces, embedded
     // operators, etc. are correctly preserved as single tokens.
-    let tokens = crate::sql::lexer::tokenize(where_str)
-        .map_err(Error::Parse)?;
+    let tokens = crate::sql::lexer::tokenize(where_str).map_err(Error::Parse)?;
     // Drop trailing EOF (and any leading WHERE keyword, in case the caller
     // passed the full predicate including `WHERE`).
-    let tokens: Vec<crate::sql::lexer::Token> = tokens.into_iter()
-        .filter(|t| !matches!(t, crate::sql::lexer::Token::EOF))
-        .collect();
-    let tokens: Vec<crate::sql::lexer::Token> = if tokens.first().and_then(|t| match t {
-        crate::sql::lexer::Token::Keyword(k) if k.eq_ignore_ascii_case("WHERE") => Some(()),
-        _ => None,
-    }).is_some() {
+    let tokens: Vec<crate::sql::lexer::Token> =
+        tokens.into_iter().filter(|t| !matches!(t, crate::sql::lexer::Token::EOF)).collect();
+    let tokens: Vec<crate::sql::lexer::Token> = if tokens
+        .first()
+        .and_then(|t| match t {
+            crate::sql::lexer::Token::Keyword(k) if k.eq_ignore_ascii_case("WHERE") => Some(()),
+            _ => None,
+        })
+        .is_some()
+    {
         tokens[1..].to_vec()
     } else {
         tokens
@@ -2131,25 +2162,27 @@ fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bool>> {
         let col_name = match &tokens[i] {
             crate::sql::lexer::Token::Ident(s) => s.clone(),
             crate::sql::lexer::Token::Keyword(k) => k.clone(), // tolerate keyword-as-identifier
-            other => return Err(Error::Other(format!(
-                "expected column name in WHERE clause, got {:?}", other
-            ))),
+            other => {
+                return Err(Error::Other(format!(
+                    "expected column name in WHERE clause, got {:?}",
+                    other
+                )))
+            }
         };
         if i + 2 >= tokens.len() {
-            return Err(Error::Other(format!(
-                "incomplete WHERE predicate near '{col_name}'"
-            )));
+            return Err(Error::Other(format!("incomplete WHERE predicate near '{col_name}'")));
         }
         let op = match &tokens[i + 1] {
             crate::sql::lexer::Token::Op(s) => s.clone(),
-            other => return Err(Error::Other(format!(
-                "expected comparison operator after '{col_name}', got {:?}", other
-            ))),
+            other => {
+                return Err(Error::Other(format!(
+                    "expected comparison operator after '{col_name}', got {:?}",
+                    other
+                )))
+            }
         };
         if !matches!(op.as_str(), "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=") {
-            return Err(Error::Other(format!(
-                "unsupported WHERE operator '{op}' in DML WHERE"
-            )));
+            return Err(Error::Other(format!("unsupported WHERE operator '{op}' in DML WHERE")));
         }
 
         let col_idx = table
@@ -2164,8 +2197,8 @@ fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bool>> {
                 // Quoted string. If the column has a string sidecar, we
                 // keep the original text for direct comparison; otherwise
                 // we hash it (matching parse_value_cell behaviour).
-                let has_string_sidecar = col_idx < table.string_columns.len()
-                    && table.string_columns[col_idx].is_some();
+                let has_string_sidecar =
+                    col_idx < table.string_columns.len() && table.string_columns[col_idx].is_some();
                 if has_string_sidecar {
                     (0u64, Some(s.clone()))
                 } else {
@@ -2187,9 +2220,12 @@ fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bool>> {
                 // expression evaluator path.
                 (0u64, None)
             }
-            other => return Err(Error::Other(format!(
-                "expected literal value in WHERE clause, got {:?}", other
-            ))),
+            other => {
+                return Err(Error::Other(format!(
+                    "expected literal value in WHERE clause, got {:?}",
+                    other
+                )))
+            }
         };
 
         predicates.push(Pred {
@@ -2216,18 +2252,20 @@ fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bool>> {
         if let Some(ref s) = p.raw_string {
             if col_idx < table.string_columns.len() {
                 if let Some(ref sc) = table.string_columns[col_idx] {
-                    let mask: Vec<bool> = (0..n).map(|i| {
-                        let cell_str = sc.get(i);
-                        match p.op.as_str() {
-                            "=" => cell_str == s.as_str(),
-                            "!=" => cell_str != s.as_str(),
-                            "<" => cell_str < s.as_str(),
-                            ">" => cell_str > s.as_str(),
-                            "<=" => cell_str <= s.as_str(),
-                            ">=" => cell_str >= s.as_str(),
-                            _ => false,
-                        }
-                    }).collect();
+                    let mask: Vec<bool> = (0..n)
+                        .map(|i| {
+                            let cell_str = sc.get(i);
+                            match p.op.as_str() {
+                                "=" => cell_str == s.as_str(),
+                                "!=" => cell_str != s.as_str(),
+                                "<" => cell_str < s.as_str(),
+                                ">" => cell_str > s.as_str(),
+                                "<=" => cell_str <= s.as_str(),
+                                ">=" => cell_str >= s.as_str(),
+                                _ => false,
+                            }
+                        })
+                        .collect();
                     per_pred_masks.push(mask);
                     continue;
                 }
@@ -2273,11 +2311,8 @@ fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bool>> {
 /// Convert a QueryResult into a Table that can be registered in the catalog.
 fn result_to_table(name: &str, result: &QueryResult) -> Table {
     let column_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
-    let columns: Vec<std::sync::Arc<Vec<u64>>> = result
-        .columns
-        .iter()
-        .map(|c| std::sync::Arc::new(c.values.clone()))
-        .collect();
+    let columns: Vec<std::sync::Arc<Vec<u64>>> =
+        result.columns.iter().map(|c| std::sync::Arc::new(c.values.clone())).collect();
     let string_columns: Vec<Option<std::sync::Arc<crate::exec::fm_index::StringSearchColumn>>> =
         vec![None; result.columns.len()];
     Table {
@@ -2287,7 +2322,7 @@ fn result_to_table(name: &str, result: &QueryResult) -> Table {
         row_count: result.row_count,
         string_columns,
         null_bitmaps: vec![],
-            schema: None,
+        schema: None,
     }
 }
 
@@ -2307,7 +2342,8 @@ fn compute_new_rows(table: &Table, result: &QueryResult) -> usize {
             let mut matches = true;
             for col_idx in 0..ncols {
                 let r_val = result.columns[col_idx].values.get(r_row).copied().unwrap_or(0);
-                let t_val = table.columns.get(col_idx).and_then(|c| c.get(t_row)).copied().unwrap_or(0);
+                let t_val =
+                    table.columns.get(col_idx).and_then(|c| c.get(t_row)).copied().unwrap_or(0);
                 if r_val != t_val {
                     matches = false;
                     break;
@@ -2355,8 +2391,20 @@ mod tests {
         DataSourceTable::from_loaded(LoadedTable {
             name: "t".into(),
             columns: vec![
-                LoadedColumn { name: "id".into(), cells: ids, row_count: n, string_search: None, null_bitmap: None },
-                LoadedColumn { name: "x".into(), cells: xs, row_count: n, string_search: None, null_bitmap: None },
+                LoadedColumn {
+                    name: "id".into(),
+                    cells: ids,
+                    row_count: n,
+                    string_search: None,
+                    null_bitmap: None,
+                },
+                LoadedColumn {
+                    name: "x".into(),
+                    cells: xs,
+                    row_count: n,
+                    string_search: None,
+                    null_bitmap: None,
+                },
             ],
             row_count: n,
         })
@@ -2367,7 +2415,13 @@ mod tests {
         let n = values.len();
         DataSourceTable::from_loaded(LoadedTable {
             name: "ft".into(),
-            columns: vec![LoadedColumn { name: "v".into(), cells: values.to_vec(), row_count: n, string_search: None, null_bitmap: None }],
+            columns: vec![LoadedColumn {
+                name: "v".into(),
+                cells: values.to_vec(),
+                row_count: n,
+                string_search: None,
+                null_bitmap: None,
+            }],
             row_count: n,
         })
     }
@@ -2401,8 +2455,17 @@ mod tests {
                 LoadedColumn {
                     name: "id".into(),
                     cells: (0..1000).map(|i| i as u64).collect(),
-                    row_count: 1000, string_search: None, null_bitmap: None },
-                LoadedColumn { name: "x".into(), cells: xs, row_count: 1000, string_search: None, null_bitmap: None },
+                    row_count: 1000,
+                    string_search: None,
+                    null_bitmap: None,
+                },
+                LoadedColumn {
+                    name: "x".into(),
+                    cells: xs,
+                    row_count: 1000,
+                    string_search: None,
+                    null_bitmap: None,
+                },
             ],
             row_count: 1000,
         });
@@ -2575,12 +2638,8 @@ mod tests {
         // The __dummy__ table is always present.
         assert_eq!(engine.catalog().len(), 1);
         // But no user tables.
-        let names: Vec<&str> = engine
-            .catalog()
-            .table_names()
-            .into_iter()
-            .filter(|n| *n != "__dummy__")
-            .collect();
+        let names: Vec<&str> =
+            engine.catalog().table_names().into_iter().filter(|n| *n != "__dummy__").collect();
         assert!(names.is_empty());
     }
 
@@ -2793,7 +2852,12 @@ fn parse_merge(sql: &str) -> Option<crate::exec::merge::Merge> {
                     after_group
                 };
                 // Skip the alias identifier.
-                let after_alias = after_as.split_whitespace().next().map(|n| &after_as[n.len()..]).unwrap_or(after_as).trim_start();
+                let after_alias = after_as
+                    .split_whitespace()
+                    .next()
+                    .map(|n| &after_as[n.len()..])
+                    .unwrap_or(after_as)
+                    .trim_start();
                 if after_alias.starts_with('(') {
                     if let Some(close2) = after_alias.find(')') {
                         source_col_names = after_alias[1..close2]
@@ -2876,10 +2940,8 @@ fn parse_merge(sql: &str) -> Option<crate::exec::merge::Merge> {
         // Parse `(col1, col2) VALUES (val1, val2)` — best-effort.
         if let Some(open) = ins_str.find('(') {
             if let Some(close) = ins_str.find(')') {
-                let cols: Vec<String> = ins_str[open + 1..close]
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect();
+                let cols: Vec<String> =
+                    ins_str[open + 1..close].split(',').map(|s| s.trim().to_string()).collect();
                 if let Some(vals_pos) = ins_str[close..].to_lowercase().find("values") {
                     let vals_str = &ins_str[close + vals_pos + "values".len()..];
                     if let Some(v_open) = vals_str.find('(') {
@@ -2901,13 +2963,18 @@ fn parse_merge(sql: &str) -> Option<crate::exec::merge::Merge> {
     // value of the join column (stringified). The merge module uses
     // source_rows[i].0 as the join key to match against target.col_values.
     if !source_col_names.is_empty() && !join_source_col.is_empty() {
-        if let Some(src_idx) = source_col_names.iter().position(|c| c.eq_ignore_ascii_case(&join_source_col)) {
+        if let Some(src_idx) =
+            source_col_names.iter().position(|c| c.eq_ignore_ascii_case(&join_source_col))
+        {
             // Each source_row tuple's first element becomes the join key.
             // The Vec<String> carries the full row values in source_col_names order.
-            source_rows = source_rows.into_iter().map(|(_old_key, mut vals)| {
-                let key = vals.get(src_idx).cloned().unwrap_or_default();
-                (key, vals)
-            }).collect();
+            source_rows = source_rows
+                .into_iter()
+                .map(|(_old_key, mut vals)| {
+                    let key = vals.get(src_idx).cloned().unwrap_or_default();
+                    (key, vals)
+                })
+                .collect();
         }
     }
 
@@ -2933,9 +3000,18 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
     let mut cur = String::new();
     for c in s.chars() {
         match c {
-            '\'' => { in_str = !in_str; cur.push(c); }
-            '(' if !in_str => { depth += 1; cur.push(c); }
-            ')' if !in_str => { depth -= 1; cur.push(c); }
+            '\'' => {
+                in_str = !in_str;
+                cur.push(c);
+            }
+            '(' if !in_str => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' if !in_str => {
+                depth -= 1;
+                cur.push(c);
+            }
             ',' if depth == 0 && !in_str => {
                 out.push(cur.clone());
                 cur.clear();
@@ -2988,10 +3064,8 @@ fn parse_values_tuples(s: &str) -> Vec<(String, Vec<String>)> {
         }
     }
     for t in &tuples {
-        let vals: Vec<String> = split_top_level_commas(t)
-            .into_iter()
-            .map(|v| v.trim().to_string())
-            .collect();
+        let vals: Vec<String> =
+            split_top_level_commas(t).into_iter().map(|v| v.trim().to_string()).collect();
         if !vals.is_empty() {
             let first = vals[0].clone();
             out.push((first, vals));
@@ -3011,7 +3085,9 @@ impl QueryEngine {
     fn materialize_views_in_sql(&mut self, sql: &str) -> String {
         let lower = sql.to_lowercase();
         // Collect view names that appear in the SQL before mutating self.
-        let view_names: Vec<String> = self.views.names()
+        let view_names: Vec<String> = self
+            .views
+            .names()
             .into_iter()
             .map(|s| s.to_string())
             .filter(|view_name| {
@@ -3022,10 +3098,9 @@ impl QueryEngine {
         // Now materialize each view. We collect (name, select_sql) pairs
         // first to release the immutable borrow on self.views before we
         // call self.execute_inner (which needs &mut self).
-        let view_specs: Vec<(String, String)> = view_names.into_iter()
-            .filter_map(|name| {
-                self.views.get(&name).map(|v| (name, v.select_sql.clone()))
-            })
+        let view_specs: Vec<(String, String)> = view_names
+            .into_iter()
+            .filter_map(|name| self.views.get(&name).map(|v| (name, v.select_sql.clone())))
             .collect();
         for (view_name, select_sql) in view_specs {
             if let Ok(result) = self.execute_inner(&select_sql, &Instant::now(), None) {
@@ -3047,7 +3122,9 @@ impl QueryEngine {
     ) -> Result<QueryResult> {
         let target_name = merge.target.clone();
         // Load the target table into a QueryResult.
-        let table = self.catalog.get(&target_name)
+        let table = self
+            .catalog
+            .get(&target_name)
             .ok_or_else(|| Error::NotFound(format!("MERGE target table \"{target_name}\"")))?
             .clone();
         let mut qr = table_to_query_result(&table);
@@ -3068,27 +3145,25 @@ impl QueryEngine {
 /// Convert a `Table` into a `QueryResult` so `execute_merge` can operate
 /// on it.
 fn table_to_query_result(table: &Table) -> QueryResult {
-    let columns: Vec<ResultColumn> = table.column_names.iter().enumerate().map(|(i, name)| {
-        ResultColumn {
+    let columns: Vec<ResultColumn> = table
+        .column_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| ResultColumn {
             name: name.clone(),
             values: table.columns[i].to_vec(),
             string_values: None,
             type_oid: 0,
             null_mask: None,
-        }
-    }).collect();
-    QueryResult {
-        columns,
-        row_count: table.row_count,
-        elapsed_us: 0,
-    }
+        })
+        .collect();
+    QueryResult { columns, row_count: table.row_count, elapsed_us: 0 }
 }
 
 /// Convert a `QueryResult` back into a `Table` (round-trip after merge).
 fn query_result_to_table(name: &str, qr: &QueryResult) -> Table {
-    let columns: Vec<std::sync::Arc<Vec<u64>>> = qr.columns.iter()
-        .map(|c| std::sync::Arc::new(c.values.clone()))
-        .collect();
+    let columns: Vec<std::sync::Arc<Vec<u64>>> =
+        qr.columns.iter().map(|c| std::sync::Arc::new(c.values.clone())).collect();
     let column_names: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
     Table {
         name: name.to_string(),
@@ -3153,11 +3228,8 @@ fn extract_temporal_table_name(sql: &str) -> Option<String> {
     let after_sv = &lower[sv_pos + "system_versioning".len()..];
     let after_sv_trimmed = after_sv.trim_start();
     // Optional '='.
-    let after_eq = if after_sv_trimmed.starts_with('=') {
-        &after_sv_trimmed[1..]
-    } else {
-        after_sv_trimmed
-    };
+    let after_eq =
+        if after_sv_trimmed.starts_with('=') { &after_sv_trimmed[1..] } else { after_sv_trimmed };
     let after_eq_trimmed = after_eq.trim_start();
     if !after_eq_trimmed.starts_with("on") {
         return None;
@@ -3182,31 +3254,38 @@ fn extract_temporal_table_name(sql: &str) -> Option<String> {
 }
 
 /// Convert temporal-table rows (Vec<Vec<u64>>) into a QueryResult.
-fn rows_to_query_result(rows: &[Vec<u64>], column_names: &[String], start: &Instant) -> QueryResult {
+fn rows_to_query_result(
+    rows: &[Vec<u64>],
+    column_names: &[String],
+    start: &Instant,
+) -> QueryResult {
     let row_count = rows.len();
     let n_cols = column_names.len();
-    let columns: Vec<ResultColumn> = (0..n_cols).map(|i| {
-        let values: Vec<u64> = rows.iter().map(|r| r.get(i).copied().unwrap_or(0)).collect();
-        ResultColumn {
-            name: column_names[i].clone(),
-            values,
-            string_values: None,
-            type_oid: 0,
-            null_mask: None,
-        }
-    }).collect();
-    QueryResult {
-        columns,
-        row_count,
-        elapsed_us: start.elapsed().as_micros() as u64,
-    }
+    let columns: Vec<ResultColumn> = (0..n_cols)
+        .map(|i| {
+            let values: Vec<u64> = rows.iter().map(|r| r.get(i).copied().unwrap_or(0)).collect();
+            ResultColumn {
+                name: column_names[i].clone(),
+                values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            }
+        })
+        .collect();
+    QueryResult { columns, row_count, elapsed_us: start.elapsed().as_micros() as u64 }
 }
 
 /// Apply window functions to a QueryResult (Wave 53 wiring for
 /// exec/window.rs). Detects `SelectItem::Window` items in the query and
 /// appends a new ResultColumn for each.
-fn apply_window_functions(result: &QueryResult, query: &crate::sql::parser::SelectQuery) -> QueryResult {
-    use crate::exec::window::{parse_window_spec, row_number, rank, dense_rank, sum_over, count_over};
+fn apply_window_functions(
+    result: &QueryResult,
+    query: &crate::sql::parser::SelectQuery,
+) -> QueryResult {
+    use crate::exec::window::{
+        count_over, dense_rank, parse_window_spec, rank, row_number, sum_over,
+    };
     use crate::sql::parser::SelectItem;
 
     let mut new_cols: Vec<ResultColumn> = result.columns.clone();
@@ -3235,11 +3314,7 @@ fn apply_window_functions(result: &QueryResult, query: &crate::sql::parser::Sele
             });
         }
     }
-    QueryResult {
-        columns: new_cols,
-        row_count: result.row_count,
-        elapsed_us: result.elapsed_us,
-    }
+    QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us }
 }
 
 /// Stub for parsing PIVOT/UNPIVOT from QueryExtensions. The current
@@ -3353,12 +3428,7 @@ fn parse_pivot_clause(sql: &str) -> Option<PivotClause> {
     if agg.is_empty() || value_col.is_empty() {
         return None;
     }
-    Some(PivotClause {
-        agg,
-        value_col,
-        pivot_col,
-        pivot_values,
-    })
+    Some(PivotClause { agg, value_col, pivot_col, pivot_values })
 }
 
 /// Strip the PIVOT clause (and any trailing `AS alias`) from a SQL string,
@@ -3401,10 +3471,7 @@ fn strip_pivot_clause(sql: &str) -> String {
     if rest_trimmed_start.to_uppercase().starts_with("AS ") {
         let after_as = &rest_trimmed_start["AS ".len()..];
         // Skip the alias identifier (alphanumeric + underscore).
-        let alias_len = after_as
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .count();
+        let alias_len = after_as.chars().take_while(|c| c.is_alphanumeric() || *c == '_').count();
         let after_alias = &after_as[alias_len..];
         // Build the result: sql[..pivot_pos] + after_alias.
         return format!("{}{}", &sql[..pivot_pos], after_alias);
@@ -3478,22 +3545,27 @@ fn split_union_all(sql: &str) -> Option<(String, String)> {
 fn concatenate_results(left: QueryResult, right: QueryResult, start: &Instant) -> QueryResult {
     let total_rows = left.row_count + right.row_count;
     let n_cols = left.columns.len();
-    let mut columns: Vec<ResultColumn> = left.columns.into_iter().enumerate().map(|(i, mut c)| {
-        // Append the right result's values for this column.
-        if i < right.columns.len() {
-            c.values.extend(right.columns[i].values.iter().copied());
-            // Merge string_values if both have them.
-            if let Some(ref mut left_sv) = c.string_values {
-                if let Some(ref right_sv) = right.columns[i].string_values {
-                    left_sv.extend(right_sv.iter().cloned());
-                } else {
-                    // Right has no strings — pad with empty strings.
-                    left_sv.extend(std::iter::repeat(String::new()).take(right.row_count));
+    let mut columns: Vec<ResultColumn> = left
+        .columns
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut c)| {
+            // Append the right result's values for this column.
+            if i < right.columns.len() {
+                c.values.extend(right.columns[i].values.iter().copied());
+                // Merge string_values if both have them.
+                if let Some(ref mut left_sv) = c.string_values {
+                    if let Some(ref right_sv) = right.columns[i].string_values {
+                        left_sv.extend(right_sv.iter().cloned());
+                    } else {
+                        // Right has no strings — pad with empty strings.
+                        left_sv.extend(std::iter::repeat(String::new()).take(right.row_count));
+                    }
                 }
             }
-        }
-        c
-    }).collect();
+            c
+        })
+        .collect();
     // If right has more columns than left (shouldn't happen for a valid UNION),
     // pad with empty columns.
     while columns.len() < n_cols {
@@ -3505,11 +3577,7 @@ fn concatenate_results(left: QueryResult, right: QueryResult, start: &Instant) -
             null_mask: None,
         });
     }
-    QueryResult {
-        columns,
-        row_count: total_rows,
-        elapsed_us: start.elapsed().as_micros() as u64,
-    }
+    QueryResult { columns, row_count: total_rows, elapsed_us: start.elapsed().as_micros() as u64 }
 }
 
 // -----------------------------------------------------------------------
@@ -3527,9 +3595,8 @@ fn deduplicate_rows(result: QueryResult) -> QueryResult {
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
     let mut keep_indices: Vec<usize> = Vec::with_capacity(result.row_count);
     for row in 0..result.row_count {
-        let key: Vec<u64> = result.columns.iter()
-            .map(|c| c.values.get(row).copied().unwrap_or(0))
-            .collect();
+        let key: Vec<u64> =
+            result.columns.iter().map(|c| c.values.get(row).copied().unwrap_or(0)).collect();
         if seen.insert(key) {
             keep_indices.push(row);
         }
@@ -3538,24 +3605,27 @@ fn deduplicate_rows(result: QueryResult) -> QueryResult {
         return result; // no duplicates
     }
     let new_row_count = keep_indices.len();
-    let columns: Vec<ResultColumn> = result.columns.into_iter().map(|mut c| {
-        let new_values: Vec<u64> = keep_indices.iter().map(|&i| c.values.get(i).copied().unwrap_or(0)).collect();
-        c.values = new_values;
-        if let Some(ref mut sv) = c.string_values {
-            let new_sv: Vec<String> = keep_indices.iter().map(|&i| sv.get(i).cloned().unwrap_or_default()).collect();
-            *sv = new_sv;
-        }
-        if let Some(ref mut bm) = c.null_mask {
-            let new_bm: Vec<bool> = keep_indices.iter().map(|&i| bm.get(i).copied().unwrap_or(false)).collect();
-            *bm = new_bm;
-        }
-        c
-    }).collect();
-    QueryResult {
-        columns,
-        row_count: new_row_count,
-        elapsed_us: result.elapsed_us,
-    }
+    let columns: Vec<ResultColumn> = result
+        .columns
+        .into_iter()
+        .map(|mut c| {
+            let new_values: Vec<u64> =
+                keep_indices.iter().map(|&i| c.values.get(i).copied().unwrap_or(0)).collect();
+            c.values = new_values;
+            if let Some(ref mut sv) = c.string_values {
+                let new_sv: Vec<String> =
+                    keep_indices.iter().map(|&i| sv.get(i).cloned().unwrap_or_default()).collect();
+                *sv = new_sv;
+            }
+            if let Some(ref mut bm) = c.null_mask {
+                let new_bm: Vec<bool> =
+                    keep_indices.iter().map(|&i| bm.get(i).copied().unwrap_or(false)).collect();
+                *bm = new_bm;
+            }
+            c
+        })
+        .collect();
+    QueryResult { columns, row_count: new_row_count, elapsed_us: result.elapsed_us }
 }
 
 /// A parsed JSON_VALUE / JSON_QUERY call extracted from a SQL string.
@@ -3596,7 +3666,13 @@ fn extract_json_value_calls(sql: &str) -> Vec<JsonValueCall> {
         let jv_pos = lower[search_from..].find("json_value(").map(|p| p + search_from);
         let jq_pos = lower[search_from..].find("json_query(").map(|p| p + search_from);
         let (pos, is_query) = match (jv_pos, jq_pos) {
-            (Some(p), Some(q)) => if p <= q { (p, false) } else { (q, true) },
+            (Some(p), Some(q)) => {
+                if p <= q {
+                    (p, false)
+                } else {
+                    (q, true)
+                }
+            }
             (Some(p), None) => (p, false),
             (None, Some(q)) => (q, true),
             (None, None) => break,
@@ -3651,10 +3727,8 @@ fn extract_json_value_calls(sql: &str) -> Vec<JsonValueCall> {
         let leading_ws = rest.len() - rest_trimmed.len();
         let alias = if rest_trimmed.to_uppercase().starts_with("AS ") {
             let after_as = &rest_trimmed["AS ".len()..];
-            let alias_len = after_as
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .count();
+            let alias_len =
+                after_as.chars().take_while(|c| c.is_alphanumeric() || *c == '_').count();
             if alias_len > 0 {
                 let alias = after_as[..alias_len].to_string();
                 after += leading_ws + "AS ".len() + alias_len;
@@ -3667,11 +3741,8 @@ fn extract_json_value_calls(sql: &str) -> Vec<JsonValueCall> {
         };
         // Compute the 0-indexed position of this call in the SELECT list:
         // count top-level commas between SELECT and the call's byte position.
-        let select_position = if let Some(sp) = select_pos {
-            count_top_level_commas(&lower[sp..pos])
-        } else {
-            0
-        };
+        let select_position =
+            if let Some(sp) = select_pos { count_top_level_commas(&lower[sp..pos]) } else { 0 };
         calls.push(JsonValueCall {
             start: pos,
             end: after,
@@ -3695,7 +3766,9 @@ fn count_top_level_commas(s: &str) -> usize {
     let mut count = 0;
     for c in s.chars() {
         if in_str {
-            if c == '\'' { in_str = false; }
+            if c == '\'' {
+                in_str = false;
+            }
         } else {
             match c {
                 '\'' => in_str = true,
@@ -3794,18 +3867,25 @@ impl QueryEngine {
             if strings.is_empty() {
                 continue;
             }
-            let extracted: Vec<String> = strings.iter().map(|s| {
-                if c.is_query {
-                    crate::exec::json::json_query(s, &c.path).unwrap_or_default()
-                } else {
-                    crate::exec::json::json_value(s, &c.path).unwrap_or_default()
-                }
-            }).collect();
+            let extracted: Vec<String> = strings
+                .iter()
+                .map(|s| {
+                    if c.is_query {
+                        crate::exec::json::json_query(s, &c.path).unwrap_or_default()
+                    } else {
+                        crate::exec::json::json_value(s, &c.path).unwrap_or_default()
+                    }
+                })
+                .collect();
             // Replace the column with a new one carrying the extracted strings.
             use xxhash_rust::xxh3;
             let values: Vec<u64> = extracted.iter().map(|s| xxh3::xxh3_64(s.as_bytes())).collect();
             let final_name = c.alias.clone().unwrap_or_else(|| {
-                if c.is_query { "json_query".into() } else { "json_value".into() }
+                if c.is_query {
+                    "json_query".into()
+                } else {
+                    "json_value".into()
+                }
             });
             result.columns[col_idx] = ResultColumn {
                 name: final_name,
@@ -3860,13 +3940,25 @@ fn default_cell_for_type(col_def: &crate::sql::ColumnDef, _row_count: usize) -> 
         // Fall through to type-based default.
     }
     match col_def.col_type {
-        ColumnType::Int | ColumnType::BigInt | ColumnType::SmallInt
-        | ColumnType::TinyInt | ColumnType::Bit | ColumnType::Boolean
-        | ColumnType::Date | ColumnType::Timestamp | ColumnType::Uuid => 0,
-        ColumnType::Float | ColumnType::Real
-        | ColumnType::Decimal(_, _) | ColumnType::Numeric(_, _) => 0.0f64.to_bits(),
-        ColumnType::Varchar(_) | ColumnType::Nvarchar(_) | ColumnType::Text
-        | ColumnType::Json | ColumnType::Array(_) | ColumnType::Bytea
+        ColumnType::Int
+        | ColumnType::BigInt
+        | ColumnType::SmallInt
+        | ColumnType::TinyInt
+        | ColumnType::Bit
+        | ColumnType::Boolean
+        | ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Uuid => 0,
+        ColumnType::Float
+        | ColumnType::Real
+        | ColumnType::Decimal(_, _)
+        | ColumnType::Numeric(_, _) => 0.0f64.to_bits(),
+        ColumnType::Varchar(_)
+        | ColumnType::Nvarchar(_)
+        | ColumnType::Text
+        | ColumnType::Json
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
         | ColumnType::Enum(_) => {
             // Empty string → hash of empty bytes (consistent with INSERT
             // of '' which goes through parse_value_cell).
@@ -3918,7 +4010,8 @@ fn literal_to_cell(val: &crate::sql::parser::Value) -> Option<u64> {
             Some(xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
         }
         Value::Hex(bytes) => {
-            let v = bytes.iter().enumerate().fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i)));
+            let v =
+                bytes.iter().enumerate().fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i)));
             Some(v)
         }
     }

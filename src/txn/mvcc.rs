@@ -113,10 +113,7 @@ pub struct MvccTransaction {
 impl MvccTxnManager {
     /// Create a new MVCC transaction manager.
     pub fn new() -> Self {
-        Self {
-            commit_state: HashMap::new(),
-            active: None,
-        }
+        Self { commit_state: HashMap::new(), active: None }
     }
 
     /// Begin a new transaction. Returns the transaction ID.
@@ -124,11 +121,15 @@ impl MvccTxnManager {
     /// transactions — see Wave 69 for SAVEPOINT support).
     pub fn begin(&mut self) -> Result<u64, String> {
         if self.active.is_some() {
-            return Err("a transaction is already active (use SAVEPOINT for nested transactions)".into());
+            return Err(
+                "a transaction is already active (use SAVEPOINT for nested transactions)".into()
+            );
         }
         let id = NEXT_TXN_ID.fetch_add(1, Ordering::SeqCst);
         // Take a snapshot of the currently-committed transactions.
-        let snapshot: HashSet<u64> = self.commit_state.iter()
+        let snapshot: HashSet<u64> = self
+            .commit_state
+            .iter()
             .filter(|(_, &state)| state == TxnState::Committed)
             .map(|(&id, _)| id)
             .collect();
@@ -270,11 +271,17 @@ mod tests {
         // But if we check from autocommit's perspective (no active txn),
         // the row is still visible because txn 2 hasn't committed.
         mgr.active = None;
-        assert!(mgr.is_row_visible(&deleted_row), "autocommit must still see the row (txn 2 not committed)");
+        assert!(
+            mgr.is_row_visible(&deleted_row),
+            "autocommit must still see the row (txn 2 not committed)"
+        );
         // Txn 2 commits.
         mgr.commit_state.insert(id2, TxnState::Committed);
         // Now autocommit sees the row as deleted.
-        assert!(!mgr.is_row_visible(&deleted_row), "after txn 2 commits, the deleted row must be invisible");
+        assert!(
+            !mgr.is_row_visible(&deleted_row),
+            "after txn 2 commits, the deleted row must be invisible"
+        );
     }
 
     #[test]

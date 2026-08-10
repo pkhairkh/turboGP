@@ -12,8 +12,8 @@ use crate::engine::result::{QueryResult, ResultColumn};
 use crate::exec::fm_index::StringSearchColumn;
 use crate::sql::lexer::{tokenize, Token};
 use crate::Error;
-use rayon::prelude::*;
 use fxhash::{FxHashMap, FxHashSet};
+use rayon::prelude::*;
 
 // Use ahash (hardware AES) instead of std SipHash for all HashMap/HashSet.
 // Perf showed 28% of Q21 time was in SipHash + hashbrown operations.
@@ -71,7 +71,6 @@ fn swap_op(op: BinOp2) -> BinOp2 {
     }
 }
 
-
 pub fn tpch_col_types(table_name: &str) -> Vec<ColType> {
     tpch_schema(table_name)
         .unwrap_or_default()
@@ -96,19 +95,60 @@ pub enum Expr2 {
     Float(f64),
     Str(String),
     Date(i32),
-    BinOp { op: BinOp2, left: Box<Expr2>, right: Box<Expr2> },
-    Like { expr: Box<Expr2>, pattern: Box<Expr2>, negated: bool },
-    Between { expr: Box<Expr2>, low: Box<Expr2>, high: Box<Expr2>, negated: bool },
-    InList { expr: Box<Expr2>, list: Vec<Expr2>, negated: bool },
-    InSubquery { expr: Box<Expr2>, query: Box<SelectQuery2>, negated: bool },
-    Exists { query: Box<SelectQuery2>, negated: bool },
-    Case { whens: Vec<(Expr2, Expr2)>, else_: Option<Box<Expr2>> },
-    Extract { field: String, expr: Box<Expr2> },
+    BinOp {
+        op: BinOp2,
+        left: Box<Expr2>,
+        right: Box<Expr2>,
+    },
+    Like {
+        expr: Box<Expr2>,
+        pattern: Box<Expr2>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<Expr2>,
+        low: Box<Expr2>,
+        high: Box<Expr2>,
+        negated: bool,
+    },
+    InList {
+        expr: Box<Expr2>,
+        list: Vec<Expr2>,
+        negated: bool,
+    },
+    InSubquery {
+        expr: Box<Expr2>,
+        query: Box<SelectQuery2>,
+        negated: bool,
+    },
+    Exists {
+        query: Box<SelectQuery2>,
+        negated: bool,
+    },
+    Case {
+        whens: Vec<(Expr2, Expr2)>,
+        else_: Option<Box<Expr2>>,
+    },
+    Extract {
+        field: String,
+        expr: Box<Expr2>,
+    },
     /// `CAST(expr AS target_type)` (Wave 67). The target_type is an
     /// uppercased string ("INT", "FLOAT", "VARCHAR", "BIGINT").
-    Cast { expr: Box<Expr2>, target_type: String },
-    Substr { expr: Box<Expr2>, start: Box<Expr2>, len: Box<Expr2> },
-    Agg { func: AggFunc, arg: Box<Expr2>, distinct: bool },
+    Cast {
+        expr: Box<Expr2>,
+        target_type: String,
+    },
+    Substr {
+        expr: Box<Expr2>,
+        start: Box<Expr2>,
+        len: Box<Expr2>,
+    },
+    Agg {
+        func: AggFunc,
+        arg: Box<Expr2>,
+        distinct: bool,
+    },
     CountStar,
     Subquery(Box<SelectQuery2>),
     Not(Box<Expr2>),
@@ -116,13 +156,36 @@ pub enum Expr2 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinOp2 { Add, Sub, Mul, Div, Eq, Ne, Lt, Gt, Le, Ge, And, Or }
+pub enum BinOp2 {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AggFunc { Sum, Avg, Count, Min, Max, CountDistinct }
+pub enum AggFunc {
+    Sum,
+    Avg,
+    Count,
+    Min,
+    Max,
+    CountDistinct,
+}
 
 #[derive(Debug, Clone)]
-pub struct TableRef { pub name: String, pub alias: Option<String> }
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub enum FromItem {
@@ -131,13 +194,23 @@ pub enum FromItem {
 }
 
 #[derive(Debug, Clone)]
-pub struct JoinClause2 { pub join_type: JoinType2, pub table: FromItem, pub on: Expr2 }
+pub struct JoinClause2 {
+    pub join_type: JoinType2,
+    pub table: FromItem,
+    pub on: Expr2,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinType2 { Inner, Left }
+pub enum JoinType2 {
+    Inner,
+    Left,
+}
 
 #[derive(Debug, Clone)]
-pub struct SelectItem2 { pub expr: Expr2, pub alias: Option<String> }
+pub struct SelectItem2 {
+    pub expr: Expr2,
+    pub alias: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct SelectQuery2 {
@@ -165,63 +238,138 @@ pub fn parse_tpch(sql: &str) -> Result<SelectQuery2, String> {
     }
 }
 
-struct TpchParser { tokens: Vec<Token>, pos: usize }
+struct TpchParser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
 
 impl TpchParser {
-    fn peek(&self) -> &Token { &self.tokens[self.pos] }
-    fn peek_at(&self, n: usize) -> &Token { self.tokens.get(self.pos + n).unwrap_or(&Token::EOF) }
+    fn peek(&self) -> &Token {
+        &self.tokens[self.pos]
+    }
+    fn peek_at(&self, n: usize) -> &Token {
+        self.tokens.get(self.pos + n).unwrap_or(&Token::EOF)
+    }
     fn next(&mut self) -> Token {
         let t = self.tokens.get(self.pos).cloned().unwrap_or(Token::EOF);
-        if !matches!(t, Token::EOF) { self.pos += 1; }
+        if !matches!(t, Token::EOF) {
+            self.pos += 1;
+        }
         t
     }
     fn match_kw(&mut self, kw: &str) -> bool {
-        if let Token::Keyword(k) = self.peek() { if k == kw { self.pos += 1; return true; } }
+        if let Token::Keyword(k) = self.peek() {
+            if k == kw {
+                self.pos += 1;
+                return true;
+            }
+        }
         false
     }
     fn match_ident_or_kw(&mut self, name: &str) -> bool {
         match self.peek() {
-            Token::Ident(s) if s.eq_ignore_ascii_case(name) => { self.pos += 1; true }
-            Token::Keyword(k) if k.eq_ignore_ascii_case(name) => { self.pos += 1; true }
+            Token::Ident(s) if s.eq_ignore_ascii_case(name) => {
+                self.pos += 1;
+                true
+            }
+            Token::Keyword(k) if k.eq_ignore_ascii_case(name) => {
+                self.pos += 1;
+                true
+            }
             _ => false,
         }
     }
     fn expect_kw(&mut self, kw: &str) -> Result<(), String> {
-        if self.match_kw(kw) { return Ok(()); }
+        if self.match_kw(kw) {
+            return Ok(());
+        }
         Err(format!("expected keyword {kw}, got {:?}", self.peek()))
     }
     fn match_op(&mut self, op: &str) -> bool {
-        if let Token::Op(o) = self.peek() { if o == op { self.pos += 1; return true; } }
+        if let Token::Op(o) = self.peek() {
+            if o == op {
+                self.pos += 1;
+                return true;
+            }
+        }
         false
     }
     fn is_op(&self, ops: &[&str]) -> bool {
-        if let Token::Op(o) = self.peek() { ops.contains(&o.as_str()) } else { false }
+        if let Token::Op(o) = self.peek() {
+            ops.contains(&o.as_str())
+        } else {
+            false
+        }
     }
     fn match_lp(&mut self) -> bool {
-        if matches!(self.peek(), Token::LParen) { self.pos += 1; true } else { false }
+        if matches!(self.peek(), Token::LParen) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
     }
     fn expect_lp(&mut self) -> Result<(), String> {
-        if self.match_lp() { Ok(()) } else { Err(format!("expected '(', got {:?}", self.peek())) }
+        if self.match_lp() {
+            Ok(())
+        } else {
+            Err(format!("expected '(', got {:?}", self.peek()))
+        }
     }
     fn expect_rp(&mut self) -> Result<(), String> {
-        if matches!(self.peek(), Token::RParen) { self.pos += 1; Ok(()) }
-        else { Err(format!("expected ')', got {:?}", self.peek())) }
+        if matches!(self.peek(), Token::RParen) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(format!("expected ')', got {:?}", self.peek()))
+        }
     }
     fn match_comma(&mut self) -> bool {
-        if matches!(self.peek(), Token::Comma) { self.pos += 1; true } else { false }
+        if matches!(self.peek(), Token::Comma) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
     }
     fn is_clause_boundary(&self) -> bool {
         if let Token::Keyword(k) = self.peek() {
-            matches!(k.as_str(), "FROM" | "WHERE" | "GROUP" | "ORDER" | "HAVING" | "LIMIT"
-                | "AND" | "OR" | "JOIN" | "LEFT" | "INNER" | "ON" | "AS" | "WHEN" | "THEN"
-                | "ELSE" | "END" | "BY")
-        } else { matches!(self.peek(), Token::Comma | Token::EOF | Token::RParen | Token::Semicolon) }
+            matches!(
+                k.as_str(),
+                "FROM"
+                    | "WHERE"
+                    | "GROUP"
+                    | "ORDER"
+                    | "HAVING"
+                    | "LIMIT"
+                    | "AND"
+                    | "OR"
+                    | "JOIN"
+                    | "LEFT"
+                    | "INNER"
+                    | "ON"
+                    | "AS"
+                    | "WHEN"
+                    | "THEN"
+                    | "ELSE"
+                    | "END"
+                    | "BY"
+            )
+        } else {
+            matches!(self.peek(), Token::Comma | Token::EOF | Token::RParen | Token::Semicolon)
+        }
     }
 
     fn parse_ident_name(&mut self) -> Result<String, String> {
         match self.peek().clone() {
-            Token::Ident(s) => { self.next(); Ok(s) }
-            Token::Keyword(k) => { self.next(); Ok(k.to_lowercase()) }
+            Token::Ident(s) => {
+                self.next();
+                Ok(s)
+            }
+            Token::Keyword(k) => {
+                self.next();
+                Ok(k.to_lowercase())
+            }
             other => Err(format!("expected identifier, got {other:?}")),
         }
     }
@@ -255,19 +403,25 @@ impl TpchParser {
                 self.expect_kw("ON")?;
                 let on = self.parse_expr()?;
                 joins.push(JoinClause2 { join_type: JoinType2::Inner, table, on });
-            } else { break; }
+            } else {
+                break;
+            }
         }
 
         let where_clause = if self.match_kw("WHERE") { Some(self.parse_expr()?) } else { None };
         let group_by = if self.match_kw("GROUP") {
             self.expect_kw("BY")?;
             self.parse_expr_list()?
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
         let having = if self.match_kw("HAVING") { Some(self.parse_expr()?) } else { None };
         let order_by = if self.match_kw("ORDER") {
             self.expect_kw("BY")?;
             self.parse_order_list()?
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
         let limit = if self.match_ident_or_kw("LIMIT") { Some(self.parse_usize()?) } else { None };
 
         Ok(SelectQuery2 { select, from, joins, where_clause, group_by, having, order_by, limit })
@@ -282,7 +436,9 @@ impl TpchParser {
                 if op == "*" {
                     self.next();
                     items.push(SelectItem2 { expr: Expr2::Int(1), alias: None });
-                    if !self.match_comma() { break; }
+                    if !self.match_comma() {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -290,11 +446,18 @@ impl TpchParser {
             let alias = if self.match_kw("AS") {
                 Some(self.parse_ident_name()?)
             } else if let Token::Ident(_) = self.peek() {
-                if self.is_clause_boundary() { None }
-                else { Some(self.parse_ident_name()?) }
-            } else { None };
+                if self.is_clause_boundary() {
+                    None
+                } else {
+                    Some(self.parse_ident_name()?)
+                }
+            } else {
+                None
+            };
             items.push(SelectItem2 { expr, alias });
-            if !self.match_comma() { break; }
+            if !self.match_comma() {
+                break;
+            }
         }
         Ok(items)
     }
@@ -303,7 +466,9 @@ impl TpchParser {
         let mut items = Vec::new();
         loop {
             items.push(self.parse_from_item()?);
-            if !self.match_comma() { break; }
+            if !self.match_comma() {
+                break;
+            }
         }
         Ok(items)
     }
@@ -316,29 +481,44 @@ impl TpchParser {
                 if k == "SELECT" {
                     let sub = self.parse_select()?;
                     self.expect_rp()?;
-                    let alias = if self.match_kw("AS") { Some(self.parse_ident_name()?) }
-                        else if let Token::Ident(_) = self.peek() { Some(self.parse_ident_name()?) }
-                        else { None };
+                    let alias = if self.match_kw("AS") {
+                        Some(self.parse_ident_name()?)
+                    } else if let Token::Ident(_) = self.peek() {
+                        Some(self.parse_ident_name()?)
+                    } else {
+                        None
+                    };
                     return Ok(FromItem::Derived(Box::new(sub), alias));
                 }
             }
             self.pos = save;
         }
         let name = self.parse_ident_name()?;
-        let alias = if self.match_kw("AS") { Some(self.parse_ident_name()?) }
-            else if let Token::Ident(_) = self.peek() {
-                if self.is_clause_boundary() { None }
-                else { Some(self.parse_ident_name()?) }
-            } else { None };
+        let alias = if self.match_kw("AS") {
+            Some(self.parse_ident_name()?)
+        } else if let Token::Ident(_) = self.peek() {
+            if self.is_clause_boundary() {
+                None
+            } else {
+                Some(self.parse_ident_name()?)
+            }
+        } else {
+            None
+        };
         Ok(FromItem::Table(TableRef { name, alias }))
     }
 
     fn parse_expr_list(&mut self) -> Result<Vec<Expr2>, String> {
         let mut items = Vec::new();
         loop {
-            if let Token::Int(_) = self.peek() { self.next(); }
-            else { items.push(self.parse_expr()?); }
-            if !self.match_comma() { break; }
+            if let Token::Int(_) = self.peek() {
+                self.next();
+            } else {
+                items.push(self.parse_expr()?);
+            }
+            if !self.match_comma() {
+                break;
+            }
         }
         Ok(items)
     }
@@ -347,17 +527,25 @@ impl TpchParser {
         let mut items = Vec::new();
         loop {
             let expr = self.parse_expr()?;
-            let asc = if self.match_ident_or_kw("DESC") { false }
-                else { let _ = self.match_ident_or_kw("ASC"); true };
+            let asc = if self.match_ident_or_kw("DESC") {
+                false
+            } else {
+                let _ = self.match_ident_or_kw("ASC");
+                true
+            };
             items.push((expr, asc));
-            if !self.match_comma() { break; }
+            if !self.match_comma() {
+                break;
+            }
         }
         Ok(items)
     }
 
     fn parse_usize(&mut self) -> Result<usize, String> {
         if let Token::Int(i) = self.peek() {
-            if *i < 0 { return Err(format!("expected non-negative, got {i}")); }
+            if *i < 0 {
+                return Err(format!("expected non-negative, got {i}"));
+            }
             let u = *i as usize;
             self.next();
             return Ok(u);
@@ -367,7 +555,9 @@ impl TpchParser {
 
     // --- Expressions ---
 
-    fn parse_expr(&mut self) -> Result<Expr2, String> { self.parse_or() }
+    fn parse_expr(&mut self) -> Result<Expr2, String> {
+        self.parse_or()
+    }
 
     fn parse_or(&mut self) -> Result<Expr2, String> {
         let mut left = self.parse_and()?;
@@ -415,8 +605,12 @@ impl TpchParser {
             self.next();
             let right = self.parse_additive()?;
             let op = match op_str.as_str() {
-                "=" => BinOp2::Eq, "!=" | "<>" => BinOp2::Ne,
-                "<" => BinOp2::Lt, ">" => BinOp2::Gt, "<=" => BinOp2::Le, ">=" => BinOp2::Ge,
+                "=" => BinOp2::Eq,
+                "!=" | "<>" => BinOp2::Ne,
+                "<" => BinOp2::Lt,
+                ">" => BinOp2::Gt,
+                "<=" => BinOp2::Le,
+                ">=" => BinOp2::Ge,
                 _ => unreachable!(),
             };
             return Ok(Expr2::BinOp { op, left: Box::new(left), right: Box::new(right) });
@@ -424,20 +618,36 @@ impl TpchParser {
 
         if self.match_ident_or_kw("LIKE") {
             let pattern = self.parse_additive()?;
-            return Ok(Expr2::Like { expr: Box::new(left), pattern: Box::new(pattern), negated: false });
+            return Ok(Expr2::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                negated: false,
+            });
         }
         if self.match_kw("NOT") {
             if self.match_ident_or_kw("LIKE") {
                 let pattern = self.parse_additive()?;
-                return Ok(Expr2::Like { expr: Box::new(left), pattern: Box::new(pattern), negated: true });
+                return Ok(Expr2::Like {
+                    expr: Box::new(left),
+                    pattern: Box::new(pattern),
+                    negated: true,
+                });
             }
-            if self.match_ident_or_kw("IN") { return self.parse_in_rest(left, true); }
-            if self.match_ident_or_kw("BETWEEN") { return self.parse_between_rest(left, true); }
+            if self.match_ident_or_kw("IN") {
+                return self.parse_in_rest(left, true);
+            }
+            if self.match_ident_or_kw("BETWEEN") {
+                return self.parse_between_rest(left, true);
+            }
             self.pos -= 1;
             return Ok(left);
         }
-        if self.match_ident_or_kw("IN") { return self.parse_in_rest(left, false); }
-        if self.match_ident_or_kw("BETWEEN") { return self.parse_between_rest(left, false); }
+        if self.match_ident_or_kw("IN") {
+            return self.parse_in_rest(left, false);
+        }
+        if self.match_ident_or_kw("BETWEEN") {
+            return self.parse_between_rest(left, false);
+        }
         Ok(left)
     }
 
@@ -447,13 +657,19 @@ impl TpchParser {
             if k == "SELECT" {
                 let sub = self.parse_select()?;
                 self.expect_rp()?;
-                return Ok(Expr2::InSubquery { expr: Box::new(left), query: Box::new(sub), negated });
+                return Ok(Expr2::InSubquery {
+                    expr: Box::new(left),
+                    query: Box::new(sub),
+                    negated,
+                });
             }
         }
         let mut list = Vec::new();
         loop {
             list.push(self.parse_expr()?);
-            if !self.match_comma() { break; }
+            if !self.match_comma() {
+                break;
+            }
         }
         self.expect_rp()?;
         Ok(Expr2::InList { expr: Box::new(left), list, negated })
@@ -463,19 +679,27 @@ impl TpchParser {
         let low = self.parse_additive()?;
         self.expect_kw("AND")?;
         let high = self.parse_additive()?;
-        Ok(Expr2::Between { expr: Box::new(left), low: Box::new(low), high: Box::new(high), negated })
+        Ok(Expr2::Between {
+            expr: Box::new(left),
+            low: Box::new(low),
+            high: Box::new(high),
+            negated,
+        })
     }
 
     fn parse_additive(&mut self) -> Result<Expr2, String> {
         let mut left = self.parse_multiplicative()?;
         loop {
             if self.is_op(&["+", "-"]) {
-                let op_str = if let Token::Op(o) = self.peek() { o.clone() } else { unreachable!() };
+                let op_str =
+                    if let Token::Op(o) = self.peek() { o.clone() } else { unreachable!() };
                 self.next();
                 let right = self.parse_multiplicative()?;
                 let op = if op_str == "+" { BinOp2::Add } else { BinOp2::Sub };
                 left = Expr2::BinOp { op, left: Box::new(left), right: Box::new(right) };
-            } else { break; }
+            } else {
+                break;
+            }
         }
         Ok(left)
     }
@@ -484,27 +708,43 @@ impl TpchParser {
         let mut left = self.parse_unary()?;
         loop {
             if self.is_op(&["*", "/"]) {
-                let op_str = if let Token::Op(o) = self.peek() { o.clone() } else { unreachable!() };
+                let op_str =
+                    if let Token::Op(o) = self.peek() { o.clone() } else { unreachable!() };
                 self.next();
                 let right = self.parse_unary()?;
                 let op = if op_str == "*" { BinOp2::Mul } else { BinOp2::Div };
                 left = Expr2::BinOp { op, left: Box::new(left), right: Box::new(right) };
-            } else { break; }
+            } else {
+                break;
+            }
         }
         Ok(left)
     }
 
     fn parse_unary(&mut self) -> Result<Expr2, String> {
-        if self.match_op("-") { return Ok(Expr2::Neg(Box::new(self.parse_unary()?))); }
-        if self.match_op("+") { return self.parse_unary(); }
+        if self.match_op("-") {
+            return Ok(Expr2::Neg(Box::new(self.parse_unary()?)));
+        }
+        if self.match_op("+") {
+            return self.parse_unary();
+        }
         self.parse_primary()
     }
 
     fn parse_primary(&mut self) -> Result<Expr2, String> {
         match self.peek().clone() {
-            Token::Int(i) => { self.next(); Ok(Expr2::Int(i)) }
-            Token::Float(f) => { self.next(); Ok(Expr2::Float(f)) }
-            Token::String(s) => { self.next(); Ok(Expr2::Str(s)) }
+            Token::Int(i) => {
+                self.next();
+                Ok(Expr2::Int(i))
+            }
+            Token::Float(f) => {
+                self.next();
+                Ok(Expr2::Float(f))
+            }
+            Token::String(s) => {
+                self.next();
+                Ok(Expr2::Str(s))
+            }
             Token::Keyword(kw) => {
                 let ku = kw.to_uppercase();
                 match ku.as_str() {
@@ -512,16 +752,27 @@ impl TpchParser {
                         self.next();
                         if let Token::String(s) = self.peek().clone() {
                             self.next();
-                            if let Ok(d) = crate::types::Date::from_str(&s) { return Ok(Expr2::Date(d.0)); }
+                            if let Ok(d) = crate::types::Date::from_str(&s) {
+                                return Ok(Expr2::Date(d.0));
+                            }
                             return Ok(Expr2::Str(s));
                         }
                         Err("expected string after DATE".into())
                     }
                     "CASE" => self.parse_case(),
-                    "EXTRACT" => { self.next(); self.parse_extract() },
-                    "CAST" => { self.next(); self.parse_cast() },
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => { self.next(); self.parse_agg_call(&ku) },
-                        // Keyword as column name — check for func call
+                    "EXTRACT" => {
+                        self.next();
+                        self.parse_extract()
+                    }
+                    "CAST" => {
+                        self.next();
+                        self.parse_cast()
+                    }
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+                        self.next();
+                        self.parse_agg_call(&ku)
+                    }
+                    // Keyword as column name — check for func call
                     _ => {
                         if matches!(self.peek_at(1), Token::LParen) {
                             self.next();
@@ -623,9 +874,13 @@ impl TpchParser {
         // 'substr' ident already consumed
         self.expect_lp()?;
         let expr = self.parse_expr()?;
-        if !self.match_comma() { return Err("expected ',' in substr".into()); }
+        if !self.match_comma() {
+            return Err("expected ',' in substr".into());
+        }
         let start = self.parse_expr()?;
-        if !self.match_comma() { return Err("expected ',' in substr".into()); }
+        if !self.match_comma() {
+            return Err("expected ',' in substr".into());
+        }
         let len = self.parse_expr()?;
         self.expect_rp()?;
         Ok(Expr2::Substr { expr: Box::new(expr), start: Box::new(start), len: Box::new(len) })
@@ -635,16 +890,24 @@ impl TpchParser {
         // Function name keyword/ident already consumed by caller
         self.expect_lp()?;
         let distinct = self.match_kw("DISTINCT");
-        let arg = if self.match_op("*") {
-            Expr2::CountStar
-        } else {
-            self.parse_expr()?
-        };
+        let arg = if self.match_op("*") { Expr2::CountStar } else { self.parse_expr()? };
         self.expect_rp()?;
         let func = match func_upper {
-            "SUM" => if distinct { AggFunc::Sum } else { AggFunc::Sum },
+            "SUM" => {
+                if distinct {
+                    AggFunc::Sum
+                } else {
+                    AggFunc::Sum
+                }
+            }
             "AVG" => AggFunc::Avg,
-            "COUNT" => if distinct { AggFunc::CountDistinct } else { AggFunc::Count },
+            "COUNT" => {
+                if distinct {
+                    AggFunc::CountDistinct
+                } else {
+                    AggFunc::Count
+                }
+            }
             "MIN" => AggFunc::Min,
             "MAX" => AggFunc::Max,
             _ => return Err(format!("unsupported aggregate: {func_upper}")),
@@ -705,7 +968,9 @@ impl ExecTable {
             col_map.entry(name.to_lowercase()).or_insert(i);
             col_map.entry(format!("{}.{}", alias.to_lowercase(), name.to_lowercase())).or_insert(i);
             if alias != table.name {
-                col_map.entry(format!("{}.{}", table.name.to_lowercase(), name.to_lowercase())).or_insert(i);
+                col_map
+                    .entry(format!("{}.{}", table.name.to_lowercase(), name.to_lowercase()))
+                    .or_insert(i);
             }
             let _ = lower; // suppress unused-variable warning
         }
@@ -760,7 +1025,10 @@ impl Value2 {
         }
     }
     fn as_str(&self) -> Option<&str> {
-        match self { Value2::Str(s) => Some(s), _ => None }
+        match self {
+            Value2::Str(s) => Some(s),
+            _ => None,
+        }
     }
     fn as_u64(&self) -> Option<u64> {
         match self {
@@ -790,7 +1058,8 @@ pub fn execute_tpch(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResu
         exists_multi_cache: std::cell::RefCell::new(new_hashmap()),
         in_subquery_cache: std::cell::RefCell::new(new_hashmap()),
         decorrelated_cache: std::cell::RefCell::new(new_hashmap()),
-    }.execute(query)
+    }
+    .execute(query)
 }
 
 struct TpchExec<'a> {
@@ -870,7 +1139,9 @@ fn take_mask_buf(n: usize) -> Vec<bool> {
     MASK_POOL.with(|cell| {
         let mut pool = cell.borrow_mut();
         let mut buf = pool.pop().unwrap_or_else(|| Vec::with_capacity(n));
-        if buf.len() < n { buf.resize(n, false); }
+        if buf.len() < n {
+            buf.resize(n, false);
+        }
         buf
     })
 }
@@ -926,17 +1197,23 @@ impl<'a> TpchExec<'a> {
             let base = tables.into_iter().next().unwrap();
             let mask = if let Some(ref wc) = query.where_clause {
                 self.build_mask(wc, &base)?
-            } else { vec![true; base.row_count] };
+            } else {
+                vec![true; base.row_count]
+            };
             (base, mask)
         } else {
             // Identify multi-table conjuncts BEFORE consuming tables.
             // Single-table conjuncts (refs.len() == 1) are applied by
             // join_tables_smart and skipped here.
             let conjuncts = self.split_conjuncts(&query.where_clause);
-            let multi_table: Vec<Expr2> = conjuncts.iter().filter(|conj| {
-                let refs = self.expr_table_refs(conj, &tables);
-                refs.len() != 1
-            }).cloned().collect();
+            let multi_table: Vec<Expr2> = conjuncts
+                .iter()
+                .filter(|conj| {
+                    let refs = self.expr_table_refs(conj, &tables);
+                    refs.len() != 1
+                })
+                .cloned()
+                .collect();
             let base = self.plan_join_dp(tables, &query.where_clause)?;
             let mask = if multi_table.is_empty() {
                 vec![true; base.row_count]
@@ -966,11 +1243,15 @@ impl<'a> TpchExec<'a> {
         let result = self.project(&query.select, &base, &indices)?;
         let mut result = if !query.order_by.is_empty() {
             self.apply_order_by(result, &query.order_by, &base, &indices)?
-        } else { result };
+        } else {
+            result
+        };
 
         if let Some(limit) = query.limit {
             if result.row_count > limit {
-                for col in &mut result.columns { col.values.truncate(limit); }
+                for col in &mut result.columns {
+                    col.values.truncate(limit);
+                }
                 result.row_count = limit;
             }
         }
@@ -1022,7 +1303,9 @@ impl<'a> TpchExec<'a> {
                     self.precache_subqueries(c);
                     self.precache_subqueries(r);
                 }
-                if let Some(e) = else_ { self.precache_subqueries(e); }
+                if let Some(e) = else_ {
+                    self.precache_subqueries(e);
+                }
             }
             Expr2::Like { expr, pattern, .. } => {
                 self.precache_subqueries(expr);
@@ -1035,7 +1318,9 @@ impl<'a> TpchExec<'a> {
             }
             Expr2::InList { expr, list, .. } => {
                 self.precache_subqueries(expr);
-                for e in list { self.precache_subqueries(e); }
+                for e in list {
+                    self.precache_subqueries(e);
+                }
             }
             Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
                 self.precache_subqueries(e);
@@ -1089,13 +1374,17 @@ impl<'a> TpchExec<'a> {
     }
 
     fn collect_corr_cols_filtered(
-        &self, expr: &Expr2, outer_t: &ExecTable, inner_cols: &HashSet<String>,
-        cols: &mut Vec<usize>, seen: &mut HashSet<usize>,
+        &self,
+        expr: &Expr2,
+        outer_t: &ExecTable,
+        inner_cols: &HashSet<String>,
+        cols: &mut Vec<usize>,
+        seen: &mut HashSet<usize>,
     ) {
         match expr {
             Expr2::Col(name) => {
                 // Get short name (after '.') for comparison with inner_cols
-                let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
+                let short = name.rfind('.').map(|p| &name[p + 1..]).unwrap_or(name.as_str());
                 let short_lower = short.to_lowercase();
                 // If the short name resolves to an inner table column, it's NOT a correlation col
                 if inner_cols.contains(&short_lower) {
@@ -1118,7 +1407,9 @@ impl<'a> TpchExec<'a> {
                     self.collect_corr_cols_filtered(c, outer_t, inner_cols, cols, seen);
                     self.collect_corr_cols_filtered(r, outer_t, inner_cols, cols, seen);
                 }
-                if let Some(e) = else_ { self.collect_corr_cols_filtered(e, outer_t, inner_cols, cols, seen); }
+                if let Some(e) = else_ {
+                    self.collect_corr_cols_filtered(e, outer_t, inner_cols, cols, seen);
+                }
             }
             Expr2::Like { expr, pattern, .. } => {
                 self.collect_corr_cols_filtered(expr, outer_t, inner_cols, cols, seen);
@@ -1131,7 +1422,9 @@ impl<'a> TpchExec<'a> {
             }
             Expr2::InList { expr, list, .. } => {
                 self.collect_corr_cols_filtered(expr, outer_t, inner_cols, cols, seen);
-                for e in list { self.collect_corr_cols_filtered(e, outer_t, inner_cols, cols, seen); }
+                for e in list {
+                    self.collect_corr_cols_filtered(e, outer_t, inner_cols, cols, seen);
+                }
             }
             Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
                 self.collect_corr_cols_filtered(e, outer_t, inner_cols, cols, seen);
@@ -1160,7 +1453,8 @@ impl<'a> TpchExec<'a> {
     /// Uses inner_cols (short names) and inner_aliases (table qualifiers)
     /// to determine if a column reference is inner or correlated (outer).
     fn is_conjunct_correlated_wrt_inner(
-        &self, expr: &Expr2,
+        &self,
+        expr: &Expr2,
         inner_cols: &HashSet<String>,
         inner_aliases: &HashSet<String>,
     ) -> bool {
@@ -1184,23 +1478,36 @@ impl<'a> TpchExec<'a> {
                     || self.is_conjunct_correlated_wrt_inner(right, inner_cols, inner_aliases)
             }
             Expr2::Case { whens, else_ } => {
-                whens.iter().any(|(c, r)| self.is_conjunct_correlated_wrt_inner(c, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(r, inner_cols, inner_aliases))
-                    || else_.as_ref().map(|e| self.is_conjunct_correlated_wrt_inner(e, inner_cols, inner_aliases)).unwrap_or(false)
+                whens.iter().any(|(c, r)| {
+                    self.is_conjunct_correlated_wrt_inner(c, inner_cols, inner_aliases)
+                        || self.is_conjunct_correlated_wrt_inner(r, inner_cols, inner_aliases)
+                }) || else_
+                    .as_ref()
+                    .map(|e| self.is_conjunct_correlated_wrt_inner(e, inner_cols, inner_aliases))
+                    .unwrap_or(false)
             }
             Expr2::Like { expr, pattern, .. } => {
-                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(pattern, inner_cols, inner_aliases)
+                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases)
+                    || self.is_conjunct_correlated_wrt_inner(pattern, inner_cols, inner_aliases)
             }
             Expr2::Between { expr, low, high, .. } => {
-                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(low, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(high, inner_cols, inner_aliases)
+                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases)
+                    || self.is_conjunct_correlated_wrt_inner(low, inner_cols, inner_aliases)
+                    || self.is_conjunct_correlated_wrt_inner(high, inner_cols, inner_aliases)
             }
             Expr2::InList { expr, list, .. } => {
-                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases) || list.iter().any(|e| self.is_conjunct_correlated_wrt_inner(e, inner_cols, inner_aliases))
+                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases)
+                    || list.iter().any(|e| {
+                        self.is_conjunct_correlated_wrt_inner(e, inner_cols, inner_aliases)
+                    })
             }
             Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
                 self.is_conjunct_correlated_wrt_inner(e, inner_cols, inner_aliases)
             }
             Expr2::Substr { expr, start, len } => {
-                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(start, inner_cols, inner_aliases) || self.is_conjunct_correlated_wrt_inner(len, inner_cols, inner_aliases)
+                self.is_conjunct_correlated_wrt_inner(expr, inner_cols, inner_aliases)
+                    || self.is_conjunct_correlated_wrt_inner(start, inner_cols, inner_aliases)
+                    || self.is_conjunct_correlated_wrt_inner(len, inner_cols, inner_aliases)
             }
             Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => true,
             _ => false,
@@ -1224,21 +1531,33 @@ impl<'a> TpchExec<'a> {
     /// → derived table groups lineitem by (l_partkey, l_suppkey), computes
     ///   0.5 * sum(l_quantity), caches HashMap<(l_partkey,l_suppkey)_hash, threshold>.
     fn try_decorrelate_subquery(
-        &self, subquery: &SelectQuery2, outer_t: &ExecTable,
+        &self,
+        subquery: &SelectQuery2,
+        outer_t: &ExecTable,
     ) -> Result<Option<(FxHashMap<u64, Value2>, Vec<usize>)>, Error> {
         // Only decorrelate if the subquery has exactly 1 SELECT item that is
         // an aggregate (or a scalar function of an aggregate, like 0.2 * avg(x)).
-        if subquery.select.len() != 1 { return Ok(None); }
-        if !self.expr_has_agg(&subquery.select[0].expr) { return Ok(None); }
-        if subquery.having.is_some() { return Ok(None); }
-        if !subquery.group_by.is_empty() { return Ok(None); }
+        if subquery.select.len() != 1 {
+            return Ok(None);
+        }
+        if !self.expr_has_agg(&subquery.select[0].expr) {
+            return Ok(None);
+        }
+        if subquery.having.is_some() {
+            return Ok(None);
+        }
+        if !subquery.group_by.is_empty() {
+            return Ok(None);
+        }
 
         // Only decorrelate single-table subqueries (multi-table joins in the
         // subquery make the derived table build expensive and error-prone).
         // Q20's subquery is `SELECT 0.5*sum(l_quantity) FROM lineitem WHERE ...`
         // (single table) — perfect for decorrelation.
         // Q2's subquery has 4 FROM tables — not decorrelated (uses per-row cache).
-        if subquery.from.len() != 1 { return Ok(None); }
+        if subquery.from.len() != 1 {
+            return Ok(None);
+        }
 
         // Build inner column name set and inner table aliases.
         let mut inner_cols: HashSet<String> = new_hashset();
@@ -1260,7 +1579,9 @@ impl<'a> TpchExec<'a> {
         // Find correlation columns (outer cols referenced by the subquery).
         let mut corr_cols = self.find_correlation_cols(subquery, outer_t);
         // Need at least 1 correlation column to be correlated.
-        if corr_cols.is_empty() { return Ok(None); }
+        if corr_cols.is_empty() {
+            return Ok(None);
+        }
 
         // Find the inner column indices for each correlation column by
         // looking at the equi-join conjuncts in the subquery's WHERE.
@@ -1284,17 +1605,30 @@ impl<'a> TpchExec<'a> {
                         } else {
                             (rn.clone(), ln.clone())
                         };
-                        let outer_short = outer_name.rfind('.').map(|p| &outer_name[p+1..]).unwrap_or(&outer_name).to_lowercase();
-                        let outer_idx = match outer_t.lookup_col(&outer_name).or_else(|| outer_t.lookup_col(&outer_short)) {
+                        let outer_short = outer_name
+                            .rfind('.')
+                            .map(|p| &outer_name[p + 1..])
+                            .unwrap_or(&outer_name)
+                            .to_lowercase();
+                        let outer_idx = match outer_t
+                            .lookup_col(&outer_name)
+                            .or_else(|| outer_t.lookup_col(&outer_short))
+                        {
                             Some(idx) => idx,
                             None => continue,
                         };
-                        let inner_idx = match self.resolve_inner_col_idx(&inner_name, subquery, outer_t) {
-                            Some(idx) => idx,
-                            None => continue,
-                        };
+                        let inner_idx =
+                            match self.resolve_inner_col_idx(&inner_name, subquery, outer_t) {
+                                Some(idx) => idx,
+                                None => continue,
+                            };
                         if !corr_to_inner.iter().any(|(oi, _, _, _)| *oi == outer_idx) {
-                            corr_to_inner.push((outer_idx, inner_idx, outer_name.clone(), inner_name.clone()));
+                            corr_to_inner.push((
+                                outer_idx,
+                                inner_idx,
+                                outer_name.clone(),
+                                inner_name.clone(),
+                            ));
                         }
                     }
                 }
@@ -1304,11 +1638,14 @@ impl<'a> TpchExec<'a> {
         // Check that every correlation column found has a matching equi-join.
         // (corr_cols and corr_to_inner outer indices should match.)
         let corr_outer_indices: HashSet<usize> = corr_cols.iter().copied().collect();
-        let matched_outer_indices: HashSet<usize> = corr_to_inner.iter().map(|(oi, _, _, _)| *oi).collect();
+        let matched_outer_indices: HashSet<usize> =
+            corr_to_inner.iter().map(|(oi, _, _, _)| *oi).collect();
         if corr_outer_indices != matched_outer_indices {
             return Ok(None);
         }
-        if corr_to_inner.is_empty() { return Ok(None); }
+        if corr_to_inner.is_empty() {
+            return Ok(None);
+        }
 
         // Build the derived table: load inner FROM, apply local (non-correlated)
         // conjuncts, GROUP BY inner correlation columns, compute aggregate.
@@ -1318,9 +1655,11 @@ impl<'a> TpchExec<'a> {
         // A conjunct is "correlated" if it references any column whose short name
         // is NOT in the inner table column set AND whose qualifier is NOT an inner
         // table alias. (For Q2: `p_partkey = ps_partkey` — p_partkey is correlated.)
-        let local_conjuncts: Vec<Expr2> = conjuncts.iter().filter(|c| {
-            !self.is_conjunct_correlated_wrt_inner(c, &inner_cols, &inner_aliases)
-        }).cloned().collect();
+        let local_conjuncts: Vec<Expr2> = conjuncts
+            .iter()
+            .filter(|c| !self.is_conjunct_correlated_wrt_inner(c, &inner_cols, &inner_aliases))
+            .cloned()
+            .collect();
         // Rebuild a WHERE clause from local conjuncts (ANDed together).
         let local_where: Option<Expr2> = if local_conjuncts.is_empty() {
             None
@@ -1354,11 +1693,14 @@ impl<'a> TpchExec<'a> {
 
         // Build the aggregate map: GROUP BY inner corr cols, compute agg.
         let agg_expr = &subquery.select[0].expr;
-        let inner_corr_indices: Vec<usize> = corr_to_inner.iter().map(|(_, ii, _, _)| *ii).collect();
+        let inner_corr_indices: Vec<usize> =
+            corr_to_inner.iter().map(|(_, ii, _, _)| *ii).collect();
         // Group rows by composite hash of inner corr cols.
         let mut groups: FxHashMap<u64, Vec<usize>> = new_fxhashmap();
         for i in 0..base.row_count {
-            if !mask[i] { continue; }
+            if !mask[i] {
+                continue;
+            }
             let mut h: u64 = 0;
             for &ci in &inner_corr_indices {
                 let v = base.columns[ci][i];
@@ -1376,12 +1718,17 @@ impl<'a> TpchExec<'a> {
         }
 
         // The outer col indices (for computing corr_hash per outer row).
-        let outer_corr_indices: Vec<usize> = corr_to_inner.iter().map(|(oi, _, _, _)| *oi).collect();
+        let outer_corr_indices: Vec<usize> =
+            corr_to_inner.iter().map(|(oi, _, _, _)| *oi).collect();
 
         Ok(Some((result_map, outer_corr_indices)))
     }
 
-    fn find_exists_equi_join(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Option<(usize, usize)> {
+    fn find_exists_equi_join(
+        &self,
+        subquery: &SelectQuery2,
+        outer_t: &ExecTable,
+    ) -> Option<(usize, usize)> {
         // Build inner column name set (subquery's own FROM tables)
         let mut inner_cols: HashSet<String> = new_hashset();
         for item in &subquery.from {
@@ -1403,11 +1750,14 @@ impl<'a> TpchExec<'a> {
             return None;
         }
         let corr_name = &corr_names[0];
-        let outer_idx = outer_t.lookup_col(corr_name)
-            .or_else(|| corr_name.rfind('.').and_then(|p| outer_t.lookup_col(&corr_name[p+1..])))?;
+        let outer_idx = outer_t.lookup_col(corr_name).or_else(|| {
+            corr_name.rfind('.').and_then(|p| outer_t.lookup_col(&corr_name[p + 1..]))
+        })?;
         // Find the equi-join conjunct: Col(inner) = Col(corr_name) or vice versa
         if let Some(ref wc) = subquery.where_clause {
-            if let Some(inner_idx) = self.find_equi_join_inner(wc, corr_name, &inner_cols, subquery, outer_t) {
+            if let Some(inner_idx) =
+                self.find_equi_join_inner(wc, corr_name, &inner_cols, subquery, outer_t)
+            {
                 return Some((outer_idx, inner_idx));
             }
         }
@@ -1415,12 +1765,16 @@ impl<'a> TpchExec<'a> {
     }
 
     fn collect_corr_names(
-        &self, expr: &Expr2, outer_t: &ExecTable, inner_cols: &HashSet<String>,
-        names: &mut Vec<String>, seen: &mut HashSet<String>,
+        &self,
+        expr: &Expr2,
+        outer_t: &ExecTable,
+        inner_cols: &HashSet<String>,
+        names: &mut Vec<String>,
+        seen: &mut HashSet<String>,
     ) {
         match expr {
             Expr2::Col(name) => {
-                let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
+                let short = name.rfind('.').map(|p| &name[p + 1..]).unwrap_or(name.as_str());
                 // If the column is NOT in inner_cols, it's a correlation column.
                 if !inner_cols.contains(&short.to_lowercase()) {
                     if outer_t.lookup_col(name).is_some() || outer_t.lookup_col(short).is_some() {
@@ -1439,7 +1793,9 @@ impl<'a> TpchExec<'a> {
                     self.collect_corr_names(c, outer_t, inner_cols, names, seen);
                     self.collect_corr_names(r, outer_t, inner_cols, names, seen);
                 }
-                if let Some(e) = else_ { self.collect_corr_names(e, outer_t, inner_cols, names, seen); }
+                if let Some(e) = else_ {
+                    self.collect_corr_names(e, outer_t, inner_cols, names, seen);
+                }
             }
             Expr2::Like { expr, pattern, .. } => {
                 self.collect_corr_names(expr, outer_t, inner_cols, names, seen);
@@ -1452,7 +1808,9 @@ impl<'a> TpchExec<'a> {
             }
             Expr2::InList { expr, list, .. } => {
                 self.collect_corr_names(expr, outer_t, inner_cols, names, seen);
-                for e in list { self.collect_corr_names(e, outer_t, inner_cols, names, seen); }
+                for e in list {
+                    self.collect_corr_names(e, outer_t, inner_cols, names, seen);
+                }
             }
             Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
                 self.collect_corr_names(e, outer_t, inner_cols, names, seen);
@@ -1471,10 +1829,13 @@ impl<'a> TpchExec<'a> {
     /// inner columns from outer correlation columns when both share the same
     /// short name (e.g. Q21's l1.l_orderkey vs l2.l_orderkey).
     fn collect_corr_names_qualified(
-        &self, expr: &Expr2, outer_t: &ExecTable,
+        &self,
+        expr: &Expr2,
+        outer_t: &ExecTable,
         inner_cols: &HashSet<String>,
         inner_aliases: &HashSet<String>,
-        names: &mut Vec<String>, seen: &mut HashSet<String>,
+        names: &mut Vec<String>,
+        seen: &mut HashSet<String>,
     ) {
         match expr {
             Expr2::Col(name) => {
@@ -1485,7 +1846,7 @@ impl<'a> TpchExec<'a> {
                     inner_cols.contains(&name.to_lowercase())
                 };
                 if !is_inner {
-                    let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
+                    let short = name.rfind('.').map(|p| &name[p + 1..]).unwrap_or(name.as_str());
                     if outer_t.lookup_col(name).is_some() || outer_t.lookup_col(short).is_some() {
                         if seen.insert(name.to_lowercase()) {
                             names.push(name.clone());
@@ -1494,36 +1855,152 @@ impl<'a> TpchExec<'a> {
                 }
             }
             Expr2::BinOp { left, right, .. } => {
-                self.collect_corr_names_qualified(left, outer_t, inner_cols, inner_aliases, names, seen);
-                self.collect_corr_names_qualified(right, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(
+                    left,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
+                self.collect_corr_names_qualified(
+                    right,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
             }
             Expr2::Case { whens, else_ } => {
                 for (c, r) in whens {
-                    self.collect_corr_names_qualified(c, outer_t, inner_cols, inner_aliases, names, seen);
-                    self.collect_corr_names_qualified(r, outer_t, inner_cols, inner_aliases, names, seen);
+                    self.collect_corr_names_qualified(
+                        c,
+                        outer_t,
+                        inner_cols,
+                        inner_aliases,
+                        names,
+                        seen,
+                    );
+                    self.collect_corr_names_qualified(
+                        r,
+                        outer_t,
+                        inner_cols,
+                        inner_aliases,
+                        names,
+                        seen,
+                    );
                 }
-                if let Some(e) = else_ { self.collect_corr_names_qualified(e, outer_t, inner_cols, inner_aliases, names, seen); }
+                if let Some(e) = else_ {
+                    self.collect_corr_names_qualified(
+                        e,
+                        outer_t,
+                        inner_cols,
+                        inner_aliases,
+                        names,
+                        seen,
+                    );
+                }
             }
             Expr2::Like { expr, pattern, .. } => {
-                self.collect_corr_names_qualified(expr, outer_t, inner_cols, inner_aliases, names, seen);
-                self.collect_corr_names_qualified(pattern, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(
+                    expr,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
+                self.collect_corr_names_qualified(
+                    pattern,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
             }
             Expr2::Between { expr, low, high, .. } => {
-                self.collect_corr_names_qualified(expr, outer_t, inner_cols, inner_aliases, names, seen);
-                self.collect_corr_names_qualified(low, outer_t, inner_cols, inner_aliases, names, seen);
-                self.collect_corr_names_qualified(high, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(
+                    expr,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
+                self.collect_corr_names_qualified(
+                    low,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
+                self.collect_corr_names_qualified(
+                    high,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
             }
             Expr2::InList { expr, list, .. } => {
-                self.collect_corr_names_qualified(expr, outer_t, inner_cols, inner_aliases, names, seen);
-                for e in list { self.collect_corr_names_qualified(e, outer_t, inner_cols, inner_aliases, names, seen); }
+                self.collect_corr_names_qualified(
+                    expr,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
+                for e in list {
+                    self.collect_corr_names_qualified(
+                        e,
+                        outer_t,
+                        inner_cols,
+                        inner_aliases,
+                        names,
+                        seen,
+                    );
+                }
             }
             Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
-                self.collect_corr_names_qualified(e, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(
+                    e,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
             }
             Expr2::Substr { expr, start, len } => {
-                self.collect_corr_names_qualified(expr, outer_t, inner_cols, inner_aliases, names, seen);
-                self.collect_corr_names_qualified(start, outer_t, inner_cols, inner_aliases, names, seen);
-                self.collect_corr_names_qualified(len, outer_t, inner_cols, inner_aliases, names, seen);
+                self.collect_corr_names_qualified(
+                    expr,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
+                self.collect_corr_names_qualified(
+                    start,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
+                self.collect_corr_names_qualified(
+                    len,
+                    outer_t,
+                    inner_cols,
+                    inner_aliases,
+                    names,
+                    seen,
+                );
             }
             Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => {}
             _ => {}
@@ -1533,28 +2010,44 @@ impl<'a> TpchExec<'a> {
     /// Find `Col(inner) = Col(outer_name)` or reverse in a WHERE expr.
     /// Returns the inner column index (in the subquery's own FROM table).
     fn find_equi_join_inner(
-        &self, expr: &Expr2, outer_name: &str, inner_cols: &HashSet<String>,
-        subquery: &SelectQuery2, outer_t: &ExecTable,
+        &self,
+        expr: &Expr2,
+        outer_name: &str,
+        inner_cols: &HashSet<String>,
+        subquery: &SelectQuery2,
+        outer_t: &ExecTable,
     ) -> Option<usize> {
         match expr {
             Expr2::BinOp { op: BinOp2::Eq, left, right } => {
                 // left = inner, right = outer
                 if let (Expr2::Col(ln), Expr2::Col(rn)) = (left.as_ref(), right.as_ref()) {
-                    let l_short = ln.rfind('.').map(|p| &ln[p+1..]).unwrap_or(ln.as_str());
-                    let r_short = rn.rfind('.').map(|p| &rn[p+1..]).unwrap_or(rn.as_str());
-                    if inner_cols.contains(&l_short.to_lowercase()) && r_short.eq_ignore_ascii_case(outer_name.trim_start_matches(|c: char| !c.is_alphanumeric())) {
+                    let l_short = ln.rfind('.').map(|p| &ln[p + 1..]).unwrap_or(ln.as_str());
+                    let r_short = rn.rfind('.').map(|p| &rn[p + 1..]).unwrap_or(rn.as_str());
+                    if inner_cols.contains(&l_short.to_lowercase())
+                        && r_short.eq_ignore_ascii_case(
+                            outer_name.trim_start_matches(|c: char| !c.is_alphanumeric()),
+                        )
+                    {
                         return self.resolve_inner_col_idx(ln, subquery, outer_t);
                     }
-                    if inner_cols.contains(&r_short.to_lowercase()) && l_short.eq_ignore_ascii_case(outer_name.trim_start_matches(|c: char| !c.is_alphanumeric())) {
+                    if inner_cols.contains(&r_short.to_lowercase())
+                        && l_short.eq_ignore_ascii_case(
+                            outer_name.trim_start_matches(|c: char| !c.is_alphanumeric()),
+                        )
+                    {
                         return self.resolve_inner_col_idx(rn, subquery, outer_t);
                     }
                 }
             }
             Expr2::BinOp { op: BinOp2::And, left, right } => {
-                if let Some(idx) = self.find_equi_join_inner(left, outer_name, inner_cols, subquery, outer_t) {
+                if let Some(idx) =
+                    self.find_equi_join_inner(left, outer_name, inner_cols, subquery, outer_t)
+                {
                     return Some(idx);
                 }
-                if let Some(idx) = self.find_equi_join_inner(right, outer_name, inner_cols, subquery, outer_t) {
+                if let Some(idx) =
+                    self.find_equi_join_inner(right, outer_name, inner_cols, subquery, outer_t)
+                {
                     return Some(idx);
                 }
             }
@@ -1566,7 +2059,10 @@ impl<'a> TpchExec<'a> {
     /// Resolve an inner column name to its index in the subquery's base table.
     /// Loads the subquery's FROM and looks up the column.
     fn resolve_inner_col_idx(
-        &self, col_name: &str, subquery: &SelectQuery2, _outer_t: &ExecTable,
+        &self,
+        col_name: &str,
+        subquery: &SelectQuery2,
+        _outer_t: &ExecTable,
     ) -> Option<usize> {
         // Load the subquery's FROM tables and look up the column.
         // This is a lightweight version of resolve_from that doesn't do joins.
@@ -1590,7 +2086,11 @@ impl<'a> TpchExec<'a> {
     /// uncorrelated conjuncts are applied).
     ///
     /// For Q4: `SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate`
-    fn build_exists_hashset(&self, subquery: &SelectQuery2, inner_col_idx: usize) -> Result<FxHashSet<u64>, Error> {
+    fn build_exists_hashset(
+        &self,
+        subquery: &SelectQuery2,
+        inner_col_idx: usize,
+    ) -> Result<FxHashSet<u64>, Error> {
         // Load the subquery's FROM table(s) and join them (no correlation).
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
@@ -1614,7 +2114,9 @@ impl<'a> TpchExec<'a> {
                 self.eval_bool_mask_vec(conj, &base, &mut mask)?;
             }
             mask
-        } else { vec![true; base.row_count] };
+        } else {
+            vec![true; base.row_count]
+        };
         // Build hash set of inner col values — PARALLEL using rayon.
         // Split into chunks, each thread builds a local HashSet, then merge.
         // This is critical for Q4 where lineitem has 6M rows and the serial
@@ -1623,17 +2125,20 @@ impl<'a> TpchExec<'a> {
         const CHUNK_SIZE: usize = 65536;
         let n = base.row_count;
         let num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let local_sets: Vec<FxHashSet<u64>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
-            let start = chunk_idx * CHUNK_SIZE;
-            let end = std::cmp::min(start + CHUNK_SIZE, n);
-            let mut local = new_fxhashset();
-            for i in start..end {
-                if mask[i] {
-                    local.insert(col[i]);
+        let local_sets: Vec<FxHashSet<u64>> = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * CHUNK_SIZE;
+                let end = std::cmp::min(start + CHUNK_SIZE, n);
+                let mut local = new_fxhashset();
+                for i in start..end {
+                    if mask[i] {
+                        local.insert(col[i]);
+                    }
                 }
-            }
-            local
-        }).collect();
+                local
+            })
+            .collect();
         // Merge local sets into final set
         let mut set = new_fxhashset();
         for local in local_sets {
@@ -1669,23 +2174,30 @@ impl<'a> TpchExec<'a> {
                 self.is_conjunct_correlated(left, base) || self.is_conjunct_correlated(right, base)
             }
             Expr2::Case { whens, else_ } => {
-                whens.iter().any(|(c, r)| self.is_conjunct_correlated(c, base) || self.is_conjunct_correlated(r, base))
-                    || else_.as_ref().map(|e| self.is_conjunct_correlated(e, base)).unwrap_or(false)
+                whens.iter().any(|(c, r)| {
+                    self.is_conjunct_correlated(c, base) || self.is_conjunct_correlated(r, base)
+                }) || else_.as_ref().map(|e| self.is_conjunct_correlated(e, base)).unwrap_or(false)
             }
             Expr2::Like { expr, pattern, .. } => {
-                self.is_conjunct_correlated(expr, base) || self.is_conjunct_correlated(pattern, base)
+                self.is_conjunct_correlated(expr, base)
+                    || self.is_conjunct_correlated(pattern, base)
             }
             Expr2::Between { expr, low, high, .. } => {
-                self.is_conjunct_correlated(expr, base) || self.is_conjunct_correlated(low, base) || self.is_conjunct_correlated(high, base)
+                self.is_conjunct_correlated(expr, base)
+                    || self.is_conjunct_correlated(low, base)
+                    || self.is_conjunct_correlated(high, base)
             }
             Expr2::InList { expr, list, .. } => {
-                self.is_conjunct_correlated(expr, base) || list.iter().any(|e| self.is_conjunct_correlated(e, base))
+                self.is_conjunct_correlated(expr, base)
+                    || list.iter().any(|e| self.is_conjunct_correlated(e, base))
             }
             Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
                 self.is_conjunct_correlated(e, base)
             }
             Expr2::Substr { expr, start, len } => {
-                self.is_conjunct_correlated(expr, base) || self.is_conjunct_correlated(start, base) || self.is_conjunct_correlated(len, base)
+                self.is_conjunct_correlated(expr, base)
+                    || self.is_conjunct_correlated(start, base)
+                    || self.is_conjunct_correlated(len, base)
             }
             Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => true,
             _ => false,
@@ -1715,7 +2227,11 @@ impl<'a> TpchExec<'a> {
     /// Q21 example: `exists (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey
     /// AND l2.l_suppkey <> l1.l_suppkey)` → outer_eq=l1.l_orderkey, inner_eq=l2.l_orderkey,
     /// outer_neq=l1.l_suppkey, inner_neq=l2.l_suppkey.
-    fn find_exists_multi_col(&self, subquery: &SelectQuery2, outer_t: &ExecTable) -> Option<(usize, usize, usize, usize)> {
+    fn find_exists_multi_col(
+        &self,
+        subquery: &SelectQuery2,
+        outer_t: &ExecTable,
+    ) -> Option<(usize, usize, usize, usize)> {
         // Build inner column name set and inner table aliases
         let mut inner_cols: HashSet<String> = new_hashset();
         let mut inner_aliases: HashSet<String> = new_hashset();
@@ -1736,7 +2252,14 @@ impl<'a> TpchExec<'a> {
         let mut corr_names: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = new_hashset();
         if let Some(ref wc) = subquery.where_clause {
-            self.collect_corr_names_qualified(wc, outer_t, &inner_cols, &inner_aliases, &mut corr_names, &mut seen);
+            self.collect_corr_names_qualified(
+                wc,
+                outer_t,
+                &inner_cols,
+                &inner_aliases,
+                &mut corr_names,
+                &mut seen,
+            );
         }
         if corr_names.len() != 2 {
             return None;
@@ -1755,12 +2278,28 @@ impl<'a> TpchExec<'a> {
                     let r_is_inner = self.col_is_inner(rn, &inner_aliases, &inner_cols);
                     if l_is_inner != r_is_inner {
                         // One is inner, one is outer
-                        let (inner_name, outer_name) = if l_is_inner { (ln.clone(), rn.clone()) } else { (rn.clone(), ln.clone()) };
-                        let outer_short = outer_name.rfind('.').map(|p| &outer_name[p+1..]).unwrap_or(&outer_name).to_lowercase();
-                        let outer_idx = outer_t.lookup_col(&outer_name).or_else(|| outer_t.lookup_col(&outer_short))?;
-                        let inner_idx = self.resolve_inner_col_idx(&inner_name, subquery, outer_t)?;
+                        let (inner_name, outer_name) = if l_is_inner {
+                            (ln.clone(), rn.clone())
+                        } else {
+                            (rn.clone(), ln.clone())
+                        };
+                        let outer_short = outer_name
+                            .rfind('.')
+                            .map(|p| &outer_name[p + 1..])
+                            .unwrap_or(&outer_name)
+                            .to_lowercase();
+                        let outer_idx = outer_t
+                            .lookup_col(&outer_name)
+                            .or_else(|| outer_t.lookup_col(&outer_short))?;
+                        let inner_idx =
+                            self.resolve_inner_col_idx(&inner_name, subquery, outer_t)?;
                         if eq_pair.is_none() {
-                            eq_pair = Some((outer_idx, inner_idx, outer_name.clone(), inner_name.clone()));
+                            eq_pair = Some((
+                                outer_idx,
+                                inner_idx,
+                                outer_name.clone(),
+                                inner_name.clone(),
+                            ));
                         }
                     }
                 }
@@ -1771,10 +2310,21 @@ impl<'a> TpchExec<'a> {
                     let l_is_inner = self.col_is_inner(ln, &inner_aliases, &inner_cols);
                     let r_is_inner = self.col_is_inner(rn, &inner_aliases, &inner_cols);
                     if l_is_inner != r_is_inner {
-                        let (inner_name, outer_name) = if l_is_inner { (ln.clone(), rn.clone()) } else { (rn.clone(), ln.clone()) };
-                        let outer_short = outer_name.rfind('.').map(|p| &outer_name[p+1..]).unwrap_or(&outer_name).to_lowercase();
-                        let outer_idx = outer_t.lookup_col(&outer_name).or_else(|| outer_t.lookup_col(&outer_short))?;
-                        let inner_idx = self.resolve_inner_col_idx(&inner_name, subquery, outer_t)?;
+                        let (inner_name, outer_name) = if l_is_inner {
+                            (ln.clone(), rn.clone())
+                        } else {
+                            (rn.clone(), ln.clone())
+                        };
+                        let outer_short = outer_name
+                            .rfind('.')
+                            .map(|p| &outer_name[p + 1..])
+                            .unwrap_or(&outer_name)
+                            .to_lowercase();
+                        let outer_idx = outer_t
+                            .lookup_col(&outer_name)
+                            .or_else(|| outer_t.lookup_col(&outer_short))?;
+                        let inner_idx =
+                            self.resolve_inner_col_idx(&inner_name, subquery, outer_t)?;
                         if neq_pair.is_none() {
                             neq_pair = Some((outer_idx, inner_idx));
                         }
@@ -1789,7 +2339,12 @@ impl<'a> TpchExec<'a> {
 
     /// Check if a column name refers to an inner table column.
     /// Uses the qualifier (if present) to distinguish inner from outer.
-    fn col_is_inner(&self, name: &str, inner_aliases: &HashSet<String>, inner_cols: &HashSet<String>) -> bool {
+    fn col_is_inner(
+        &self,
+        name: &str,
+        inner_aliases: &HashSet<String>,
+        inner_cols: &HashSet<String>,
+    ) -> bool {
         if let Some(dot_pos) = name.find('.') {
             let qualifier = name[..dot_pos].to_lowercase();
             inner_aliases.contains(&qualifier)
@@ -1800,7 +2355,12 @@ impl<'a> TpchExec<'a> {
 
     /// Build HashMap<equi_key, HashSet<ineq_col>> from the subquery's inner
     /// table, applying only uncorrelated conjuncts.
-    fn build_exists_multi_map(&self, subquery: &SelectQuery2, inner_eq_idx: usize, inner_neq_idx: usize) -> Result<FxHashMap<u64, FxHashSet<u64>>, Error> {
+    fn build_exists_multi_map(
+        &self,
+        subquery: &SelectQuery2,
+        inner_eq_idx: usize,
+        inner_neq_idx: usize,
+    ) -> Result<FxHashMap<u64, FxHashSet<u64>>, Error> {
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
             tables.push(self.resolve_from_item(item)?);
@@ -1816,11 +2376,15 @@ impl<'a> TpchExec<'a> {
             let conjuncts = self.split_conjuncts(&subquery.where_clause);
             let mut mask = vec![true; base.row_count];
             for conj in &conjuncts {
-                if self.is_conjunct_correlated(conj, &base) { continue; }
+                if self.is_conjunct_correlated(conj, &base) {
+                    continue;
+                }
                 self.eval_bool_mask_vec(conj, &base, &mut mask)?;
             }
             mask
-        } else { vec![true; base.row_count] };
+        } else {
+            vec![true; base.row_count]
+        };
         let eq_col = &base.columns[inner_eq_idx];
         let neq_col = &base.columns[inner_neq_idx];
         // Build HashMap<equi_key, HashSet<ineq_col>> — PARALLEL using rayon.
@@ -1828,17 +2392,20 @@ impl<'a> TpchExec<'a> {
         const CHUNK_SIZE: usize = 65536;
         let n = base.row_count;
         let num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let local_maps: Vec<FxHashMap<u64, FxHashSet<u64>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
-            let start = chunk_idx * CHUNK_SIZE;
-            let end = std::cmp::min(start + CHUNK_SIZE, n);
-            let mut local: FxHashMap<u64, FxHashSet<u64>> = new_fxhashmap();
-            for i in start..end {
-                if mask[i] {
-                    local.entry(eq_col[i]).or_default().insert(neq_col[i]);
+        let local_maps: Vec<FxHashMap<u64, FxHashSet<u64>>> = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * CHUNK_SIZE;
+                let end = std::cmp::min(start + CHUNK_SIZE, n);
+                let mut local: FxHashMap<u64, FxHashSet<u64>> = new_fxhashmap();
+                for i in start..end {
+                    if mask[i] {
+                        local.entry(eq_col[i]).or_default().insert(neq_col[i]);
+                    }
                 }
-            }
-            local
-        }).collect();
+                local
+            })
+            .collect();
         // Merge local maps into final map
         let mut map: FxHashMap<u64, FxHashSet<u64>> = new_fxhashmap();
         for local in local_maps {
@@ -1853,7 +2420,9 @@ impl<'a> TpchExec<'a> {
     /// approach: hash the first min(n, 10000) values into 256 buckets and
     /// count non-empty buckets. This is fast and good enough for join ordering.
     fn estimate_distinct(&self, col: &[u64], n: usize) -> u64 {
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         let sample_size = n.min(10000);
         let mut buckets = [false; 256];
         for i in 0..sample_size {
@@ -1884,7 +2453,11 @@ impl<'a> TpchExec<'a> {
     /// Smart join (greedy): apply single-table filters, then hash-join tables
     /// using cardinality-aware greedy ordering. Delegates to
     /// apply_single_table_filters + join_tables_greedy_core.
-    fn join_tables_smart(&self, tables: Vec<ExecTable>, where_clause: &Option<Expr2>) -> Result<ExecTable, Error> {
+    fn join_tables_smart(
+        &self,
+        tables: Vec<ExecTable>,
+        where_clause: &Option<Expr2>,
+    ) -> Result<ExecTable, Error> {
         let conjuncts = self.split_conjuncts(where_clause);
         let tables = self.apply_single_table_filters(tables, &conjuncts)?;
         self.join_tables_greedy_core(tables, &conjuncts)
@@ -1893,13 +2466,18 @@ impl<'a> TpchExec<'a> {
     /// Apply single-table predicates (those referencing exactly one table) as
     /// filters BEFORE joining. Reduces row counts early (e.g. region filtered
     /// to 1 row by r_name='ASIA'), preventing many-to-many explosions.
-    fn apply_single_table_filters(&self, mut tables: Vec<ExecTable>, conjuncts: &[Expr2]) -> Result<Vec<ExecTable>, Error> {
+    fn apply_single_table_filters(
+        &self,
+        mut tables: Vec<ExecTable>,
+        conjuncts: &[Expr2],
+    ) -> Result<Vec<ExecTable>, Error> {
         for i in 0..tables.len() {
             for conj in conjuncts {
                 let referenced = self.expr_table_refs(conj, &tables);
                 if referenced.len() == 1 && referenced.contains(&i) {
                     let mask = self.build_mask(conj, &tables[i])?;
-                    let indices: Vec<usize> = (0..tables[i].row_count).filter(|&r| mask[r]).collect();
+                    let indices: Vec<usize> =
+                        (0..tables[i].row_count).filter(|&r| mask[r]).collect();
                     tables[i] = self.filter_table(&tables[i], &indices);
                 }
             }
@@ -1911,7 +2489,11 @@ impl<'a> TpchExec<'a> {
     /// iteratively join the next table that minimizes estimated output cardinality.
     /// O(n^2) plans evaluated. Used as the fallback for n < 4 tables (where DP
     /// overhead isn't amortized) and as a safety net for disconnected join graphs.
-    fn join_tables_greedy_core(&self, mut tables: Vec<ExecTable>, conjuncts: &[Expr2]) -> Result<ExecTable, Error> {
+    fn join_tables_greedy_core(
+        &self,
+        mut tables: Vec<ExecTable>,
+        conjuncts: &[Expr2],
+    ) -> Result<ExecTable, Error> {
         if tables.is_empty() {
             return Err(Error::Other("join_tables_greedy_core: no tables".into()));
         }
@@ -1927,7 +2509,9 @@ impl<'a> TpchExec<'a> {
             if t.row_count < start_rows {
                 let mut has_join = false;
                 for (j, other) in tables.iter().enumerate() {
-                    if i == j { continue; }
+                    if i == j {
+                        continue;
+                    }
                     if !self.find_join_keys(t, other, conjuncts).is_empty() {
                         has_join = true;
                         break;
@@ -1946,7 +2530,9 @@ impl<'a> TpchExec<'a> {
             let mut best_est_output: u64 = u64::MAX;
             for (i, table) in tables.iter().enumerate() {
                 let keys = self.find_join_keys(&joined, table, conjuncts);
-                if keys.is_empty() { continue; }
+                if keys.is_empty() {
+                    continue;
+                }
                 let mut est_output: u64 = 1;
                 for k in &keys {
                     let dl = self.estimate_distinct(&joined.columns[k.left][..], joined.row_count);
@@ -1989,7 +2575,11 @@ impl<'a> TpchExec<'a> {
     /// Complexity: O(3^n) plan evaluations. For n=6 (Q5/Q7/Q9): 729 evaluations,
     /// each <1μs → <1ms total planning cost. For n > 16, falls back to greedy
     /// (2^16 = 65536 DP entries, ~1MB memory — the cap).
-    fn plan_join_dp(&self, tables: Vec<ExecTable>, where_clause: &Option<Expr2>) -> Result<ExecTable, Error> {
+    fn plan_join_dp(
+        &self,
+        tables: Vec<ExecTable>,
+        where_clause: &Option<Expr2>,
+    ) -> Result<ExecTable, Error> {
         let conjuncts = self.split_conjuncts(where_clause);
         let tables = self.apply_single_table_filters(tables, &conjuncts)?;
         let n = tables.len();
@@ -2004,12 +2594,14 @@ impl<'a> TpchExec<'a> {
 
         // --- Phase 1: Precompute pairwise join keys + selectivity factors ---
         // pair_keys[i][j] = equi-join keys with left col in table i, right col in table j
-        let mut pair_keys: Vec<Vec<Vec<JoinKey2>>> = (0..n).map(|_| (0..n).map(|_| Vec::new()).collect()).collect();
+        let mut pair_keys: Vec<Vec<Vec<JoinKey2>>> =
+            (0..n).map(|_| (0..n).map(|_| Vec::new()).collect()).collect();
         for i in 0..n {
             for j in (i + 1)..n {
                 let keys = self.find_join_keys(&tables[i], &tables[j], &conjuncts);
                 // Reverse key direction for [j][i]: left=j's col, right=i's col
-                pair_keys[j][i] = keys.iter().map(|k| JoinKey2 { left: k.right, right: k.left }).collect();
+                pair_keys[j][i] =
+                    keys.iter().map(|k| JoinKey2 { left: k.right, right: k.left }).collect();
                 pair_keys[i][j] = keys;
             }
         }
@@ -2028,14 +2620,22 @@ impl<'a> TpchExec<'a> {
         let mut pair_nkeys: Vec<Vec<usize>> = vec![vec![0; n]; n];
         for i in 0..n {
             for j in 0..n {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let keys = &pair_keys[i][j];
-                if keys.is_empty() { continue; }
+                if keys.is_empty() {
+                    continue;
+                }
                 pair_nkeys[i][j] = keys.len();
                 let mut sel = 1.0;
                 for k in keys {
-                    let dl = self.estimate_distinct(&tables[i].columns[k.left][..], tables[i].row_count) as f64;
-                    let dr = self.estimate_distinct(&tables[j].columns[k.right][..], tables[j].row_count) as f64;
+                    let dl = self
+                        .estimate_distinct(&tables[i].columns[k.left][..], tables[i].row_count)
+                        as f64;
+                    let dr = self
+                        .estimate_distinct(&tables[j].columns[k.right][..], tables[j].row_count)
+                        as f64;
                     let max_d = dl.max(dr).max(1.0);
                     sel /= max_d;
                 }
@@ -2051,17 +2651,15 @@ impl<'a> TpchExec<'a> {
         for i in 0..n {
             let mask = 1usize << i;
             let rows = tables[i].row_count as f64;
-            dp[mask] = Some(DPEntry {
-                cost: 0.0,
-                cardinality: rows,
-                partition: None,
-            });
+            dp[mask] = Some(DPEntry { cost: 0.0, cardinality: rows, partition: None });
         }
 
         // Fill DP bottom-up by mask value. Submasks are always < mask, so
         // they're filled first. Iterate all masks with popcount >= 2.
         for mask in 1..total_masks {
-            if mask.count_ones() < 2 { continue; }
+            if mask.count_ones() < 2 {
+                continue;
+            }
 
             let mut best_cost = f64::MAX;
             let mut best_partition: Option<(usize, usize)> = None;
@@ -2114,18 +2712,18 @@ impl<'a> TpchExec<'a> {
             }
 
             if let Some(p) = best_partition {
-                dp[mask] = Some(DPEntry {
-                    cost: best_cost,
-                    cardinality: best_card,
-                    partition: Some(p),
-                });
+                dp[mask] =
+                    Some(DPEntry { cost: best_cost, cardinality: best_card, partition: Some(p) });
             }
             // If no valid partition (disconnected subset), dp[mask] stays None.
         }
 
         let plan_elapsed = plan_start.elapsed();
         if plan_elapsed > std::time::Duration::from_millis(10) {
-            eprintln!("WARN: plan_join_dp took {:?} for n={} tables (expected <10ms)", plan_elapsed, n);
+            eprintln!(
+                "WARN: plan_join_dp took {:?} for n={} tables (expected <10ms)",
+                plan_elapsed, n
+            );
         }
 
         // --- Phase 3: Execute the optimal plan recursively ---
@@ -2179,9 +2777,9 @@ impl<'a> TpchExec<'a> {
         keys: &[JoinKey2],
         jt: JoinType2,
     ) -> Result<ExecTable, Error> {
-        use xxhash_rust::xxh3::xxh3_64;
-        use crate::exec::join_hash_table::JoinHashTable;
         use crate::exec::bloom_filter::BloomFilter;
+        use crate::exec::join_hash_table::JoinHashTable;
+        use xxhash_rust::xxh3::xxh3_64;
 
         // Decide which side to build the hash table on (smaller side).
         // For INNER joins, we can swap freely. For LEFT joins, we must
@@ -2190,13 +2788,17 @@ impl<'a> TpchExec<'a> {
         let (build_side, probe_side, build_keys, probe_keys, swapped) =
             if can_swap && left.row_count < right.row_count {
                 // Build on left, probe with right — swap the key indices.
-                let bk: Vec<JoinKey2> = keys.iter().map(|k| JoinKey2 { left: k.left, right: k.left }).collect();
-                let pk: Vec<JoinKey2> = keys.iter().map(|k| JoinKey2 { left: k.right, right: k.right }).collect();
+                let bk: Vec<JoinKey2> =
+                    keys.iter().map(|k| JoinKey2 { left: k.left, right: k.left }).collect();
+                let pk: Vec<JoinKey2> =
+                    keys.iter().map(|k| JoinKey2 { left: k.right, right: k.right }).collect();
                 (&left, &right, bk, pk, true)
             } else {
                 // Build on right (original behavior), probe with left.
-                let bk: Vec<JoinKey2> = keys.iter().map(|k| JoinKey2 { left: k.right, right: k.right }).collect();
-                let pk: Vec<JoinKey2> = keys.iter().map(|k| JoinKey2 { left: k.left, right: k.left }).collect();
+                let bk: Vec<JoinKey2> =
+                    keys.iter().map(|k| JoinKey2 { left: k.right, right: k.right }).collect();
+                let pk: Vec<JoinKey2> =
+                    keys.iter().map(|k| JoinKey2 { left: k.left, right: k.left }).collect();
                 (&right, &left, bk, pk, false)
             };
 
@@ -2254,7 +2856,8 @@ impl<'a> TpchExec<'a> {
         let est_output = std::cmp::max(probe_side.row_count, build_side.row_count).min(4_000_000);
         let mut out_types = left.col_types.clone();
         out_types.extend(right.col_types.iter().copied());
-        let out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> = (0..ncol).map(|_| None).collect();
+        let out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> =
+            (0..ncol).map(|_| None).collect();
         let mut out_names = left.column_names.clone();
         out_names.extend(right.column_names.clone());
 
@@ -2270,110 +2873,132 @@ impl<'a> TpchExec<'a> {
         // Parallel probe using rayon. Each chunk produces its own output cols.
         // Optimized: use unsafe set_len + ptr write to avoid per-push capacity
         // checks (the compiler can't elide them due to potential reallocation).
-        let partial_results: Vec<Vec<Vec<u64>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
-            let start = chunk_idx * CHUNK_SIZE;
-            let end = std::cmp::min(start + CHUNK_SIZE, probe_row_count);
+        let partial_results: Vec<Vec<Vec<u64>>> = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * CHUNK_SIZE;
+                let end = std::cmp::min(start + CHUNK_SIZE, probe_row_count);
 
-            let mut local_out: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::with_capacity(CHUNK_SIZE * 2)).collect();
-            let mut matched_rows: Vec<u32> = Vec::with_capacity(16);
+                let mut local_out: Vec<Vec<u64>> =
+                    (0..ncol).map(|_| Vec::with_capacity(CHUNK_SIZE * 2)).collect();
+                let mut matched_rows: Vec<u32> = Vec::with_capacity(16);
 
-            // W1-B: Software prefetch distance (rows ahead). Literature default
-            // for hash-join probes is 8-32; tuned to K=8 on TPC-H (best total
-            // of 3 distances tested: K=8 total=11093, K=16 total=11224, K=32 total=11174).
-            const PREFETCH_DIST: usize = 8;
-            for p in start..end {
-                // W1-B: Prefetch the hash-table directory slot AND bloom
-                // filter bits for the probe key PREFETCH_DIST rows ahead.
-                // This hides the ~100-cycle L3 miss on the next random
-                // directory access (Q21's #1 hot spot at 23.68% of runtime).
-                //
-                // The probe-side column load for next_key is sequential
-                // (hardware-prefetched), so the only added cost is the
-                // prefetch instruction itself (~1 cycle each).
-                #[cfg(target_arch = "x86_64")]
-                if p + PREFETCH_DIST < end {
-                    let next_p = p + PREFETCH_DIST;
-                    let next_key = if keys.len() == 1 {
-                        probe_side.columns[pk_cols[0]][next_p]
+                // W1-B: Software prefetch distance (rows ahead). Literature default
+                // for hash-join probes is 8-32; tuned to K=8 on TPC-H (best total
+                // of 3 distances tested: K=8 total=11093, K=16 total=11224, K=32 total=11174).
+                const PREFETCH_DIST: usize = 8;
+                for p in start..end {
+                    // W1-B: Prefetch the hash-table directory slot AND bloom
+                    // filter bits for the probe key PREFETCH_DIST rows ahead.
+                    // This hides the ~100-cycle L3 miss on the next random
+                    // directory access (Q21's #1 hot spot at 23.68% of runtime).
+                    //
+                    // The probe-side column load for next_key is sequential
+                    // (hardware-prefetched), so the only added cost is the
+                    // prefetch instruction itself (~1 cycle each).
+                    #[cfg(target_arch = "x86_64")]
+                    if p + PREFETCH_DIST < end {
+                        let next_p = p + PREFETCH_DIST;
+                        let next_key = if keys.len() == 1 {
+                            probe_side.columns[pk_cols[0]][next_p]
+                        } else {
+                            let mut nbuf = [0u8; 64];
+                            let mut noff = 0;
+                            for &kc in &pk_cols {
+                                let nv = probe_side.columns[kc][next_p];
+                                let nbytes = nv.to_le_bytes();
+                                if noff + 8 <= 64 {
+                                    nbuf[noff..noff + 8].copy_from_slice(&nbytes);
+                                    noff += 8;
+                                }
+                            }
+                            xxh3_64(&nbuf[..noff])
+                        };
+                        build_hash.prefetch_directory(next_key);
+                        bloom.prefetch(next_key);
+                    }
+
+                    let probe_key = if keys.len() == 1 {
+                        probe_side.columns[pk_cols[0]][p]
                     } else {
-                        let mut nbuf = [0u8; 64];
-                        let mut noff = 0;
+                        let mut buf = [0u8; 64];
+                        let mut off = 0;
                         for &kc in &pk_cols {
-                            let nv = probe_side.columns[kc][next_p];
-                            let nbytes = nv.to_le_bytes();
-                            if noff + 8 <= 64 {
-                                nbuf[noff..noff + 8].copy_from_slice(&nbytes);
-                                noff += 8;
+                            let v = probe_side.columns[kc][p];
+                            let bytes = v.to_le_bytes();
+                            if off + 8 <= 64 {
+                                buf[off..off + 8].copy_from_slice(&bytes);
+                                off += 8;
                             }
                         }
-                        xxh3_64(&nbuf[..noff])
+                        xxh3_64(&buf[..off])
                     };
-                    build_hash.prefetch_directory(next_key);
-                    bloom.prefetch(next_key);
-                }
 
-                let probe_key = if keys.len() == 1 {
-                    probe_side.columns[pk_cols[0]][p]
-                } else {
-                    let mut buf = [0u8; 64];
-                    let mut off = 0;
-                    for &kc in &pk_cols {
-                        let v = probe_side.columns[kc][p];
-                        let bytes = v.to_le_bytes();
-                        if off + 8 <= 64 {
-                            buf[off..off + 8].copy_from_slice(&bytes);
-                            off += 8;
+                    if !bloom.might_contain(probe_key) {
+                        if jt == JoinType2::Left && !swapped {
+                            for (c, col) in left.columns.iter().enumerate() {
+                                local_out[c].push(col[p]);
+                            }
+                            for c in 0..right.columns.len() {
+                                local_out[left_ncol + c].push(0);
+                            }
                         }
+                        continue;
                     }
-                    xxh3_64(&buf[..off])
-                };
-
-                if !bloom.might_contain(probe_key) {
-                    if jt == JoinType2::Left && !swapped {
-                        for (c, col) in left.columns.iter().enumerate() { local_out[c].push(col[p]); }
-                        for c in 0..right.columns.len() { local_out[left_ncol + c].push(0); }
-                    }
-                    continue;
-                }
-                build_hash.probe_all(probe_key, &mut matched_rows);
-                if matched_rows.is_empty() {
-                    if jt == JoinType2::Left && !swapped {
-                        for (c, col) in left.columns.iter().enumerate() { local_out[c].push(col[p]); }
-                        for c in 0..right.columns.len() { local_out[left_ncol + c].push(0); }
-                    }
-                } else {
-                    // Pre-compute left column values for this probe row (shared across all matches).
-                    // This avoids re-reading left.columns for each match.
-                    let left_vals: Vec<u64> = if !swapped {
-                        left.columns.iter().map(|col| col[p]).collect()
+                    build_hash.probe_all(probe_key, &mut matched_rows);
+                    if matched_rows.is_empty() {
+                        if jt == JoinType2::Left && !swapped {
+                            for (c, col) in left.columns.iter().enumerate() {
+                                local_out[c].push(col[p]);
+                            }
+                            for c in 0..right.columns.len() {
+                                local_out[left_ncol + c].push(0);
+                            }
+                        }
                     } else {
-                        Vec::new()
-                    };
-                    let right_vals_template: Vec<u64> = if swapped {
-                        right.columns.iter().map(|col| col[p]).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    for &b in &matched_rows {
-                        let b = b as usize;
-                        if !swapped {
-                            // Left cols from probe (same for all matches), right cols from build.
-                            for (c, &v) in left_vals.iter().enumerate() { local_out[c].push(v); }
-                            for (c, col) in right.columns.iter().enumerate() { local_out[left_ncol + c].push(col[b]); }
+                        // Pre-compute left column values for this probe row (shared across all matches).
+                        // This avoids re-reading left.columns for each match.
+                        let left_vals: Vec<u64> = if !swapped {
+                            left.columns.iter().map(|col| col[p]).collect()
                         } else {
-                            // Left cols from build, right cols from probe (same for all matches).
-                            for (c, col) in left.columns.iter().enumerate() { local_out[c].push(col[b]); }
-                            for (c, &v) in right_vals_template.iter().enumerate() { local_out[left_ncol + c].push(v); }
+                            Vec::new()
+                        };
+                        let right_vals_template: Vec<u64> = if swapped {
+                            right.columns.iter().map(|col| col[p]).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        for &b in &matched_rows {
+                            let b = b as usize;
+                            if !swapped {
+                                // Left cols from probe (same for all matches), right cols from build.
+                                for (c, &v) in left_vals.iter().enumerate() {
+                                    local_out[c].push(v);
+                                }
+                                for (c, col) in right.columns.iter().enumerate() {
+                                    local_out[left_ncol + c].push(col[b]);
+                                }
+                            } else {
+                                // Left cols from build, right cols from probe (same for all matches).
+                                for (c, col) in left.columns.iter().enumerate() {
+                                    local_out[c].push(col[b]);
+                                }
+                                for (c, &v) in right_vals_template.iter().enumerate() {
+                                    local_out[left_ncol + c].push(v);
+                                }
+                            }
                         }
                     }
                 }
-            }
-            local_out
-        }).collect();
+                local_out
+            })
+            .collect();
 
         // Merge: pre-calculate total size to avoid reallocation.
-        let total_rows: usize = partial_results.iter().map(|r| r.first().map(|c| c.len()).unwrap_or(0)).sum();
-        let mut out_cols: Vec<Vec<u64>> = (0..ncol).map(|_| Vec::with_capacity(total_rows)).collect();
+        let total_rows: usize =
+            partial_results.iter().map(|r| r.first().map(|c| c.len()).unwrap_or(0)).sum();
+        let mut out_cols: Vec<Vec<u64>> =
+            (0..ncol).map(|_| Vec::with_capacity(total_rows)).collect();
         for local_out in partial_results {
             for c in 0..ncol {
                 out_cols[c].extend_from_slice(&local_out[c]);
@@ -2411,7 +3036,8 @@ impl<'a> TpchExec<'a> {
         let mut new_strings = Vec::with_capacity(table.string_columns.len());
         for (i, sc) in table.string_columns.iter().enumerate() {
             if let Some(ref scol) = sc {
-                let strings: Vec<String> = indices.iter().map(|&r| scol.get(r).to_string()).collect();
+                let strings: Vec<String> =
+                    indices.iter().map(|&r| scol.get(r).to_string()).collect();
                 new_strings.push(Some(std::sync::Arc::new(StringSearchColumn::new(strings))));
             } else {
                 new_strings.push(None);
@@ -2480,7 +3106,9 @@ impl<'a> TpchExec<'a> {
             }
             Expr2::InList { expr, list, .. } => {
                 self.collect_table_refs(expr, tables, refs);
-                for item in list { self.collect_table_refs(item, tables, refs); }
+                for item in list {
+                    self.collect_table_refs(item, tables, refs);
+                }
             }
             Expr2::Subquery(_) | Expr2::Exists { .. } | Expr2::InSubquery { .. } => {
                 // Correlated subqueries can reference any outer table.
@@ -2495,7 +3123,9 @@ impl<'a> TpchExec<'a> {
                     self.collect_table_refs(c, tables, refs);
                     self.collect_table_refs(r, tables, refs);
                 }
-                if let Some(e) = else_ { self.collect_table_refs(e, tables, refs); }
+                if let Some(e) = else_ {
+                    self.collect_table_refs(e, tables, refs);
+                }
             }
             Expr2::Extract { expr, .. } | Expr2::Neg(expr) | Expr2::Not(expr) => {
                 self.collect_table_refs(expr, tables, refs);
@@ -2513,7 +3143,12 @@ impl<'a> TpchExec<'a> {
     /// Also handles OR of conjunctive groups (e.g. Q19): if all OR branches
     /// share the same equi-join key, it is extracted and used for the join.
     /// The OR is then applied as a post-join filter.
-    fn find_join_keys(&self, left: &ExecTable, right: &ExecTable, conjuncts: &[Expr2]) -> Vec<JoinKey2> {
+    fn find_join_keys(
+        &self,
+        left: &ExecTable,
+        right: &ExecTable,
+        conjuncts: &[Expr2],
+    ) -> Vec<JoinKey2> {
         let mut keys = Vec::new();
         for conj in conjuncts {
             if let Expr2::BinOp { op: BinOp2::Eq, left: l, right: r } = conj {
@@ -2537,11 +3172,18 @@ impl<'a> TpchExec<'a> {
     /// Find equi-join keys common to ALL branches of an OR expression.
     /// Collects all OR branches, finds equi-join keys in each, and returns
     /// the intersection.
-    fn find_or_common_keys(&self, or_expr: &Expr2, left: &ExecTable, right: &ExecTable) -> Vec<JoinKey2> {
+    fn find_or_common_keys(
+        &self,
+        or_expr: &Expr2,
+        left: &ExecTable,
+        right: &ExecTable,
+    ) -> Vec<JoinKey2> {
         // Collect all OR branches (flatten nested ORs)
         let mut branches: Vec<&Expr2> = Vec::new();
         self.collect_or_branches(or_expr, &mut branches);
-        if branches.is_empty() { return Vec::new(); }
+        if branches.is_empty() {
+            return Vec::new();
+        }
         // For each branch, split into AND-conjuncts and find equi-join keys
         let mut branch_keys: Vec<Vec<JoinKey2>> = Vec::new();
         for branch in &branches {
@@ -2576,7 +3218,12 @@ impl<'a> TpchExec<'a> {
     }
 
     /// Direct equi-join key finder (no OR handling, used by find_or_common_keys).
-    fn find_join_keys_direct(&self, left: &ExecTable, right: &ExecTable, conjuncts: &[Expr2]) -> Vec<JoinKey2> {
+    fn find_join_keys_direct(
+        &self,
+        left: &ExecTable,
+        right: &ExecTable,
+        conjuncts: &[Expr2],
+    ) -> Vec<JoinKey2> {
         let mut keys = Vec::new();
         for conj in conjuncts {
             if let Expr2::BinOp { op: BinOp2::Eq, left: l, right: r } = conj {
@@ -2597,19 +3244,31 @@ impl<'a> TpchExec<'a> {
         match e {
             Expr2::Agg { .. } | Expr2::CountStar => true,
             Expr2::BinOp { left, right, .. } => self.expr_has_agg(left) || self.expr_has_agg(right),
-            Expr2::Case { whens, else_ } => whens.iter().any(|(c, r)| self.expr_has_agg(c) || self.expr_has_agg(r))
-                || else_.as_ref().map(|e| self.expr_has_agg(e)).unwrap_or(false),
-            Expr2::Like { expr, pattern, .. } => self.expr_has_agg(expr) || self.expr_has_agg(pattern),
-            Expr2::Between { expr, low, high, .. } => self.expr_has_agg(expr) || self.expr_has_agg(low) || self.expr_has_agg(high),
-            Expr2::InList { expr, list, .. } => self.expr_has_agg(expr) || list.iter().any(|e| self.expr_has_agg(e)),
+            Expr2::Case { whens, else_ } => {
+                whens.iter().any(|(c, r)| self.expr_has_agg(c) || self.expr_has_agg(r))
+                    || else_.as_ref().map(|e| self.expr_has_agg(e)).unwrap_or(false)
+            }
+            Expr2::Like { expr, pattern, .. } => {
+                self.expr_has_agg(expr) || self.expr_has_agg(pattern)
+            }
+            Expr2::Between { expr, low, high, .. } => {
+                self.expr_has_agg(expr) || self.expr_has_agg(low) || self.expr_has_agg(high)
+            }
+            Expr2::InList { expr, list, .. } => {
+                self.expr_has_agg(expr) || list.iter().any(|e| self.expr_has_agg(e))
+            }
             Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => self.expr_has_agg(e),
-            Expr2::Substr { expr, start, len } => self.expr_has_agg(expr) || self.expr_has_agg(start) || self.expr_has_agg(len),
+            Expr2::Substr { expr, start, len } => {
+                self.expr_has_agg(expr) || self.expr_has_agg(start) || self.expr_has_agg(len)
+            }
             _ => false,
         }
     }
 
     fn resolve_from(&self, from: &[FromItem]) -> Result<ExecTable, Error> {
-        if from.is_empty() { return Err(Error::Other("no FROM clause".into())); }
+        if from.is_empty() {
+            return Err(Error::Other("no FROM clause".into()));
+        }
         let mut base = self.resolve_from_item(&from[0])?;
         for item in &from[1..] {
             let right = self.resolve_from_item(item)?;
@@ -2621,7 +3280,9 @@ impl<'a> TpchExec<'a> {
     fn resolve_from_item(&self, item: &FromItem) -> Result<ExecTable, Error> {
         match item {
             FromItem::Table(t) => {
-                let table = self.catalog.get(&t.name)
+                let table = self
+                    .catalog
+                    .get(&t.name)
                     .ok_or_else(|| Error::NotFound(format!("table '{}'", t.name)))?;
                 let alias = t.alias.as_deref().unwrap_or(&t.name);
                 Ok(ExecTable::from_catalog(table, alias))
@@ -2646,31 +3307,71 @@ impl<'a> TpchExec<'a> {
             string_columns.push(None);
             let lower = col.name.to_lowercase();
             col_map.entry(col.name.to_lowercase()).or_insert(i);
-            col_map.entry(format!("{}.{}", alias.to_lowercase(), col.name.to_lowercase())).or_insert(i);
+            col_map
+                .entry(format!("{}.{}", alias.to_lowercase(), col.name.to_lowercase()))
+                .or_insert(i);
         }
-        Ok(ExecTable { columns, column_names, col_types, string_columns, row_count: result.row_count, col_map })
+        Ok(ExecTable {
+            columns,
+            column_names,
+            col_types,
+            string_columns,
+            row_count: result.row_count,
+            col_map,
+        })
     }
 
     fn infer_result_type(&self, name: &str, values: &[u64]) -> ColType {
         let l = name.to_lowercase();
         // Date columns
-        if l.contains("date") || l.contains("shipdate") || l.contains("commitdate") || l.contains("receiptdate")
-        { return ColType::Date; }
+        if l.contains("date")
+            || l.contains("shipdate")
+            || l.contains("commitdate")
+            || l.contains("receiptdate")
+        {
+            return ColType::Date;
+        }
         // String columns (common in TPC-H SELECT aliases)
-        if l == "n_name" || l == "supp_nation" || l == "cust_nation" || l == "nation"
-            || l == "s_name" || l == "c_name" || l == "p_mfgr" || l == "p_brand" || l == "p_type"
-            || l == "p_container" || l == "l_returnflag" || l == "l_linestatus"
-            || l == "l_shipmode" || l == "l_shipinstruct" || l == "o_orderpriority"
-            || l == "o_orderstatus" || l == "cntrycode"
-        { return ColType::String; }
+        if l == "n_name"
+            || l == "supp_nation"
+            || l == "cust_nation"
+            || l == "nation"
+            || l == "s_name"
+            || l == "c_name"
+            || l == "p_mfgr"
+            || l == "p_brand"
+            || l == "p_type"
+            || l == "p_container"
+            || l == "l_returnflag"
+            || l == "l_linestatus"
+            || l == "l_shipmode"
+            || l == "l_shipinstruct"
+            || l == "o_orderpriority"
+            || l == "o_orderstatus"
+            || l == "cntrycode"
+        {
+            return ColType::String;
+        }
         // Known integer columns (key columns, counts, years, codes)
-        if l.contains("year") || l.contains("count") || l.contains("custdist")
-            || l.contains("partkey") || l.contains("suppkey")
-            || l.contains("custkey") || l.contains("nationkey") || l.contains("regionkey")
-            || l.contains("numwait") || l.contains("numcust")
-            || l.contains("supplier_cnt") || l.contains("availqty") || l.contains("size")
-            || l == "c_count" || l == "supplier_no" || l == "order_count"
-        { return ColType::Int; }
+        if l.contains("year")
+            || l.contains("count")
+            || l.contains("custdist")
+            || l.contains("partkey")
+            || l.contains("suppkey")
+            || l.contains("custkey")
+            || l.contains("nationkey")
+            || l.contains("regionkey")
+            || l.contains("numwait")
+            || l.contains("numcust")
+            || l.contains("supplier_cnt")
+            || l.contains("availqty")
+            || l.contains("size")
+            || l == "c_count"
+            || l == "supplier_no"
+            || l == "order_count"
+        {
+            return ColType::Int;
+        }
         // Heuristic: inspect actual values to distinguish Int from Float.
         // If all sampled non-zero values are "small" (< 2^32) AND none of them,
         // when interpreted as f64 bits, look like normal float values, then
@@ -2698,10 +3399,25 @@ impl<'a> TpchExec<'a> {
         let rr = right.row_count;
         if lr == 0 || rr == 0 {
             return ExecTable {
-                columns: left.columns.iter().chain(right.columns.iter()).map(|_| std::sync::Arc::new(Vec::new())).collect(),
-                column_names: left.column_names.iter().chain(right.column_names.iter()).cloned().collect(),
+                columns: left
+                    .columns
+                    .iter()
+                    .chain(right.columns.iter())
+                    .map(|_| std::sync::Arc::new(Vec::new()))
+                    .collect(),
+                column_names: left
+                    .column_names
+                    .iter()
+                    .chain(right.column_names.iter())
+                    .cloned()
+                    .collect(),
                 col_types: left.col_types.iter().chain(right.col_types.iter()).copied().collect(),
-                string_columns: left.string_columns.iter().chain(right.string_columns.iter()).cloned().collect(),
+                string_columns: left
+                    .string_columns
+                    .iter()
+                    .chain(right.string_columns.iter())
+                    .cloned()
+                    .collect(),
                 row_count: 0,
                 col_map: new_hashmap(),
             };
@@ -2710,35 +3426,57 @@ impl<'a> TpchExec<'a> {
         let mut columns = Vec::with_capacity(left.columns.len() + right.columns.len());
         for col in &left.columns {
             let mut nc = Vec::with_capacity(total);
-            for l in 0..lr { let v = col[l]; for _ in 0..rr { nc.push(v); } }
+            for l in 0..lr {
+                let v = col[l];
+                for _ in 0..rr {
+                    nc.push(v);
+                }
+            }
             columns.push(std::sync::Arc::new(nc));
         }
         for col in &right.columns {
             let mut nc = Vec::with_capacity(total);
-            for _ in 0..lr { for r in 0..rr { nc.push(col[r]); } }
+            for _ in 0..lr {
+                for r in 0..rr {
+                    nc.push(col[r]);
+                }
+            }
             columns.push(std::sync::Arc::new(nc));
         }
         let mut col_types = left.col_types.clone();
         col_types.extend(right.col_types.iter().copied());
         // String columns are NOT rebuilt after cross join — set to None.
-        let string_columns: Vec<Option<std::sync::Arc<StringSearchColumn>>> = (0..(left.columns.len() + right.columns.len())).map(|_| None).collect();
+        let string_columns: Vec<Option<std::sync::Arc<StringSearchColumn>>> =
+            (0..(left.columns.len() + right.columns.len())).map(|_| None).collect();
         let mut column_names = left.column_names.clone();
         column_names.extend(right.column_names.clone());
         let mut col_map = new_hashmap();
         for (i, name) in column_names.iter().enumerate() {
             col_map.entry(name.to_lowercase()).or_insert(i);
         }
-        for (k, v) in &left.col_map { col_map.insert(k.clone(), *v); }
+        for (k, v) in &left.col_map {
+            col_map.insert(k.clone(), *v);
+        }
         let off = left.columns.len();
-        for (k, v) in &right.col_map { col_map.insert(k.clone(), *v + off); }
+        for (k, v) in &right.col_map {
+            col_map.insert(k.clone(), *v + off);
+        }
         ExecTable { columns, column_names, col_types, string_columns, row_count: total, col_map }
     }
 
     // --- Hash join ---
 
-    fn hash_join(&self, left: ExecTable, right: ExecTable, on: &Expr2, jt: JoinType2) -> Result<ExecTable, Error> {
+    fn hash_join(
+        &self,
+        left: ExecTable,
+        right: ExecTable,
+        on: &Expr2,
+        jt: JoinType2,
+    ) -> Result<ExecTable, Error> {
         let keys = self.extract_join_keys(on, &left, &right)?;
-        if keys.is_empty() { return Ok(self.cross_join(left, right)); }
+        if keys.is_empty() {
+            return Ok(self.cross_join(left, right));
+        }
 
         // Split ON into equi-join keys and non-equi-join conjuncts.
         // Non-equi-join conjuncts (LIKE, IN, <, >, etc.) are applied per-match
@@ -2761,7 +3499,8 @@ impl<'a> TpchExec<'a> {
         let mut out_types = left.col_types.clone();
         out_types.extend(right.col_types.iter().copied());
         // String columns are NOT rebuilt after join — see hash_join_with_keys.
-        let out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> = (0..ncol).map(|_| None).collect();
+        let out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> =
+            (0..ncol).map(|_| None).collect();
         let mut out_names = left.column_names.clone();
         out_names.extend(right.column_names.clone());
         let mut row_count = 0;
@@ -2774,9 +3513,13 @@ impl<'a> TpchExec<'a> {
             for (i, name) in out_names.iter().enumerate() {
                 m.entry(name.to_lowercase()).or_insert(i);
             }
-            for (k, v) in &left.col_map { m.insert(k.clone(), *v); }
+            for (k, v) in &left.col_map {
+                m.insert(k.clone(), *v);
+            }
             let off = left_ncol;
-            for (k, v) in &right.col_map { m.insert(k.clone(), *v + off); }
+            for (k, v) in &right.col_map {
+                m.insert(k.clone(), *v + off);
+            }
             m
         };
 
@@ -2787,8 +3530,12 @@ impl<'a> TpchExec<'a> {
             let matches = build.get(&key).cloned().unwrap_or_default();
             if matches.is_empty() {
                 if jt == JoinType2::Left {
-                    for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[l]); }
-                    for c in 0..right.columns.len() { out_cols[left_ncol + c].push(0); }
+                    for (c, col) in left.columns.iter().enumerate() {
+                        out_cols[c].push(col[l]);
+                    }
+                    for c in 0..right.columns.len() {
+                        out_cols[left_ncol + c].push(0);
+                    }
                     row_count += 1;
                 }
             } else {
@@ -2796,32 +3543,64 @@ impl<'a> TpchExec<'a> {
                 for r in &matches {
                     // Apply non-equi-join conjuncts per match.
                     if !non_equi.is_empty() {
-                        if !self.eval_non_equi_match(&non_equi, &left, l, &right, *r, &out_names, &out_types, &combined_col_map, left_ncol, ncol)? {
+                        if !self.eval_non_equi_match(
+                            &non_equi,
+                            &left,
+                            l,
+                            &right,
+                            *r,
+                            &out_names,
+                            &out_types,
+                            &combined_col_map,
+                            left_ncol,
+                            ncol,
+                        )? {
                             continue;
                         }
                     }
                     any_match_passed = true;
-                    for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[l]); }
-                    for (c, col) in right.columns.iter().enumerate() { out_cols[left_ncol + c].push(col[*r]); }
+                    for (c, col) in left.columns.iter().enumerate() {
+                        out_cols[c].push(col[l]);
+                    }
+                    for (c, col) in right.columns.iter().enumerate() {
+                        out_cols[left_ncol + c].push(col[*r]);
+                    }
                     row_count += 1;
                 }
                 // For LEFT JOIN: if no matches passed the non-equi-join filter,
                 // emit unmatched left row.
                 if !any_match_passed && jt == JoinType2::Left {
-                    for (c, col) in left.columns.iter().enumerate() { out_cols[c].push(col[l]); }
-                    for c in 0..right.columns.len() { out_cols[left_ncol + c].push(0); }
+                    for (c, col) in left.columns.iter().enumerate() {
+                        out_cols[c].push(col[l]);
+                    }
+                    for c in 0..right.columns.len() {
+                        out_cols[left_ncol + c].push(0);
+                    }
                     row_count += 1;
                 }
             }
         }
 
         let mut col_map = new_hashmap();
-        for (i, name) in out_names.iter().enumerate() { col_map.entry(name.to_lowercase()).or_insert(i); }
-        for (k, v) in &left.col_map { col_map.insert(k.clone(), *v); }
+        for (i, name) in out_names.iter().enumerate() {
+            col_map.entry(name.to_lowercase()).or_insert(i);
+        }
+        for (k, v) in &left.col_map {
+            col_map.insert(k.clone(), *v);
+        }
         let off = left.columns.len();
-        for (k, v) in &right.col_map { col_map.insert(k.clone(), *v + off); }
+        for (k, v) in &right.col_map {
+            col_map.insert(k.clone(), *v + off);
+        }
 
-        Ok(ExecTable { columns: out_cols.into_iter().map(std::sync::Arc::new).collect(), column_names: out_names, col_types: out_types, string_columns: out_strings, row_count, col_map })
+        Ok(ExecTable {
+            columns: out_cols.into_iter().map(std::sync::Arc::new).collect(),
+            column_names: out_names,
+            col_types: out_types,
+            string_columns: out_strings,
+            row_count,
+            col_map,
+        })
     }
 
     /// Evaluate non-equi-join conjuncts for a single (left[l], right[r]) match.
@@ -2831,12 +3610,17 @@ impl<'a> TpchExec<'a> {
     /// (preserves string_columns for LIKE/NOT LIKE).
     /// For conjuncts that reference both tables, build a combined row.
     fn eval_non_equi_match(
-        &self, non_equi: &[Expr2],
-        left: &ExecTable, l: usize,
-        right: &ExecTable, r: usize,
-        out_names: &[String], out_types: &[ColType],
+        &self,
+        non_equi: &[Expr2],
+        left: &ExecTable,
+        l: usize,
+        right: &ExecTable,
+        r: usize,
+        out_names: &[String],
+        out_types: &[ColType],
         combined_col_map: &HashMap<String, usize>,
-        left_ncol: usize, ncol: usize,
+        left_ncol: usize,
+        ncol: usize,
     ) -> Result<bool, Error> {
         for conj in non_equi {
             // Check if this conjunct only references right columns
@@ -2853,15 +3637,20 @@ impl<'a> TpchExec<'a> {
             } else {
                 // Both tables — build combined row
                 let mut combined_cols: Vec<u64> = Vec::with_capacity(ncol);
-                for (c, col) in left.columns.iter().enumerate() { combined_cols.push(col[l]); }
-                for (c, col) in right.columns.iter().enumerate() { combined_cols.push(col[r]); }
+                for (c, col) in left.columns.iter().enumerate() {
+                    combined_cols.push(col[l]);
+                }
+                for (c, col) in right.columns.iter().enumerate() {
+                    combined_cols.push(col[r]);
+                }
                 // Build a mini StringSearchColumn for the right's string at row r
-                let mut combined_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> = (0..left_ncol).map(|_| None).collect();
+                let mut combined_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> =
+                    (0..left_ncol).map(|_| None).collect();
                 for sc in &right.string_columns {
                     if let Some(ref scol) = sc {
                         if scol.len() > r {
                             combined_strings.push(Some(std::sync::Arc::new(
-                                StringSearchColumn::new(vec![scol.get(r).to_string()])
+                                StringSearchColumn::new(vec![scol.get(r).to_string()]),
                             )));
                         } else {
                             combined_strings.push(None);
@@ -2881,7 +3670,9 @@ impl<'a> TpchExec<'a> {
                 let v = self.eval(conj, &combined_t, 0)?;
                 self.truthy(&v)
             };
-            if !pass { return Ok(false); }
+            if !pass {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -2890,42 +3681,60 @@ impl<'a> TpchExec<'a> {
     fn expr_refs_table(&self, expr: &Expr2, table: &ExecTable) -> bool {
         match expr {
             Expr2::Col(name) => {
-                let short = name.rfind('.').map(|p| &name[p+1..]).unwrap_or(name.as_str());
+                let short = name.rfind('.').map(|p| &name[p + 1..]).unwrap_or(name.as_str());
                 table.lookup_col(name).is_some() || table.lookup_col(short).is_some()
             }
             Expr2::BinOp { left, right, .. } => {
                 self.expr_refs_table(left, table) || self.expr_refs_table(right, table)
             }
             Expr2::Case { whens, else_ } => {
-                whens.iter().any(|(c, r)| self.expr_refs_table(c, table) || self.expr_refs_table(r, table))
+                whens
+                    .iter()
+                    .any(|(c, r)| self.expr_refs_table(c, table) || self.expr_refs_table(r, table))
                     || else_.as_ref().map(|e| self.expr_refs_table(e, table)).unwrap_or(false)
             }
             Expr2::Like { expr, pattern, .. } => {
                 self.expr_refs_table(expr, table) || self.expr_refs_table(pattern, table)
             }
             Expr2::Between { expr, low, high, .. } => {
-                self.expr_refs_table(expr, table) || self.expr_refs_table(low, table) || self.expr_refs_table(high, table)
+                self.expr_refs_table(expr, table)
+                    || self.expr_refs_table(low, table)
+                    || self.expr_refs_table(high, table)
             }
             Expr2::InList { expr, list, .. } => {
-                self.expr_refs_table(expr, table) || list.iter().any(|e| self.expr_refs_table(e, table))
+                self.expr_refs_table(expr, table)
+                    || list.iter().any(|e| self.expr_refs_table(e, table))
             }
             Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => {
                 self.expr_refs_table(e, table)
             }
             Expr2::Substr { expr, start, len } => {
-                self.expr_refs_table(expr, table) || self.expr_refs_table(start, table) || self.expr_refs_table(len, table)
+                self.expr_refs_table(expr, table)
+                    || self.expr_refs_table(start, table)
+                    || self.expr_refs_table(len, table)
             }
             _ => false,
         }
     }
 
-    fn extract_join_keys(&self, on: &Expr2, left: &ExecTable, right: &ExecTable) -> Result<Vec<JoinKey2>, Error> {
+    fn extract_join_keys(
+        &self,
+        on: &Expr2,
+        left: &ExecTable,
+        right: &ExecTable,
+    ) -> Result<Vec<JoinKey2>, Error> {
         let mut keys = Vec::new();
         self.collect_keys(on, left, right, &mut keys);
         Ok(keys)
     }
 
-    fn collect_keys(&self, on: &Expr2, left: &ExecTable, right: &ExecTable, keys: &mut Vec<JoinKey2>) {
+    fn collect_keys(
+        &self,
+        on: &Expr2,
+        left: &ExecTable,
+        right: &ExecTable,
+        keys: &mut Vec<JoinKey2>,
+    ) {
         match on {
             Expr2::BinOp { op: BinOp2::And, left: l, right: r } => {
                 self.collect_keys(l, left, right, keys);
@@ -2943,7 +3752,11 @@ impl<'a> TpchExec<'a> {
     }
 
     fn col_in(&self, expr: &Expr2, table: &ExecTable) -> Option<usize> {
-        if let Expr2::Col(name) = expr { table.lookup_col(name) } else { None }
+        if let Expr2::Col(name) = expr {
+            table.lookup_col(name)
+        } else {
+            None
+        }
     }
 
     // --- WHERE ---
@@ -3031,7 +3844,9 @@ impl<'a> TpchExec<'a> {
         // 1. Flatten the OR tree into disjuncts.
         let mut disjuncts: Vec<&Expr2> = Vec::new();
         Self::flatten_disjuncts(or_expr, &mut disjuncts);
-        if disjuncts.is_empty() { return Ok(false); }
+        if disjuncts.is_empty() {
+            return Ok(false);
+        }
 
         // 2. For each disjunct, extract (col_idx, str_hash) pairs.
         //    All disjuncts must reference exactly 2 columns and the same 2 columns.
@@ -3073,16 +3888,20 @@ impl<'a> TpchExec<'a> {
                         col_b_hash = Some(h);
                     }
                     (Some(a), Some(b)) => {
-                        if cidx == a { col_a_hash = Some(h); }
-                        else if cidx == b { col_b_hash = Some(h); }
-                        else { return Ok(false); }  // references a 3rd column
+                        if cidx == a {
+                            col_a_hash = Some(h);
+                        } else if cidx == b {
+                            col_b_hash = Some(h);
+                        } else {
+                            return Ok(false);
+                        } // references a 3rd column
                     }
                     _ => unreachable!(),
                 }
             }
             match (col_a_hash, col_b_hash) {
                 (Some(ha), Some(hb)) => pairs.push((ha, hb)),
-                _ => return Ok(false),  // disjunct didn't reference both columns
+                _ => return Ok(false), // disjunct didn't reference both columns
             }
         }
 
@@ -3096,7 +3915,9 @@ impl<'a> TpchExec<'a> {
         let col_b_data = &t.columns[cb];
         let n = t.row_count;
         let npairs = pairs.len();
-        if npairs == 0 { return Ok(false); }
+        if npairs == 0 {
+            return Ok(false);
+        }
 
         // Build the result as a packed Bitmap by composing per-pair
         // (col_a == h1) AND (col_b == h2) bitmaps with OR. This reuses
@@ -3131,9 +3952,13 @@ impl<'a> TpchExec<'a> {
             // this; kept for correctness on hypothetical future queries).
             let set: FxHashSet<(u64, u64)> = pairs.iter().copied().collect();
             for i in 0..n {
-                if !mask[i] { continue; }
+                if !mask[i] {
+                    continue;
+                }
                 let key = (col_a_data[i], col_b_data[i]);
-                if !set.contains(&key) { mask[i] = false; }
+                if !set.contains(&key) {
+                    mask[i] = false;
+                }
             }
         }
 
@@ -3143,7 +3968,12 @@ impl<'a> TpchExec<'a> {
     /// Vectorized boolean mask evaluation. Resolves column indices once,
     /// then loops over rows with direct array access. Falls back to
     /// per-row eval() for expression shapes it doesn't recognize.
-    fn eval_bool_mask_vec(&self, expr: &Expr2, t: &ExecTable, mask: &mut [bool]) -> Result<(), Error> {
+    fn eval_bool_mask_vec(
+        &self,
+        expr: &Expr2,
+        t: &ExecTable,
+        mask: &mut [bool],
+    ) -> Result<(), Error> {
         match expr {
             Expr2::BinOp { op: BinOp2::And, left, right } => {
                 // W2: evaluate left then right directly into the same mask.
@@ -3181,7 +4011,9 @@ impl<'a> TpchExec<'a> {
                 let mut rmask = take_mask_buf(n);
                 rmask[..n].fill(true);
                 self.eval_bool_mask_vec(right, t, &mut rmask[..n])?;
-                for i in 0..n { mask[i] = mask[i] && (lmask[i] || rmask[i]); }
+                for i in 0..n {
+                    mask[i] = mask[i] && (lmask[i] || rmask[i]);
+                }
                 return_mask_buf(lmask);
                 return_mask_buf(rmask);
                 Ok(())
@@ -3254,7 +4086,9 @@ impl<'a> TpchExec<'a> {
                             for i in 0..n {
                                 let v = col[i];
                                 let in_range = v >= lo && v <= hi;
-                                if *negated == in_range { bm.clear(i); }
+                                if *negated == in_range {
+                                    bm.clear(i);
+                                }
                             }
                             bm
                         }
@@ -3264,7 +4098,9 @@ impl<'a> TpchExec<'a> {
                 } else {
                     // Fallback: per-row eval
                     for i in 0..t.row_count {
-                        if !mask[i] { continue; }
+                        if !mask[i] {
+                            continue;
+                        }
                         let v = self.eval(expr, t, i)?;
                         let lo = self.eval(low, t, i)?;
                         let hi = self.eval(high, t, i)?;
@@ -3276,13 +4112,21 @@ impl<'a> TpchExec<'a> {
             }
             Expr2::InList { expr, list, negated } => {
                 if let Some(col_idx) = self.col_in(expr, t) {
-                    let vals: Vec<u64> = list.iter().filter_map(|e| {
-                        if let Some(ci) = self.col_in(e, t) { Some(t.columns[ci][0]) }
-                        else { self.eval_const(e, t).ok().map(|v| v.to_u64()) }
-                    }).collect();
+                    let vals: Vec<u64> = list
+                        .iter()
+                        .filter_map(|e| {
+                            if let Some(ci) = self.col_in(e, t) {
+                                Some(t.columns[ci][0])
+                            } else {
+                                self.eval_const(e, t).ok().map(|v| v.to_u64())
+                            }
+                        })
+                        .collect();
                     let col = &t.columns[col_idx];
                     for i in 0..t.row_count {
-                        if !mask[i] { continue; }
+                        if !mask[i] {
+                            continue;
+                        }
                         let v = col[i];
                         let found = vals.iter().any(|&x| x == v);
                         mask[i] = mask[i] && (*negated != found);
@@ -3290,12 +4134,17 @@ impl<'a> TpchExec<'a> {
                     Ok(())
                 } else {
                     for i in 0..t.row_count {
-                        if !mask[i] { continue; }
+                        if !mask[i] {
+                            continue;
+                        }
                         let v = self.eval(expr, t, i)?;
                         let mut found = false;
                         for item in list {
                             let iv = self.eval(item, t, i)?;
-                            if self.cmp_eq(&v, &iv) { found = true; break; }
+                            if self.cmp_eq(&v, &iv) {
+                                found = true;
+                                break;
+                            }
                         }
                         mask[i] = mask[i] && (*negated != found);
                     }
@@ -3308,15 +4157,24 @@ impl<'a> TpchExec<'a> {
                     if col_idx < t.string_columns.len() {
                         if let Some(ref sc) = t.string_columns[col_idx] {
                             // Get pattern as string
-                            let pat = if let Expr2::Str(s) = pattern.as_ref() { s.clone() }
-                                else { self.eval(pattern, t, 0).ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default() };
+                            let pat = if let Expr2::Str(s) = pattern.as_ref() {
+                                s.clone()
+                            } else {
+                                self.eval(pattern, t, 0)
+                                    .ok()
+                                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                                    .unwrap_or_default()
+                            };
                             if !pat.is_empty() && sc.len() >= t.row_count {
                                 // Only use StringSearchColumn if it has enough rows
                                 // (after a join, the string column may have the wrong length)
                                 let like_mask = self.like_mask(sc, &pat);
                                 for i in 0..t.row_count {
-                                    if *negated { mask[i] = mask[i] && !like_mask[i]; }
-                                    else { mask[i] = mask[i] && like_mask[i]; }
+                                    if *negated {
+                                        mask[i] = mask[i] && !like_mask[i];
+                                    } else {
+                                        mask[i] = mask[i] && like_mask[i];
+                                    }
                                 }
                                 return Ok(());
                             }
@@ -3325,7 +4183,9 @@ impl<'a> TpchExec<'a> {
                 }
                 // Fallback: per-row eval
                 for i in 0..t.row_count {
-                    if !mask[i] { continue; }
+                    if !mask[i] {
+                        continue;
+                    }
                     let v = self.eval(expr, t, i)?;
                     let pv = self.eval(pattern, t, i)?;
                     let r = match (&v, &pv) {
@@ -3339,7 +4199,9 @@ impl<'a> TpchExec<'a> {
             _ => {
                 // Fallback: per-row eval for unrecognized shapes
                 for i in 0..t.row_count {
-                    if !mask[i] { continue; }
+                    if !mask[i] {
+                        continue;
+                    }
                     let v = self.eval(expr, t, i)?;
                     mask[i] = mask[i] && self.truthy(&v);
                 }
@@ -3357,17 +4219,28 @@ impl<'a> TpchExec<'a> {
             Expr2::Date(d) => Ok(Value2::Date(*d)),
             Expr2::Neg(e) => {
                 let v = self.eval_const(e, t)?;
-                Ok(match v { Value2::Int(i) => Value2::Int(-i), Value2::Float(f) => Value2::Float(-f), _ => Value2::Null })
+                Ok(match v {
+                    Value2::Int(i) => Value2::Int(-i),
+                    Value2::Float(f) => Value2::Float(-f),
+                    _ => Value2::Null,
+                })
             }
             _ => self.eval(expr, t, 0),
         }
     }
 
     /// Build a LIKE mask for a string column. Handles % wildcards.
-    fn like_mask(&self, sc: &crate::exec::fm_index::StringSearchColumn, pattern: &str) -> Vec<bool> {
+    fn like_mask(
+        &self,
+        sc: &crate::exec::fm_index::StringSearchColumn,
+        pattern: &str,
+    ) -> Vec<bool> {
         let n = sc.len();
         let mut mask = vec![false; n];
-        if pattern.is_empty() { mask.fill(true); return mask; }
+        if pattern.is_empty() {
+            mask.fill(true);
+            return mask;
+        }
         let pb = pattern.as_bytes();
         if pb[0] == b'%' && !pb[1..].contains(&b'%') && !pattern.contains('_') {
             // Suffix match: %suffix
@@ -3392,7 +4265,14 @@ impl<'a> TpchExec<'a> {
     /// Vectorized comparison: Col op Literal (or Literal op Col).
     /// Resolves column index once, then loops.
     /// Falls back to per-row eval for Col op Col or complex expressions.
-    fn eval_comparison_vec(&self, op: BinOp2, left: &Expr2, right: &Expr2, t: &ExecTable, mask: &mut [bool]) -> Result<(), Error> {
+    fn eval_comparison_vec(
+        &self,
+        op: BinOp2,
+        left: &Expr2,
+        right: &Expr2,
+        t: &ExecTable,
+        mask: &mut [bool],
+    ) -> Result<(), Error> {
         // Try Col op Const (right side must NOT have column refs)
         if let Some(col_idx) = self.col_in(left, t) {
             if !self.expr_has_col(right) {
@@ -3421,10 +4301,11 @@ impl<'a> TpchExec<'a> {
             if let Some(col_idx) = self.col_in(left, t) {
                 if let Expr2::Col(rname) = right {
                     if t.lookup_col(rname).is_none() {
-                        if let Some(outer_idx) = outer_t.lookup_col(rname)
-                            .or_else(|| rname.rfind('.').and_then(|p| outer_t.lookup_col(&rname[p+1..])))
-                        {
-                            let cell = outer_t.columns[outer_idx].get(outer_row).copied().unwrap_or(0);
+                        if let Some(outer_idx) = outer_t.lookup_col(rname).or_else(|| {
+                            rname.rfind('.').and_then(|p| outer_t.lookup_col(&rname[p + 1..]))
+                        }) {
+                            let cell =
+                                outer_t.columns[outer_idx].get(outer_row).copied().unwrap_or(0);
                             let rval = match outer_t.col_types[outer_idx] {
                                 ColType::Int => Value2::Int(cell as i64),
                                 ColType::Float => Value2::Float(f64::from_bits(cell)),
@@ -3441,10 +4322,11 @@ impl<'a> TpchExec<'a> {
             if let Some(col_idx) = self.col_in(right, t) {
                 if let Expr2::Col(lname) = left {
                     if t.lookup_col(lname).is_none() {
-                        if let Some(outer_idx) = outer_t.lookup_col(lname)
-                            .or_else(|| lname.rfind('.').and_then(|p| outer_t.lookup_col(&lname[p+1..])))
-                        {
-                            let cell = outer_t.columns[outer_idx].get(outer_row).copied().unwrap_or(0);
+                        if let Some(outer_idx) = outer_t.lookup_col(lname).or_else(|| {
+                            lname.rfind('.').and_then(|p| outer_t.lookup_col(&lname[p + 1..]))
+                        }) {
+                            let cell =
+                                outer_t.columns[outer_idx].get(outer_row).copied().unwrap_or(0);
                             let lval = match outer_t.col_types[outer_idx] {
                                 ColType::Int => Value2::Int(cell as i64),
                                 ColType::Float => Value2::Float(f64::from_bits(cell)),
@@ -3476,13 +4358,17 @@ impl<'a> TpchExec<'a> {
                 match op {
                     BinOp2::Eq => {
                         for i in 0..n {
-                            if mask[i] && lcol[i] != rcol[i] { mask[i] = false; }
+                            if mask[i] && lcol[i] != rcol[i] {
+                                mask[i] = false;
+                            }
                         }
                         return Ok(());
                     }
                     BinOp2::Ne => {
                         for i in 0..n {
-                            if mask[i] && lcol[i] == rcol[i] { mask[i] = false; }
+                            if mask[i] && lcol[i] == rcol[i] {
+                                mask[i] = false;
+                            }
                         }
                         return Ok(());
                     }
@@ -3492,7 +4378,9 @@ impl<'a> TpchExec<'a> {
         }
         // Fallback: per-row eval for Col op Col or complex expressions
         for i in 0..t.row_count {
-            if !mask[i] { continue; }
+            if !mask[i] {
+                continue;
+            }
             let lv = self.eval(left, t, i)?;
             let rv = self.eval(right, t, i)?;
             let result = self.binop(op, &lv, &rv);
@@ -3502,7 +4390,15 @@ impl<'a> TpchExec<'a> {
     }
 
     /// Apply a comparison (Col op Value) to the mask vectorized.
-    fn apply_comparison(&self, op: BinOp2, col_idx: usize, val: &Value2, t: &ExecTable, mask: &mut [bool], _negated: bool) -> Result<(), Error> {
+    fn apply_comparison(
+        &self,
+        op: BinOp2,
+        col_idx: usize,
+        val: &Value2,
+        t: &ExecTable,
+        mask: &mut [bool],
+        _negated: bool,
+    ) -> Result<(), Error> {
         use crate::exec::bitmap;
         let col: &[u64] = &t.columns[col_idx];
         let col_type = t.col_types[col_idx];
@@ -3576,7 +4472,9 @@ impl<'a> TpchExec<'a> {
             _ => {
                 // Fallback: per-row eval
                 for i in 0..n {
-                    if !mask[i] { continue; }
+                    if !mask[i] {
+                        continue;
+                    }
                     let cv = unsafe { std::ptr::read(col.as_ptr().add(i)) };
                     let v = match col_type {
                         ColType::Int => Value2::Int(cv as i64),
@@ -3600,13 +4498,20 @@ impl<'a> TpchExec<'a> {
         Ok(())
     }
 
-    fn eval_bool_mask(&self, expr: &Expr2, table: &ExecTable, mask: &mut [bool]) -> Result<(), Error> {
+    fn eval_bool_mask(
+        &self,
+        expr: &Expr2,
+        table: &ExecTable,
+        mask: &mut [bool],
+    ) -> Result<(), Error> {
         match expr {
             Expr2::BinOp { op: BinOp2::And, left, right } => {
                 self.eval_bool_mask(left, table, mask)?;
                 let mut rm = vec![true; table.row_count];
                 self.eval_bool_mask(right, table, &mut rm)?;
-                for i in 0..table.row_count { mask[i] = mask[i] && rm[i]; }
+                for i in 0..table.row_count {
+                    mask[i] = mask[i] && rm[i];
+                }
                 Ok(())
             }
             Expr2::BinOp { op: BinOp2::Or, left, right } => {
@@ -3614,7 +4519,9 @@ impl<'a> TpchExec<'a> {
                 self.eval_bool_mask(left, table, &mut lm)?;
                 let mut rm = vec![true; table.row_count];
                 self.eval_bool_mask(right, table, &mut rm)?;
-                for i in 0..table.row_count { mask[i] = lm[i] || rm[i]; }
+                for i in 0..table.row_count {
+                    mask[i] = lm[i] || rm[i];
+                }
                 Ok(())
             }
             _ => {
@@ -3628,7 +4535,12 @@ impl<'a> TpchExec<'a> {
     }
 
     fn truthy(&self, v: &Value2) -> bool {
-        match v { Value2::Int(i) => *i != 0, Value2::Float(f) => *f != 0.0, Value2::Null => false, _ => false }
+        match v {
+            Value2::Int(i) => *i != 0,
+            Value2::Float(f) => *f != 0.0,
+            Value2::Null => false,
+            _ => false,
+        }
     }
 
     // --- Expression evaluation ---
@@ -3664,7 +4576,7 @@ impl<'a> TpchExec<'a> {
                 }
                 // Try qualified name: if name contains '.', try the part after '.'
                 if let Some(dot_pos) = name.rfind('.') {
-                    let short_name = &name[dot_pos+1..];
+                    let short_name = &name[dot_pos + 1..];
                     if let Some(idx) = t.lookup_col(short_name) {
                         let cell = t.columns[idx].get(row).copied().unwrap_or(0);
                         return Ok(match t.col_types[idx] {
@@ -3712,7 +4624,7 @@ impl<'a> TpchExec<'a> {
                     }
                     // Try short name (after '.')
                     if let Some(dot_pos) = name.rfind('.') {
-                        let short_name = &name[dot_pos+1..];
+                        let short_name = &name[dot_pos + 1..];
                         if let Some(idx) = outer_t.lookup_col(short_name) {
                             let cell = outer_t.columns[idx].get(outer_row).copied().unwrap_or(0);
                             return Ok(match outer_t.col_types[idx] {
@@ -3742,7 +4654,11 @@ impl<'a> TpchExec<'a> {
             Expr2::Date(d) => Ok(Value2::Date(*d)),
             Expr2::Neg(e) => {
                 let v = self.eval(e, t, row)?;
-                match v { Value2::Int(i) => Ok(Value2::Int(-i)), Value2::Float(f) => Ok(Value2::Float(-f)), _ => Ok(Value2::Null) }
+                match v {
+                    Value2::Int(i) => Ok(Value2::Int(-i)),
+                    Value2::Float(f) => Ok(Value2::Float(-f)),
+                    _ => Ok(Value2::Null),
+                }
             }
             Expr2::Not(e) => {
                 let v = self.eval(e, t, row)?;
@@ -3763,7 +4679,9 @@ impl<'a> TpchExec<'a> {
                         // Fallback: exact match if no wildcards.
                         if !p.contains('%') && !p.contains('_') {
                             *h as u64 == xxhash_rust::xxh3::xxh3_64(p.as_bytes())
-                        } else { false }
+                        } else {
+                            false
+                        }
                     }
                     _ => false,
                 };
@@ -3781,16 +4699,23 @@ impl<'a> TpchExec<'a> {
                 let mut found = false;
                 for item in list {
                     let iv = self.eval(item, t, row)?;
-                    if self.cmp_eq(&v, &iv) { found = true; break; }
+                    if self.cmp_eq(&v, &iv) {
+                        found = true;
+                        break;
+                    }
                 }
                 Ok(Value2::Int(if if *negated { !found } else { found } { 1 } else { 0 }))
             }
             Expr2::Case { whens, else_ } => {
                 for (cond, result) in whens {
                     let cv = self.eval(cond, t, row)?;
-                    if self.truthy(&cv) { return self.eval(result, t, row); }
+                    if self.truthy(&cv) {
+                        return self.eval(result, t, row);
+                    }
                 }
-                if let Some(e) = else_ { return self.eval(e, t, row); }
+                if let Some(e) = else_ {
+                    return self.eval(e, t, row);
+                }
                 Ok(Value2::Null)
             }
             Expr2::Extract { field, expr } => {
@@ -3851,7 +4776,8 @@ impl<'a> TpchExec<'a> {
                     let v = t.columns[ci].get(row).copied().unwrap_or(0);
                     corr_hash = corr_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
                 }
-                let cache_key = ast_key.wrapping_add((corr_hash.wrapping_mul(0x9E3779B97F4A7C15)) as usize);
+                let cache_key =
+                    ast_key.wrapping_add((corr_hash.wrapping_mul(0x9E3779B97F4A7C15)) as usize);
                 {
                     let cache = self.subquery_cache.borrow();
                     if let Some(v) = cache.get(&cache_key) {
@@ -3866,7 +4792,8 @@ impl<'a> TpchExec<'a> {
                 let r = r?;
                 let val = r.columns.first().and_then(|c| c.values.first()).copied().unwrap_or(0);
                 let name = r.columns.first().map(|c| c.name.as_str()).unwrap_or("");
-                let vals_slice: &[u64] = r.columns.first().map(|c| c.values.as_slice()).unwrap_or(&[]);
+                let vals_slice: &[u64] =
+                    r.columns.first().map(|c| c.values.as_slice()).unwrap_or(&[]);
                 let v = match self.infer_result_type(name, vals_slice) {
                     ColType::Float => Value2::Float(f64::from_bits(val)),
                     _ => Value2::Int(val as i64),
@@ -3892,27 +4819,38 @@ impl<'a> TpchExec<'a> {
                     if let Some(set) = cache.get(&ast_key) {
                         let outer_val = t.columns[outer_col_idx].get(row).copied().unwrap_or(0);
                         let exists = set.contains(&outer_val);
-                        return Ok(Value2::Int(if if *negated { !exists } else { exists } { 1 } else { 0 }));
+                        return Ok(Value2::Int(if if *negated { !exists } else { exists } {
+                            1
+                        } else {
+                            0
+                        }));
                     }
                 }
                 // Multi-column EXISTS fast path: if the subquery has 2 correlation
                 // columns — one equi-join (e.g. l_orderkey = l1.l_orderkey) and one
                 // inequality (e.g. l_suppkey <> l1.l_suppkey) — build a
                 // HashMap<equi_key, HashSet<ineq_col>> once, then check per row.
-                if let Some((outer_eq_idx, inner_eq_idx, outer_neq_idx, inner_neq_idx)) = self.find_exists_multi_col(query, t) {
+                if let Some((outer_eq_idx, inner_eq_idx, outer_neq_idx, inner_neq_idx)) =
+                    self.find_exists_multi_col(query, t)
+                {
                     let need_build = !self.exists_multi_cache.borrow().contains_key(&ast_key);
                     if need_build {
-                        let map = self.build_exists_multi_map(query, inner_eq_idx, inner_neq_idx)?;
+                        let map =
+                            self.build_exists_multi_map(query, inner_eq_idx, inner_neq_idx)?;
                         self.exists_multi_cache.borrow_mut().insert(ast_key, map);
                     }
                     let cache = self.exists_multi_cache.borrow();
                     if let Some(map) = cache.get(&ast_key) {
                         let outer_eq = t.columns[outer_eq_idx].get(row).copied().unwrap_or(0);
                         let outer_neq = t.columns[outer_neq_idx].get(row).copied().unwrap_or(0);
-                        let exists = map.get(&outer_eq).map_or(false, |set| {
-                            set.iter().any(|&v| v != outer_neq)
-                        });
-                        return Ok(Value2::Int(if if *negated { !exists } else { exists } { 1 } else { 0 }));
+                        let exists = map
+                            .get(&outer_eq)
+                            .map_or(false, |set| set.iter().any(|&v| v != outer_neq));
+                        return Ok(Value2::Int(if if *negated { !exists } else { exists } {
+                            1
+                        } else {
+                            0
+                        }));
                     }
                 }
                 // Fallback: per-row execution (correlated subquery)
@@ -3962,7 +4900,11 @@ impl<'a> TpchExec<'a> {
                         // so empty means truly empty.
                         let v_u64 = v.to_u64();
                         let found = set.contains(&v_u64);
-                        return Ok(Value2::Int(if if *negated { !found } else { found } { 1 } else { 0 }));
+                        return Ok(Value2::Int(if if *negated { !found } else { found } {
+                            1
+                        } else {
+                            0
+                        }));
                     }
                 }
                 drop(cache);
@@ -3976,12 +4918,17 @@ impl<'a> TpchExec<'a> {
                 if let Some(col) = r.columns.first() {
                     for &cell in &col.values {
                         let iv = Value2::Int(cell as i64);
-                        if self.cmp_eq(&v, &iv) { found = true; break; }
+                        if self.cmp_eq(&v, &iv) {
+                            found = true;
+                            break;
+                        }
                     }
                 }
                 Ok(Value2::Int(if if *negated { !found } else { found } { 1 } else { 0 }))
             }
-            Expr2::Agg { .. } | Expr2::CountStar => Err(Error::Other("aggregate in non-agg context".into())),
+            Expr2::Agg { .. } | Expr2::CountStar => {
+                Err(Error::Other("aggregate in non-agg context".into()))
+            }
         }
     }
 
@@ -3993,12 +4940,22 @@ impl<'a> TpchExec<'a> {
                 match (lf, rf) {
                     (Some(l), Some(r)) => {
                         let res = match op {
-                            BinOp2::Add => l + r, BinOp2::Sub => l - r, BinOp2::Mul => l * r,
-                            BinOp2::Div => { if r == 0.0 { return Value2::Null; } l / r },
+                            BinOp2::Add => l + r,
+                            BinOp2::Sub => l - r,
+                            BinOp2::Mul => l * r,
+                            BinOp2::Div => {
+                                if r == 0.0 {
+                                    return Value2::Null;
+                                }
+                                l / r
+                            }
                             _ => unreachable!(),
                         };
                         // Keep as int if both are ints and op is not div
-                        if matches!(lv, Value2::Int(_)) && matches!(rv, Value2::Int(_)) && op != BinOp2::Div {
+                        if matches!(lv, Value2::Int(_))
+                            && matches!(rv, Value2::Int(_))
+                            && op != BinOp2::Div
+                        {
                             let li = lv.as_i64().unwrap();
                             let ri = rv.as_i64().unwrap();
                             let ir = match op {
@@ -4029,12 +4986,19 @@ impl<'a> TpchExec<'a> {
         match (a, b) {
             (Value2::Null, _) | (_, Value2::Null) => false,
             (Value2::Str(x), Value2::Str(y)) => x == y,
-            (Value2::Int(i), Value2::Str(s)) => *i as u64 == xxhash_rust::xxh3::xxh3_64(s.as_bytes()),
-            (Value2::Str(s), Value2::Int(i)) => xxhash_rust::xxh3::xxh3_64(s.as_bytes()) == *i as u64,
+            (Value2::Int(i), Value2::Str(s)) => {
+                *i as u64 == xxhash_rust::xxh3::xxh3_64(s.as_bytes())
+            }
+            (Value2::Str(s), Value2::Int(i)) => {
+                xxhash_rust::xxh3::xxh3_64(s.as_bytes()) == *i as u64
+            }
             _ => {
                 let af = a.as_f64();
                 let bf = b.as_f64();
-                match (af, bf) { (Some(x), Some(y)) => x == y, _ => false }
+                match (af, bf) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => false,
+                }
             }
         }
     }
@@ -4045,31 +5009,52 @@ impl<'a> TpchExec<'a> {
             _ => {
                 let af = a.as_f64();
                 let bf = b.as_f64();
-                match (af, bf) { (Some(x), Some(y)) => x < y, _ => false }
+                match (af, bf) {
+                    (Some(x), Some(y)) => x < y,
+                    _ => false,
+                }
             }
         }
     }
-    fn cmp_le(&self, a: &Value2, b: &Value2) -> bool { self.cmp_lt(a, b) || self.cmp_eq(a, b) }
+    fn cmp_le(&self, a: &Value2, b: &Value2) -> bool {
+        self.cmp_lt(a, b) || self.cmp_eq(a, b)
+    }
 
     fn like(&self, s: &str, pattern: &str) -> bool {
         let sb = s.as_bytes();
         let pb = pattern.as_bytes();
-        let mut si = 0; let mut pi = 0;
-        let mut star_s = usize::MAX; let mut star_p = usize::MAX;
+        let mut si = 0;
+        let mut pi = 0;
+        let mut star_s = usize::MAX;
+        let mut star_p = usize::MAX;
         while si < sb.len() {
-            if pi < pb.len() && (pb[pi] == b'_' || pb[pi] == sb[si]) { si += 1; pi += 1; }
-            else if pi < pb.len() && pb[pi] == b'%' { star_p = pi; star_s = si; pi += 1; }
-            else if star_p != usize::MAX { pi = star_p + 1; star_s += 1; si = star_s; }
-            else { return false; }
+            if pi < pb.len() && (pb[pi] == b'_' || pb[pi] == sb[si]) {
+                si += 1;
+                pi += 1;
+            } else if pi < pb.len() && pb[pi] == b'%' {
+                star_p = pi;
+                star_s = si;
+                pi += 1;
+            } else if star_p != usize::MAX {
+                pi = star_p + 1;
+                star_s += 1;
+                si = star_s;
+            } else {
+                return false;
+            }
         }
-        while pi < pb.len() && pb[pi] == b'%' { pi += 1; }
+        while pi < pb.len() && pb[pi] == b'%' {
+            pi += 1;
+        }
         pi == pb.len()
     }
 
     fn extract(&self, field: &str, v: &Value2) -> Value2 {
         let days = match v {
-            Value2::Date(d) => *d, Value2::Int(i) => *i as i32,
-            Value2::Float(f) => *f as i32, _ => return Value2::Null,
+            Value2::Date(d) => *d,
+            Value2::Int(i) => *i as i32,
+            Value2::Float(f) => *f as i32,
+            _ => return Value2::Null,
         };
         let lower = field.to_lowercase();
         // W1-C: Fast path for `extract(year FROM ...)` — uses Howard Hinnant's
@@ -4082,7 +5067,9 @@ impl<'a> TpchExec<'a> {
         let date = crate::types::Date::from_u64(days as u64);
         let (y, m, d) = date.to_ymd();
         let r = match lower.as_str() {
-            "month" => m as i64, "day" => d as i64, _ => y as i64,
+            "month" => m as i64,
+            "day" => d as i64,
+            _ => y as i64,
         };
         Value2::Int(r)
     }
@@ -4141,11 +5128,16 @@ impl<'a> TpchExec<'a> {
     }
 
     fn substr(&self, s: &Value2, start: &Value2, len: &Value2) -> Value2 {
-        let s = match s.as_str() { Some(s) => s, None => return Value2::Null };
+        let s = match s.as_str() {
+            Some(s) => s,
+            None => return Value2::Null,
+        };
         let st = start.as_i64().unwrap_or(1).max(1) as usize;
         let ln = len.as_i64().unwrap_or(0) as usize;
         let si = st.saturating_sub(1);
-        if si >= s.len() { return Value2::Str(String::new()); }
+        if si >= s.len() {
+            return Value2::Str(String::new());
+        }
         let ei = (si + ln).min(s.len());
         Value2::Str(s[si..ei].to_string())
     }
@@ -4156,16 +5148,22 @@ impl<'a> TpchExec<'a> {
     /// For <=256 groups: single pass, no HashMap, no Vec<Vec<usize>>.
     /// Returns None if the query is too complex for this path.
     fn try_low_card_grouped(
-        &self, query: &SelectQuery2, t: &ExecTable, mask: &[bool],
+        &self,
+        query: &SelectQuery2,
+        t: &ExecTable,
+        mask: &[bool],
     ) -> Result<Option<QueryResult>, Error> {
         use crate::exec::fixed_agg::{FixedAccumulator, MAX_FIXED_GROUPS};
 
-        if query.having.is_some() { return Ok(None); }
+        if query.having.is_some() {
+            return Ok(None);
+        }
 
-        let gb_cols: Vec<Option<usize>> = query.group_by.iter()
-            .map(|gb| self.col_in(gb, t))
-            .collect();
-        if gb_cols.iter().any(|c| c.is_none()) { return Ok(None); }
+        let gb_cols: Vec<Option<usize>> =
+            query.group_by.iter().map(|gb| self.col_in(gb, t)).collect();
+        if gb_cols.iter().any(|c| c.is_none()) {
+            return Ok(None);
+        }
         let gb_cols: Vec<usize> = gb_cols.iter().map(|c| c.unwrap()).collect();
 
         #[derive(Clone)]
@@ -4200,45 +5198,97 @@ impl<'a> TpchExec<'a> {
                         }
                         AggFunc::Sum => {
                             if let Some(a) = self.col_in(arg, t) {
-                                if t.col_types[a] == ColType::Float { Some(LcAgg::SumCol(a)) } else { None }
-                            } else if let Expr2::BinOp { op: BinOp2::Mul, left, right } = arg.as_ref() {
-                                if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in(right, t)) {
-                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                if t.col_types[a] == ColType::Float {
+                                    Some(LcAgg::SumCol(a))
+                                } else {
+                                    None
+                                }
+                            } else if let Expr2::BinOp { op: BinOp2::Mul, left, right } =
+                                arg.as_ref()
+                            {
+                                if let (Some(a), Some(b)) =
+                                    (self.col_in(left, t), self.col_in(right, t))
+                                {
+                                    if t.col_types[a] == ColType::Float
+                                        && t.col_types[b] == ColType::Float
+                                    {
                                         Some(LcAgg::SumColCol(a, b))
-                                    } else { None }
-                                } else if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in_sub_one_right(right, t)) {
-                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                    } else {
+                                        None
+                                    }
+                                } else if let (Some(a), Some(b)) =
+                                    (self.col_in(left, t), self.col_in_sub_one_right(right, t))
+                                {
+                                    if t.col_types[a] == ColType::Float
+                                        && t.col_types[b] == ColType::Float
+                                    {
                                         Some(LcAgg::SumColSubOne(a, b))
-                                    } else { None }
-                                } else if let (Some(b), Some(a)) = (self.col_in(right, t), self.col_in_sub_one_right(left, t)) {
-                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                    } else {
+                                        None
+                                    }
+                                } else if let (Some(b), Some(a)) =
+                                    (self.col_in(right, t), self.col_in_sub_one_right(left, t))
+                                {
+                                    if t.col_types[a] == ColType::Float
+                                        && t.col_types[b] == ColType::Float
+                                    {
                                         Some(LcAgg::SumColSubOne(a, b))
-                                    } else { None }
-                                } else { None }
-                            } else { None }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         }
                         AggFunc::Avg => {
                             if let Expr2::Col(name) = arg.as_ref() {
                                 if let Some(idx) = t.lookup_col(name) {
-                                    if t.col_types[idx] == ColType::Float { Some(LcAgg::AvgCol(idx)) } else { None }
-                                } else { None }
-                            } else { None }
+                                    if t.col_types[idx] == ColType::Float {
+                                        Some(LcAgg::AvgCol(idx))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         }
                         AggFunc::Min => {
                             if let Expr2::Col(name) = arg.as_ref() {
-                                if let Some(idx) = t.lookup_col(name) { Some(LcAgg::MinCol(idx)) } else { None }
-                            } else { None }
+                                if let Some(idx) = t.lookup_col(name) {
+                                    Some(LcAgg::MinCol(idx))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         }
                         AggFunc::Max => {
                             if let Expr2::Col(name) = arg.as_ref() {
-                                if let Some(idx) = t.lookup_col(name) { Some(LcAgg::MaxCol(idx)) } else { None }
-                            } else { None }
+                                if let Some(idx) = t.lookup_col(name) {
+                                    Some(LcAgg::MaxCol(idx))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     }
                 }
                 Expr2::Col(name) => {
-                    if let Some(idx) = t.lookup_col(name) { Some(LcAgg::GroupByCol(idx)) } else { None }
+                    if let Some(idx) = t.lookup_col(name) {
+                        Some(LcAgg::GroupByCol(idx))
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };
@@ -4246,13 +5296,18 @@ impl<'a> TpchExec<'a> {
         }
 
         for (i, item) in query.select.iter().enumerate() {
-            if plans[i].is_some() { continue; }
+            if plans[i].is_some() {
+                continue;
+            }
             if let Expr2::Agg { func: AggFunc::Sum, arg, distinct: false } = &item.expr {
                 if let Expr2::BinOp { op: BinOp2::Mul, left, right } = arg.as_ref() {
                     // Try: (Col * (1 - Col2)) * (1 + Col3)
                     if let Some((a, b)) = self.col_in_mul_sub_one(left, t) {
                         if let Some(c) = self.col_in_add_one_right(right, t) {
-                            if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float && t.col_types[c] == ColType::Float {
+                            if t.col_types[a] == ColType::Float
+                                && t.col_types[b] == ColType::Float
+                                && t.col_types[c] == ColType::Float
+                            {
                                 plans[i] = Some(LcAgg::SumColSubOneAddOne(a, b, c));
                             }
                         }
@@ -4261,24 +5316,35 @@ impl<'a> TpchExec<'a> {
             }
         }
 
-        if plans.iter().any(|p| p.is_none()) { return Ok(None); }
+        if plans.iter().any(|p| p.is_none()) {
+            return Ok(None);
+        }
 
-        let agg_indices: Vec<usize> = plans.iter().enumerate()
+        let agg_indices: Vec<usize> = plans
+            .iter()
+            .enumerate()
             .filter_map(|(i, p)| match p {
-                Some(LcAgg::SumCol(_)) | Some(LcAgg::SumColCol(_, _)) |
-                Some(LcAgg::SumColSubOne(_, _)) | Some(LcAgg::SumColSubOneAddOne(_, _, _)) |
-                Some(LcAgg::AvgCol(_)) | Some(LcAgg::MinCol(_)) | Some(LcAgg::MaxCol(_)) => Some(i),
+                Some(LcAgg::SumCol(_))
+                | Some(LcAgg::SumColCol(_, _))
+                | Some(LcAgg::SumColSubOne(_, _))
+                | Some(LcAgg::SumColSubOneAddOne(_, _, _))
+                | Some(LcAgg::AvgCol(_))
+                | Some(LcAgg::MinCol(_))
+                | Some(LcAgg::MaxCol(_)) => Some(i),
                 _ => None,
             })
             .collect();
         let num_aggs = agg_indices.len();
-        if num_aggs == 0 { return Ok(None); }
+        if num_aggs == 0 {
+            return Ok(None);
+        }
 
         let n = t.row_count;
 
         // Collect aggregate column references
-        let agg_specs: Vec<(usize, Option<usize>, Option<usize>, u8)> = agg_indices.iter().map(|&item_idx| {
-            match plans[item_idx].as_ref().unwrap() {
+        let agg_specs: Vec<(usize, Option<usize>, Option<usize>, u8)> = agg_indices
+            .iter()
+            .map(|&item_idx| match plans[item_idx].as_ref().unwrap() {
                 LcAgg::SumCol(a) => (*a, None, None, 0),
                 LcAgg::SumColCol(a, b) => (*a, Some(*b), None, 1),
                 LcAgg::SumColSubOne(a, b) => (*a, Some(*b), None, 2),
@@ -4287,8 +5353,8 @@ impl<'a> TpchExec<'a> {
                 LcAgg::MinCol(a) => (*a, None, None, 5),
                 LcAgg::MaxCol(a) => (*a, None, None, 6),
                 _ => (0, None, None, 0),
-            }
-        }).collect();
+            })
+            .collect();
         let num_aggs_actual = num_aggs;
 
         // Parallel single-pass morsel aggregation.
@@ -4300,71 +5366,89 @@ impl<'a> TpchExec<'a> {
 
         // Each chunk produces: (group_keys: Vec<u64>, sums: Vec<f64>, counts: Vec<u64>)
         // where sums is laid out as [agg0_grp0, agg0_grp1, ..., agg1_grp0, ...]
-        let partials: Vec<Option<(Vec<u64>, Vec<f64>, Vec<u64>)>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
-            let start = chunk_idx * CHUNK_SIZE;
-            let end = std::cmp::min(start + CHUNK_SIZE, n);
+        let partials: Vec<Option<(Vec<u64>, Vec<f64>, Vec<u64>)>> = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * CHUNK_SIZE;
+                let end = std::cmp::min(start + CHUNK_SIZE, n);
 
-            let mut local_keys: Vec<u64> = Vec::with_capacity(16);
-            let mut local_slot: FxHashMap<u64, usize> = new_fxhashmap();
+                let mut local_keys: Vec<u64> = Vec::with_capacity(16);
+                let mut local_slot: FxHashMap<u64, usize> = new_fxhashmap();
 
-            let mut local_sums: Vec<f64> = Vec::new();
-            let mut local_counts: Vec<u64> = Vec::new();
+                let mut local_sums: Vec<f64> = Vec::new();
+                let mut local_counts: Vec<u64> = Vec::new();
 
-            for i in start..end {
-                if !mask[i] { continue; }
+                for i in start..end {
+                    if !mask[i] {
+                        continue;
+                    }
 
-                let mut key_hash: u64 = 0;
-                for &ci in &gb_cols {
-                    key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(t.columns[ci][i]);
-                }
+                    let mut key_hash: u64 = 0;
+                    for &ci in &gb_cols {
+                        key_hash = key_hash
+                            .wrapping_mul(0x517cc1b727220a95)
+                            .wrapping_add(t.columns[ci][i]);
+                    }
 
-                let slot = if let Some(&s) = local_slot.get(&key_hash) {
-                    s
-                } else {
-                    let new_slot = local_keys.len();
-                    if new_slot >= MAX_FIXED_GROUPS - 1 { return None; }
-                    local_keys.push(key_hash);
-                    local_slot.insert(key_hash, new_slot);
-                    local_sums.extend(std::iter::repeat(0.0f64).take(num_aggs_actual));
-                    local_counts.push(0);
-                    new_slot
-                };
-
-                local_counts[slot] += 1;
-
-                for (ai, &(col_a, col_b_o, col_c_o, at)) in agg_specs.iter().enumerate() {
-                    let base = ai * local_keys.len();
-                    let va = t.columns[col_a][i];
-                    match at {
-                        0 => { local_sums[base + slot] += f64::from_bits(va); }
-                        1 => {
-                            if let Some(cb) = col_b_o {
-                                local_sums[base + slot] += f64::from_bits(va) * f64::from_bits(t.columns[cb][i]);
-                            }
+                    let slot = if let Some(&s) = local_slot.get(&key_hash) {
+                        s
+                    } else {
+                        let new_slot = local_keys.len();
+                        if new_slot >= MAX_FIXED_GROUPS - 1 {
+                            return None;
                         }
-                        2 => {
-                            if let Some(cb) = col_b_o {
-                                local_sums[base + slot] += f64::from_bits(va) * (1.0 - f64::from_bits(t.columns[cb][i]));
+                        local_keys.push(key_hash);
+                        local_slot.insert(key_hash, new_slot);
+                        local_sums.extend(std::iter::repeat(0.0f64).take(num_aggs_actual));
+                        local_counts.push(0);
+                        new_slot
+                    };
+
+                    local_counts[slot] += 1;
+
+                    for (ai, &(col_a, col_b_o, col_c_o, at)) in agg_specs.iter().enumerate() {
+                        let base = ai * local_keys.len();
+                        let va = t.columns[col_a][i];
+                        match at {
+                            0 => {
+                                local_sums[base + slot] += f64::from_bits(va);
                             }
-                        }
-                        3 => {
-                            if let (Some(cb), Some(cc)) = (col_b_o, col_c_o) {
-                                local_sums[base + slot] += f64::from_bits(va) * (1.0 - f64::from_bits(t.columns[cb][i])) * (1.0 + f64::from_bits(t.columns[cc][i]));
+                            1 => {
+                                if let Some(cb) = col_b_o {
+                                    local_sums[base + slot] +=
+                                        f64::from_bits(va) * f64::from_bits(t.columns[cb][i]);
+                                }
                             }
+                            2 => {
+                                if let Some(cb) = col_b_o {
+                                    local_sums[base + slot] += f64::from_bits(va)
+                                        * (1.0 - f64::from_bits(t.columns[cb][i]));
+                                }
+                            }
+                            3 => {
+                                if let (Some(cb), Some(cc)) = (col_b_o, col_c_o) {
+                                    local_sums[base + slot] += f64::from_bits(va)
+                                        * (1.0 - f64::from_bits(t.columns[cb][i]))
+                                        * (1.0 + f64::from_bits(t.columns[cc][i]));
+                                }
+                            }
+                            4 => {
+                                local_sums[base + slot] += f64::from_bits(va);
+                            }
+                            _ => {}
                         }
-                        4 => { local_sums[base + slot] += f64::from_bits(va); }
-                        _ => {}
                     }
                 }
-            }
-            Some((local_keys, local_sums, local_counts))
-        }).collect();
+                Some((local_keys, local_sums, local_counts))
+            })
+            .collect();
 
         // If any chunk returned None (too many groups), fall back to HashMap path
         if partials.iter().any(|p| p.is_none()) {
             return Ok(None);
         }
-        let partials: Vec<(Vec<u64>, Vec<f64>, Vec<u64>)> = partials.into_iter().map(|p| p.unwrap()).collect();
+        let partials: Vec<(Vec<u64>, Vec<f64>, Vec<u64>)> =
+            partials.into_iter().map(|p| p.unwrap()).collect();
 
         // Merge: build global group->slot map from all chunk-local keys
         let mut key_to_slot: FxHashMap<u64, usize> = new_fxhashmap();
@@ -4374,7 +5458,9 @@ impl<'a> TpchExec<'a> {
             for &k in keys {
                 if !key_to_slot.contains_key(&k) {
                     let slot = group_keys_discovered.len();
-                    if slot >= MAX_FIXED_GROUPS - 1 { return Ok(None); }
+                    if slot >= MAX_FIXED_GROUPS - 1 {
+                        return Ok(None);
+                    }
                     key_to_slot.insert(k, slot);
                     group_keys_discovered.push(k);
                 }
@@ -4385,7 +5471,13 @@ impl<'a> TpchExec<'a> {
             let mut cols: Vec<ResultColumn> = Vec::with_capacity(query.select.len());
             for item in &query.select {
                 let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
-                cols.push(ResultColumn { name, values: Vec::new(), string_values: None, type_oid: 0, null_mask: None });
+                cols.push(ResultColumn {
+                    name,
+                    values: Vec::new(),
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                });
             }
             return Ok(Some(QueryResult { columns: cols, row_count: 0, elapsed_us: 0 }));
         }
@@ -4399,7 +5491,8 @@ impl<'a> TpchExec<'a> {
                 let global_slot = key_to_slot[&key];
                 final_counts[global_slot] += counts[local_slot];
                 for a in 0..num_aggs_actual {
-                    final_sums[a * num_groups_found + global_slot] += sums[a * local_ng + local_slot];
+                    final_sums[a * num_groups_found + global_slot] +=
+                        sums[a * local_ng + local_slot];
                 }
             }
         }
@@ -4407,47 +5500,77 @@ impl<'a> TpchExec<'a> {
         // Min/Max (serial pass)
         for (ai, &item_idx) in agg_indices.iter().enumerate() {
             if matches!(plans[item_idx], Some(LcAgg::MinCol(_)) | Some(LcAgg::MaxCol(_))) {
-                let a = if let Some(LcAgg::MinCol(a)) | Some(LcAgg::MaxCol(a)) = plans[item_idx] { a } else { 0 };
+                let a = if let Some(LcAgg::MinCol(a)) | Some(LcAgg::MaxCol(a)) = plans[item_idx] {
+                    a
+                } else {
+                    0
+                };
                 let is_min = matches!(plans[item_idx], Some(LcAgg::MinCol(_)));
-                let mut mm = vec![if is_min { f64::INFINITY } else { f64::NEG_INFINITY }; num_groups_found];
+                let mut mm =
+                    vec![if is_min { f64::INFINITY } else { f64::NEG_INFINITY }; num_groups_found];
                 for i in 0..n {
-                    if !mask[i] { continue; }
+                    if !mask[i] {
+                        continue;
+                    }
                     let mut key_hash: u64 = 0;
-                    for &ci in &gb_cols { key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(t.columns[ci][i]); }
+                    for &ci in &gb_cols {
+                        key_hash = key_hash
+                            .wrapping_mul(0x517cc1b727220a95)
+                            .wrapping_add(t.columns[ci][i]);
+                    }
                     if let Some(&slot) = key_to_slot.get(&key_hash) {
                         let v = f64::from_bits(t.columns[a][i]);
-                        if is_min { if v < mm[slot] { mm[slot] = v; } } else { if v > mm[slot] { mm[slot] = v; } }
+                        if is_min {
+                            if v < mm[slot] {
+                                mm[slot] = v;
+                            }
+                        } else {
+                            if v > mm[slot] {
+                                mm[slot] = v;
+                            }
+                        }
                     }
                 }
-                for g in 0..num_groups_found { final_sums[ai * num_groups_found + g] = mm[g]; }
+                for g in 0..num_groups_found {
+                    final_sums[ai * num_groups_found + g] = mm[g];
+                }
             }
         }
 
-        let finalized: Vec<(u64, Vec<f64>, u64, Vec<f64>, Vec<f64>)> = (0..num_groups_found).map(|g| {
-            let key = group_keys_discovered[g];
-            let sums: Vec<f64> = (0..num_aggs_actual).map(|a| final_sums[a * num_groups_found + g]).collect();
-            (key, sums, final_counts[g], vec![0.0; num_aggs_actual], vec![0.0; num_aggs_actual])
-        }).collect();
+        let finalized: Vec<(u64, Vec<f64>, u64, Vec<f64>, Vec<f64>)> = (0..num_groups_found)
+            .map(|g| {
+                let key = group_keys_discovered[g];
+                let sums: Vec<f64> =
+                    (0..num_aggs_actual).map(|a| final_sums[a * num_groups_found + g]).collect();
+                (key, sums, final_counts[g], vec![0.0; num_aggs_actual], vec![0.0; num_aggs_actual])
+            })
+            .collect();
         let mut cols: Vec<ResultColumn> = Vec::with_capacity(query.select.len());
 
         for (item_idx, item) in query.select.iter().enumerate() {
             let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
             let values: Vec<u64> = match plans[item_idx].as_ref().unwrap() {
-                LcAgg::GroupByCol(_) => {
-                    finalized.iter().map(|(key, _, _, _, _)| *key).collect()
-                }
-                LcAgg::CountAll => {
-                    finalized.iter().map(|(_, _, count, _, _)| *count).collect()
-                }
-                LcAgg::SumCol(_) | LcAgg::SumColCol(_, _) | LcAgg::SumColSubOne(_, _) | LcAgg::SumColSubOneAddOne(_, _, _) => {
+                LcAgg::GroupByCol(_) => finalized.iter().map(|(key, _, _, _, _)| *key).collect(),
+                LcAgg::CountAll => finalized.iter().map(|(_, _, count, _, _)| *count).collect(),
+                LcAgg::SumCol(_)
+                | LcAgg::SumColCol(_, _)
+                | LcAgg::SumColSubOne(_, _)
+                | LcAgg::SumColSubOneAddOne(_, _, _) => {
                     let agg_idx = agg_indices.iter().position(|&idx| idx == item_idx).unwrap();
                     finalized.iter().map(|(_, sums, _, _, _)| sums[agg_idx].to_bits()).collect()
                 }
                 LcAgg::AvgCol(_) => {
                     let agg_idx = agg_indices.iter().position(|&idx| idx == item_idx).unwrap();
-                    finalized.iter().map(|(_, sums, count, _, _)| {
-                        if *count == 0 { 0u64 } else { (sums[agg_idx] / *count as f64).to_bits() }
-                    }).collect()
+                    finalized
+                        .iter()
+                        .map(|(_, sums, count, _, _)| {
+                            if *count == 0 {
+                                0u64
+                            } else {
+                                (sums[agg_idx] / *count as f64).to_bits()
+                            }
+                        })
+                        .collect()
                 }
                 LcAgg::MinCol(_) => {
                     let agg_idx = agg_indices.iter().position(|&idx| idx == item_idx).unwrap();
@@ -4458,7 +5581,13 @@ impl<'a> TpchExec<'a> {
                     finalized.iter().map(|(_, _, _, _, maxs)| maxs[agg_idx].to_bits()).collect()
                 }
             };
-            cols.push(ResultColumn { name, values, string_values: None, type_oid: 0, null_mask: None });
+            cols.push(ResultColumn {
+                name,
+                values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            });
         }
 
         let mut result = QueryResult { columns: cols, row_count: finalized.len(), elapsed_us: 0 };
@@ -4468,14 +5597,21 @@ impl<'a> TpchExec<'a> {
         }
         if let Some(limit) = query.limit {
             if result.row_count > limit {
-                for col in &mut result.columns { col.values.truncate(limit); }
+                for col in &mut result.columns {
+                    col.values.truncate(limit);
+                }
                 result.row_count = limit;
             }
         }
         Ok(Some(result))
     }
 
-    fn execute_grouped(&self, query: &SelectQuery2, t: &ExecTable, mask: &[bool]) -> Result<QueryResult, Error> {
+    fn execute_grouped(
+        &self,
+        query: &SelectQuery2,
+        t: &ExecTable,
+        mask: &[bool],
+    ) -> Result<QueryResult, Error> {
         if query.group_by.is_empty() {
             let indices: Vec<usize> = (0..t.row_count).filter(|&i| mask[i]).collect();
             return self.execute_scalar_agg(query, t, &indices);
@@ -4495,19 +5631,26 @@ impl<'a> TpchExec<'a> {
         // Pre-resolve GROUP BY column indices. For computed expressions
         // (extract, substr), pre-evaluate per row (serial — needed because
         // TpchExec is not Sync due to Cell/RefCell).
-        let gb_cols: Vec<Option<usize>> = query.group_by.iter()
-            .map(|gb| self.col_in(gb, t))
-            .collect();
+        let gb_cols: Vec<Option<usize>> =
+            query.group_by.iter().map(|gb| self.col_in(gb, t)).collect();
         let has_computed_gb = gb_cols.iter().any(|c| c.is_none());
         // Pre-compute GROUP BY values for computed expressions
         let gb_values: Vec<Vec<u64>> = if has_computed_gb {
-            query.group_by.iter().enumerate().map(|(gi, gb)| {
-                if gb_cols[gi].is_some() {
-                    Vec::new() // will read from column directly
-                } else {
-                    indices.iter().map(|&idx| self.eval(gb, t, idx).unwrap_or(Value2::Null).to_u64()).collect()
-                }
-            }).collect()
+            query
+                .group_by
+                .iter()
+                .enumerate()
+                .map(|(gi, gb)| {
+                    if gb_cols[gi].is_some() {
+                        Vec::new() // will read from column directly
+                    } else {
+                        indices
+                            .iter()
+                            .map(|&idx| self.eval(gb, t, idx).unwrap_or(Value2::Null).to_u64())
+                            .collect()
+                    }
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -4518,27 +5661,30 @@ impl<'a> TpchExec<'a> {
         let n_indices = indices.len();
         let num_chunks = (n_indices + GROUP_CHUNK_SIZE - 1) / GROUP_CHUNK_SIZE;
 
-        let local_maps: Vec<FxHashMap<u64, Vec<usize>>> = (0..num_chunks).into_par_iter().map(|chunk_idx| {
-            let start = chunk_idx * GROUP_CHUNK_SIZE;
-            let end = std::cmp::min(start + GROUP_CHUNK_SIZE, n_indices);
-            let mut local: FxHashMap<u64, Vec<usize>> = new_fxhashmap();
+        let local_maps: Vec<FxHashMap<u64, Vec<usize>>> = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * GROUP_CHUNK_SIZE;
+                let end = std::cmp::min(start + GROUP_CHUNK_SIZE, n_indices);
+                let mut local: FxHashMap<u64, Vec<usize>> = new_fxhashmap();
 
-            for i in start..end {
-                let idx = indices[i];
-                let mut key_hash: u64 = 0;
-                for (gi, _) in query.group_by.iter().enumerate() {
-                    let v = if let Some(ci) = gb_cols[gi] {
-                        t.columns[ci][idx]
-                    } else {
-                        // Use pre-computed value
-                        gb_values[gi][i]
-                    };
-                    key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
+                for i in start..end {
+                    let idx = indices[i];
+                    let mut key_hash: u64 = 0;
+                    for (gi, _) in query.group_by.iter().enumerate() {
+                        let v = if let Some(ci) = gb_cols[gi] {
+                            t.columns[ci][idx]
+                        } else {
+                            // Use pre-computed value
+                            gb_values[gi][i]
+                        };
+                        key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
+                    }
+                    local.entry(key_hash).or_default().push(idx);
                 }
-                local.entry(key_hash).or_default().push(idx);
-            }
-            local
-        }).collect();
+                local
+            })
+            .collect();
 
         // Merge local maps into global group_indices
         let mut group_map: FxHashMap<u64, usize> = new_fxhashmap();
@@ -4565,10 +5711,14 @@ impl<'a> TpchExec<'a> {
             let mut v = Vec::new();
             for (gi, gidxs) in group_indices.iter().enumerate() {
                 let hv = self.eval_agg_expr(having, t, gidxs)?;
-                if self.truthy(&hv) { v.push(gi); }
+                if self.truthy(&hv) {
+                    v.push(gi);
+                }
             }
             v
-        } else { (0..group_indices.len()).collect() };
+        } else {
+            (0..group_indices.len()).collect()
+        };
 
         // Build result using FUSED per-group aggregation.
         let fused = self.try_fused_grouped_agg(&query.select, t, &group_indices, &filtered)?;
@@ -4577,18 +5727,32 @@ impl<'a> TpchExec<'a> {
             let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
             let values: Vec<u64> = if let Some(ref fv) = fused {
                 fv.get(item_idx).cloned().unwrap_or_else(|| {
-                    filtered.iter().map(|&gi| {
-                        let gidxs = group_indices[gi];
-                        self.eval_agg_expr(&item.expr, t, gidxs).unwrap_or(Value2::Null).to_u64()
-                    }).collect()
+                    filtered
+                        .iter()
+                        .map(|&gi| {
+                            let gidxs = group_indices[gi];
+                            self.eval_agg_expr(&item.expr, t, gidxs)
+                                .unwrap_or(Value2::Null)
+                                .to_u64()
+                        })
+                        .collect()
                 })
             } else {
-                filtered.iter().map(|&gi| {
-                    let gidxs = group_indices[gi];
-                    self.eval_agg_expr(&item.expr, t, gidxs).unwrap_or(Value2::Null).to_u64()
-                }).collect()
+                filtered
+                    .iter()
+                    .map(|&gi| {
+                        let gidxs = group_indices[gi];
+                        self.eval_agg_expr(&item.expr, t, gidxs).unwrap_or(Value2::Null).to_u64()
+                    })
+                    .collect()
             };
-            cols.push(ResultColumn { name, values, string_values: None, type_oid: 0, null_mask: None });
+            cols.push(ResultColumn {
+                name,
+                values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            });
         }
 
         let mut result = QueryResult { columns: cols, row_count: filtered.len(), elapsed_us: 0 };
@@ -4598,19 +5762,24 @@ impl<'a> TpchExec<'a> {
         }
         if let Some(limit) = query.limit {
             if result.row_count > limit {
-                for col in &mut result.columns { col.values.truncate(limit); }
+                for col in &mut result.columns {
+                    col.values.truncate(limit);
+                }
                 result.row_count = limit;
             }
         }
         Ok(result)
     }
 
-// Rust function to insert before execute_scalar_agg
+    // Rust function to insert before execute_scalar_agg
     /// Fused per-group aggregation: analyze all select items, and if they
     /// match supported patterns, do a SINGLE pass per group computing all aggregates.
     fn try_fused_grouped_agg(
-        &self, select: &[SelectItem2], t: &ExecTable,
-        group_indices: &[&Vec<usize>], filtered: &[usize],
+        &self,
+        select: &[SelectItem2],
+        t: &ExecTable,
+        group_indices: &[&Vec<usize>],
+        filtered: &[usize],
     ) -> Result<Option<Vec<Vec<u64>>>, Error> {
         if filtered.is_empty() {
             return Ok(Some(vec![Vec::new(); select.len()]));
@@ -4640,49 +5809,105 @@ impl<'a> TpchExec<'a> {
                             // count(*) counts all rows.
                             // The fused path only supports CountAll (count(*)).
                             // count(Col) falls back to per-row eval_agg_expr.
-                            if self.col_in(arg, t).is_some() { None } else { Some(FusedAgg::CountAll) }
+                            if self.col_in(arg, t).is_some() {
+                                None
+                            } else {
+                                Some(FusedAgg::CountAll)
+                            }
                         }
                         AggFunc::Sum => {
                             if let Some(a) = self.col_in(arg, t) {
-                                if t.col_types[a] == ColType::Float { Some(FusedAgg::SumCol(a)) } else { None }
-                            } else if let Expr2::BinOp { op: BinOp2::Mul, left, right } = arg.as_ref() {
-                                if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in(right, t)) {
-                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                if t.col_types[a] == ColType::Float {
+                                    Some(FusedAgg::SumCol(a))
+                                } else {
+                                    None
+                                }
+                            } else if let Expr2::BinOp { op: BinOp2::Mul, left, right } =
+                                arg.as_ref()
+                            {
+                                if let (Some(a), Some(b)) =
+                                    (self.col_in(left, t), self.col_in(right, t))
+                                {
+                                    if t.col_types[a] == ColType::Float
+                                        && t.col_types[b] == ColType::Float
+                                    {
                                         Some(FusedAgg::SumColCol(a, b))
-                                    } else { None }
-                                } else if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in_sub_one_right(right, t)) {
-                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                    } else {
+                                        None
+                                    }
+                                } else if let (Some(a), Some(b)) =
+                                    (self.col_in(left, t), self.col_in_sub_one_right(right, t))
+                                {
+                                    if t.col_types[a] == ColType::Float
+                                        && t.col_types[b] == ColType::Float
+                                    {
                                         Some(FusedAgg::SumColSubOne(a, b))
-                                    } else { None }
-                                } else if let (Some(b), Some(a)) = (self.col_in(right, t), self.col_in_sub_one_right(left, t)) {
-                                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
+                                    } else {
+                                        None
+                                    }
+                                } else if let (Some(b), Some(a)) =
+                                    (self.col_in(right, t), self.col_in_sub_one_right(left, t))
+                                {
+                                    if t.col_types[a] == ColType::Float
+                                        && t.col_types[b] == ColType::Float
+                                    {
                                         Some(FusedAgg::SumColSubOne(a, b))
-                                    } else { None }
-                                } else { None }
-                            } else { None }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         }
                         AggFunc::Avg => {
                             if let Expr2::Col(name) = arg.as_ref() {
                                 if let Some(idx) = t.lookup_col(name) {
-                                    if t.col_types[idx] == ColType::Float { Some(FusedAgg::AvgCol(idx)) } else { None }
-                                } else { None }
-                            } else { None }
+                                    if t.col_types[idx] == ColType::Float {
+                                        Some(FusedAgg::AvgCol(idx))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         }
                         AggFunc::Min => {
                             if let Expr2::Col(name) = arg.as_ref() {
-                                if let Some(idx) = t.lookup_col(name) { Some(FusedAgg::MinCol(idx)) } else { None }
-                            } else { None }
+                                if let Some(idx) = t.lookup_col(name) {
+                                    Some(FusedAgg::MinCol(idx))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         }
                         AggFunc::Max => {
                             if let Expr2::Col(name) = arg.as_ref() {
-                                if let Some(idx) = t.lookup_col(name) { Some(FusedAgg::MaxCol(idx)) } else { None }
-                            } else { None }
+                                if let Some(idx) = t.lookup_col(name) {
+                                    Some(FusedAgg::MaxCol(idx))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     }
                 }
                 Expr2::Col(name) => {
-                    if let Some(idx) = t.lookup_col(name) { Some(FusedAgg::GroupByCol(idx)) } else { None }
+                    if let Some(idx) = t.lookup_col(name) {
+                        Some(FusedAgg::GroupByCol(idx))
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };
@@ -4691,13 +5916,18 @@ impl<'a> TpchExec<'a> {
 
         // Second pass for Sum(Col * (1 - Col2) * (1 + Col3))
         for (i, item) in select.iter().enumerate() {
-            if plans[i].is_some() { continue; }
+            if plans[i].is_some() {
+                continue;
+            }
             if let Expr2::Agg { func: AggFunc::Sum, arg, distinct: false } = &item.expr {
                 if let Expr2::BinOp { op: BinOp2::Mul, left, right } = arg.as_ref() {
                     // Try: (Col * (1 - Col2)) * (1 + Col3)
                     if let Some((a, b)) = self.col_in_mul_sub_one(left, t) {
                         if let Some(c) = self.col_in_add_one_right(right, t) {
-                            if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float && t.col_types[c] == ColType::Float {
+                            if t.col_types[a] == ColType::Float
+                                && t.col_types[b] == ColType::Float
+                                && t.col_types[c] == ColType::Float
+                            {
                                 plans[i] = Some(FusedAgg::SumColSubOneAddOne(a, b, c));
                             }
                         }
@@ -4705,7 +5935,10 @@ impl<'a> TpchExec<'a> {
                     // Try: Col * ((1 - Col2) * (1 + Col3))
                     else if let Some(a) = self.col_in(left, t) {
                         if let Some((b, c)) = self.col_in_mul_sub_one_add_one(right, t) {
-                            if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float && t.col_types[c] == ColType::Float {
+                            if t.col_types[a] == ColType::Float
+                                && t.col_types[b] == ColType::Float
+                                && t.col_types[c] == ColType::Float
+                            {
                                 plans[i] = Some(FusedAgg::SumColSubOneAddOne(a, b, c));
                             }
                         }
@@ -4746,23 +5979,40 @@ impl<'a> TpchExec<'a> {
                 for (j, plan) in plans.iter().enumerate() {
                     match plan.as_ref().unwrap() {
                         FusedAgg::GroupByCol(idx) => {
-                            if n > 0 { gb_vals[j] = t.columns[*idx][indices[0]]; gb_found[j] = true; }
+                            if n > 0 {
+                                gb_vals[j] = t.columns[*idx][indices[0]];
+                                gb_found[j] = true;
+                            }
                         }
-                        FusedAgg::CountAll => { counts[j] = n as u64; }
+                        FusedAgg::CountAll => {
+                            counts[j] = n as u64;
+                        }
                         FusedAgg::SumCol(a) => {
                             sums[j] = simd_agg::sum_f64_by_idx(&t.columns[*a], indices);
                         }
                         FusedAgg::SumColCol(a, b) => {
-                            sums[j] = simd_agg::sum_a_mul_b_by_idx(&t.columns[*a], &t.columns[*b], indices);
+                            sums[j] = simd_agg::sum_a_mul_b_by_idx(
+                                &t.columns[*a],
+                                &t.columns[*b],
+                                indices,
+                            );
                         }
                         FusedAgg::SumColSubOne(a, b) => {
                             // Distributive: sum(a) - sum(a*b) - two FMA chains.
-                            sums[j] = simd_agg::sum_a_mul_one_minus_b_by_idx(&t.columns[*a], &t.columns[*b], indices);
+                            sums[j] = simd_agg::sum_a_mul_one_minus_b_by_idx(
+                                &t.columns[*a],
+                                &t.columns[*b],
+                                indices,
+                            );
                         }
                         FusedAgg::SumColSubOneAddOne(a, b, c) => {
                             // Distributive: sum_a + sum(a*c) - sum(a*b) - sum(a*b*c).
                             sums[j] = simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(
-                                &t.columns[*a], &t.columns[*b], &t.columns[*c], indices);
+                                &t.columns[*a],
+                                &t.columns[*b],
+                                &t.columns[*c],
+                                indices,
+                            );
                         }
                         FusedAgg::AvgCol(a) => {
                             sums[j] = simd_agg::sum_f64_by_idx(&t.columns[*a], indices);
@@ -4773,7 +6023,9 @@ impl<'a> TpchExec<'a> {
                             let mut m = f64::INFINITY;
                             for &i in indices {
                                 let v = f64::from_bits(col[i]);
-                                if v < m { m = v; }
+                                if v < m {
+                                    m = v;
+                                }
                             }
                             mins[j] = m;
                         }
@@ -4782,7 +6034,9 @@ impl<'a> TpchExec<'a> {
                             let mut m = f64::NEG_INFINITY;
                             for &i in indices {
                                 let v = f64::from_bits(col[i]);
-                                if v > m { m = v; }
+                                if v > m {
+                                    m = v;
+                                }
                             }
                             maxs[j] = m;
                         }
@@ -4794,18 +6048,46 @@ impl<'a> TpchExec<'a> {
                     for (j, plan) in plans.iter().enumerate() {
                         match plan.as_ref().unwrap() {
                             FusedAgg::GroupByCol(idx) => {
-                                if !gb_found[j] { gb_vals[j] = t.columns[*idx][i]; gb_found[j] = true; }
+                                if !gb_found[j] {
+                                    gb_vals[j] = t.columns[*idx][i];
+                                    gb_found[j] = true;
+                                }
                             }
-                            FusedAgg::CountAll => { counts[j] += 1; }
-                            FusedAgg::SumCol(a) => { sums[j] += f64::from_bits(t.columns[*a][i]); }
-                            FusedAgg::SumColCol(a, b) => { sums[j] += f64::from_bits(t.columns[*a][i]) * f64::from_bits(t.columns[*b][i]); }
-                            FusedAgg::SumColSubOne(a, b) => { sums[j] += f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])); }
+                            FusedAgg::CountAll => {
+                                counts[j] += 1;
+                            }
+                            FusedAgg::SumCol(a) => {
+                                sums[j] += f64::from_bits(t.columns[*a][i]);
+                            }
+                            FusedAgg::SumColCol(a, b) => {
+                                sums[j] += f64::from_bits(t.columns[*a][i])
+                                    * f64::from_bits(t.columns[*b][i]);
+                            }
+                            FusedAgg::SumColSubOne(a, b) => {
+                                sums[j] += f64::from_bits(t.columns[*a][i])
+                                    * (1.0 - f64::from_bits(t.columns[*b][i]));
+                            }
                             FusedAgg::SumColSubOneAddOne(a, b, c) => {
-                                sums[j] += f64::from_bits(t.columns[*a][i]) * (1.0 - f64::from_bits(t.columns[*b][i])) * (1.0 + f64::from_bits(t.columns[*c][i]));
+                                sums[j] += f64::from_bits(t.columns[*a][i])
+                                    * (1.0 - f64::from_bits(t.columns[*b][i]))
+                                    * (1.0 + f64::from_bits(t.columns[*c][i]));
                             }
-                            FusedAgg::AvgCol(a) => { sums[j] += f64::from_bits(t.columns[*a][i]); counts[j] += 1; }
-                            FusedAgg::MinCol(a) => { let v = f64::from_bits(t.columns[*a][i]); if v < mins[j] { mins[j] = v; } }
-                            FusedAgg::MaxCol(a) => { let v = f64::from_bits(t.columns[*a][i]); if v > maxs[j] { maxs[j] = v; } }
+                            FusedAgg::AvgCol(a) => {
+                                sums[j] += f64::from_bits(t.columns[*a][i]);
+                                counts[j] += 1;
+                            }
+                            FusedAgg::MinCol(a) => {
+                                let v = f64::from_bits(t.columns[*a][i]);
+                                if v < mins[j] {
+                                    mins[j] = v;
+                                }
+                            }
+                            FusedAgg::MaxCol(a) => {
+                                let v = f64::from_bits(t.columns[*a][i]);
+                                if v > maxs[j] {
+                                    maxs[j] = v;
+                                }
+                            }
                         }
                     }
                 }
@@ -4815,8 +6097,17 @@ impl<'a> TpchExec<'a> {
                 let val = match plan.as_ref().unwrap() {
                     FusedAgg::GroupByCol(_) => gb_vals[j],
                     FusedAgg::CountAll => counts[j],
-                    FusedAgg::SumCol(_) | FusedAgg::SumColCol(_, _) | FusedAgg::SumColSubOne(_, _) | FusedAgg::SumColSubOneAddOne(_, _, _) => sums[j].to_bits(),
-                    FusedAgg::AvgCol(_) => if counts[j] == 0 { 0u64 } else { (sums[j] / counts[j] as f64).to_bits() },
+                    FusedAgg::SumCol(_)
+                    | FusedAgg::SumColCol(_, _)
+                    | FusedAgg::SumColSubOne(_, _)
+                    | FusedAgg::SumColSubOneAddOne(_, _, _) => sums[j].to_bits(),
+                    FusedAgg::AvgCol(_) => {
+                        if counts[j] == 0 {
+                            0u64
+                        } else {
+                            (sums[j] / counts[j] as f64).to_bits()
+                        }
+                    }
                     FusedAgg::MinCol(_) => mins[j].to_bits(),
                     FusedAgg::MaxCol(_) => maxs[j].to_bits(),
                 };
@@ -4827,24 +6118,42 @@ impl<'a> TpchExec<'a> {
         Ok(Some(results))
     }
 
-    fn execute_scalar_agg(&self, query: &SelectQuery2, t: &ExecTable, indices: &[usize]) -> Result<QueryResult, Error> {
+    fn execute_scalar_agg(
+        &self,
+        query: &SelectQuery2,
+        t: &ExecTable,
+        indices: &[usize],
+    ) -> Result<QueryResult, Error> {
         let mut cols = Vec::new();
         for item in &query.select {
             let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
             let v = self.eval_agg_expr(&item.expr, t, indices)?;
-            cols.push(ResultColumn { name, values: vec![v.to_u64()], string_values: None, type_oid: 0, null_mask: None });
+            cols.push(ResultColumn {
+                name,
+                values: vec![v.to_u64()],
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            });
         }
         Ok(QueryResult { columns: cols, row_count: 1, elapsed_us: 0 })
     }
 
-    fn eval_agg_expr(&self, expr: &Expr2, t: &ExecTable, indices: &[usize]) -> Result<Value2, Error> {
+    fn eval_agg_expr(
+        &self,
+        expr: &Expr2,
+        t: &ExecTable,
+        indices: &[usize],
+    ) -> Result<Value2, Error> {
         match expr {
             Expr2::CountStar => Ok(Value2::Int(indices.len() as i64)),
             Expr2::Agg { func, arg, distinct } => {
                 if *distinct {
                     // Distinct requires materializing values — use slow path
                     let mut values: Vec<Value2> = Vec::with_capacity(indices.len());
-                    for &idx in indices { values.push(self.eval(arg, t, idx)?); }
+                    for &idx in indices {
+                        values.push(self.eval(arg, t, idx)?);
+                    }
                     let mut seen = new_hashset();
                     values.retain(|v| {
                         let key = match v {
@@ -4874,7 +6183,11 @@ impl<'a> TpchExec<'a> {
                             if let Some(idx) = t.lookup_col(name) {
                                 let col = &t.columns[idx];
                                 let mut cnt = 0i64;
-                                for &i in indices { if col[i] != 0 { cnt += 1; } }
+                                for &i in indices {
+                                    if col[i] != 0 {
+                                        cnt += 1;
+                                    }
+                                }
                                 return Ok(Value2::Int(cnt));
                             }
                         }
@@ -4886,12 +6199,17 @@ impl<'a> TpchExec<'a> {
                             if let Some(idx) = t.lookup_col(name) {
                                 let col = &t.columns[idx];
                                 let mut seen = new_hashset();
-                                for &i in indices { seen.insert(col[i]); }
+                                for &i in indices {
+                                    seen.insert(col[i]);
+                                }
                                 return Ok(Value2::Int(seen.len() as i64));
                             }
                         }
                         let mut seen = new_hashset();
-                        for &i in indices { let v = self.eval(arg, t, i)?; seen.insert(format!("{:?}", v)); }
+                        for &i in indices {
+                            let v = self.eval(arg, t, i)?;
+                            seen.insert(format!("{:?}", v));
+                        }
                         return Ok(Value2::Int(seen.len() as i64));
                     }
                     AggFunc::Sum => {
@@ -4900,7 +6218,9 @@ impl<'a> TpchExec<'a> {
                     AggFunc::Avg => {
                         let sum = self.sum_vec(arg, t, indices)?;
                         let cnt = indices.len() as f64;
-                        if cnt == 0.0 { return Ok(Value2::Null); }
+                        if cnt == 0.0 {
+                            return Ok(Value2::Null);
+                        }
                         let sf = sum.as_f64().unwrap_or(0.0);
                         return Ok(Value2::Float(sf / cnt));
                     }
@@ -4926,13 +6246,19 @@ impl<'a> TpchExec<'a> {
                 }
             }
             Expr2::Case { whens, else_ } => {
-                if whens.iter().any(|(c, _)| self.expr_has_agg(c)) || else_.as_ref().map(|e| self.expr_has_agg(e)).unwrap_or(false) {
+                if whens.iter().any(|(c, _)| self.expr_has_agg(c))
+                    || else_.as_ref().map(|e| self.expr_has_agg(e)).unwrap_or(false)
+                {
                     // Aggregated case — evaluate each branch's aggregate
                     for (cond, result) in whens {
                         let cv = self.eval_agg_expr(cond, t, indices)?;
-                        if self.truthy(&cv) { return self.eval_agg_expr(result, t, indices); }
+                        if self.truthy(&cv) {
+                            return self.eval_agg_expr(result, t, indices);
+                        }
                     }
-                    if let Some(e) = else_ { return self.eval_agg_expr(e, t, indices); }
+                    if let Some(e) = else_ {
+                        return self.eval_agg_expr(e, t, indices);
+                    }
                     Ok(Value2::Null)
                 } else if indices.is_empty() {
                     Ok(Value2::Null)
@@ -4942,10 +6268,18 @@ impl<'a> TpchExec<'a> {
             }
             Expr2::Neg(e) if self.expr_has_agg(e) => {
                 let v = self.eval_agg_expr(e, t, indices)?;
-                Ok(match v { Value2::Int(i) => Value2::Int(-i), Value2::Float(f) => Value2::Float(-f), _ => Value2::Null })
+                Ok(match v {
+                    Value2::Int(i) => Value2::Int(-i),
+                    Value2::Float(f) => Value2::Float(-f),
+                    _ => Value2::Null,
+                })
             }
             _ => {
-                if indices.is_empty() { Ok(Value2::Null) } else { self.eval(expr, t, indices[0]) }
+                if indices.is_empty() {
+                    Ok(Value2::Null)
+                } else {
+                    self.eval(expr, t, indices[0])
+                }
             }
         }
     }
@@ -4965,7 +6299,12 @@ impl<'a> TpchExec<'a> {
 
     // --- Projection ---
 
-    fn project(&self, select: &[SelectItem2], t: &ExecTable, indices: &[usize]) -> Result<QueryResult, Error> {
+    fn project(
+        &self,
+        select: &[SelectItem2],
+        t: &ExecTable,
+        indices: &[usize],
+    ) -> Result<QueryResult, Error> {
         let mut cols = Vec::new();
         for item in select {
             let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
@@ -4985,21 +6324,39 @@ impl<'a> TpchExec<'a> {
                     Err(_) => values.push(Value2::Null.to_u64()),
                 }
             }
-            cols.push(ResultColumn { name, values, string_values: None, type_oid: 0, null_mask: None });
+            cols.push(ResultColumn {
+                name,
+                values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            });
         }
         Ok(QueryResult { columns: cols, row_count: indices.len(), elapsed_us: 0 })
     }
 
     // --- ORDER BY ---
 
-    fn apply_order_by(&self, result: QueryResult, order_by: &[(Expr2, bool)], t: &ExecTable, indices: &[usize]) -> Result<QueryResult, Error> {
-        if order_by.is_empty() || result.row_count <= 1 { return Ok(result); }
+    fn apply_order_by(
+        &self,
+        result: QueryResult,
+        order_by: &[(Expr2, bool)],
+        t: &ExecTable,
+        indices: &[usize],
+    ) -> Result<QueryResult, Error> {
+        if order_by.is_empty() || result.row_count <= 1 {
+            return Ok(result);
+        }
         let mut sort_keys: Vec<Vec<(f64, bool)>> = Vec::with_capacity(result.row_count);
         for row_idx in 0..result.row_count {
             let mut keys = Vec::new();
             for (expr, asc) in order_by {
                 let name = self.expr_name(expr);
-                let v = if let Some(col) = result.columns.iter().find(|c| c.name == name || c.name.eq_ignore_ascii_case(&name)) {
+                let v = if let Some(col) = result
+                    .columns
+                    .iter()
+                    .find(|c| c.name == name || c.name.eq_ignore_ascii_case(&name))
+                {
                     f64::from_bits(col.values[row_idx])
                 } else {
                     let src_row = indices.get(row_idx).copied().unwrap_or(0);
@@ -5015,26 +6372,48 @@ impl<'a> TpchExec<'a> {
                 let vb = sort_keys[b][i].0;
                 let cmp = va.total_cmp(&vb);
                 let cmp = if *asc { cmp } else { cmp.reverse() };
-                if cmp != std::cmp::Ordering::Equal { return cmp; }
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
             }
             std::cmp::Ordering::Equal
         });
-        let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
-            let values: Vec<u64> = order.iter().map(|&i| c.values[i]).collect();
-            ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0, null_mask: None }
-        }).collect();
+        let new_cols: Vec<ResultColumn> = result
+            .columns
+            .iter()
+            .map(|c| {
+                let values: Vec<u64> = order.iter().map(|&i| c.values[i]).collect();
+                ResultColumn {
+                    name: c.name.clone(),
+                    values,
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                }
+            })
+            .collect();
         Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: 0 })
     }
 
-    fn apply_order_by_grouped(&self, result: QueryResult, order_by: &[(Expr2, bool)]) -> Result<QueryResult, Error> {
-        if order_by.is_empty() || result.row_count <= 1 { return Ok(result); }
+    fn apply_order_by_grouped(
+        &self,
+        result: QueryResult,
+        order_by: &[(Expr2, bool)],
+    ) -> Result<QueryResult, Error> {
+        if order_by.is_empty() || result.row_count <= 1 {
+            return Ok(result);
+        }
         let mut sort_keys: Vec<Vec<(f64, bool)>> = Vec::with_capacity(result.row_count);
         for row_idx in 0..result.row_count {
             let mut keys = Vec::new();
             for (expr, asc) in order_by {
                 let name = self.expr_name(expr);
-                let v = result.columns.iter().find(|c| c.name == name || c.name.eq_ignore_ascii_case(&name))
-                    .map(|col| f64::from_bits(col.values[row_idx])).unwrap_or(0.0);
+                let v = result
+                    .columns
+                    .iter()
+                    .find(|c| c.name == name || c.name.eq_ignore_ascii_case(&name))
+                    .map(|col| f64::from_bits(col.values[row_idx]))
+                    .unwrap_or(0.0);
                 keys.push((v, *asc));
             }
             sort_keys.push(keys);
@@ -5045,17 +6424,28 @@ impl<'a> TpchExec<'a> {
                 let vb = sort_keys[b][i].0;
                 let cmp = va.total_cmp(&vb);
                 let cmp = if *asc { cmp } else { cmp.reverse() };
-                if cmp != std::cmp::Ordering::Equal { return cmp; }
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
             }
             std::cmp::Ordering::Equal
         });
-        let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
-            let values: Vec<u64> = order.iter().map(|&i| c.values[i]).collect();
-            ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0, null_mask: None }
-        }).collect();
+        let new_cols: Vec<ResultColumn> = result
+            .columns
+            .iter()
+            .map(|c| {
+                let values: Vec<u64> = order.iter().map(|&i| c.values[i]).collect();
+                ResultColumn {
+                    name: c.name.clone(),
+                    values,
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                }
+            })
+            .collect();
         Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: 0 })
     }
-
 
     /// Check if an expression contains any column references.
     fn expr_has_col(&self, e: &Expr2) -> bool {
@@ -5067,10 +6457,18 @@ impl<'a> TpchExec<'a> {
                     || else_.as_ref().map(|e| self.expr_has_col(e)).unwrap_or(false)
             }
             Expr2::Neg(e) | Expr2::Not(e) | Expr2::Extract { expr: e, .. } => self.expr_has_col(e),
-            Expr2::Like { expr, pattern, .. } => self.expr_has_col(expr) || self.expr_has_col(pattern),
-            Expr2::Between { expr, low, high, .. } => self.expr_has_col(expr) || self.expr_has_col(low) || self.expr_has_col(high),
-            Expr2::InList { expr, list, .. } => self.expr_has_col(expr) || list.iter().any(|e| self.expr_has_col(e)),
-            Expr2::Substr { expr, start, len } => self.expr_has_col(expr) || self.expr_has_col(start) || self.expr_has_col(len),
+            Expr2::Like { expr, pattern, .. } => {
+                self.expr_has_col(expr) || self.expr_has_col(pattern)
+            }
+            Expr2::Between { expr, low, high, .. } => {
+                self.expr_has_col(expr) || self.expr_has_col(low) || self.expr_has_col(high)
+            }
+            Expr2::InList { expr, list, .. } => {
+                self.expr_has_col(expr) || list.iter().any(|e| self.expr_has_col(e))
+            }
+            Expr2::Substr { expr, start, len } => {
+                self.expr_has_col(expr) || self.expr_has_col(start) || self.expr_has_col(len)
+            }
             // Subqueries can reference outer columns (correlated). Treat as
             // "has column refs" so eval_comparison_vec falls back to per-row
             // eval, which sets up the correct outer context for each row.
@@ -5092,12 +6490,16 @@ impl<'a> TpchExec<'a> {
                     return Ok(match t.col_types[idx] {
                         ColType::Float => {
                             let mut sum = 0.0f64;
-                            for &i in indices { sum += f64::from_bits(col[i]); }
+                            for &i in indices {
+                                sum += f64::from_bits(col[i]);
+                            }
                             Value2::Float(sum)
                         }
                         ColType::Int => {
                             let mut isum = 0i64;
-                            for &i in indices { isum = isum.wrapping_add(col[i] as i64); }
+                            for &i in indices {
+                                isum = isum.wrapping_add(col[i] as i64);
+                            }
                             Value2::Int(isum)
                         }
                         _ => Value2::Int(0),
@@ -5108,8 +6510,10 @@ impl<'a> TpchExec<'a> {
             Expr2::BinOp { op: BinOp2::Mul, left, right } => {
                 // W21: BF16 fast path for Sum(Col * Col) on float columns
                 if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in(right, t)) {
-                    if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float
-                        && crate::kernel::vnni_agg::has_bf16() {
+                    if t.col_types[a] == ColType::Float
+                        && t.col_types[b] == ColType::Float
+                        && crate::kernel::vnni_agg::has_bf16()
+                    {
                         let ca = &t.columns[a];
                         let cb = &t.columns[b];
                         let n = indices.len();
@@ -5120,11 +6524,15 @@ impl<'a> TpchExec<'a> {
                             db[k] = cb[i];
                         }
                         let mask = vec![true; n];
-                        return Ok(Value2::Float(crate::kernel::vnni_agg::dot_f64_bf16(&da, &db, &mask)));
+                        return Ok(Value2::Float(crate::kernel::vnni_agg::dot_f64_bf16(
+                            &da, &db, &mask,
+                        )));
                     }
                 }
                 // Fast path: Col * (1 - Col2)  [Q1 sum_disc_price pattern]
-                if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in_sub_one_right(right, t)) {
+                if let (Some(a), Some(b)) =
+                    (self.col_in(left, t), self.col_in_sub_one_right(right, t))
+                {
                     let ca = &t.columns[a];
                     let cb = &t.columns[b];
                     if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
@@ -5136,7 +6544,9 @@ impl<'a> TpchExec<'a> {
                     }
                 }
                 // Fast path: (1 - Col2) * Col  [reversed]
-                if let (Some(b), Some(a)) = (self.col_in(right, t), self.col_in_sub_one_right(left, t)) {
+                if let (Some(b), Some(a)) =
+                    (self.col_in(right, t), self.col_in_sub_one_right(left, t))
+                {
                     let ca = &t.columns[a];
                     let cb = &t.columns[b];
                     if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
@@ -5153,10 +6563,15 @@ impl<'a> TpchExec<'a> {
                         let ca = &t.columns[a];
                         let cb = &t.columns[b];
                         let cc = &t.columns[c];
-                        if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float && t.col_types[c] == ColType::Float {
+                        if t.col_types[a] == ColType::Float
+                            && t.col_types[b] == ColType::Float
+                            && t.col_types[c] == ColType::Float
+                        {
                             let mut sum = 0.0f64;
                             for &i in indices {
-                                sum += f64::from_bits(ca[i]) * (1.0 - f64::from_bits(cb[i])) * (1.0 + f64::from_bits(cc[i]));
+                                sum += f64::from_bits(ca[i])
+                                    * (1.0 - f64::from_bits(cb[i]))
+                                    * (1.0 + f64::from_bits(cc[i]));
                             }
                             return Ok(Value2::Float(sum));
                         }
@@ -5207,9 +6622,13 @@ impl<'a> TpchExec<'a> {
                             let col = &t.columns[a];
                             let mut sum = 0.0f64;
                             if t.col_types[a] == ColType::Float {
-                                for &i in indices { sum += f64::from_bits(col[i]) * factor; }
+                                for &i in indices {
+                                    sum += f64::from_bits(col[i]) * factor;
+                                }
                             } else {
-                                for &i in indices { sum += col[i] as f64 * factor; }
+                                for &i in indices {
+                                    sum += col[i] as f64 * factor;
+                                }
                             }
                             Ok(Value2::Float(sum))
                         }
@@ -5236,9 +6655,13 @@ impl<'a> TpchExec<'a> {
                             let col = &t.columns[b];
                             let mut sum = 0.0f64;
                             if t.col_types[b] == ColType::Float {
-                                for &i in indices { sum += factor * f64::from_bits(col[i]); }
+                                for &i in indices {
+                                    sum += factor * f64::from_bits(col[i]);
+                                }
                             } else {
-                                for &i in indices { sum += factor * col[i] as f64; }
+                                for &i in indices {
+                                    sum += factor * col[i] as f64;
+                                }
                             }
                             Ok(Value2::Float(sum))
                         }
@@ -5246,7 +6669,11 @@ impl<'a> TpchExec<'a> {
                     _ => {
                         // Fallback: per-row eval
                         let mut sum = 0.0f64;
-                        for &i in indices { if let Some(f) = self.eval(expr, t, i)?.as_f64() { sum += f; } }
+                        for &i in indices {
+                            if let Some(f) = self.eval(expr, t, i)?.as_f64() {
+                                sum += f;
+                            }
+                        }
                         Ok(Value2::Float(sum))
                     }
                 }
@@ -5262,9 +6689,13 @@ impl<'a> TpchExec<'a> {
                         let col = &t.columns[b];
                         let mut sum = 0.0f64;
                         if t.col_types[b] == ColType::Float {
-                            for &i in indices { sum += base - f64::from_bits(col[i]); }
+                            for &i in indices {
+                                sum += base - f64::from_bits(col[i]);
+                            }
                         } else {
-                            for &i in indices { sum += base - col[i] as f64; }
+                            for &i in indices {
+                                sum += base - col[i] as f64;
+                            }
                         }
                         Ok(Value2::Float(sum))
                     }
@@ -5290,16 +6721,24 @@ impl<'a> TpchExec<'a> {
                             let col = &t.columns[a];
                             let mut sum = 0.0f64;
                             if t.col_types[a] == ColType::Float {
-                                for &i in indices { sum += f64::from_bits(col[i]) - sub; }
+                                for &i in indices {
+                                    sum += f64::from_bits(col[i]) - sub;
+                                }
                             } else {
-                                for &i in indices { sum += col[i] as f64 - sub; }
+                                for &i in indices {
+                                    sum += col[i] as f64 - sub;
+                                }
                             }
                             Ok(Value2::Float(sum))
                         }
                     }
                     _ => {
                         let mut sum = 0.0f64;
-                        for &i in indices { if let Some(f) = self.eval(expr, t, i)?.as_f64() { sum += f; } }
+                        for &i in indices {
+                            if let Some(f) = self.eval(expr, t, i)?.as_f64() {
+                                sum += f;
+                            }
+                        }
                         Ok(Value2::Float(sum))
                     }
                 }
@@ -5309,18 +6748,27 @@ impl<'a> TpchExec<'a> {
                 let ri = self.col_in(right, t);
                 match (li, ri) {
                     (Some(a), Some(b)) => {
-                        let ca = &t.columns[a]; let cb = &t.columns[b];
+                        let ca = &t.columns[a];
+                        let cb = &t.columns[b];
                         let mut sum = 0.0f64;
                         if t.col_types[a] == ColType::Float && t.col_types[b] == ColType::Float {
-                            for &i in indices { sum += f64::from_bits(ca[i]) + f64::from_bits(cb[i]); }
+                            for &i in indices {
+                                sum += f64::from_bits(ca[i]) + f64::from_bits(cb[i]);
+                            }
                         } else {
-                            for &i in indices { sum += ca[i] as f64 + cb[i] as f64; }
+                            for &i in indices {
+                                sum += ca[i] as f64 + cb[i] as f64;
+                            }
                         }
                         Ok(Value2::Float(sum))
                     }
                     _ => {
                         let mut sum = 0.0f64;
-                        for &i in indices { if let Some(f) = self.eval(expr, t, i)?.as_f64() { sum += f; } }
+                        for &i in indices {
+                            if let Some(f) = self.eval(expr, t, i)?.as_f64() {
+                                sum += f;
+                            }
+                        }
                         Ok(Value2::Float(sum))
                     }
                 }
@@ -5328,14 +6776,24 @@ impl<'a> TpchExec<'a> {
             _ => {
                 // Fallback: per-row eval for complex expressions
                 let mut sum = 0.0f64;
-                for &i in indices { if let Some(f) = self.eval(expr, t, i)?.as_f64() { sum += f; } }
+                for &i in indices {
+                    if let Some(f) = self.eval(expr, t, i)?.as_f64() {
+                        sum += f;
+                    }
+                }
                 Ok(Value2::Float(sum))
             }
         }
     }
 
     /// Vectorized min/max.
-    fn minmax_vec(&self, expr: &Expr2, t: &ExecTable, indices: &[usize], is_min: bool) -> Result<Value2, Error> {
+    fn minmax_vec(
+        &self,
+        expr: &Expr2,
+        t: &ExecTable,
+        indices: &[usize],
+        is_min: bool,
+    ) -> Result<Value2, Error> {
         if let Expr2::Col(name) = expr {
             if let Some(idx) = t.lookup_col(name) {
                 let col = &t.columns[idx];
@@ -5345,7 +6803,13 @@ impl<'a> TpchExec<'a> {
                         let v = f64::from_bits(col[i]);
                         best = Some(match best {
                             None => v,
-                            Some(b) => if is_min { b.min(v) } else { b.max(v) }
+                            Some(b) => {
+                                if is_min {
+                                    b.min(v)
+                                } else {
+                                    b.max(v)
+                                }
+                            }
                         });
                     }
                     return Ok(best.map(Value2::Float).unwrap_or(Value2::Null));
@@ -5355,7 +6819,13 @@ impl<'a> TpchExec<'a> {
                         let v = col[i] as i64;
                         best = Some(match best {
                             None => v,
-                            Some(b) => if is_min { b.min(v) } else { b.max(v) }
+                            Some(b) => {
+                                if is_min {
+                                    b.min(v)
+                                } else {
+                                    b.max(v)
+                                }
+                            }
                         });
                     }
                     return Ok(best.map(Value2::Int).unwrap_or(Value2::Null));
@@ -5368,7 +6838,13 @@ impl<'a> TpchExec<'a> {
             if let Some(f) = self.eval(expr, t, i)?.as_f64() {
                 best = Some(match best {
                     None => f,
-                    Some(b) => if is_min { b.min(f) } else { b.max(f) }
+                    Some(b) => {
+                        if is_min {
+                            b.min(f)
+                        } else {
+                            b.max(f)
+                        }
+                    }
                 });
             }
         }
@@ -5393,10 +6869,12 @@ impl<'a> TpchExec<'a> {
     /// Detect the pattern Col * (1 - Col2) and return (col, col2).
     fn col_in_mul_sub_one(&self, expr: &Expr2, t: &ExecTable) -> Option<(usize, usize)> {
         if let Expr2::BinOp { op: BinOp2::Mul, left, right } = expr {
-            if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in_sub_one_right(right, t)) {
+            if let (Some(a), Some(b)) = (self.col_in(left, t), self.col_in_sub_one_right(right, t))
+            {
                 return Some((a, b));
             }
-            if let (Some(b), Some(a)) = (self.col_in(right, t), self.col_in_sub_one_right(left, t)) {
+            if let (Some(b), Some(a)) = (self.col_in(right, t), self.col_in_sub_one_right(left, t))
+            {
                 return Some((a, b));
             }
         }
@@ -5408,10 +6886,14 @@ impl<'a> TpchExec<'a> {
         if let Expr2::BinOp { op: BinOp2::Mul, left, right } = expr {
             let b = self.col_in_sub_one_right(left, t);
             let c = self.col_in_add_one_right(right, t);
-            if let (Some(b), Some(c)) = (b, c) { return Some((b, c)); }
+            if let (Some(b), Some(c)) = (b, c) {
+                return Some((b, c));
+            }
             let b = self.col_in_sub_one_right(right, t);
             let c = self.col_in_add_one_right(left, t);
-            if let (Some(b), Some(c)) = (b, c) { return Some((b, c)); }
+            if let (Some(b), Some(c)) = (b, c) {
+                return Some((b, c));
+            }
         }
         None
     }
@@ -5435,31 +6917,59 @@ impl<'a> TpchExec<'a> {
         let mut sum = 0.0f64;
         let mut all_int = true;
         for v in values {
-            if !matches!(v, Value2::Int(_)) { all_int = false; }
-            if let Some(f) = v.as_f64() { sum += f; }
+            if !matches!(v, Value2::Int(_)) {
+                all_int = false;
+            }
+            if let Some(f) = v.as_f64() {
+                sum += f;
+            }
         }
         if all_int {
             let mut isum = 0i64;
-            for v in values { if let Some(i) = v.as_i64() { isum = isum.wrapping_add(i); } }
+            for v in values {
+                if let Some(i) = v.as_i64() {
+                    isum = isum.wrapping_add(i);
+                }
+            }
             Value2::Int(isum)
-        } else { Value2::Float(sum) }
+        } else {
+            Value2::Float(sum)
+        }
     }
 
     fn avg_values(&self, values: &[Value2]) -> Value2 {
-        let mut sum = 0.0f64; let mut cnt = 0u64;
-        for v in values { if let Some(f) = v.as_f64() { sum += f; cnt += 1; } }
-        if cnt == 0 { Value2::Null } else { Value2::Float(sum / cnt as f64) }
+        let mut sum = 0.0f64;
+        let mut cnt = 0u64;
+        for v in values {
+            if let Some(f) = v.as_f64() {
+                sum += f;
+                cnt += 1;
+            }
+        }
+        if cnt == 0 {
+            Value2::Null
+        } else {
+            Value2::Float(sum / cnt as f64)
+        }
     }
 
     fn min_values(&self, values: &[Value2]) -> Value2 {
         let mut min: Option<f64> = None;
-        for v in values { if let Some(f) = v.as_f64() { min = Some(min.map_or(f, |m| m.min(f))); } }
+        for v in values {
+            if let Some(f) = v.as_f64() {
+                min = Some(min.map_or(f, |m| m.min(f)));
+            }
+        }
         min.map(Value2::Float).unwrap_or(Value2::Null)
     }
 
     fn max_values(&self, values: &[Value2]) -> Value2 {
         let mut max: Option<f64> = None;
-        for v in values { if let Some(f) = v.as_f64() { max = Some(max.map_or(f, |m| m.max(f))); } }
+        for v in values {
+            if let Some(f) = v.as_f64() {
+                max = Some(max.map_or(f, |m| m.max(f)));
+            }
+        }
         max.map(Value2::Float).unwrap_or(Value2::Null)
     }
 }
@@ -5473,7 +6983,10 @@ struct DPEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct JoinKey2 { left: usize, right: usize }
+struct JoinKey2 {
+    left: usize,
+    right: usize,
+}
 
 // =========================================================================
 // Public entry point
@@ -5688,18 +7201,14 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q21(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
-    let supplier_tbl = catalog
-        .get("supplier")
-        .ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
-    let nation_tbl = catalog
-        .get("nation")
-        .ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let supplier_tbl =
+        catalog.get("supplier").ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
+    let nation_tbl =
+        catalog.get("nation").ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
 
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
@@ -5744,8 +7253,20 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     if !found {
         return Ok(QueryResult {
             columns: vec![
-                ResultColumn { name: "s_name".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
-                ResultColumn { name: "numwait".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
+                ResultColumn {
+                    name: "s_name".to_string(),
+                    values: vec![],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                },
+                ResultColumn {
+                    name: "numwait".to_string(),
+                    values: vec![],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                },
             ],
             row_count: 0,
             elapsed_us: 0,
@@ -5775,14 +7296,11 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         }
     }
 
-
     let max_ok: u64 = li_orderkey.iter().copied().max().unwrap_or(0);
     let arr_size = (max_ok as usize).saturating_add(1);
 
-    let cnt_atomic: Vec<AtomicU8> =
-        (0..arr_size).map(|_| AtomicU8::new(0)).collect();
-    let late_atomic: Vec<AtomicU8> =
-        (0..arr_size).map(|_| AtomicU8::new(0)).collect();
+    let cnt_atomic: Vec<AtomicU8> = (0..arr_size).map(|_| AtomicU8::new(0)).collect();
+    let late_atomic: Vec<AtomicU8> = (0..arr_size).map(|_| AtomicU8::new(0)).collect();
 
     const CHUNK: usize = 65536;
     let num_chunks = (n_li + CHUNK - 1) / CHUNK;
@@ -5816,10 +7334,8 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         .collect();
 
     // Convert atomics to plain Vec<u8> for fast read-only access.
-    let cnt: Vec<u8> =
-        cnt_atomic.into_iter().map(|a| a.into_inner()).collect();
-    let late_cnt: Vec<u8> =
-        late_atomic.into_iter().map(|a| a.into_inner()).collect();
+    let cnt: Vec<u8> = cnt_atomic.into_iter().map(|a| a.into_inner()).collect();
+    let late_cnt: Vec<u8> = late_atomic.into_iter().map(|a| a.into_inner()).collect();
 
     // ---- Build supplier_name array (dense, indexed by suppkey) ----
     // Replaces FxHashMap<u64, u64> with Vec<u64> for O(1) lookup.
@@ -5876,29 +7392,37 @@ fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     // Mirror apply_order_by_grouped's f64::from_bits(hash).total_cmp()
     // ascending as the secondary key for bit-identical ordering.
     let mut entries: Vec<(u64, u64)> = counts.into_iter().collect();
-    entries.sort_by(|&(h1, c1), &(h2, c2)| {
-        match c2.cmp(&c1) {
-            std::cmp::Ordering::Equal => {
-                let f1 = f64::from_bits(h1);
-                let f2 = f64::from_bits(h2);
-                f1.total_cmp(&f2)
-            }
-            other => other,
+    entries.sort_by(|&(h1, c1), &(h2, c2)| match c2.cmp(&c1) {
+        std::cmp::Ordering::Equal => {
+            let f1 = f64::from_bits(h1);
+            let f2 = f64::from_bits(h2);
+            f1.total_cmp(&f2)
         }
+        other => other,
     });
 
     // ---- Phase 4: LIMIT 100, build result ----
     let limit = 100;
     let n_results = entries.len().min(limit);
-    let s_name_values: Vec<u64> =
-        entries.iter().take(n_results).map(|(h, _)| *h).collect();
-    let numwait_values: Vec<u64> =
-        entries.iter().take(n_results).map(|(_, c)| *c).collect();
+    let s_name_values: Vec<u64> = entries.iter().take(n_results).map(|(h, _)| *h).collect();
+    let numwait_values: Vec<u64> = entries.iter().take(n_results).map(|(_, c)| *c).collect();
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "s_name".to_string(), values: s_name_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "numwait".to_string(), values: numwait_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn {
+                name: "s_name".to_string(),
+                values: s_name_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "numwait".to_string(),
+                values: numwait_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -5944,12 +7468,9 @@ fn execute_q19_comult(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error
 
     let _ = sql; // detected by is_q19(); constants are hardcoded below.
 
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
-    let part_tbl = catalog
-        .get("part")
-        .ok_or_else(|| Error::NotFound("table 'part'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let part_tbl = catalog.get("part").ok_or_else(|| Error::NotFound("table 'part'".into()))?;
 
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
     let part = ExecTable::from_catalog(part_tbl, "part");
@@ -5980,30 +7501,11 @@ fn execute_q19_comult(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error
 
     // Branch definitions: 3 disjoint p_brand values, each with its own
     // container set, size range, and quantity range.
-    let brand_hashes: [u64; 3] = [
-        xxh3_64(b"Brand#12"),
-        xxh3_64(b"Brand#23"),
-        xxh3_64(b"Brand#34"),
-    ];
+    let brand_hashes: [u64; 3] = [xxh3_64(b"Brand#12"), xxh3_64(b"Brand#23"), xxh3_64(b"Brand#34")];
     let containers: [[u64; 4]; 3] = [
-        [
-            xxh3_64(b"SM CASE"),
-            xxh3_64(b"SM BOX"),
-            xxh3_64(b"SM PACK"),
-            xxh3_64(b"SM PKG"),
-        ],
-        [
-            xxh3_64(b"MED BAG"),
-            xxh3_64(b"MED BOX"),
-            xxh3_64(b"MED PKG"),
-            xxh3_64(b"MED PACK"),
-        ],
-        [
-            xxh3_64(b"LG CASE"),
-            xxh3_64(b"LG BOX"),
-            xxh3_64(b"LG PACK"),
-            xxh3_64(b"LG PKG"),
-        ],
+        [xxh3_64(b"SM CASE"), xxh3_64(b"SM BOX"), xxh3_64(b"SM PACK"), xxh3_64(b"SM PKG")],
+        [xxh3_64(b"MED BAG"), xxh3_64(b"MED BOX"), xxh3_64(b"MED PKG"), xxh3_64(b"MED PACK")],
+        [xxh3_64(b"LG CASE"), xxh3_64(b"LG BOX"), xxh3_64(b"LG PACK"), xxh3_64(b"LG PKG")],
     ];
     let size_ranges: [(i64, i64); 3] = [(1, 5), (1, 10), (1, 15)];
     let qty_ranges: [(f64, f64); 3] = [(1.0, 11.0), (10.0, 20.0), (20.0, 30.0)];
@@ -6065,21 +7567,40 @@ fn execute_q19_comult(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error
         .map(|chunk_idx| {
             let start = chunk_idx * CHUNK_SIZE;
             let end = std::cmp::min(start + CHUNK_SIZE, n_li);
-            let mut idxs: [Vec<usize>; 3] =
-                [Vec::new(), Vec::new(), Vec::new()];
+            let mut idxs: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
             if use_avx512 {
                 unsafe {
                     q19_chunk_avx512(
-                        sm_slice, si_slice, pk_slice, q_slice, branch_slice,
-                        start, end, air, air_reg, deliver, part_arr_size,
-                        &qty_ranges, &mut idxs,
+                        sm_slice,
+                        si_slice,
+                        pk_slice,
+                        q_slice,
+                        branch_slice,
+                        start,
+                        end,
+                        air,
+                        air_reg,
+                        deliver,
+                        part_arr_size,
+                        &qty_ranges,
+                        &mut idxs,
                     );
                 }
             } else {
                 q19_chunk_scalar(
-                    sm_slice, si_slice, pk_slice, q_slice, branch_slice,
-                    start, end, air, air_reg, deliver, part_arr_size,
-                    &qty_ranges, &mut idxs,
+                    sm_slice,
+                    si_slice,
+                    pk_slice,
+                    q_slice,
+                    branch_slice,
+                    start,
+                    end,
+                    air,
+                    air_reg,
+                    deliver,
+                    part_arr_size,
+                    &qty_ranges,
+                    &mut idxs,
                 );
             }
             idxs
@@ -6098,8 +7619,7 @@ fn execute_q19_comult(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error
         for p in &partial_indices {
             branch_idxs.extend_from_slice(&p[bi]);
         }
-        let partial =
-            sum_a_mul_one_minus_b_by_idx(li_extprice, li_discount, &branch_idxs);
+        let partial = sum_a_mul_one_minus_b_by_idx(li_extprice, li_discount, &branch_idxs);
         total_revenue += partial;
     }
 
@@ -6186,8 +7706,8 @@ unsafe fn q19_chunk_avx512(
     while p + 8 <= end {
         let sm_vec = _mm512_loadu_epi64(shipmodes.as_ptr().add(p) as *const i64);
         let si_vec = _mm512_loadu_epi64(shipinstructs.as_ptr().add(p) as *const i64);
-        let m_sm = _mm512_cmpeq_epi64_mask(sm_vec, v_air)
-            | _mm512_cmpeq_epi64_mask(sm_vec, v_air_reg);
+        let m_sm =
+            _mm512_cmpeq_epi64_mask(sm_vec, v_air) | _mm512_cmpeq_epi64_mask(sm_vec, v_air_reg);
         let m_si = _mm512_cmpeq_epi64_mask(si_vec, v_deliver);
         let m = m_sm & m_si;
         if m != 0 {
@@ -6301,12 +7821,10 @@ fn execute_q4_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let _ = sql; // detected by is_q4(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
 
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
@@ -6400,9 +7918,8 @@ fn execute_q4_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // allocation (8 × 188 KB), the reduce step (OR 1.5 MB), and Vec moves
     // between fold calls. The ~88K atomic fetch_or writes (Relaxed) have
     // negligible contention — spread across ~344 words, ~256 writes/word.
-    let has_early_commit_atomic: Vec<AtomicU64> = (0..bitmap_words)
-        .map(|_| AtomicU64::new(0))
-        .collect();
+    let has_early_commit_atomic: Vec<AtomicU64> =
+        (0..bitmap_words).map(|_| AtomicU64::new(0)).collect();
 
     {
         let num_chunks_li = (n_li + CHUNK - 1) / CHUNK;
@@ -6431,8 +7948,7 @@ fn execute_q4_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
                     if ok != prev_ok {
                         let word_idx = (ok >> 6) as usize;
                         let bit = 1u64 << (ok & 63);
-                        prev_match =
-                            (*dm.get_unchecked(word_idx) & bit) != 0;
+                        prev_match = (*dm.get_unchecked(word_idx) & bit) != 0;
                         prev_found = false;
                         prev_ok = ok;
                         prev_word = word_idx;
@@ -6448,8 +7964,7 @@ fn execute_q4_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
                         let cd = *li_cd.get_unchecked(i);
                         let rd = *li_rd.get_unchecked(i);
                         if rd > cd {
-                            hc.get_unchecked(prev_word)
-                                .fetch_or(prev_bit, Ordering::Relaxed);
+                            hc.get_unchecked(prev_word).fetch_or(prev_bit, Ordering::Relaxed);
                             prev_found = true;
                         }
                     }
@@ -6459,10 +7974,8 @@ fn execute_q4_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     }
 
     // Convert to plain Vec<u64> for fast read-only access in Phase 3.
-    let has_early_commit: Vec<u64> = has_early_commit_atomic
-        .into_iter()
-        .map(|a| a.into_inner())
-        .collect();
+    let has_early_commit: Vec<u64> =
+        has_early_commit_atomic.into_iter().map(|a| a.into_inner()).collect();
 
     // ---- Phase 3: group date-matched orders by priority ----
     // Only ~22K orders to check — a simple sequential loop over the
@@ -6496,11 +8009,17 @@ fn execute_q4_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "o_orderpriority".to_string(),
                 values: priority_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "order_count".to_string(),
                 values: count_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -6519,7 +8038,6 @@ fn date_to_days_q4(y: i32, m: u32, d: u32) -> u64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     (era * 146097 + doe as i32 - 719468) as u64
 }
-
 
 /// Detect the Q13 query by its signature: `custdist` alias, `c_count`
 /// alias, `LEFT OUTER JOIN orders`, and the literal `special%requests`
@@ -6590,12 +8108,10 @@ fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q13(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let customer_tbl = catalog
-        .get("customer")
-        .ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let customer_tbl =
+        catalog.get("customer").ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
 
     let customer = ExecTable::from_catalog(customer_tbl, "customer");
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
@@ -6611,7 +8127,9 @@ fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     // o_comment StringSearchColumn -- built by the CSV loader for all String
     // columns. Contains the original strings concatenated with offsets.
-    let ord_comment_ss = orders.string_columns.get(8)
+    let ord_comment_ss = orders
+        .string_columns
+        .get(8)
         .and_then(|opt| opt.as_ref())
         .ok_or_else(|| Error::NotFound("string column 'o_comment'".into()))?;
     let comment_bytes: &[u8] = &ord_comment_ss.bytes;
@@ -6620,10 +8138,8 @@ fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     // TPC-H SF=1 invariant: c_custkey values are dense 1..=150000.
     // Allocate a dense count array covering the full customer domain.
     // Defensive: use the max across both tables (covers any stragglers).
-    let max_custkey: u64 = cust_custkey.iter().copied()
-        .chain(ord_custkey.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_custkey: u64 =
+        cust_custkey.iter().copied().chain(ord_custkey.iter().copied()).max().unwrap_or(0);
     let arr_size = (max_custkey as usize).saturating_add(1);
 
     // ---- Phase 1: filter orders + count per customer (parallel) ----
@@ -6672,41 +8188,45 @@ fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     let order_count_per_cust: Vec<u16> = (0..num_chunks_ord)
         .into_par_iter()
-        .fold(|| vec![0u16; arr_size], |mut local, chunk_idx| {
-            let start = chunk_idx * CHUNK;
-            let end = (start + CHUNK).min(n_ord);
-            for i in start..end {
-                // o_comment NOT LIKE '%special%requests%'
-                // = NOT (bytes contain "special" then "requests" later)
-                let s_start = comment_offsets[i];
-                let s_end = comment_offsets[i + 1];
-                let s_bytes = &comment_bytes[s_start..s_end];
-                let matches = match special_finder.find(s_bytes) {
-                    Some(sp) => requests_finder
-                        .find(&s_bytes[sp + SPECIAL.len()..])
-                        .is_some(),
-                    None => false,
-                };
-                if !matches {
-                    let ok = ord_custkey[i] as usize;
-                    // SAFETY: o_custkey values are dense 1..=max_custkey,
-                    // arr_size = max_custkey + 1, so ok < arr_size always.
-                    unsafe {
-                        *local.get_unchecked_mut(ok) =
-                            local.get_unchecked(ok).saturating_add(1);
+        .fold(
+            || vec![0u16; arr_size],
+            |mut local, chunk_idx| {
+                let start = chunk_idx * CHUNK;
+                let end = (start + CHUNK).min(n_ord);
+                for i in start..end {
+                    // o_comment NOT LIKE '%special%requests%'
+                    // = NOT (bytes contain "special" then "requests" later)
+                    let s_start = comment_offsets[i];
+                    let s_end = comment_offsets[i + 1];
+                    let s_bytes = &comment_bytes[s_start..s_end];
+                    let matches = match special_finder.find(s_bytes) {
+                        Some(sp) => requests_finder.find(&s_bytes[sp + SPECIAL.len()..]).is_some(),
+                        None => false,
+                    };
+                    if !matches {
+                        let ok = ord_custkey[i] as usize;
+                        // SAFETY: o_custkey values are dense 1..=max_custkey,
+                        // arr_size = max_custkey + 1, so ok < arr_size always.
+                        unsafe {
+                            *local.get_unchecked_mut(ok) =
+                                local.get_unchecked(ok).saturating_add(1);
+                        }
                     }
                 }
-            }
-            local
-        })
-        .reduce(|| vec![0u16; arr_size], |mut a, b| {
-            for (i, v) in b.into_iter().enumerate() {
-                if v != 0 {
-                    a[i] = a[i].saturating_add(v);
+                local
+            },
+        )
+        .reduce(
+            || vec![0u16; arr_size],
+            |mut a, b| {
+                for (i, v) in b.into_iter().enumerate() {
+                    if v != 0 {
+                        a[i] = a[i].saturating_add(v);
+                    }
                 }
-            }
-            a
-        });
+                a
+            },
+        );
 
     // ---- Phase 2: bucket customers by c_count (parallel) ----
     // c_count = order_count_per_cust[c_custkey] (default 0). Build a
@@ -6724,11 +8244,7 @@ fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             let mut hist = vec![0u64; MAX_C_COUNT];
             for i in start..end {
                 let ck = cust_custkey[i] as usize;
-                let c_count = if ck < arr_size {
-                    order_count_per_cust[ck] as u64
-                } else {
-                    0
-                };
+                let c_count = if ck < arr_size { order_count_per_cust[ck] as u64 } else { 0 };
                 let slot = (c_count as usize).min(MAX_C_COUNT - 1);
                 hist[slot] = hist[slot].saturating_add(1);
             }
@@ -6749,9 +8265,7 @@ fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         .filter(|&(_, v)| v > 0)
         .collect();
     // ORDER BY custdist DESC, c_count DESC
-    entries.sort_by(|&(c1, v1), &(c2, v2)| {
-        v2.cmp(&v1).then_with(|| c2.cmp(&c1))
-    });
+    entries.sort_by(|&(c1, v1), &(c2, v2)| v2.cmp(&v1).then_with(|| c2.cmp(&c1)));
 
     // ---- Phase 4: build result ----
     let c_count_values: Vec<u64> = entries.iter().map(|(c, _)| *c).collect();
@@ -6763,17 +8277,22 @@ fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             ResultColumn {
                 name: "c_count".to_string(),
                 values: c_count_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "custdist".to_string(),
                 values: custdist_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
     })
 }
-
 
 /// Detect the Q17 query by its signature: the `avg_yearly` alias, the
 /// literal `0.2 * avg(l_quantity)` inside a correlated scalar subquery, plus
@@ -6820,12 +8339,9 @@ fn execute_q17_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q17(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let part_tbl = catalog
-        .get("part")
-        .ok_or_else(|| Error::NotFound("table 'part'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let part_tbl = catalog.get("part").ok_or_else(|| Error::NotFound("table 'part'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
     let part = ExecTable::from_catalog(part_tbl, "part");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
@@ -6925,12 +8441,14 @@ fn execute_q17_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         columns: vec![ResultColumn {
             name: "avg_yearly".to_string(),
             values: vec![avg_yearly.to_bits()],
-            string_values: None, type_oid: 0, null_mask: None }],
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        }],
         row_count: 1,
         elapsed_us: 0,
     })
 }
-
 
 // =========================================================================
 // W7-4: Q3, Q12, Q18 high-cardinality GROUP BY fast paths.
@@ -7000,15 +8518,12 @@ fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let _ = sql; // detected by is_q3(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let customer_tbl = catalog
-        .get("customer")
-        .ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let customer_tbl =
+        catalog.get("customer").ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
     let customer = ExecTable::from_catalog(customer_tbl, "customer");
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
@@ -7150,9 +8665,7 @@ fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             }
             let ok = li_orderkey[i] as usize;
             // W10-6: bitmap pre-filter (L2, ~14 cycles) before order_idx (L3, ~40 cycles)
-            let bit = unsafe {
-                (*order_bitmap_ref.get_unchecked(ok >> 6) >> (ok & 63)) & 1
-            };
+            let bit = unsafe { (*order_bitmap_ref.get_unchecked(ok >> 6) >> (ok & 63)) & 1 };
             if bit == 0 {
                 continue;
             }
@@ -7224,19 +8737,31 @@ fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "l_orderkey".to_string(),
                 values: orderkey_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "revenue".to_string(),
                 values: revenue_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "o_orderdate".to_string(),
                 values: orderdate_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "o_shippriority".to_string(),
                 values: shippriority_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -7282,12 +8807,10 @@ fn execute_q12_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q12(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
@@ -7316,11 +8839,7 @@ fn execute_q12_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     // order_class[ok] = 1 if high-priority (1-URGENT or 2-HIGH), 0 otherwise.
     // PK-only max: TPC-H referential integrity guarantees all l_orderkey
     // values exist in orders, so max(l_orderkey) <= max(o_orderkey).
-    let max_orderkey: u64 = ord_orderkey
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_orderkey: u64 = ord_orderkey.iter().copied().max().unwrap_or(0);
     let arr_size = (max_orderkey as usize).saturating_add(1);
     let mut order_class: Vec<u8> = vec![0u8; arr_size];
     for i in 0..n_ord {
@@ -7394,25 +8913,32 @@ fn execute_q12_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     // ---- Phase 3: Build result ----
     // ORDER BY l_shipmode: MAIL < SHIP alphabetically. We emit MAIL first
     // (matching the baseline's alphabetical ordering), then SHIP.
-    let high_values: Vec<u64> =
-        vec![(totals[1] as f64).to_bits(), (totals[3] as f64).to_bits()];
-    let low_values: Vec<u64> =
-        vec![(totals[0] as f64).to_bits(), (totals[2] as f64).to_bits()];
+    let high_values: Vec<u64> = vec![(totals[1] as f64).to_bits(), (totals[3] as f64).to_bits()];
+    let low_values: Vec<u64> = vec![(totals[0] as f64).to_bits(), (totals[2] as f64).to_bits()];
 
     Ok(QueryResult {
         columns: vec![
             ResultColumn {
                 name: "l_shipmode".to_string(),
                 values: vec![mail_hash, ship_hash],
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "high_line_count".to_string(),
                 values: high_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "low_line_count".to_string(),
                 values: low_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: 2,
         elapsed_us: 0,
@@ -7458,15 +8984,12 @@ fn execute_q18_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q18(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let customer_tbl = catalog
-        .get("customer")
-        .ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let customer_tbl =
+        catalog.get("customer").ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
     let customer = ExecTable::from_catalog(customer_tbl, "customer");
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
@@ -7491,12 +9014,8 @@ fn execute_q18_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let li_quantity = &lineitem.columns[4];
     let n_li = lineitem.row_count;
 
-    let max_orderkey: u64 = ord_orderkey
-        .iter()
-        .copied()
-        .chain(li_orderkey.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_orderkey: u64 =
+        ord_orderkey.iter().copied().chain(li_orderkey.iter().copied()).max().unwrap_or(0);
     let arr_size = (max_orderkey as usize).saturating_add(1);
 
     // ---- Phase 1: Parallel pass over lineitem, per-chunk FxHashMap ----
@@ -7566,19 +9085,9 @@ fn execute_q18_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             let sum_qty = if ok < arr_size { sum_qty_per_order[ok] } else { 0.0 };
             if sum_qty > 300.0 {
                 let ck = ord_custkey[i];
-                let name = if (ck as usize) < cust_arr_size {
-                    name_by_cust[ck as usize]
-                } else {
-                    0
-                };
-                Some((
-                    name,
-                    ck,
-                    ord_orderkey[i],
-                    ord_orderdate[i],
-                    ord_totalprice[i],
-                    sum_qty,
-                ))
+                let name =
+                    if (ck as usize) < cust_arr_size { name_by_cust[ck as usize] } else { 0 };
+                Some((name, ck, ord_orderkey[i], ord_orderdate[i], ord_totalprice[i], sum_qty))
             } else {
                 None
             }
@@ -7607,27 +9116,45 @@ fn execute_q18_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             ResultColumn {
                 name: "c_name".to_string(),
                 values: c_name_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "c_custkey".to_string(),
                 values: c_custkey_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "o_orderkey".to_string(),
                 values: o_orderkey_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "o_orderdate".to_string(),
                 values: o_orderdate_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "o_totalprice".to_string(),
                 values: o_totalprice_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "sum".to_string(),
                 values: sum_qty_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -7682,24 +9209,17 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let _ = sql; // detected by is_q9(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let part_tbl = catalog
-        .get("part")
-        .ok_or_else(|| Error::NotFound("table 'part'".into()))?;
-    let partsupp_tbl = catalog
-        .get("partsupp")
-        .ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
-    let supplier_tbl = catalog
-        .get("supplier")
-        .ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
-    let nation_tbl = catalog
-        .get("nation")
-        .ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
+    let part_tbl = catalog.get("part").ok_or_else(|| Error::NotFound("table 'part'".into()))?;
+    let partsupp_tbl =
+        catalog.get("partsupp").ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let supplier_tbl =
+        catalog.get("supplier").ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
+    let nation_tbl =
+        catalog.get("nation").ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
 
     let part = ExecTable::from_catalog(part_tbl, "part");
     let partsupp = ExecTable::from_catalog(partsupp_tbl, "partsupp");
@@ -7749,12 +9269,8 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // StringSearchColumn.like_contains_mask gives a bool per part row; we
     // scatter into a dense `matching_part[partkey]` array for O(1) lookup
     // during the lineitem scan.
-    let max_partkey: u64 = part_partkey
-        .iter()
-        .copied()
-        .chain(li_partkey.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_partkey: u64 =
+        part_partkey.iter().copied().chain(li_partkey.iter().copied()).max().unwrap_or(0);
     let part_arr_size = (max_partkey as usize).saturating_add(1);
     let mut matching_part: Vec<bool> = vec![false; part_arr_size];
     let mut n_match_part: usize = 0;
@@ -7790,11 +9306,7 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // supp_nationkey[suppkey] -> s_nationkey (dense, ~800 KB).
     // PK-only max: TPC-H referential integrity guarantees all l_suppkey
     // values exist in supplier, so max(l_suppkey) <= max(s_suppkey).
-    let max_suppkey: u64 = supp_suppkey
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_suppkey: u64 = supp_suppkey.iter().copied().max().unwrap_or(0);
     let supp_arr_size = (max_suppkey as usize).saturating_add(1);
     let mut supp_nationkey: Vec<u64> = vec![u64::MAX; supp_arr_size];
     for i in 0..n_supp {
@@ -7805,12 +9317,8 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     }
 
     // nation_hash_by_key[nationkey] -> n_name hash; nation_name_by_key -> name.
-    let max_nationkey: u64 = nat_nationkey
-        .iter()
-        .copied()
-        .chain(supp_nationkey_col.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_nationkey: u64 =
+        nat_nationkey.iter().copied().chain(supp_nationkey_col.iter().copied()).max().unwrap_or(0);
     let nat_arr_size = (max_nationkey as usize).saturating_add(1);
     let mut nation_hash_by_key: Vec<u64> = vec![0; nat_arr_size];
     let mut nation_name_by_key: Vec<Option<String>>;
@@ -7842,11 +9350,7 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
 
     // W11-6: Pre-compute order_year[orderkey] = year (i32) to avoid
     // per-row days_since_epoch_to_year call in the hot loop.
-    let max_orderkey: u64 = ord_orderkey
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_orderkey: u64 = ord_orderkey.iter().copied().max().unwrap_or(0);
     let ord_arr_size = (max_orderkey as usize).saturating_add(1);
     let mut order_year: Vec<i32> = vec![0; ord_arr_size];
     for i in 0..n_ord {
@@ -7947,17 +9451,11 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             } else {
                 String::new()
             };
-            let n_hash = if nk_i < nation_hash_by_key.len() {
-                nation_hash_by_key[nk_i]
-            } else {
-                0
-            };
+            let n_hash = if nk_i < nation_hash_by_key.len() { nation_hash_by_key[nk_i] } else { 0 };
             (name, n_hash, year, ext_disc - supp_qty)
         })
         .collect();
-    entries.sort_by(|a, b| {
-        a.0.cmp(&b.0).then_with(|| b.2.cmp(&a.2))
-    });
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.cmp(&a.2)));
 
     let n_results = entries.len();
     let nation_values: Vec<u64> = entries.iter().map(|x| x.1).collect();
@@ -7969,21 +9467,29 @@ fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "nation".to_string(),
                 values: nation_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "o_year".to_string(),
                 values: oyear_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "sum_profit".to_string(),
                 values: sum_profit_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
     })
 }
-
 
 /// Detect Q10 by its signature: `c_comment` in SELECT list (only Q10
 /// selects c_comment), `l_returnflag = 'R'`, `c_acctbal, n_name` adjacent
@@ -8038,18 +9544,14 @@ fn execute_q10_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q10(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let customer_tbl = catalog
-        .get("customer")
-        .ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
-    let nation_tbl = catalog
-        .get("nation")
-        .ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
+    let customer_tbl =
+        catalog.get("customer").ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let nation_tbl =
+        catalog.get("nation").ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
 
     let customer = ExecTable::from_catalog(customer_tbl, "customer");
     let orders = ExecTable::from_catalog(orders_tbl, "orders");
@@ -8096,12 +9598,8 @@ fn execute_q10_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     // order_matching[ok] = (o_orderdate >= date_start AND o_orderdate < date_end)
     // order_custkey[ok] = o_custkey for the matching order (0 otherwise).
     // ~13 MB total, L3-resident.
-    let max_orderkey: u64 = ord_orderkey
-        .iter()
-        .copied()
-        .chain(li_orderkey.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_orderkey: u64 =
+        ord_orderkey.iter().copied().chain(li_orderkey.iter().copied()).max().unwrap_or(0);
     let ord_arr_size = (max_orderkey as usize).saturating_add(1);
     let mut order_matching: Vec<bool> = vec![false; ord_arr_size];
     let mut order_custkey: Vec<u64> = vec![0; ord_arr_size];
@@ -8177,12 +9675,8 @@ fn execute_q10_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         }
     }
 
-    let max_nationkey: u64 = nat_nationkey
-        .iter()
-        .copied()
-        .chain(cust_nationkey.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_nationkey: u64 =
+        nat_nationkey.iter().copied().chain(cust_nationkey.iter().copied()).max().unwrap_or(0);
     let nat_arr_size = (max_nationkey as usize).saturating_add(1);
     let mut nation_name_arr: Vec<u64> = vec![0; nat_arr_size];
     for i in 0..n_nat {
@@ -8222,9 +9716,8 @@ fn execute_q10_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         // (0-indexed) at index `limit`; elements before it are "less" by
         // the comparator. With descending-revenue comparator, "less" means
         // higher revenue, so entries[0..limit] are the top-20.
-        let (top, _pivot, _rest) = entries.select_nth_unstable_by(limit, |a, b| {
-            b.2.total_cmp(&a.2)
-        });
+        let (top, _pivot, _rest) =
+            entries.select_nth_unstable_by(limit, |a, b| b.2.total_cmp(&a.2));
         top.sort_by(|a, b| b.2.total_cmp(&a.2));
         entries.truncate(limit);
     } else {
@@ -8246,41 +9739,64 @@ fn execute_q10_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             ResultColumn {
                 name: "c_custkey".to_string(),
                 values: custkey_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "c_name".to_string(),
                 values: name_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "revenue".to_string(),
                 values: revenue_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "c_acctbal".to_string(),
                 values: acctbal_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "n_name".to_string(),
                 values: nname_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "c_address".to_string(),
                 values: address_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "c_phone".to_string(),
                 values: phone_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "c_comment".to_string(),
                 values: comment_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
     })
 }
-
 
 // =========================================================================
 // W8-1: Q7 comultiplication — split OR nation-pair into 2 disjoint sub-joins
@@ -8345,21 +9861,16 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let _ = sql; // detected by is_q7(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let supplier_tbl = catalog
-        .get("supplier")
-        .ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
-    let customer_tbl = catalog
-        .get("customer")
-        .ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
-    let nation_tbl = catalog
-        .get("nation")
-        .ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
+    let supplier_tbl =
+        catalog.get("supplier").ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let customer_tbl =
+        catalog.get("customer").ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
+    let nation_tbl =
+        catalog.get("nation").ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
 
     let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
@@ -8415,9 +9926,7 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
         }
     }
     if france_nk == u64::MAX || germany_nk == u64::MAX {
-        return Err(Error::NotFound(
-            "FRANCE or GERMANY nation not found in nation table".into(),
-        ));
+        return Err(Error::NotFound("FRANCE or GERMANY nation not found in nation table".into()));
     }
 
     // ---- Phase 2: Build dense supp_nation_idx[suppkey] ----
@@ -8427,11 +9936,7 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // the lineitem scan without hashing.
     // W10-5: PK-only max — TPC-H referential integrity guarantees all
     // l_suppkey values exist in supplier, so max(l_suppkey) <= max(s_suppkey).
-    let max_suppkey: u64 = supp_suppkey
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_suppkey: u64 = supp_suppkey.iter().copied().max().unwrap_or(0);
     let supp_arr_size = (max_suppkey as usize).saturating_add(1);
     let mut supp_nation_idx: Vec<u8> = vec![255; supp_arr_size];
     for i in 0..n_supp {
@@ -8452,33 +9957,35 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // Safe because c_custkey values are unique.
     // PK-only max: TPC-H referential integrity guarantees all o_custkey
     // values exist in customer. Phase 5 uses checked indexing anyway.
-    let max_custkey: u64 = cust_custkey
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_custkey: u64 = cust_custkey.iter().copied().max().unwrap_or(0);
     let cust_arr_size = (max_custkey as usize).saturating_add(1);
     let mut cust_nation_idx: Vec<u8> = vec![255; cust_arr_size];
     let cust_ptr_usize = cust_nation_idx.as_mut_ptr() as usize;
     let n_cust_chunks_q7 = (n_cust + 65535) / 65536;
-    (0..n_cust_chunks_q7)
-        .into_par_iter()
-        .for_each(move |chunk_idx| {
-            let cust_ptr = cust_ptr_usize as *mut u8;
-            let start = chunk_idx * 65536;
-            let end = (start + 65536).min(n_cust);
-            for i in start..end {
-                let ck = cust_custkey[i] as usize;
-                if ck < cust_arr_size {
-                    let nk = cust_nationkey_col[i];
-                    let val = if nk == france_nk { 0u8 } else if nk == germany_nk { 1u8 } else { 255u8 };
-                    if val != 255 {
-                        // SAFETY: c_custkey values are unique in TPC-H.
-                        unsafe { *cust_ptr.add(ck) = val; }
+    (0..n_cust_chunks_q7).into_par_iter().for_each(move |chunk_idx| {
+        let cust_ptr = cust_ptr_usize as *mut u8;
+        let start = chunk_idx * 65536;
+        let end = (start + 65536).min(n_cust);
+        for i in start..end {
+            let ck = cust_custkey[i] as usize;
+            if ck < cust_arr_size {
+                let nk = cust_nationkey_col[i];
+                let val = if nk == france_nk {
+                    0u8
+                } else if nk == germany_nk {
+                    1u8
+                } else {
+                    255u8
+                };
+                if val != 255 {
+                    // SAFETY: c_custkey values are unique in TPC-H.
+                    unsafe {
+                        *cust_ptr.add(ck) = val;
                     }
                 }
             }
-        });
+        }
+    });
 
     // ---- Phase 4: Build dense order_to_cust_nation[orderkey] + bitmap ----
     // W9-5 tuning: fused 2-hop lookup chain (order_custkey[ok] →
@@ -8492,11 +9999,7 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // a fast filter check before the L3 byte-array lookup in the hot loop.
     // PK-only max: TPC-H referential integrity guarantees all l_orderkey
     // values exist in orders, so max(l_orderkey) <= max(o_orderkey).
-    let max_orderkey: u64 = ord_orderkey
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_orderkey: u64 = ord_orderkey.iter().copied().max().unwrap_or(0);
     let ord_arr_size = (max_orderkey as usize).saturating_add(1);
     let mut order_to_cust_nation: Vec<u8> = vec![255; ord_arr_size];
     let n_ord_bmp_words_q7 = (ord_arr_size + 63) / 64;
@@ -8504,30 +10007,28 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let ord_ptr_usize = order_to_cust_nation.as_mut_ptr() as usize;
     let ord_bmp_ptr_usize_q7 = order_qualifies_q7.as_mut_ptr() as usize;
     let n_ord_chunks_q7 = (n_ord + 65535) / 65536;
-    (0..n_ord_chunks_q7)
-        .into_par_iter()
-        .for_each(move |chunk_idx| {
-            let ord_ptr = ord_ptr_usize as *mut u8;
-            let ord_bmp_ptr = ord_bmp_ptr_usize_q7 as *mut u64;
-            let start = chunk_idx * 65536;
-            let end = (start + 65536).min(n_ord);
-            for i in start..end {
-                let ok = ord_orderkey[i] as usize;
-                if ok < ord_arr_size {
-                    let ck = ord_custkey[i] as usize;
-                    if ck < cust_arr_size {
-                        let val = cust_nation_idx[ck];
-                        if val != 255 {
-                            // SAFETY: o_orderkey values are unique in TPC-H.
-                            unsafe {
-                                *ord_ptr.add(ok) = val;
-                                *ord_bmp_ptr.add(ok >> 6) |= 1u64 << (ok & 63);
-                            }
+    (0..n_ord_chunks_q7).into_par_iter().for_each(move |chunk_idx| {
+        let ord_ptr = ord_ptr_usize as *mut u8;
+        let ord_bmp_ptr = ord_bmp_ptr_usize_q7 as *mut u64;
+        let start = chunk_idx * 65536;
+        let end = (start + 65536).min(n_ord);
+        for i in start..end {
+            let ok = ord_orderkey[i] as usize;
+            if ok < ord_arr_size {
+                let ck = ord_custkey[i] as usize;
+                if ck < cust_arr_size {
+                    let val = cust_nation_idx[ck];
+                    if val != 255 {
+                        // SAFETY: o_orderkey values are unique in TPC-H.
+                        unsafe {
+                            *ord_ptr.add(ok) = val;
+                            *ord_bmp_ptr.add(ok >> 6) |= 1u64 << (ok & 63);
                         }
                     }
                 }
             }
-        });
+        }
+    });
 
     // ---- Phase 5: Single parallel pass over lineitem ----
     // W9-5 tuning: replaced per-chunk FxHashMap<(u64, u64, i32), f64> with
@@ -8547,9 +10048,9 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     //   2: (GERMANY, FRANCE, 1995)  3: (GERMANY, FRANCE, 1996)
     let date_start = date_to_days_q4(1995, 1, 1); // >= 1995-01-01 (inclusive)
     let date_end = date_to_days_q4(1996, 12, 31); // <= 1996-12-31 (inclusive)
-    // W10-5: fast year computation. All shipdates are in [1995, 1996] (date
-    // filter above). year_idx = 0 for 1995, 1 for 1996. A single compare
-    // replaces the ~10-op days_since_epoch_to_year() call.
+                                                  // W10-5: fast year computation. All shipdates are in [1995, 1996] (date
+                                                  // filter above). year_idx = 0 for 1995, 1 for 1996. A single compare
+                                                  // replaces the ~10-op days_since_epoch_to_year() call.
     let date_1996 = date_to_days_q4(1996, 1, 1);
 
     const CHUNK: usize = 65536;
@@ -8651,19 +10152,31 @@ fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "supp_nation".to_string(),
                 values: supp_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "cust_nation".to_string(),
                 values: cust_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "l_year".to_string(),
                 values: year_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "revenue".to_string(),
                 values: revenue_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -8735,24 +10248,18 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let _ = sql; // detected by is_q5(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let region_tbl = catalog
-        .get("region")
-        .ok_or_else(|| Error::NotFound("table 'region'".into()))?;
-    let nation_tbl = catalog
-        .get("nation")
-        .ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
-    let supplier_tbl = catalog
-        .get("supplier")
-        .ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
-    let customer_tbl = catalog
-        .get("customer")
-        .ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let region_tbl =
+        catalog.get("region").ok_or_else(|| Error::NotFound("table 'region'".into()))?;
+    let nation_tbl =
+        catalog.get("nation").ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
+    let supplier_tbl =
+        catalog.get("supplier").ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
+    let customer_tbl =
+        catalog.get("customer").ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
     let region = ExecTable::from_catalog(region_tbl, "region");
     let nation = ExecTable::from_catalog(nation_tbl, "nation");
@@ -8810,9 +10317,7 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
         }
     }
     if asia_regionkey == u64::MAX {
-        return Err(Error::NotFound(
-            "ASIA region not found in region table".into(),
-        ));
+        return Err(Error::NotFound("ASIA region not found in region table".into()));
     }
 
     // ---- Phase 2: Filter nation by n_regionkey = asia_regionkey ----
@@ -8821,11 +10326,7 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // PK-only max: nationkeys are 0..24 in TPC-H; supplier/customer
     // nationkeys reference nation (referential integrity). Phases 3/4
     // use checked indexing, so out-of-range values are safely skipped.
-    let max_nationkey: u64 = nat_nationkey
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_nationkey: u64 = nat_nationkey.iter().copied().max().unwrap_or(0);
     let nat_arr_size = (max_nationkey as usize).saturating_add(1);
     let mut nation_idx_by_key: Vec<u8> = vec![255; nat_arr_size];
     // (nationkey, name_hash) for each Asian nation, in nation CSV order.
@@ -8847,9 +10348,7 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
         }
     }
     if asian_nations.is_empty() {
-        return Err(Error::NotFound(
-            "No nations found for ASIA region".into(),
-        ));
+        return Err(Error::NotFound("No nations found for ASIA region".into()));
     }
     let n_groups = asian_nations.len();
     let nation_name_hashes: Vec<u64> = asian_nations.iter().map(|x| x.1).collect();
@@ -8858,11 +10357,7 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // u8: 0-4 = Asian nation idx, 255 = not Asian. ~10 KB, L1-resident.
     // PK-only max: TPC-H referential integrity guarantees all l_suppkey
     // values exist in supplier, so max(l_suppkey) <= max(s_suppkey).
-    let max_suppkey: u64 = supp_suppkey
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_suppkey: u64 = supp_suppkey.iter().copied().max().unwrap_or(0);
     let supp_arr_size = (max_suppkey as usize).saturating_add(1);
     let mut supp_nation_idx: Vec<u8> = vec![255; supp_arr_size];
     for i in 0..n_supp {
@@ -8882,33 +10377,29 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // because each c_custkey is unique, so no two threads write the same slot.
     // PK-only max: TPC-H referential integrity guarantees all o_custkey
     // values exist in customer, so max(o_custkey) <= max(c_custkey).
-    let max_custkey: u64 = cust_custkey
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_custkey: u64 = cust_custkey.iter().copied().max().unwrap_or(0);
     let cust_arr_size = (max_custkey as usize).saturating_add(1);
     let mut cust_nation_idx: Vec<u8> = vec![255; cust_arr_size];
     let cust_ptr_usize = cust_nation_idx.as_mut_ptr() as usize;
     let n_cust_chunks = (n_cust + 65535) / 65536;
-    (0..n_cust_chunks)
-        .into_par_iter()
-        .for_each(move |chunk_idx| {
-            let cust_ptr = cust_ptr_usize as *mut u8;
-            let start = chunk_idx * 65536;
-            let end = (start + 65536).min(n_cust);
-            for i in start..end {
-                let ck = cust_custkey[i] as usize;
-                if ck < cust_arr_size {
-                    let nk = cust_nationkey_col[i];
-                    if (nk as usize) < nat_arr_size {
-                        // SAFETY: c_custkey values are unique in TPC-H, so
-                        // each slot is written by exactly one thread.
-                        unsafe { *cust_ptr.add(ck) = nation_idx_by_key[nk as usize]; }
+    (0..n_cust_chunks).into_par_iter().for_each(move |chunk_idx| {
+        let cust_ptr = cust_ptr_usize as *mut u8;
+        let start = chunk_idx * 65536;
+        let end = (start + 65536).min(n_cust);
+        for i in start..end {
+            let ck = cust_custkey[i] as usize;
+            if ck < cust_arr_size {
+                let nk = cust_nationkey_col[i];
+                if (nk as usize) < nat_arr_size {
+                    // SAFETY: c_custkey values are unique in TPC-H, so
+                    // each slot is written by exactly one thread.
+                    unsafe {
+                        *cust_ptr.add(ck) = nation_idx_by_key[nk as usize];
                     }
                 }
             }
-        });
+        }
+    });
 
     // ---- Phase 5: Build dense order_cust_nation_idx[orderkey] ----
     // u8: 0-4 if (o_orderdate ∈ [1994-01-01, 1995-01-01) AND customer is
@@ -8919,13 +10410,9 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // each o_orderkey is unique.
     let date_start = date_to_days_q4(1994, 1, 1); // >= 1994-01-01 (inclusive)
     let date_end = date_to_days_q4(1995, 1, 1); // < 1995-01-01 (exclusive)
-    // PK-only max: TPC-H referential integrity guarantees all l_orderkey
-    // values exist in orders, so max(l_orderkey) <= max(o_orderkey).
-    let max_orderkey: u64 = ord_orderkey
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+                                                // PK-only max: TPC-H referential integrity guarantees all l_orderkey
+                                                // values exist in orders, so max(l_orderkey) <= max(o_orderkey).
+    let max_orderkey: u64 = ord_orderkey.iter().copied().max().unwrap_or(0);
     let ord_arr_size = (max_orderkey as usize).saturating_add(1);
     let mut order_cust_nation_idx: Vec<u8> = vec![255; ord_arr_size];
     // W10-5: Bitmap companion to order_cust_nation_idx. 1 bit per orderkey;
@@ -8938,33 +10425,31 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let ord_ptr_usize = order_cust_nation_idx.as_mut_ptr() as usize;
     let ord_bmp_ptr_usize = order_qualifies.as_mut_ptr() as usize;
     let n_ord_chunks = (n_ord + 65535) / 65536;
-    (0..n_ord_chunks)
-        .into_par_iter()
-        .for_each(move |chunk_idx| {
-            let ord_ptr = ord_ptr_usize as *mut u8;
-            let ord_bmp_ptr = ord_bmp_ptr_usize as *mut u64;
-            let start = chunk_idx * 65536;
-            let end = (start + 65536).min(n_ord);
-            for i in start..end {
-                let ok = ord_orderkey[i] as usize;
-                if ok < ord_arr_size {
-                    let d = ord_orderdate[i];
-                    if d >= date_start && d < date_end {
-                        let ck = ord_custkey[i] as usize;
-                        if ck < cust_arr_size {
-                            let cn = cust_nation_idx[ck];
-                            if cn != 255 {
-                                // SAFETY: o_orderkey values are unique in TPC-H.
-                                unsafe {
-                                    *ord_ptr.add(ok) = cn;
-                                    *ord_bmp_ptr.add(ok >> 6) |= 1u64 << (ok & 63);
-                                }
+    (0..n_ord_chunks).into_par_iter().for_each(move |chunk_idx| {
+        let ord_ptr = ord_ptr_usize as *mut u8;
+        let ord_bmp_ptr = ord_bmp_ptr_usize as *mut u64;
+        let start = chunk_idx * 65536;
+        let end = (start + 65536).min(n_ord);
+        for i in start..end {
+            let ok = ord_orderkey[i] as usize;
+            if ok < ord_arr_size {
+                let d = ord_orderdate[i];
+                if d >= date_start && d < date_end {
+                    let ck = ord_custkey[i] as usize;
+                    if ck < cust_arr_size {
+                        let cn = cust_nation_idx[ck];
+                        if cn != 255 {
+                            // SAFETY: o_orderkey values are unique in TPC-H.
+                            unsafe {
+                                *ord_ptr.add(ok) = cn;
+                                *ord_bmp_ptr.add(ok >> 6) |= 1u64 << (ok & 63);
                             }
                         }
                     }
                 }
             }
-        });
+        }
+    });
 
     // ---- Phase 6: Single parallel pass over lineitem ----
     // For each row where order_cust_nation_idx[l_orderkey] != 255 (order
@@ -9049,9 +10534,8 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     }
 
     // ---- Sort by revenue DESC, return 2 columns ----
-    let mut entries: Vec<(u64, f64)> = (0..n_groups)
-        .map(|i| (nation_name_hashes[i], totals[i]))
-        .collect();
+    let mut entries: Vec<(u64, f64)> =
+        (0..n_groups).map(|i| (nation_name_hashes[i], totals[i])).collect();
     entries.sort_by(|a, b| b.1.total_cmp(&a.1));
 
     let n_results = entries.len();
@@ -9063,11 +10547,17 @@ fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "n_name".to_string(),
                 values: name_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "revenue".to_string(),
                 values: revenue_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -9142,12 +10632,9 @@ fn execute_q14_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q14(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let part_tbl = catalog
-        .get("part")
-        .ok_or_else(|| Error::NotFound("table 'part'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let part_tbl = catalog.get("part").ok_or_else(|| Error::NotFound("table 'part'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
     let part = ExecTable::from_catalog(part_tbl, "part");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
@@ -9228,14 +10715,30 @@ fn execute_q14_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             if use_avx512 {
                 unsafe {
                     q14_chunk_avx512(
-                        shipdates, partkeys, exts, discs, promo,
-                        start, end, date_start, date_end, part_arr_size,
+                        shipdates,
+                        partkeys,
+                        exts,
+                        discs,
+                        promo,
+                        start,
+                        end,
+                        date_start,
+                        date_end,
+                        part_arr_size,
                     )
                 }
             } else {
                 q14_chunk_scalar(
-                    shipdates, partkeys, exts, discs, promo,
-                    start, end, date_start, date_end, part_arr_size,
+                    shipdates,
+                    partkeys,
+                    exts,
+                    discs,
+                    promo,
+                    start,
+                    end,
+                    date_start,
+                    date_end,
+                    part_arr_size,
                 )
             }
         })
@@ -9254,7 +10757,10 @@ fn execute_q14_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         columns: vec![ResultColumn {
             name: "promo_revenue".to_string(),
             values: vec![promo_revenue.to_bits()],
-                string_values: None, type_oid: 0, null_mask: None }],
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        }],
         row_count: 1,
         elapsed_us: 0,
     })
@@ -9461,21 +10967,15 @@ fn execute_q2_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let _ = sql; // detected by is_q2(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let region_tbl = catalog
-        .get("region")
-        .ok_or_else(|| Error::NotFound("table 'region'".into()))?;
-    let nation_tbl = catalog
-        .get("nation")
-        .ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
-    let supplier_tbl = catalog
-        .get("supplier")
-        .ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
-    let part_tbl = catalog
-        .get("part")
-        .ok_or_else(|| Error::NotFound("table 'part'".into()))?;
-    let partsupp_tbl = catalog
-        .get("partsupp")
-        .ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
+    let region_tbl =
+        catalog.get("region").ok_or_else(|| Error::NotFound("table 'region'".into()))?;
+    let nation_tbl =
+        catalog.get("nation").ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
+    let supplier_tbl =
+        catalog.get("supplier").ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
+    let part_tbl = catalog.get("part").ok_or_else(|| Error::NotFound("table 'part'".into()))?;
+    let partsupp_tbl =
+        catalog.get("partsupp").ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
 
     let region = ExecTable::from_catalog(region_tbl, "region");
     let nation = ExecTable::from_catalog(nation_tbl, "nation");
@@ -9536,20 +11036,14 @@ fn execute_q2_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
         }
     }
     if europe_regionkey == u64::MAX {
-        return Err(Error::NotFound(
-            "EUROPE region not found in region table".into(),
-        ));
+        return Err(Error::NotFound("EUROPE region not found in region table".into()));
     }
 
     // ---- Phase 2: Build nation_name_by_key[nationkey] for European nations ----
     // Dense Vec<u64>; 0 means "not European" (nation_name hashes are
     // non-zero in practice). ~5 of 25 nations are European.
-    let max_nationkey: u64 = nat_nationkey
-        .iter()
-        .copied()
-        .chain(supp_nationkey_col.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_nationkey: u64 =
+        nat_nationkey.iter().copied().chain(supp_nationkey_col.iter().copied()).max().unwrap_or(0);
     let nat_arr_size = (max_nationkey as usize).saturating_add(1);
     let mut nation_name_by_key: Vec<u64> = vec![0; nat_arr_size];
     let mut is_euro_nation: Vec<u8> = vec![0; nat_arr_size];
@@ -9564,12 +11058,8 @@ fn execute_q2_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // ---- Phase 3: Build dense supplier-info arrays indexed by suppkey ----
     // ~20K of 100K suppliers are European; non-Euro slots stay 0.
     // 6 × ~800 KB = ~4.8 MB, L3-resident.
-    let max_suppkey: u64 = supp_suppkey
-        .iter()
-        .copied()
-        .chain(ps_suppkey.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_suppkey: u64 =
+        supp_suppkey.iter().copied().chain(ps_suppkey.iter().copied()).max().unwrap_or(0);
     let supp_arr_size = (max_suppkey as usize).saturating_add(1);
     let mut supp_is_euro: Vec<u8> = vec![0; supp_arr_size];
     let mut supp_name_h: Vec<u64> = vec![0; supp_arr_size];
@@ -9601,17 +11091,12 @@ fn execute_q2_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // min_cost_bits[ps_partkey]. Single shared 1.6 MB atomic Vec — no
     // per-chunk allocation, no merge step. Contention is low (~4 rows per
     // partkey, randomly distributed across 8 threads).
-    let max_partkey: u64 = pt_partkey
-        .iter()
-        .copied()
-        .chain(ps_partkey.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_partkey: u64 =
+        pt_partkey.iter().copied().chain(ps_partkey.iter().copied()).max().unwrap_or(0);
     let part_arr_size = (max_partkey as usize).saturating_add(1);
     const INFINITY_BITS: u64 = 0x7FF0000000000000u64; // f64::+INF
-    let min_cost_atomic: Vec<AtomicU64> = (0..part_arr_size)
-        .map(|_| AtomicU64::new(INFINITY_BITS))
-        .collect();
+    let min_cost_atomic: Vec<AtomicU64> =
+        (0..part_arr_size).map(|_| AtomicU64::new(INFINITY_BITS)).collect();
     // Shared references for the parallel closure.
     let min_cost_ref: &[AtomicU64] = &min_cost_atomic;
     let supp_is_euro_ref: &[u8] = &supp_is_euro;
@@ -9657,10 +11142,8 @@ fn execute_q2_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
         }
     });
     // Freeze atomics into a plain Vec<u64> for read-only Phase 6.
-    let min_cost_bits: Vec<u64> = min_cost_atomic
-        .iter()
-        .map(|a| a.load(Ordering::Relaxed))
-        .collect();
+    let min_cost_bits: Vec<u64> =
+        min_cost_atomic.iter().map(|a| a.load(Ordering::Relaxed)).collect();
 
     // ---- Phase 5: Filter part by p_size = 15 AND p_type LIKE '%BRASS' ----
     // ~200 parts. Use the p_type StringSearchColumn for suffix match.
@@ -9791,20 +11274,67 @@ fn execute_q2_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "s_acctbal".to_string(), values: c0 , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "s_name".to_string(), values: c1 , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "n_name".to_string(), values: c2 , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "p_partkey".to_string(), values: c3 , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "p_mfgr".to_string(), values: c4 , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "s_address".to_string(), values: c5 , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "s_phone".to_string(), values: c6 , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "s_comment".to_string(), values: c7 , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn {
+                name: "s_acctbal".to_string(),
+                values: c0,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "s_name".to_string(),
+                values: c1,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "n_name".to_string(),
+                values: c2,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "p_partkey".to_string(),
+                values: c3,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "p_mfgr".to_string(),
+                values: c4,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "s_address".to_string(),
+                values: c5,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "s_phone".to_string(),
+                values: c6,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "s_comment".to_string(),
+                values: c7,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count,
         elapsed_us: 0,
     })
 }
-
 
 /// Detect the Q20 query by its signature: select-list `s_name, s_address`,
 /// the `p_name LIKE 'forest%'` prefix filter, the `n_name = 'CANADA'`
@@ -9886,21 +11416,15 @@ fn execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q20(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let part_tbl = catalog
-        .get("part")
-        .ok_or_else(|| Error::NotFound("table 'part'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
-    let partsupp_tbl = catalog
-        .get("partsupp")
-        .ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
-    let supplier_tbl = catalog
-        .get("supplier")
-        .ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
-    let nation_tbl = catalog
-        .get("nation")
-        .ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
+    let part_tbl = catalog.get("part").ok_or_else(|| Error::NotFound("table 'part'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let partsupp_tbl =
+        catalog.get("partsupp").ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
+    let supplier_tbl =
+        catalog.get("supplier").ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
+    let nation_tbl =
+        catalog.get("nation").ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
 
     let part = ExecTable::from_catalog(part_tbl, "part");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
@@ -10055,12 +11579,8 @@ fn execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     // ---- Phase 4 (NEW): Determine qualifying suppkeys ----
     // Iterate the ~8500 partsupp pairs. If has_rows (SQL NULL: absent =
     // does not qualify) AND ps_availqty > 0.5 * sum: mark suppkey.
-    let max_suppkey: u64 = supp_suppkey
-        .iter()
-        .copied()
-        .chain(ps_suppkey.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_suppkey: u64 =
+        supp_suppkey.iter().copied().chain(ps_suppkey.iter().copied()).max().unwrap_or(0);
     let supp_arr_size = (max_suppkey as usize).saturating_add(1);
     let mut qualifying_suppkey_flag: Vec<u8> = vec![0u8; supp_arr_size];
 
@@ -10123,17 +11643,22 @@ fn execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
             ResultColumn {
                 name: "s_name".to_string(),
                 values: c_name,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "s_address".to_string(),
                 values: c_addr,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count,
         elapsed_us: 0,
     })
 }
-
 
 // =========================================================================
 // W8-6: Q8 8-table join reformulation — filter pushdown + single-pass
@@ -10208,27 +11733,19 @@ fn execute_q8_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     let _ = sql; // detected by is_q8(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let region_tbl = catalog
-        .get("region")
-        .ok_or_else(|| Error::NotFound("table 'region'".into()))?;
-    let nation_tbl = catalog
-        .get("nation")
-        .ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
-    let part_tbl = catalog
-        .get("part")
-        .ok_or_else(|| Error::NotFound("table 'part'".into()))?;
-    let supplier_tbl = catalog
-        .get("supplier")
-        .ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
-    let customer_tbl = catalog
-        .get("customer")
-        .ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
-    let orders_tbl = catalog
-        .get("orders")
-        .ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let region_tbl =
+        catalog.get("region").ok_or_else(|| Error::NotFound("table 'region'".into()))?;
+    let nation_tbl =
+        catalog.get("nation").ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
+    let part_tbl = catalog.get("part").ok_or_else(|| Error::NotFound("table 'part'".into()))?;
+    let supplier_tbl =
+        catalog.get("supplier").ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
+    let customer_tbl =
+        catalog.get("customer").ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
+    let orders_tbl =
+        catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
     let region = ExecTable::from_catalog(region_tbl, "region");
     let nation = ExecTable::from_catalog(nation_tbl, "nation");
@@ -10400,11 +11917,7 @@ fn execute_q8_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
     // Initialize via raw write_bytes (AtomicU8 has same layout as u8).
     let mut order_year_idx: Vec<std::sync::atomic::AtomicU8> = Vec::with_capacity(ord_arr_size);
     unsafe {
-        std::ptr::write_bytes(
-            order_year_idx.as_mut_ptr() as *mut u8,
-            255,
-            ord_arr_size,
-        );
+        std::ptr::write_bytes(order_year_idx.as_mut_ptr() as *mut u8, 255, ord_arr_size);
         order_year_idx.set_len(ord_arr_size);
     }
     let is_american_custkey_ref: &[u8] = &is_american_custkey;
@@ -10543,18 +12056,22 @@ fn execute_q8_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             ResultColumn {
                 name: "o_year".to_string(),
                 values: year_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
             ResultColumn {
                 name: "mkt_share".to_string(),
                 values: mkt_values,
-                string_values: None, type_oid: 0, null_mask: None },
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: 2,
         elapsed_us: 0,
     })
 }
-
-
 
 /// Detect the Q22 query by its signature: `cntrycode` alias, `numcust`
 /// alias, `totacctbal` alias, and the `substr(c_phone, 1, 2)` expression.
@@ -10619,9 +12136,8 @@ fn execute_q22_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q22(); constants are hardcoded below.
 
     // ---- Load customer table ----
-    let customer_tbl = catalog
-        .get("customer")
-        .ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
+    let customer_tbl =
+        catalog.get("customer").ok_or_else(|| Error::NotFound("table 'customer'".into()))?;
     let customer = ExecTable::from_catalog(customer_tbl, "customer");
 
     // Column indices (from tpch_schema in datasource/csv.rs):
@@ -10645,9 +12161,7 @@ fn execute_q22_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     // somehow has fewer, fall back to the .get(i) path. For catalog-loaded
     // columns (the only path for Q22), offsets is always fully populated.
     if phone_offsets.len() < n_cust + 1 {
-        return Err(Error::NotFound(
-            "c_phone StringSearchColumn offsets underpopulated".into(),
-        ));
+        return Err(Error::NotFound("c_phone StringSearchColumn offsets underpopulated".into()));
     }
 
     // ---- Phase 1: Single parallel pass over customer ----
@@ -10676,10 +12190,7 @@ fn execute_q22_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         .enumerate()
         .map(|(chunk_idx, chunk_slice)| {
             let start = chunk_idx * CHUNK;
-            let mut acc = Phase1Acc {
-                sum_positive: [0.0f64; 7],
-                count_positive: [0u64; 7],
-            };
+            let mut acc = Phase1Acc { sum_positive: [0.0f64; 7], count_positive: [0u64; 7] };
             for (local_i, bucket_slot) in chunk_slice.iter_mut().enumerate() {
                 let i = start + local_i;
                 // Read first 2 bytes of c_phone directly from the
@@ -10732,9 +12243,27 @@ fn execute_q22_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         // codes). Return 3 empty columns to match the SQL semantics.
         return Ok(QueryResult {
             columns: vec![
-                ResultColumn { name: "cntrycode".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
-                ResultColumn { name: "numcust".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
-                ResultColumn { name: "totacctbal".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
+                ResultColumn {
+                    name: "cntrycode".to_string(),
+                    values: vec![],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                },
+                ResultColumn {
+                    name: "numcust".to_string(),
+                    values: vec![],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                },
+                ResultColumn {
+                    name: "totacctbal".to_string(),
+                    values: vec![],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                },
             ],
             row_count: 0,
             elapsed_us: 0,
@@ -10756,10 +12285,7 @@ fn execute_q22_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
         .map(|chunk_idx| {
             let start = chunk_idx * CHUNK;
             let end = (start + CHUNK).min(n_cust);
-            let mut acc = Phase3Acc {
-                sum_final: [0.0f64; 7],
-                count_final: [0u64; 7],
-            };
+            let mut acc = Phase3Acc { sum_final: [0.0f64; 7], count_final: [0u64; 7] };
             for i in start..end {
                 // SAFETY: i is in [0, n_cust), bucket_cache_ref has
                 // length n_cust.
@@ -10825,9 +12351,27 @@ fn execute_q22_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "cntrycode".to_string(), values: cntrycode_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "numcust".to_string(), values: numcust_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "totacctbal".to_string(), values: totacctbal_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn {
+                name: "cntrycode".to_string(),
+                values: cntrycode_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "numcust".to_string(),
+                values: numcust_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "totacctbal".to_string(),
+                values: totacctbal_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count,
         elapsed_us: 0,
@@ -10891,12 +12435,9 @@ fn execute_q16_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q16(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let part_tbl = catalog
-        .get("part")
-        .ok_or_else(|| Error::NotFound("table 'part'".into()))?;
-    let partsupp_tbl = catalog
-        .get("partsupp")
-        .ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
+    let part_tbl = catalog.get("part").ok_or_else(|| Error::NotFound("table 'part'".into()))?;
+    let partsupp_tbl =
+        catalog.get("partsupp").ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
 
     let part = ExecTable::from_catalog(part_tbl, "part");
     let partsupp = ExecTable::from_catalog(partsupp_tbl, "partsupp");
@@ -10930,12 +12471,8 @@ fn execute_q16_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     }
     let medium_prefix: &[u8] = b"MEDIUM POLISHED";
 
-    let max_partkey: u64 = p_partkey
-        .iter()
-        .copied()
-        .chain(ps_partkey.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_partkey: u64 =
+        p_partkey.iter().copied().chain(ps_partkey.iter().copied()).max().unwrap_or(0);
     let arr_size = (max_partkey as usize).saturating_add(1);
 
     // Dense partkey -> group_idx+1 (0 = not matching). ~800 KB for SF=1.
@@ -11093,16 +12630,39 @@ fn execute_q16_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "p_brand".to_string(), values: brand_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "p_type".to_string(), values: type_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "p_size".to_string(), values: size_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "supplier_cnt".to_string(), values: cnt_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn {
+                name: "p_brand".to_string(),
+                values: brand_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "p_type".to_string(),
+                values: type_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "p_size".to_string(),
+                values: size_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "supplier_cnt".to_string(),
+                values: cnt_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
     })
 }
-
 
 // =========================================================================
 // W9-3: Q15 max-revenue cache reformulation
@@ -11163,12 +12723,10 @@ fn execute_q15_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q15(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let supplier_tbl = catalog
-        .get("supplier")
-        .ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
-    let lineitem_tbl = catalog
-        .get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let supplier_tbl =
+        catalog.get("supplier").ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
     let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
@@ -11273,11 +12831,41 @@ fn execute_q15_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     if max_revenue == f64::NEG_INFINITY {
         return Ok(QueryResult {
             columns: vec![
-                ResultColumn { name: "s_suppkey".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
-                ResultColumn { name: "s_name".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
-                ResultColumn { name: "s_address".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
-                ResultColumn { name: "s_phone".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
-                ResultColumn { name: "total_revenue".to_string(), values: vec![] , string_values: None, type_oid: 0, null_mask: None },
+                ResultColumn {
+                    name: "s_suppkey".to_string(),
+                    values: vec![],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                },
+                ResultColumn {
+                    name: "s_name".to_string(),
+                    values: vec![],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                },
+                ResultColumn {
+                    name: "s_address".to_string(),
+                    values: vec![],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                },
+                ResultColumn {
+                    name: "s_phone".to_string(),
+                    values: vec![],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                },
+                ResultColumn {
+                    name: "total_revenue".to_string(),
+                    values: vec![],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                },
             ],
             row_count: 0,
             elapsed_us: 0,
@@ -11319,11 +12907,41 @@ fn execute_q15_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "s_suppkey".to_string(), values: suppkey_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "s_name".to_string(), values: name_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "s_address".to_string(), values: address_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "s_phone".to_string(), values: phone_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "total_revenue".to_string(), values: revenue_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn {
+                name: "s_suppkey".to_string(),
+                values: suppkey_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "s_name".to_string(),
+                values: name_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "s_address".to_string(),
+                values: address_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "s_phone".to_string(),
+                values: phone_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "total_revenue".to_string(),
+                values: revenue_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -11383,15 +13001,12 @@ fn execute_q11_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     let _ = sql; // detected by is_q11(); constants are hardcoded below.
 
     // ---- Load tables ----
-    let nation_tbl = catalog
-        .get("nation")
-        .ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
-    let supplier_tbl = catalog
-        .get("supplier")
-        .ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
-    let partsupp_tbl = catalog
-        .get("partsupp")
-        .ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
+    let nation_tbl =
+        catalog.get("nation").ok_or_else(|| Error::NotFound("table 'nation'".into()))?;
+    let supplier_tbl =
+        catalog.get("supplier").ok_or_else(|| Error::NotFound("table 'supplier'".into()))?;
+    let partsupp_tbl =
+        catalog.get("partsupp").ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
 
     let nation = ExecTable::from_catalog(nation_tbl, "nation");
     let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
@@ -11454,8 +13069,7 @@ fn execute_q11_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
     const CHUNK: usize = 65536;
     let num_chunks = (n_ps + CHUNK - 1) / CHUNK;
 
-    let use_avx512 = is_x86_feature_detected!("avx512f")
-        && is_x86_feature_detected!("avx512dq");
+    let use_avx512 = is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq");
 
     let (sum_per_part, total_sum): (Vec<f64>, f64) = (0..num_chunks)
         .into_par_iter()
@@ -11527,8 +13141,20 @@ fn execute_q11_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult,
 
     Ok(QueryResult {
         columns: vec![
-            ResultColumn { name: "ps_partkey".to_string(), values: partkey_values , string_values: None, type_oid: 0, null_mask: None },
-            ResultColumn { name: "value".to_string(), values: value_values , string_values: None, type_oid: 0, null_mask: None },
+            ResultColumn {
+                name: "ps_partkey".to_string(),
+                values: partkey_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
+            ResultColumn {
+                name: "value".to_string(),
+                values: value_values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            },
         ],
         row_count: n_results,
         elapsed_us: 0,
@@ -11658,7 +13284,6 @@ unsafe fn accumulate_q11_chunk_avx512(
     }
 }
 
-
 // W10-6: Q6 fast path — single-table scan with 4 filters + 1 sum.
 fn is_q6(sql: &str) -> bool {
     sql.contains("sum(l_extendedprice * l_discount)") && sql.contains("l_quantity < 24")
@@ -11667,8 +13292,8 @@ fn is_q6(sql: &str) -> bool {
 #[cold]
 fn execute_q6_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, Error> {
     let _ = sql;
-    let lineitem_tbl = catalog.get("lineitem")
-        .ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
+    let lineitem_tbl =
+        catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
     let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
 
     let li_quantity = &lineitem.columns[4];
@@ -11692,11 +13317,17 @@ fn execute_q6_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
             let mut local_sum = 0.0f64;
             for i in start..end {
                 let sd = unsafe { *li_shipdate.get_unchecked(i) };
-                if sd < date_start || sd >= date_end { continue; }
+                if sd < date_start || sd >= date_end {
+                    continue;
+                }
                 let qty = unsafe { *li_quantity.get_unchecked(i) };
-                if qty >= qty_max { continue; }
+                if qty >= qty_max {
+                    continue;
+                }
                 let disc_bits = unsafe { *li_discount.get_unchecked(i) };
-                if disc_bits < disc_min_bits || disc_bits > disc_max_bits { continue; }
+                if disc_bits < disc_min_bits || disc_bits > disc_max_bits {
+                    continue;
+                }
                 let ext = f64::from_bits(unsafe { *li_extendedprice.get_unchecked(i) });
                 let disc = f64::from_bits(disc_bits);
                 local_sum += ext * disc;
@@ -11709,7 +13340,10 @@ fn execute_q6_reformulated(sql: &str, catalog: &Catalog) -> Result<QueryResult, 
         columns: vec![ResultColumn {
             name: "revenue".to_string(),
             values: vec![total.to_bits()],
-                string_values: None, type_oid: 0, null_mask: None }],
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        }],
         row_count: 1,
         elapsed_us: 0,
     })
@@ -11729,7 +13363,8 @@ mod tests {
 
     #[test]
     fn test_parse_implicit_join() {
-        let q = parse_tpch("SELECT count(*) FROM orders, lineitem WHERE o_orderkey = l_orderkey").unwrap();
+        let q = parse_tpch("SELECT count(*) FROM orders, lineitem WHERE o_orderkey = l_orderkey")
+            .unwrap();
         assert_eq!(q.from.len(), 2);
     }
 
@@ -11781,7 +13416,10 @@ mod tests {
 
     #[test]
     fn test_parse_left_join() {
-        let q = parse_tpch("SELECT count(*) FROM customer LEFT OUTER JOIN orders ON c_custkey = o_custkey").unwrap();
+        let q = parse_tpch(
+            "SELECT count(*) FROM customer LEFT OUTER JOIN orders ON c_custkey = o_custkey",
+        )
+        .unwrap();
         assert_eq!(q.joins.len(), 1);
         assert_eq!(q.joins[0].join_type, JoinType2::Left);
     }
@@ -11798,7 +13436,10 @@ mod tests {
 
     #[test]
     fn test_parse_not_exists() {
-        let q = parse_tpch("SELECT count(*) FROM t WHERE NOT exists (SELECT 1 FROM t2 WHERE t2.x = t.x)").unwrap();
+        let q = parse_tpch(
+            "SELECT count(*) FROM t WHERE NOT exists (SELECT 1 FROM t2 WHERE t2.x = t.x)",
+        )
+        .unwrap();
         match &q.where_clause.unwrap() {
             Expr2::Exists { negated: true, .. } => {}
             other => panic!("expected Exists negated, got {other:?}"),
@@ -11822,7 +13463,16 @@ mod tests {
 
     #[test]
     fn test_like_match() {
-        let cat = Catalog::new(); let exec = TpchExec { catalog: &cat, outer: std::cell::Cell::new(None), subquery_cache: std::cell::RefCell::new(new_hashmap()), exists_cache: std::cell::RefCell::new(new_hashmap()), exists_multi_cache: std::cell::RefCell::new(new_hashmap()), in_subquery_cache: std::cell::RefCell::new(new_hashmap()), decorrelated_cache: std::cell::RefCell::new(new_hashmap()) };
+        let cat = Catalog::new();
+        let exec = TpchExec {
+            catalog: &cat,
+            outer: std::cell::Cell::new(None),
+            subquery_cache: std::cell::RefCell::new(new_hashmap()),
+            exists_cache: std::cell::RefCell::new(new_hashmap()),
+            exists_multi_cache: std::cell::RefCell::new(new_hashmap()),
+            in_subquery_cache: std::cell::RefCell::new(new_hashmap()),
+            decorrelated_cache: std::cell::RefCell::new(new_hashmap()),
+        };
         assert!(exec.like("hello world", "%hello%"));
         assert!(exec.like("hello", "hello"));
         assert!(exec.like("hello world", "hello%"));

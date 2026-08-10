@@ -136,12 +136,19 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
         // sidecar so SELECT can return the original strings (Wave 21)
         // and LIKE filters work (Wave 2).
         let string_search = if !all_numeric {
-            let strings: Vec<String> = parsed_rows.iter().map(|row| row[col_idx].to_string()).collect();
+            let strings: Vec<String> =
+                parsed_rows.iter().map(|row| row[col_idx].to_string()).collect();
             Some(crate::exec::fm_index::StringSearchColumn::new(strings))
         } else {
             None
         };
-        columns.push(LoadedColumn { name: name.clone(), cells, row_count, string_search, null_bitmap: None });
+        columns.push(LoadedColumn {
+            name: name.clone(),
+            cells,
+            row_count,
+            string_search,
+            null_bitmap: None,
+        });
     }
 
     Ok(LoadedTable { name: LoadedTable::name_from_path(path), columns, row_count })
@@ -266,11 +273,7 @@ pub fn tpch_schema(table: &str) -> Option<Vec<(&'static str, TpchType)>> {
             ("ps_supplycost", Float64),
             ("ps_comment", String),
         ],
-        "region" => vec![
-            ("r_regionkey", Int64),
-            ("r_name", String),
-            ("r_comment", String),
-        ],
+        "region" => vec![("r_regionkey", Int64), ("r_name", String), ("r_comment", String)],
         "supplier" => vec![
             ("s_suppkey", Int64),
             ("s_name", String),
@@ -297,9 +300,14 @@ fn parse_date_to_days(s: &[u8]) -> u64 {
     }
     // Quick ASCII-digit check — bail to 0 on non-digit (defensive).
     let b = s;
-    if !b[0].is_ascii_digit() || !b[1].is_ascii_digit() || !b[2].is_ascii_digit()
-        || !b[3].is_ascii_digit() || !b[5].is_ascii_digit() || !b[6].is_ascii_digit()
-        || !b[8].is_ascii_digit() || !b[9].is_ascii_digit()
+    if !b[0].is_ascii_digit()
+        || !b[1].is_ascii_digit()
+        || !b[2].is_ascii_digit()
+        || !b[3].is_ascii_digit()
+        || !b[5].is_ascii_digit()
+        || !b[6].is_ascii_digit()
+        || !b[8].is_ascii_digit()
+        || !b[9].is_ascii_digit()
     {
         return 0;
     }
@@ -376,8 +384,8 @@ fn strip_quotes(field: &[u8]) -> &[u8] {
 /// - a row has the wrong number of `|`-separated fields,
 /// - an integer / float field fails to parse.
 pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dyn Error>> {
-    let schema = tpch_schema(table_name)
-        .ok_or_else(|| format!("unknown TPC-H table: {}", table_name))?;
+    let schema =
+        tpch_schema(table_name).ok_or_else(|| format!("unknown TPC-H table: {}", table_name))?;
     let ncols = schema.len();
 
     let file = File::open(path)?;
@@ -402,14 +410,9 @@ pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dy
     };
     // est_rows = file_size / avg_row_size, but never smaller than 8
     // (so tiny files still preallocate something).
-    let est_rows = if file_size > 0 {
-        (file_size / avg_row_size).max(8)
-    } else {
-        8
-    };
+    let est_rows = if file_size > 0 { (file_size / avg_row_size).max(8) } else { 8 };
 
-    let mut col_cells: Vec<Vec<u64>> =
-        (0..ncols).map(|_| Vec::with_capacity(est_rows)).collect();
+    let mut col_cells: Vec<Vec<u64>> = (0..ncols).map(|_| Vec::with_capacity(est_rows)).collect();
     // String storage — only allocate for String columns (saves memory
     // for the integer/float/date columns).
     let mut col_strings: Vec<Vec<String>> = (0..ncols).map(|_| Vec::new()).collect();
@@ -535,7 +538,9 @@ pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dy
     let mut columns: Vec<LoadedColumn> = Vec::with_capacity(ncols);
     for i in 0..ncols {
         let string_search = if !col_strings[i].is_empty() {
-            Some(crate::exec::fm_index::StringSearchColumn::new(std::mem::take(&mut col_strings[i])))
+            Some(crate::exec::fm_index::StringSearchColumn::new(std::mem::take(
+                &mut col_strings[i],
+            )))
         } else {
             None
         };
@@ -554,11 +559,7 @@ pub fn read_tpch_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<dy
     // step. This matches the convention used by `QueryEngine::load_csv`
     // and `QueryEngine::load_parquet`, which both rename to the
     // caller-supplied table name after loading.
-    Ok(LoadedTable {
-        name: table_name.to_string(),
-        columns,
-        row_count,
-    })
+    Ok(LoadedTable { name: table_name.to_string(), columns, row_count })
 }
 
 #[cfg(test)]

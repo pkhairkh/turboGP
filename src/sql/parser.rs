@@ -303,11 +303,7 @@ impl Parser {
         };
 
         // Wave 60b: HAVING clause — parsed after GROUP BY.
-        let having = if self.match_keyword("HAVING") {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
+        let having = if self.match_keyword("HAVING") { Some(self.parse_expr()?) } else { None };
 
         let order_by = if self.match_keyword("ORDER") {
             self.expect_keyword("BY")?;
@@ -318,7 +314,17 @@ impl Parser {
 
         let limit = if self.match_ident("LIMIT") { Some(self.parse_usize()?) } else { None };
 
-        Ok(SelectQuery { select, from, joins, where_clause, group_by, having, order_by, limit, distinct })
+        Ok(SelectQuery {
+            select,
+            from,
+            joins,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            distinct,
+        })
     }
 
     /// Parse zero or more JOIN clauses.
@@ -456,15 +462,21 @@ impl Parser {
                         return Err("expected ( after OVER".into());
                     }
                     self.next(); // consume (
-                    // Collect everything until matching ).
+                                 // Collect everything until matching ).
                     let mut depth = 1i32;
                     let mut spec_parts: Vec<String> = Vec::new();
                     while depth > 0 {
                         match self.peek().clone() {
-                            Token::LParen => { depth += 1; spec_parts.push("(".into()); self.next(); }
+                            Token::LParen => {
+                                depth += 1;
+                                spec_parts.push("(".into());
+                                self.next();
+                            }
                             Token::RParen => {
                                 depth -= 1;
-                                if depth > 0 { spec_parts.push(")".into()); }
+                                if depth > 0 {
+                                    spec_parts.push(")".into());
+                                }
                                 self.next();
                             }
                             Token::EOF => return Err("unterminated OVER (...)".into()),
@@ -505,15 +517,47 @@ impl Parser {
         loop {
             match self.peek().clone() {
                 Token::RParen if paren_depth == 0 => break,
-                Token::RParen => { paren_depth -= 1; parts.push(")".into()); self.next(); }
-                Token::LParen => { paren_depth += 1; parts.push("(".into()); self.next(); }
+                Token::RParen => {
+                    paren_depth -= 1;
+                    parts.push(")".into());
+                    self.next();
+                }
+                Token::LParen => {
+                    paren_depth += 1;
+                    parts.push("(".into());
+                    self.next();
+                }
                 Token::Comma | Token::Semicolon | Token::EOF => break,
-                Token::Keyword(k) if k == "FROM" || k == "WHERE" || k == "GROUP" || k == "ORDER" || k == "HAVING" || k == "LIMIT" => break,
-                Token::Ident(name) => { parts.push(name); self.next(); }
-                Token::Int(i) => { parts.push(i.to_string()); self.next(); }
-                Token::Float(f) => { parts.push(f.to_string()); self.next(); }
-                Token::Op(op) => { parts.push(op); self.next(); }
-                Token::Keyword(k) => { parts.push(k); self.next(); }
+                Token::Keyword(k)
+                    if k == "FROM"
+                        || k == "WHERE"
+                        || k == "GROUP"
+                        || k == "ORDER"
+                        || k == "HAVING"
+                        || k == "LIMIT" =>
+                {
+                    break
+                }
+                Token::Ident(name) => {
+                    parts.push(name);
+                    self.next();
+                }
+                Token::Int(i) => {
+                    parts.push(i.to_string());
+                    self.next();
+                }
+                Token::Float(f) => {
+                    parts.push(f.to_string());
+                    self.next();
+                }
+                Token::Op(op) => {
+                    parts.push(op);
+                    self.next();
+                }
+                Token::Keyword(k) => {
+                    parts.push(k);
+                    self.next();
+                }
                 _ => break,
             }
         }
@@ -542,8 +586,20 @@ impl Parser {
     fn parse_table_name(&mut self) -> Result<String, String> {
         // Reserved keywords that cannot be used as table names.
         const RESERVED: &[&str] = &[
-            "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "JOIN", "ON",
-            "LEFT", "RIGHT", "INNER", "OUTER", "UNION", "EXCEPT", "INTERSECT",
+            "WHERE",
+            "GROUP",
+            "ORDER",
+            "HAVING",
+            "LIMIT",
+            "JOIN",
+            "ON",
+            "LEFT",
+            "RIGHT",
+            "INNER",
+            "OUTER",
+            "UNION",
+            "EXCEPT",
+            "INTERSECT",
         ];
         let first = match self.peek().clone() {
             Token::Ident(name) => name,
@@ -683,13 +739,21 @@ impl Parser {
         // LIKE keyword
         if self.match_ident("LIKE") {
             let right = self.parse_additive_expr()?;
-            return Ok(Expr::Binary { left: Box::new(left), op: "LIKE".to_string(), right: Box::new(right) });
+            return Ok(Expr::Binary {
+                left: Box::new(left),
+                op: "LIKE".to_string(),
+                right: Box::new(right),
+            });
         }
         // NOT LIKE
         if self.match_keyword("NOT") {
             if self.match_ident("LIKE") {
                 let right = self.parse_additive_expr()?;
-                return Ok(Expr::Binary { left: Box::new(left), op: "NOT LIKE".to_string(), right: Box::new(right) });
+                return Ok(Expr::Binary {
+                    left: Box::new(left),
+                    op: "NOT LIKE".to_string(),
+                    right: Box::new(right),
+                });
             }
             // NOT could be part of another construct; put it back
             self.pos -= 1;
@@ -707,11 +771,8 @@ impl Parser {
                 op: ">=".to_string(),
                 right: Box::new(low),
             };
-            let le = Expr::Binary {
-                left: Box::new(left),
-                op: "<=".to_string(),
-                right: Box::new(high),
-            };
+            let le =
+                Expr::Binary { left: Box::new(left), op: "<=".to_string(), right: Box::new(high) };
             return Ok(Expr::Binary {
                 left: Box::new(ge),
                 op: "AND".to_string(),
@@ -770,8 +831,13 @@ impl Parser {
                     }
                 }
                 match self.peek() {
-                    Token::Comma => { self.next(); }
-                    Token::RParen => { self.next(); break; }
+                    Token::Comma => {
+                        self.next();
+                    }
+                    Token::RParen => {
+                        self.next();
+                        break;
+                    }
                     other => return Err(format!("expected , or ) in IN list, got {other:?}")),
                 }
             }
@@ -803,9 +869,16 @@ impl Parser {
                         }
                     }
                     match self.peek() {
-                        Token::Comma => { self.next(); }
-                        Token::RParen => { self.next(); break; }
-                        other => return Err(format!("expected , or ) in NOT IN list, got {other:?}")),
+                        Token::Comma => {
+                            self.next();
+                        }
+                        Token::RParen => {
+                            self.next();
+                            break;
+                        }
+                        other => {
+                            return Err(format!("expected , or ) in NOT IN list, got {other:?}"))
+                        }
                     }
                 }
                 return Ok(and_expr.unwrap_or(left));
@@ -906,13 +979,13 @@ impl Parser {
                     self.next(); // consume (
                     let arg = self.parse_agg_arg()?;
                     if !matches!(self.peek(), Token::RParen) {
-                        return Err(format!("expected ) after function args, got {:?}", self.peek()));
+                        return Err(format!(
+                            "expected ) after function args, got {:?}",
+                            self.peek()
+                        ));
                     }
                     self.next(); // consume )
-                    return Ok(Expr::Function {
-                        name: name.to_uppercase(),
-                        arg,
-                    });
+                    return Ok(Expr::Function { name: name.to_uppercase(), arg });
                 }
                 Ok(Expr::Column(name))
             }
@@ -943,11 +1016,8 @@ impl Parser {
         if when_clauses.is_empty() {
             return Err("CASE expression must have at least one WHEN clause".into());
         }
-        let else_clause = if self.match_keyword("ELSE") {
-            Some(Box::new(self.parse_expr()?))
-        } else {
-            None
-        };
+        let else_clause =
+            if self.match_keyword("ELSE") { Some(Box::new(self.parse_expr()?)) } else { None };
         self.expect_keyword("END")?;
         Ok(Expr::Case { when_clauses, else_clause })
     }
@@ -964,7 +1034,7 @@ impl Parser {
             return Err(format!("expected ( after EXTRACT, got {:?}", self.peek()));
         }
         self.next(); // consume (
-        // The field is a keyword (YEAR, MONTH, DAY, ...) or an identifier.
+                     // The field is a keyword (YEAR, MONTH, DAY, ...) or an identifier.
         let field = match self.peek().clone() {
             Token::Keyword(k) => k.to_uppercase(),
             Token::Ident(s) => s.to_uppercase(),
@@ -1280,7 +1350,9 @@ mod tests {
         assert_eq!(q.select.len(), 3);
         assert!(matches!(&q.select[0], SelectItem::Literal(1)));
         assert!(matches!(&q.select[1], SelectItem::Column(c) if c == "URL"));
-        assert!(matches!(&q.select[2], SelectItem::Aggregate { func, arg, .. } if func == "COUNT" && arg == "*"));
+        assert!(
+            matches!(&q.select[2], SelectItem::Aggregate { func, arg, .. } if func == "COUNT" && arg == "*")
+        );
     }
 
     #[test]
@@ -1324,7 +1396,8 @@ mod tests {
     /// in expression context, causing "unexpected trailing token: LParen".
     #[test]
     fn parse_having_with_count_star() {
-        let q = parse_sql("SELECT dept, count(*) FROM t GROUP BY dept HAVING count(*) > 1").unwrap();
+        let q =
+            parse_sql("SELECT dept, count(*) FROM t GROUP BY dept HAVING count(*) > 1").unwrap();
         assert!(q.having.is_some(), "HAVING clause must be parsed");
         // Verify the HAVING expression is a Binary comparison.
         match &q.having {
@@ -1426,22 +1499,18 @@ mod tests {
     fn parse_extract_month_day() {
         let q = parse_sql("SELECT EXTRACT(MONTH FROM d) FROM t").unwrap();
         match &q.select[0] {
-            SelectItem::Expression { expr, .. } => {
-                match expr {
-                    Expr::Extract { field, .. } => assert_eq!(field, "MONTH"),
-                    other => panic!("expected Extract, got {other:?}"),
-                }
-            }
+            SelectItem::Expression { expr, .. } => match expr {
+                Expr::Extract { field, .. } => assert_eq!(field, "MONTH"),
+                other => panic!("expected Extract, got {other:?}"),
+            },
             _ => panic!("expected Expression"),
         }
         let q = parse_sql("SELECT EXTRACT(DAY FROM d) FROM t").unwrap();
         match &q.select[0] {
-            SelectItem::Expression { expr, .. } => {
-                match expr {
-                    Expr::Extract { field, .. } => assert_eq!(field, "DAY"),
-                    other => panic!("expected Extract, got {other:?}"),
-                }
-            }
+            SelectItem::Expression { expr, .. } => match expr {
+                Expr::Extract { field, .. } => assert_eq!(field, "DAY"),
+                other => panic!("expected Extract, got {other:?}"),
+            },
             _ => panic!("expected Expression"),
         }
     }
@@ -1451,12 +1520,10 @@ mod tests {
     fn parse_extract_case_insensitive() {
         let q = parse_sql("SELECT extract(year from d) FROM t").unwrap();
         match &q.select[0] {
-            SelectItem::Expression { expr, .. } => {
-                match expr {
-                    Expr::Extract { field, .. } => assert_eq!(field, "YEAR"),
-                    other => panic!("expected Extract, got {other:?}"),
-                }
-            }
+            SelectItem::Expression { expr, .. } => match expr {
+                Expr::Extract { field, .. } => assert_eq!(field, "YEAR"),
+                other => panic!("expected Extract, got {other:?}"),
+            },
             _ => panic!("expected Expression"),
         }
     }
@@ -1495,14 +1562,12 @@ mod tests {
         ] {
             let q = parse_sql(sql).unwrap();
             match &q.select[0] {
-                SelectItem::Expression { expr, .. } => {
-                    match expr {
-                        Expr::Cast { target_type, .. } => {
-                            assert_eq!(*target_type, expected_type, "SQL: {sql}");
-                        }
-                        other => panic!("SQL {sql}: expected Cast, got {other:?}"),
+                SelectItem::Expression { expr, .. } => match expr {
+                    Expr::Cast { target_type, .. } => {
+                        assert_eq!(*target_type, expected_type, "SQL: {sql}");
                     }
-                }
+                    other => panic!("SQL {sql}: expected Cast, got {other:?}"),
+                },
                 other => panic!("SQL {sql}: expected Expression, got {other:?}"),
             }
         }
@@ -1513,12 +1578,10 @@ mod tests {
     fn parse_cast_case_insensitive() {
         let q = parse_sql("SELECT cast(x as int) FROM t").unwrap();
         match &q.select[0] {
-            SelectItem::Expression { expr, .. } => {
-                match expr {
-                    Expr::Cast { target_type, .. } => assert_eq!(*target_type, "INT"),
-                    other => panic!("expected Cast, got {other:?}"),
-                }
-            }
+            SelectItem::Expression { expr, .. } => match expr {
+                Expr::Cast { target_type, .. } => assert_eq!(*target_type, "INT"),
+                other => panic!("expected Cast, got {other:?}"),
+            },
             _ => panic!("expected Expression"),
         }
     }
