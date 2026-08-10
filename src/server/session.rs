@@ -6,9 +6,9 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TxnStatus {
     #[default]
-    Idle,             // 'I'
-    InTransaction,    // 'T'
-    FailedTransaction,// 'E'
+    Idle, // 'I'
+    InTransaction,     // 'T'
+    FailedTransaction, // 'E'
 }
 
 impl TxnStatus {
@@ -32,9 +32,13 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn reset_txn(&mut self) { self.txn = TxnStatus::Idle; }
+    pub fn reset_txn(&mut self) {
+        self.txn = TxnStatus::Idle;
+    }
 
     pub fn set_context(&mut self, k: impl Into<String>, v: impl Into<String>) {
         self.session_context.insert(k.into().to_lowercase(), v.into());

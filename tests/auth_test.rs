@@ -1,8 +1,8 @@
 //! Authentication + TLS tests (Wave 65).
 
+use std::sync::{Arc, RwLock};
 use turbogp::server::auth::{PasswordManager, TlsConfig};
 use turbogp::server::ServerConfig;
-use std::sync::{Arc, RwLock};
 
 #[test]
 fn password_manager_create_and_verify() {
@@ -37,10 +37,8 @@ fn server_config_with_auth() {
 
 #[test]
 fn tls_config_struct_exists() {
-    let tls = TlsConfig {
-        cert_path: "/path/to/cert.pem".into(),
-        key_path: "/path/to/key.pem".into(),
-    };
+    let tls =
+        TlsConfig { cert_path: "/path/to/cert.pem".into(), key_path: "/path/to/key.pem".into() };
     assert_eq!(tls.cert_path, "/path/to/cert.pem");
     assert_eq!(tls.key_path, "/path/to/key.pem");
 }

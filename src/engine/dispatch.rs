@@ -60,7 +60,9 @@ pub fn classify_query(query: &SelectQuery) -> QueryShape {
     if has_group_by {
         // Check if all select items are either GROUP BY columns or count(*)
         let has_agg = query.select.iter().any(|s| matches!(s, SelectItem::Aggregate { .. }));
-        if !has_agg { return QueryShape::Complex; }
+        if !has_agg {
+            return QueryShape::Complex;
+        }
 
         // Check if the aggregate is count(*) or sum(col)
         let agg = query.select.iter().find_map(|s| {
@@ -124,10 +126,7 @@ pub fn classify_query(query: &SelectQuery) -> QueryShape {
 
 /// Execute a query using kernel-direct dispatch.
 /// Returns None if the shape is Complex (caller should use fallback).
-pub fn execute_dispatched(
-    query: &SelectQuery,
-    table: &Table,
-) -> Option<Result<QueryResult>> {
+pub fn execute_dispatched(query: &SelectQuery, table: &Table) -> Option<Result<QueryResult>> {
     let shape = classify_query(query);
     if shape == QueryShape::Complex {
         return None;
@@ -174,9 +173,7 @@ fn expr_needs_tpch_fallback(expr: &Expr) -> bool {
 
 fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     match shape {
-        QueryShape::CountAll => {
-            Ok(single_value("count", table.row_count as u64))
-        }
+        QueryShape::CountAll => Ok(single_value("count", table.row_count as u64)),
         QueryShape::CountFilter => {
             let mask = build_filter_mask(query, table)?;
             // For COUNT(col) (not COUNT(*)), exclude NULL values (Wave 33).
@@ -242,7 +239,8 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
             let col_idx = resolve_agg_col(&query.select[0], table)?;
             // Exclude NULLs (Wave 33).
             let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
-            let count = vectorized::count_distinct_masked(&table.columns[col_idx], &null_adjusted_mask);
+            let count =
+                vectorized::count_distinct_masked(&table.columns[col_idx], &null_adjusted_mask);
             Ok(single_value("count", count))
         }
         QueryShape::GroupByCount | QueryShape::GroupBySum | QueryShape::GroupByOrderByLimit => {
@@ -251,23 +249,48 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
         QueryShape::SelectStar => {
             let mask = build_filter_mask(query, table)?;
             let limit = query.limit.unwrap_or(mask.iter().filter(|&&b| b).count());
-            let indices: Vec<usize> = (0..table.row_count).filter(|&i| mask[i]).take(limit).collect();
-            let cols: Vec<ResultColumn> = table.column_names.iter().enumerate().map(|(i, name)| {
-                let values: Vec<u64> = indices.iter().map(|&idx| table.columns[i][idx]).collect();
-                // Wave 52 fix: propagate NULL bitmap.
-                let null_mask = if i < table.null_bitmaps.len() {
-                    if let Some(ref bm) = table.null_bitmaps[i] {
-                        let m: Vec<bool> = indices.iter().map(|&idx| bm.is_null(idx)).collect();
-                        if m.iter().any(|&x| x) { Some(m) } else { None }
-                    } else { None }
-                } else { None };
-                ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0, null_mask }
-            }).collect();
+            let indices: Vec<usize> =
+                (0..table.row_count).filter(|&i| mask[i]).take(limit).collect();
+            let cols: Vec<ResultColumn> = table
+                .column_names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let values: Vec<u64> =
+                        indices.iter().map(|&idx| table.columns[i][idx]).collect();
+                    // Wave 52 fix: propagate NULL bitmap.
+                    let null_mask = if i < table.null_bitmaps.len() {
+                        if let Some(ref bm) = table.null_bitmaps[i] {
+                            let m: Vec<bool> = indices.iter().map(|&idx| bm.is_null(idx)).collect();
+                            if m.iter().any(|&x| x) {
+                                Some(m)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    ResultColumn {
+                        name: name.clone(),
+                        values,
+                        string_values: None,
+                        type_oid: 0,
+                        null_mask,
+                    }
+                })
+                .collect();
             Ok(QueryResult { columns: cols, row_count: indices.len(), elapsed_us: 0 })
         }
         QueryShape::SelectColumn => {
             let mask = build_filter_mask(query, table)?;
-            let name = if let SelectItem::Column(n) = &query.select[0] { n.clone() } else { return Err(Error::Other("expected column".into())); };
+            let name = if let SelectItem::Column(n) = &query.select[0] {
+                n.clone()
+            } else {
+                return Err(Error::Other("expected column".into()));
+            };
             let col_idx = resolve_col_name(&name, table)?;
 
             // Get matching indices.
@@ -290,14 +313,22 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
                     indices.sort_by(|&a, &b| {
                         let sa = sc.get(a);
                         let sb = sc.get(b);
-                        if *ascending { sa.cmp(sb) } else { sb.cmp(sa) }
+                        if *ascending {
+                            sa.cmp(sb)
+                        } else {
+                            sb.cmp(sa)
+                        }
                     });
                 } else {
                     let col = &table.columns[order_col_idx];
                     indices.sort_by(|&a, &b| {
                         let va = col.get(a).copied().unwrap_or(0);
                         let vb = col.get(b).copied().unwrap_or(0);
-                        if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
+                        if *ascending {
+                            va.cmp(&vb)
+                        } else {
+                            vb.cmp(&va)
+                        }
                     });
                 }
             }
@@ -309,10 +340,15 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
             // If the column has a string sidecar, return the original strings (Wave 21).
             let string_values = if col_idx < table.string_columns.len() {
                 if let Some(ref sc) = table.string_columns[col_idx] {
-                    let strings: Vec<String> = indices.iter().map(|&i| sc.get(i).to_string()).collect();
+                    let strings: Vec<String> =
+                        indices.iter().map(|&i| sc.get(i).to_string()).collect();
                     Some(strings)
-                } else { None }
-            } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             // Wave 52 fix: propagate the NULL bitmap so pgwire can emit
             // NULL (length = -1) instead of "0" for NULL cells.
@@ -320,11 +356,29 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
                 if let Some(ref bm) = table.null_bitmaps[col_idx] {
                     let mask: Vec<bool> = indices.iter().map(|&i| bm.is_null(i)).collect();
                     // Only carry the mask if at least one cell is NULL.
-                    if mask.iter().any(|&m| m) { Some(mask) } else { None }
-                } else { None }
-            } else { None };
+                    if mask.iter().any(|&m| m) {
+                        Some(mask)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-            Ok(QueryResult { columns: vec![ResultColumn { name, values: values.clone(), string_values, type_oid: 0, null_mask }], row_count: values.len(), elapsed_us: 0 })
+            Ok(QueryResult {
+                columns: vec![ResultColumn {
+                    name,
+                    values: values.clone(),
+                    string_values,
+                    type_oid: 0,
+                    null_mask,
+                }],
+                row_count: values.len(),
+                elapsed_us: 0,
+            })
         }
         QueryShape::SelectMulti => {
             let mask = build_filter_mask(query, table)?;
@@ -345,14 +399,22 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
                     indices.sort_by(|&a, &b| {
                         let sa = sc.get(a);
                         let sb = sc.get(b);
-                        if *ascending { sa.cmp(sb) } else { sb.cmp(sa) }
+                        if *ascending {
+                            sa.cmp(sb)
+                        } else {
+                            sb.cmp(sa)
+                        }
                     });
                 } else {
                     let col = &table.columns[order_col_idx];
                     indices.sort_by(|&a, &b| {
                         let va = col.get(a).copied().unwrap_or(0);
                         let vb = col.get(b).copied().unwrap_or(0);
-                        if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
+                        if *ascending {
+                            va.cmp(&vb)
+                        } else {
+                            vb.cmp(&va)
+                        }
                     });
                 }
             }
@@ -362,39 +424,79 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
             for item in &query.select {
                 if let SelectItem::Column(name) = item {
                     let col_idx = resolve_col_name(name, table)?;
-                    let values: Vec<u64> = indices.iter().map(|&i| table.columns[col_idx][i]).collect();
+                    let values: Vec<u64> =
+                        indices.iter().map(|&i| table.columns[col_idx][i]).collect();
                     // Carry the string sidecar through when present so the
                     // pgwire layer can return original strings to clients.
                     let string_values = if col_idx < table.string_columns.len() {
                         if let Some(ref sc) = table.string_columns[col_idx] {
-                            let strings: Vec<String> = indices.iter().map(|&i| sc.get(i).to_string()).collect();
+                            let strings: Vec<String> =
+                                indices.iter().map(|&i| sc.get(i).to_string()).collect();
                             Some(strings)
-                        } else { None }
-                    } else { None };
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     // Wave 52 fix: propagate NULL bitmap.
                     let null_mask = if col_idx < table.null_bitmaps.len() {
                         if let Some(ref bm) = table.null_bitmaps[col_idx] {
                             let m: Vec<bool> = indices.iter().map(|&i| bm.is_null(i)).collect();
-                            if m.iter().any(|&x| x) { Some(m) } else { None }
-                        } else { None }
-                    } else { None };
-                    cols.push(ResultColumn { name: name.clone(), values, string_values, type_oid: 0, null_mask });
+                            if m.iter().any(|&x| x) {
+                                Some(m)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    cols.push(ResultColumn {
+                        name: name.clone(),
+                        values,
+                        string_values,
+                        type_oid: 0,
+                        null_mask,
+                    });
                 } else if let SelectItem::Star = item {
                     for (col_idx, name) in table.column_names.iter().enumerate() {
-                        let values: Vec<u64> = indices.iter().map(|&row_idx| table.columns[col_idx][row_idx]).collect();
+                        let values: Vec<u64> = indices
+                            .iter()
+                            .map(|&row_idx| table.columns[col_idx][row_idx])
+                            .collect();
                         let null_mask = if col_idx < table.null_bitmaps.len() {
                             if let Some(ref bm) = table.null_bitmaps[col_idx] {
-                                let m: Vec<bool> = indices.iter().map(|&row_idx| bm.is_null(row_idx)).collect();
-                                if m.iter().any(|&x| x) { Some(m) } else { None }
-                            } else { None }
-                        } else { None };
-                        cols.push(ResultColumn { name: name.clone(), values, string_values: None, type_oid: 0, null_mask });
+                                let m: Vec<bool> =
+                                    indices.iter().map(|&row_idx| bm.is_null(row_idx)).collect();
+                                if m.iter().any(|&x| x) {
+                                    Some(m)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        cols.push(ResultColumn {
+                            name: name.clone(),
+                            values,
+                            string_values: None,
+                            type_oid: 0,
+                            null_mask,
+                        });
                     }
                 }
             }
             Ok(QueryResult { columns: cols, row_count: indices.len(), elapsed_us: 0 })
         }
-        QueryShape::Complex => Err(Error::Other("complex query not supported by dispatcher".into())),
+        QueryShape::Complex => {
+            Err(Error::Other("complex query not supported by dispatcher".into()))
+        }
     }
 }
 
@@ -411,9 +513,12 @@ fn build_filter_mask(query: &SelectQuery, table: &Table) -> Result<Vec<bool>> {
                 return Ok(mask);
             }
             // Fall back to vectorized u64 filter
-            let indices = vectorized::filter_rows(&table.columns, &table.column_names, table.row_count, expr);
+            let indices =
+                vectorized::filter_rows(&table.columns, &table.column_names, table.row_count, expr);
             let mut mask = vec![false; table.row_count];
-            for i in indices { mask[i] = true; }
+            for i in indices {
+                mask[i] = true;
+            }
             Ok(mask)
         }
     }
@@ -431,16 +536,24 @@ fn try_string_like_filter(expr: &crate::sql::parser::Expr, table: &Table) -> Opt
             let op_upper = op.to_uppercase();
             if op_upper == "LIKE" || op_upper == "NOT LIKE" {
                 let (col_name, pattern) = match (left.as_ref(), right.as_ref()) {
-                    (PExpr::Column(name), PExpr::Literal(Value::String(s))) => (name.clone(), s.clone()),
-                    (PExpr::Literal(Value::String(s)), PExpr::Column(name)) => (name.clone(), s.clone()),
+                    (PExpr::Column(name), PExpr::Literal(Value::String(s))) => {
+                        (name.clone(), s.clone())
+                    }
+                    (PExpr::Literal(Value::String(s)), PExpr::Column(name)) => {
+                        (name.clone(), s.clone())
+                    }
                     _ => return None,
                 };
                 let col_idx = resolve_col_name(&col_name, table).ok()?;
-                if col_idx >= table.string_columns.len() { return None; }
+                if col_idx >= table.string_columns.len() {
+                    return None;
+                }
                 let string_col = table.string_columns[col_idx].as_ref()?;
                 let mut mask = build_like_mask(string_col, &pattern);
                 if op_upper == "NOT LIKE" {
-                    for m in mask.iter_mut() { *m = !*m; }
+                    for m in mask.iter_mut() {
+                        *m = !*m;
+                    }
                 }
                 return Some(mask);
             }
@@ -451,12 +564,16 @@ fn try_string_like_filter(expr: &crate::sql::parser::Expr, table: &Table) -> Opt
                 // column. Then AND the masks.
                 let left_mask = eval_predicate_mask(left, table)?;
                 let right_mask = eval_predicate_mask(right, table)?;
-                return Some(left_mask.iter().zip(right_mask.iter()).map(|(&a, &b)| a && b).collect());
+                return Some(
+                    left_mask.iter().zip(right_mask.iter()).map(|(&a, &b)| a && b).collect(),
+                );
             }
             if op_upper == "OR" {
                 let left_mask = eval_predicate_mask(left, table)?;
                 let right_mask = eval_predicate_mask(right, table)?;
-                return Some(left_mask.iter().zip(right_mask.iter()).map(|(&a, &b)| a || b).collect());
+                return Some(
+                    left_mask.iter().zip(right_mask.iter()).map(|(&a, &b)| a || b).collect(),
+                );
             }
             // Comparison operators on string columns — try to evaluate.
             None
@@ -488,7 +605,9 @@ fn eval_predicate_mask(expr: &crate::sql::parser::Expr, table: &Table) -> Option
                 _ => return None,
             };
             let col_idx = resolve_col_name(&col_name, table).ok()?;
-            if col_idx >= table.columns.len() { return None; }
+            if col_idx >= table.columns.len() {
+                return None;
+            }
             let col = &table.columns[col_idx];
 
             // Wave 42: For range predicates (<, >, <=, >=) on string columns
@@ -498,16 +617,18 @@ fn eval_predicate_mask(expr: &crate::sql::parser::Expr, table: &Table) -> Option
                 if let Value::String(ref s) = val {
                     if col_idx < table.string_columns.len() {
                         if let Some(ref sc) = table.string_columns[col_idx] {
-                            let mask: Vec<bool> = (0..table.row_count).map(|i| {
-                                let cell_str = sc.get(i);
-                                match op_upper.as_str() {
-                                    "<" => cell_str < s.as_str(),
-                                    ">" => cell_str > s.as_str(),
-                                    "<=" => cell_str <= s.as_str(),
-                                    ">=" => cell_str >= s.as_str(),
-                                    _ => false,
-                                }
-                            }).collect();
+                            let mask: Vec<bool> = (0..table.row_count)
+                                .map(|i| {
+                                    let cell_str = sc.get(i);
+                                    match op_upper.as_str() {
+                                        "<" => cell_str < s.as_str(),
+                                        ">" => cell_str > s.as_str(),
+                                        "<=" => cell_str <= s.as_str(),
+                                        ">=" => cell_str >= s.as_str(),
+                                        _ => false,
+                                    }
+                                })
+                                .collect();
                             return Some(mask);
                         }
                     }
@@ -519,13 +640,18 @@ fn eval_predicate_mask(expr: &crate::sql::parser::Expr, table: &Table) -> Option
                 Value::Int(i) => *i as u64,
                 Value::Float(f) => f.to_bits(),
                 Value::String(s) => {
-                    if let Ok(n) = s.parse::<u64>() { n }
-                    else if let Ok(n) = s.parse::<i64>() { n as u64 }
-                    else { xxhash_rust::xxh3::xxh3_64(s.as_bytes()) }
+                    if let Ok(n) = s.parse::<u64>() {
+                        n
+                    } else if let Ok(n) = s.parse::<i64>() {
+                        n as u64
+                    } else {
+                        xxhash_rust::xxh3::xxh3_64(s.as_bytes())
+                    }
                 }
-                Value::Hex(bytes) => {
-                    bytes.iter().enumerate().fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i)))
-                }
+                Value::Hex(bytes) => bytes
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i))),
             };
             let mask: Vec<bool> = match op_upper.as_str() {
                 "=" => col.iter().map(|&c| c == cell).collect(),
@@ -631,7 +757,9 @@ fn build_like_mask(
 
 fn resolve_agg_col(item: &SelectItem, table: &Table) -> Result<usize> {
     if let SelectItem::Aggregate { arg, .. } = item {
-        if arg == "*" { return Ok(0); }
+        if arg == "*" {
+            return Ok(0);
+        }
         return resolve_col_name(arg, table);
     }
     Err(Error::Other("expected aggregate".into()))
@@ -651,18 +779,30 @@ fn resolve_col_name(name: &str, table: &Table) -> Result<usize> {
     // Try matching bare name against qualified column names in the table
     // e.g. name="l_orderkey", table has "lineitem.l_orderkey"
     for (i, col_name) in table.column_names.iter().enumerate() {
-        if col_name == name { return Ok(i); }
-        if let Some(bare_col) = col_name.split('.').nth(1) {
-            if bare_col == name { return Ok(i); }
+        if col_name == name {
+            return Ok(i);
         }
-        if col_name.ends_with(&format!(".{}", name)) { return Ok(i); }
+        if let Some(bare_col) = col_name.split('.').nth(1) {
+            if bare_col == name {
+                return Ok(i);
+            }
+        }
+        if col_name.ends_with(&format!(".{}", name)) {
+            return Ok(i);
+        }
     }
     Err(Error::NotFound(format!("column '{}'", name)))
 }
 
 fn single_value(name: &str, value: u64) -> QueryResult {
     QueryResult {
-        columns: vec![ResultColumn { name: name.to_string(), values: vec![value] , string_values: None, type_oid: 0, null_mask: None }],
+        columns: vec![ResultColumn {
+            name: name.to_string(),
+            values: vec![value],
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        }],
         row_count: 1,
         elapsed_us: 0,
     }
@@ -681,7 +821,9 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     let indices: Vec<usize> = (0..table.row_count).filter(|&i| mask[i]).collect();
 
     // Resolve GROUP BY columns
-    let group_cols: Vec<usize> = query.group_by.iter()
+    let group_cols: Vec<usize> = query
+        .group_by
+        .iter()
         .map(|name| resolve_col_name(name, table))
         .collect::<Result<Vec<_>>>()?;
 
@@ -694,11 +836,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     // loader ever changes its hashing strategy, and it lets us emit
     // arbitrary SELECT-list shapes (e.g. `SELECT 1, URL, count(*)`).
     if group_cols.len() == 1
-        && table
-            .string_columns
-            .get(group_cols[0])
-            .and_then(|c| c.as_ref())
-            .is_some()
+        && table.string_columns.get(group_cols[0]).and_then(|c| c.as_ref()).is_some()
     {
         return execute_string_group_by(query, table, &indices, group_cols[0]);
     }
@@ -763,12 +901,16 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                         // row in each bucket (best-effort, matches multi-key
                         // path behaviour).
                         let col_idx = resolve_col_name(name, table).unwrap_or(group_col);
-                        let values: Vec<u64> = group_keys_in_order.iter().map(|k| {
-                            group_buckets.get(k)
-                                .and_then(|idxs| idxs.first())
-                                .map(|&i| table.columns[col_idx][i])
-                                .unwrap_or(0)
-                        }).collect();
+                        let values: Vec<u64> = group_keys_in_order
+                            .iter()
+                            .map(|k| {
+                                group_buckets
+                                    .get(k)
+                                    .and_then(|idxs| idxs.first())
+                                    .map(|&i| table.columns[col_idx][i])
+                                    .unwrap_or(0)
+                            })
+                            .collect();
                         result_cols.push(ResultColumn {
                             name: name.clone(),
                             values,
@@ -793,66 +935,104 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                 SelectItem::Aggregate { func, arg, alias } => {
                     let name = alias.as_deref().unwrap_or(func.as_str());
                     let func_upper = func.to_uppercase();
-                    let values: Vec<u64> = group_keys_in_order.iter().map(|k| {
-                        let idxs: &Vec<usize> = match group_buckets.get(k) {
-                            Some(v) => v,
-                            None => return 0,
-                        };
-                        match func_upper.as_str() {
-                            "COUNT" => {
-                                if arg == "*" {
-                                    idxs.len() as u64
-                                } else {
-                                    let col_idx = resolve_col_name(arg, table).unwrap_or(0);
-                                    // COUNT(col) excludes NULLs (Wave 33).
-                                    if col_idx < table.null_bitmaps.len() {
-                                        if let Some(ref bm) = table.null_bitmaps[col_idx] {
-                                            return idxs.iter().filter(|&&i| !bm.is_null(i)).count() as u64;
-                                        }
-                                    }
-                                    idxs.iter().filter(|&&i| table.columns[col_idx][i] != 0).count() as u64
-                                }
-                            }
-                            "SUM" => {
-                                let col_idx = resolve_col_name(arg, table).unwrap_or(0);
-                                let sum: u64 = idxs.iter().map(|&i| table.columns[col_idx][i]).sum();
-                                (sum as f64).to_bits()
-                            }
-                            "AVG" => {
-                                let col_idx = resolve_col_name(arg, table).unwrap_or(0);
-                                // AVG excludes NULLs (Wave 33).
-                                let (sum, cnt) = if col_idx < table.null_bitmaps.len() {
-                                    if let Some(ref bm) = table.null_bitmaps[col_idx] {
-                                        let filtered: Vec<u64> = idxs.iter()
-                                            .filter(|&&i| !bm.is_null(i))
-                                            .map(|&i| table.columns[col_idx][i])
-                                            .collect();
-                                        (filtered.iter().sum::<u64>(), filtered.len())
+                    let values: Vec<u64> = group_keys_in_order
+                        .iter()
+                        .map(|k| {
+                            let idxs: &Vec<usize> = match group_buckets.get(k) {
+                                Some(v) => v,
+                                None => return 0,
+                            };
+                            match func_upper.as_str() {
+                                "COUNT" => {
+                                    if arg == "*" {
+                                        idxs.len() as u64
                                     } else {
-                                        (idxs.iter().map(|&i| table.columns[col_idx][i]).sum::<u64>(), idxs.len())
+                                        let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                        // COUNT(col) excludes NULLs (Wave 33).
+                                        if col_idx < table.null_bitmaps.len() {
+                                            if let Some(ref bm) = table.null_bitmaps[col_idx] {
+                                                return idxs
+                                                    .iter()
+                                                    .filter(|&&i| !bm.is_null(i))
+                                                    .count()
+                                                    as u64;
+                                            }
+                                        }
+                                        idxs.iter()
+                                            .filter(|&&i| table.columns[col_idx][i] != 0)
+                                            .count() as u64
                                     }
-                                } else {
-                                    (idxs.iter().map(|&i| table.columns[col_idx][i]).sum::<u64>(), idxs.len())
-                                };
-                                if cnt == 0 { 0 } else { (sum as f64 / cnt as f64).to_bits() }
+                                }
+                                "SUM" => {
+                                    let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                    let sum: u64 =
+                                        idxs.iter().map(|&i| table.columns[col_idx][i]).sum();
+                                    (sum as f64).to_bits()
+                                }
+                                "AVG" => {
+                                    let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                    // AVG excludes NULLs (Wave 33).
+                                    let (sum, cnt) = if col_idx < table.null_bitmaps.len() {
+                                        if let Some(ref bm) = table.null_bitmaps[col_idx] {
+                                            let filtered: Vec<u64> = idxs
+                                                .iter()
+                                                .filter(|&&i| !bm.is_null(i))
+                                                .map(|&i| table.columns[col_idx][i])
+                                                .collect();
+                                            (filtered.iter().sum::<u64>(), filtered.len())
+                                        } else {
+                                            (
+                                                idxs.iter()
+                                                    .map(|&i| table.columns[col_idx][i])
+                                                    .sum::<u64>(),
+                                                idxs.len(),
+                                            )
+                                        }
+                                    } else {
+                                        (
+                                            idxs.iter()
+                                                .map(|&i| table.columns[col_idx][i])
+                                                .sum::<u64>(),
+                                            idxs.len(),
+                                        )
+                                    };
+                                    if cnt == 0 {
+                                        0
+                                    } else {
+                                        (sum as f64 / cnt as f64).to_bits()
+                                    }
+                                }
+                                "MIN" => {
+                                    let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                    idxs.iter()
+                                        .map(|&i| table.columns[col_idx][i])
+                                        .min()
+                                        .unwrap_or(0)
+                                }
+                                "MAX" => {
+                                    let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                    idxs.iter()
+                                        .map(|&i| table.columns[col_idx][i])
+                                        .max()
+                                        .unwrap_or(0)
+                                }
+                                "COUNT_DISTINCT" => {
+                                    let col_idx = resolve_col_name(arg, table).unwrap_or(0);
+                                    let seen: std::collections::HashSet<u64> =
+                                        idxs.iter().map(|&i| table.columns[col_idx][i]).collect();
+                                    seen.len() as u64
+                                }
+                                _ => 0,
                             }
-                            "MIN" => {
-                                let col_idx = resolve_col_name(arg, table).unwrap_or(0);
-                                idxs.iter().map(|&i| table.columns[col_idx][i]).min().unwrap_or(0)
-                            }
-                            "MAX" => {
-                                let col_idx = resolve_col_name(arg, table).unwrap_or(0);
-                                idxs.iter().map(|&i| table.columns[col_idx][i]).max().unwrap_or(0)
-                            }
-                            "COUNT_DISTINCT" => {
-                                let col_idx = resolve_col_name(arg, table).unwrap_or(0);
-                                let seen: std::collections::HashSet<u64> = idxs.iter().map(|&i| table.columns[col_idx][i]).collect();
-                                seen.len() as u64
-                            }
-                            _ => 0,
-                        }
-                    }).collect();
-                    result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None, type_oid: 0, null_mask: None });
+                        })
+                        .collect();
+                    result_cols.push(ResultColumn {
+                        name: name.to_string(),
+                        values,
+                        string_values: None,
+                        type_oid: 0,
+                        null_mask: None,
+                    });
                 }
                 SelectItem::Window { .. } => {
                     return Err(Error::Other(
@@ -874,25 +1054,48 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
         // Apply ORDER BY
         if !query.order_by.is_empty() {
             let (col_name, ascending) = &query.order_by[0];
-            let col_idx = result.columns.iter().position(|c| c.name == *col_name)
+            let col_idx = result
+                .columns
+                .iter()
+                .position(|c| c.name == *col_name)
                 .ok_or_else(|| Error::NotFound(format!("ORDER BY column '{}'", col_name)))?;
             let mut idx: Vec<usize> = (0..result.row_count).collect();
             idx.sort_by(|&a, &b| {
                 let va = result.columns[col_idx].values[a];
                 let vb = result.columns[col_idx].values[b];
-                if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
+                if *ascending {
+                    va.cmp(&vb)
+                } else {
+                    vb.cmp(&va)
+                }
             });
-            let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
-                let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
-                ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0, null_mask: None }
-            }).collect();
-            result = QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us };
+            let new_cols: Vec<ResultColumn> = result
+                .columns
+                .iter()
+                .map(|c| {
+                    let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
+                    ResultColumn {
+                        name: c.name.clone(),
+                        values,
+                        string_values: None,
+                        type_oid: 0,
+                        null_mask: None,
+                    }
+                })
+                .collect();
+            result = QueryResult {
+                columns: new_cols,
+                row_count: result.row_count,
+                elapsed_us: result.elapsed_us,
+            };
         }
 
         // Apply LIMIT
         if let Some(limit) = query.limit {
             if result.row_count > limit {
-                for col in &mut result.columns { col.values.truncate(limit); }
+                for col in &mut result.columns {
+                    col.values.truncate(limit);
+                }
                 result.row_count = limit;
             }
         }
@@ -912,26 +1115,37 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
 
     let mut result_cols: Vec<ResultColumn> = Vec::new();
     for (i, col_name) in query.group_by.iter().enumerate() {
-        let values: Vec<u64> = groups.keys().map(|h| {
-            if let Some(indices) = groups.get(h) {
-                if let Some(&first_idx) = indices.first() {
-                    return table.columns[group_cols[i]][first_idx];
+        let values: Vec<u64> = groups
+            .keys()
+            .map(|h| {
+                if let Some(indices) = groups.get(h) {
+                    if let Some(&first_idx) = indices.first() {
+                        return table.columns[group_cols[i]][first_idx];
+                    }
                 }
-            }
-            0
-        }).collect();
-        result_cols.push(ResultColumn { name: col_name.clone(), values, string_values: None, type_oid: 0, null_mask: None });
+                0
+            })
+            .collect();
+        result_cols.push(ResultColumn {
+            name: col_name.clone(),
+            values,
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        });
     }
 
     for item in &query.select {
         if let SelectItem::Aggregate { func, arg, alias } = item {
             let name = alias.as_deref().unwrap_or(func.as_str());
             let func_upper = func.to_uppercase();
-            let values: Vec<u64> = groups.values().map(|idxs| {
-                match func_upper.as_str() {
+            let values: Vec<u64> = groups
+                .values()
+                .map(|idxs| match func_upper.as_str() {
                     "COUNT" => {
-                        if arg == "*" { idxs.len() as u64 }
-                        else {
+                        if arg == "*" {
+                            idxs.len() as u64
+                        } else {
                             let col_idx = resolve_col_name(arg, table).unwrap_or(0);
                             idxs.iter().filter(|&&i| table.columns[col_idx][i] != 0).count() as u64
                         }
@@ -943,8 +1157,9 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                     }
                     "AVG" => {
                         let col_idx = resolve_col_name(arg, table).unwrap_or(0);
-                        if idxs.is_empty() { 0 }
-                        else {
+                        if idxs.is_empty() {
+                            0
+                        } else {
                             let sum: u64 = idxs.iter().map(|&i| table.columns[col_idx][i]).sum();
                             (sum as f64 / idxs.len() as f64).to_bits()
                         }
@@ -959,13 +1174,20 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                     }
                     "COUNT_DISTINCT" => {
                         let col_idx = resolve_col_name(arg, table).unwrap_or(0);
-                        let seen: std::collections::HashSet<u64> = idxs.iter().map(|&i| table.columns[col_idx][i]).collect();
+                        let seen: std::collections::HashSet<u64> =
+                            idxs.iter().map(|&i| table.columns[col_idx][i]).collect();
                         seen.len() as u64
                     }
                     _ => 0,
-                }
-            }).collect();
-            result_cols.push(ResultColumn { name: name.to_string(), values, string_values: None, type_oid: 0, null_mask: None });
+                })
+                .collect();
+            result_cols.push(ResultColumn {
+                name: name.to_string(),
+                values,
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            });
         }
     }
 
@@ -974,24 +1196,47 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
 
     if !query.order_by.is_empty() {
         let (col_name, ascending) = &query.order_by[0];
-        let col_idx = result.columns.iter().position(|c| c.name == *col_name)
+        let col_idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == *col_name)
             .ok_or_else(|| Error::NotFound(format!("ORDER BY column '{}'", col_name)))?;
         let mut idx: Vec<usize> = (0..result.row_count).collect();
         idx.sort_by(|&a, &b| {
             let va = result.columns[col_idx].values[a];
             let vb = result.columns[col_idx].values[b];
-            if *ascending { va.cmp(&vb) } else { vb.cmp(&va) }
+            if *ascending {
+                va.cmp(&vb)
+            } else {
+                vb.cmp(&va)
+            }
         });
-        let new_cols: Vec<ResultColumn> = result.columns.iter().map(|c| {
-            let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
-            ResultColumn { name: c.name.clone(), values, string_values: None, type_oid: 0, null_mask: None }
-        }).collect();
-        result = QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: result.elapsed_us };
+        let new_cols: Vec<ResultColumn> = result
+            .columns
+            .iter()
+            .map(|c| {
+                let values: Vec<u64> = idx.iter().map(|&i| c.values[i]).collect();
+                ResultColumn {
+                    name: c.name.clone(),
+                    values,
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                }
+            })
+            .collect();
+        result = QueryResult {
+            columns: new_cols,
+            row_count: result.row_count,
+            elapsed_us: result.elapsed_us,
+        };
     }
 
     if let Some(limit) = query.limit {
         if result.row_count > limit {
-            for col in &mut result.columns { col.values.truncate(limit); }
+            for col in &mut result.columns {
+                col.values.truncate(limit);
+            }
             result.row_count = limit;
         }
     }
@@ -1048,13 +1293,15 @@ fn execute_string_group_by(
             }
             _ => None,
         });
-        let group_name = query
-            .group_by
-            .first()
-            .cloned()
-            .or_else(|| query.select.iter().find_map(|s| {
-                if let SelectItem::Column(n) = s { Some(n.clone()) } else { None }
-            }));
+        let group_name = query.group_by.first().cloned().or_else(|| {
+            query.select.iter().find_map(|s| {
+                if let SelectItem::Column(n) = s {
+                    Some(n.clone())
+                } else {
+                    None
+                }
+            })
+        });
         let sort_by_count = agg_name.as_deref() == Some(col_name)
             || (col_name.eq_ignore_ascii_case("count") && agg_name.is_some());
         let sort_by_hash = group_name.as_deref() == Some(col_name);
@@ -1085,7 +1332,10 @@ fn execute_string_group_by(
                 result_cols.push(ResultColumn {
                     name: v.to_string(),
                     values: vec![*v; row_count],
-                    string_values: None, type_oid: 0, null_mask: None });
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                });
             }
             SelectItem::Column(name) => {
                 // The GROUP BY column — emit the per-group hash. (We
@@ -1094,7 +1344,10 @@ fn execute_string_group_by(
                 result_cols.push(ResultColumn {
                     name: name.clone(),
                     values: pairs.iter().map(|(h, _)| *h).collect(),
-                    string_values: None, type_oid: 0, null_mask: None });
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                });
             }
             SelectItem::Aggregate { func, arg: _, alias } => {
                 let func_upper = func.to_uppercase();
@@ -1107,17 +1360,24 @@ fn execute_string_group_by(
                 result_cols.push(ResultColumn {
                     name,
                     values: pairs.iter().map(|(_, c)| *c).collect(),
-                    string_values: None, type_oid: 0, null_mask: None });
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                });
             }
             SelectItem::Star => {
                 // `SELECT *` with GROUP BY is not meaningful; skip.
             }
             SelectItem::Window { .. } => {
-                return Err(Error::Other("window function in string GROUP BY — use tpch fallback".into()));
+                return Err(Error::Other(
+                    "window function in string GROUP BY — use tpch fallback".into(),
+                ));
             }
             // Wave 60a: general expressions go through the tpch fallback.
             SelectItem::Expression { .. } => {
-                return Err(Error::Other("expression in string GROUP BY — use tpch fallback".into()));
+                return Err(Error::Other(
+                    "expression in string GROUP BY — use tpch fallback".into(),
+                ));
             }
         }
     }
@@ -1156,9 +1416,27 @@ mod tests {
 
     fn make_table(n: usize) -> Table {
         let cols = vec![
-            LoadedColumn { name: "id".into(), cells: (0..n).map(|i| i as u64).collect(), row_count: n, string_search: None, null_bitmap: None },
-            LoadedColumn { name: "val".into(), cells: (0..n).map(|i| (i % 20) as u64).collect(), row_count: n, string_search: None, null_bitmap: None },
-            LoadedColumn { name: "grp".into(), cells: (0..n).map(|i| (i % 5) as u64).collect(), row_count: n, string_search: None, null_bitmap: None },
+            LoadedColumn {
+                name: "id".into(),
+                cells: (0..n).map(|i| i as u64).collect(),
+                row_count: n,
+                string_search: None,
+                null_bitmap: None,
+            },
+            LoadedColumn {
+                name: "val".into(),
+                cells: (0..n).map(|i| (i % 20) as u64).collect(),
+                row_count: n,
+                string_search: None,
+                null_bitmap: None,
+            },
+            LoadedColumn {
+                name: "grp".into(),
+                cells: (0..n).map(|i| (i % 5) as u64).collect(),
+                row_count: n,
+                string_search: None,
+                null_bitmap: None,
+            },
         ];
         Table::from_loaded(LoadedTable { name: "t".into(), columns: cols, row_count: n })
     }
@@ -1168,11 +1446,10 @@ mod tests {
     fn make_string_table(urls: Vec<&str>) -> Table {
         use crate::exec::fm_index::StringSearchColumn;
         let n = urls.len();
-        let cells: Vec<u64> = urls
-            .iter()
-            .map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
-            .collect();
-        let string_search = Some(StringSearchColumn::new(urls.iter().map(|s| s.to_string()).collect()));
+        let cells: Vec<u64> =
+            urls.iter().map(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes())).collect();
+        let string_search =
+            Some(StringSearchColumn::new(urls.iter().map(|s| s.to_string()).collect()));
         let cols = vec![LoadedColumn {
             name: "url".into(),
             cells,
@@ -1185,32 +1462,47 @@ mod tests {
 
     #[test]
     fn classify_count_all() {
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT count(*) FROM t").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT count(*) FROM t").unwrap(),
+        )
+        .unwrap();
         assert_eq!(classify_query(&q), QueryShape::CountAll);
     }
 
     #[test]
     fn classify_count_filter() {
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE id = 5").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE id = 5").unwrap(),
+        )
+        .unwrap();
         assert_eq!(classify_query(&q), QueryShape::CountFilter);
     }
 
     #[test]
     fn classify_sum() {
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT sum(val) FROM t").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT sum(val) FROM t").unwrap(),
+        )
+        .unwrap();
         assert_eq!(classify_query(&q), QueryShape::SumCol);
     }
 
     #[test]
     fn classify_group_by() {
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT grp, count(*) FROM t GROUP BY grp").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT grp, count(*) FROM t GROUP BY grp").unwrap(),
+        )
+        .unwrap();
         assert_eq!(classify_query(&q), QueryShape::GroupByCount);
     }
 
     #[test]
     fn dispatch_count_all() {
         let table = make_table(100);
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT count(*) FROM t").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT count(*) FROM t").unwrap(),
+        )
+        .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
         assert_eq!(result.columns[0].values[0], 100);
     }
@@ -1218,7 +1510,10 @@ mod tests {
     #[test]
     fn dispatch_count_filter() {
         let table = make_table(100);
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE val = 5").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE val = 5").unwrap(),
+        )
+        .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
         assert_eq!(result.columns[0].values[0], 5); // 5 rows have val=5 (i=5,25,45,65,85)
     }
@@ -1226,7 +1521,10 @@ mod tests {
     #[test]
     fn dispatch_sum() {
         let table = make_table(100);
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT sum(val) FROM t WHERE val > 15").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT sum(val) FROM t WHERE val > 15").unwrap(),
+        )
+        .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
         let sum = f64::from_bits(result.columns[0].values[0]);
         // val > 15 means val in {16,17,18,19}, each appears 5 times
@@ -1237,7 +1535,10 @@ mod tests {
     #[test]
     fn dispatch_group_by_count() {
         let table = make_table(100);
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT grp, count(*) FROM t GROUP BY grp").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT grp, count(*) FROM t GROUP BY grp").unwrap(),
+        )
+        .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
         assert_eq!(result.row_count, 5); // 5 groups
     }
@@ -1245,7 +1546,13 @@ mod tests {
     #[test]
     fn dispatch_group_by_order_limit() {
         let table = make_table(100);
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT grp, count(*) FROM t GROUP BY grp ORDER BY grp LIMIT 3").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize(
+                "SELECT grp, count(*) FROM t GROUP BY grp ORDER BY grp LIMIT 3",
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
         assert_eq!(result.row_count, 3);
     }
@@ -1253,7 +1560,10 @@ mod tests {
     #[test]
     fn dispatch_min_max() {
         let table = make_table(100);
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT max(val) FROM t").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT max(val) FROM t").unwrap(),
+        )
+        .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
         assert_eq!(result.columns[0].values[0], 19);
     }
@@ -1261,7 +1571,10 @@ mod tests {
     #[test]
     fn dispatch_count_distinct() {
         let table = make_table(100);
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT count(DISTINCT val) FROM t").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT count(DISTINCT val) FROM t").unwrap(),
+        )
+        .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
         // val = i % 20, so 20 distinct values
         assert_eq!(result.columns[0].values[0], 20);
@@ -1270,7 +1583,10 @@ mod tests {
     #[test]
     fn dispatch_select_star() {
         let table = make_table(10);
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT * FROM t LIMIT 5").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT * FROM t LIMIT 5").unwrap(),
+        )
+        .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
         assert_eq!(result.row_count, 5);
         assert_eq!(result.columns.len(), 3);
@@ -1279,7 +1595,10 @@ mod tests {
     #[test]
     fn dispatch_select_column() {
         let table = make_table(10);
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT val FROM t WHERE id < 5").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT val FROM t WHERE id < 5").unwrap(),
+        )
+        .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
         assert_eq!(result.row_count, 5);
         assert_eq!(result.columns[0].name, "val");
@@ -1289,7 +1608,10 @@ mod tests {
     fn large_filter_performance() {
         let n = 1_000_000;
         let table = make_table(n);
-        let q = crate::sql::parser::parse(crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE val = 5").unwrap()).unwrap();
+        let q = crate::sql::parser::parse(
+            crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE val = 5").unwrap(),
+        )
+        .unwrap();
         let start = std::time::Instant::now();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
         let elapsed = start.elapsed();
@@ -1326,9 +1648,8 @@ mod tests {
     fn string_group_by_with_literal_and_like() {
         // ClickBench Q15 shape: SELECT 1, URL, count(*) WHERE URL LIKE
         // 'http://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10.
-        let table = make_string_table(vec![
-            "http://a", "https://b", "http://a", "http://c", "ftp://d",
-        ]);
+        let table =
+            make_string_table(vec!["http://a", "https://b", "http://a", "http://c", "ftp://d"]);
         let q = crate::sql::parser::parse(
             crate::sql::lexer::tokenize(
                 "SELECT 1, url, count(*) AS c FROM t WHERE url LIKE 'http://%' GROUP BY 1, url ORDER BY c DESC LIMIT 10",
@@ -1351,9 +1672,7 @@ mod tests {
 
     #[test]
     fn string_group_by_limit_truncates() {
-        let table = make_string_table(vec![
-            "a", "a", "a", "b", "b", "c", "d", "e",
-        ]);
+        let table = make_string_table(vec!["a", "a", "a", "b", "b", "c", "d", "e"]);
         let q = crate::sql::parser::parse(
             crate::sql::lexer::tokenize(
                 "SELECT url, count(*) AS c FROM t GROUP BY url ORDER BY c DESC LIMIT 2",
@@ -1371,11 +1690,10 @@ mod tests {
     fn like_prefix_pattern_works() {
         // `LIKE 'http://%'` should match strings starting with "http://"
         // (not strings containing the literal "http://%").
-        let table = make_string_table(vec![
-            "http://a", "https://b", "http://c", "ftp://d",
-        ]);
+        let table = make_string_table(vec!["http://a", "https://b", "http://c", "ftp://d"]);
         let q = crate::sql::parser::parse(
-            crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE url LIKE 'http://%'").unwrap(),
+            crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE url LIKE 'http://%'")
+                .unwrap(),
         )
         .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
@@ -1386,10 +1704,13 @@ mod tests {
     #[test]
     fn like_contains_pattern_works() {
         let table = make_string_table(vec![
-            "http://google.com/x", "http://example.com/y", "https://google.com/z",
+            "http://google.com/x",
+            "http://example.com/y",
+            "https://google.com/z",
         ]);
         let q = crate::sql::parser::parse(
-            crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE url LIKE '%google%'").unwrap(),
+            crate::sql::lexer::tokenize("SELECT count(*) FROM t WHERE url LIKE '%google%'")
+                .unwrap(),
         )
         .unwrap();
         let result = execute_dispatched(&q, &table).unwrap().unwrap();
@@ -1397,7 +1718,6 @@ mod tests {
         assert_eq!(result.columns[0].values[0], 2);
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Arithmetic expression evaluation (for sum(col * (1 - col2)) etc.)
@@ -1414,17 +1734,24 @@ fn eval_arith_row(
     use crate::sql::parser::{Expr, Value};
     match expr {
         Expr::Column(name) => {
-            let col_idx = resolve_col_name(name, &crate::datasource::table::Table {
-                name: String::new(),
-                columns: vec![],
-                column_names: column_names.to_vec(),
-                row_count: 0,
-                string_columns: vec![],
-            null_bitmaps: vec![],
-            schema: None,
-            }).unwrap_or(0);
+            let col_idx = resolve_col_name(
+                name,
+                &crate::datasource::table::Table {
+                    name: String::new(),
+                    columns: vec![],
+                    column_names: column_names.to_vec(),
+                    row_count: 0,
+                    string_columns: vec![],
+                    null_bitmaps: vec![],
+                    schema: None,
+                },
+            )
+            .unwrap_or(0);
             // Find column by name
-            if let Some(idx) = column_names.iter().position(|n| n == name || n == name.split('.').nth(1).unwrap_or(name)) {
+            if let Some(idx) = column_names
+                .iter()
+                .position(|n| n == name || n == name.split('.').nth(1).unwrap_or(name))
+            {
                 return columns[idx][row_idx];
             }
             0
@@ -1438,7 +1765,13 @@ fn eval_arith_row(
                 "+" => l.wrapping_add(r),
                 "-" => l.wrapping_sub(r),
                 "*" => l.wrapping_mul(r),
-                "/" => if r == 0 { 0 } else { l / r },
+                "/" => {
+                    if r == 0 {
+                        0
+                    } else {
+                        l / r
+                    }
+                }
                 _ => 0,
             }
         }

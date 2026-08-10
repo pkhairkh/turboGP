@@ -63,13 +63,8 @@ const LOG_OUT: &str = "/root/results/clickhouse_inproc.run.log";
 
 /// Read ClickBench queries (one per line) from the verbatim file.
 fn load_clickbench_queries(path: &str) -> Vec<String> {
-    let content = fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {}", path, e));
-    content
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect()
+    let content = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {}", path, e));
+    content.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
 }
 
 /// Adapt SQL for ClickHouse:
@@ -104,10 +99,7 @@ fn adapt_sql(sql: &str, suite: &str) -> String {
 /// to compute ALL columns/aggregates and serialize the full result set — no
 /// subquery-projection optimization can skip work.
 async fn run_query(client: &Client, sql: &str) -> Result<u64, String> {
-    let mut cursor = client
-        .query(sql)
-        .fetch_bytes("JSONEachRow")
-        .map_err(|e| e.to_string())?;
+    let mut cursor = client.query(sql).fetch_bytes("JSONEachRow").map_err(|e| e.to_string())?;
     let mut row_count: u64 = 0;
     loop {
         match cursor.next().await {
@@ -150,11 +142,8 @@ async fn main() {
     println!("ClickHouse version: {}", ch_version);
 
     // Sanity-check that data is loaded.
-    let hits_n: u64 = client
-        .query("SELECT count() FROM bench.hits")
-        .fetch_one()
-        .await
-        .expect("count bench.hits");
+    let hits_n: u64 =
+        client.query("SELECT count() FROM bench.hits").fetch_one().await.expect("count bench.hits");
     let li_n: u64 = client
         .query("SELECT count() FROM bench.lineitem")
         .fetch_one()
@@ -325,14 +314,8 @@ async fn main() {
                     .join(", ")
             })
             .unwrap_or_default();
-        let best = v["best_ms"]
-            .as_f64()
-            .map(|b| format!("{:.2}", b))
-            .unwrap_or("null".into());
-        let med = v["median_ms"]
-            .as_f64()
-            .map(|m| format!("{:.2}", m))
-            .unwrap_or("null".into());
+        let best = v["best_ms"].as_f64().map(|b| format!("{:.2}", b)).unwrap_or("null".into());
+        let med = v["median_ms"].as_f64().map(|m| format!("{:.2}", m)).unwrap_or("null".into());
         let err = v["error"].as_str().unwrap_or("");
         log.push_str(&format!(
             "{:<10} {:<4} {:<5} runs=[{}] best={} med={} err={}\n",

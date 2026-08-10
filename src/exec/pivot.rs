@@ -63,7 +63,10 @@ pub fn pivot(
     out_cols.push(ResultColumn {
         name: group_col.to_string(),
         values: groups.clone(),
-        string_values: None, type_oid: 0, null_mask: None });
+        string_values: None,
+        type_oid: 0,
+        null_mask: None,
+    });
 
     for pv in pivot_values {
         let pv_cell = string_to_cell(pv);
@@ -103,7 +106,10 @@ pub fn pivot(
         out_cols.push(ResultColumn {
             name: pv.clone(),
             values: col_vals,
-        string_values: None, type_oid: 0, null_mask: None });
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        });
     }
 
     let mut result = QueryResult::empty();
@@ -150,7 +156,10 @@ pub fn unpivot(
         out_cols.push(ResultColumn {
             name: id_col_name.clone(),
             values: vals,
-        string_values: None, type_oid: 0, null_mask: None });
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        });
     }
 
     // Label column: the column names repeated for each input row.
@@ -163,23 +172,27 @@ pub fn unpivot(
     out_cols.push(ResultColumn {
         name: label_col_name.to_string(),
         values: label_vals,
-    string_values: None, type_oid: 0, null_mask: None });
+        string_values: None,
+        type_oid: 0,
+        null_mask: None,
+    });
 
     // Value column: the actual values from each unpivot column.
     let mut value_vals = Vec::with_capacity(total_out_rows);
     for row in 0..input.row_count {
         for col_name in unpivot_cols {
             let idx = find_col(input, col_name);
-            let v = idx
-                .and_then(|i| input.columns[i].values.get(row).copied())
-                .unwrap_or(0);
+            let v = idx.and_then(|i| input.columns[i].values.get(row).copied()).unwrap_or(0);
             value_vals.push(v);
         }
     }
     out_cols.push(ResultColumn {
         name: value_col_name.to_string(),
         values: value_vals,
-    string_values: None, type_oid: 0, null_mask: None });
+        string_values: None,
+        type_oid: 0,
+        null_mask: None,
+    });
 
     let mut result = QueryResult::empty();
     result.row_count = out_row_count;
@@ -206,12 +219,17 @@ pub fn grouping_sets(
         out_cols.push(ResultColumn {
             name: col_name.clone(),
             values: Vec::new(),
-        string_values: None, type_oid: 0, null_mask: None });
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        });
     }
     out_cols.push(ResultColumn {
         name: format!("{}_{}", agg.to_lowercase(), agg_col),
         values: Vec::new(),
-        string_values: None, type_oid: 0, null_mask: None,
+        string_values: None,
+        type_oid: 0,
+        null_mask: None,
     });
 
     // For each grouping set, compute the aggregate.
@@ -282,12 +300,7 @@ pub fn grouping_sets(
 }
 
 /// Compute CUBE: all 2^n combinations of the grouping columns.
-pub fn cube(
-    input: &QueryResult,
-    group_cols: &[String],
-    agg_col: &str,
-    agg: &str,
-) -> QueryResult {
+pub fn cube(input: &QueryResult, group_cols: &[String], agg_col: &str, agg: &str) -> QueryResult {
     let n = group_cols.len();
     let mut sets = Vec::new();
     for mask in 1u32..(1 << n) {
@@ -299,12 +312,7 @@ pub fn cube(
 }
 
 /// Compute ROLLUP: hierarchical grouping (prefix subsets).
-pub fn rollup(
-    input: &QueryResult,
-    group_cols: &[String],
-    agg_col: &str,
-    agg: &str,
-) -> QueryResult {
+pub fn rollup(input: &QueryResult, group_cols: &[String], agg_col: &str, agg: &str) -> QueryResult {
     let n = group_cols.len();
     let mut sets = Vec::new();
     for k in (1..=n).rev() {
@@ -346,8 +354,14 @@ mod tests {
     fn make_result(names: &[&str], cols: &[Vec<u64>]) -> QueryResult {
         let mut r = QueryResult::empty();
         for (i, name) in names.iter().enumerate() {
-            r.push_column(ResultColumn { name: name.to_string(), values: cols[i].clone() , string_values: None, type_oid: 0, null_mask: None })
-                .unwrap();
+            r.push_column(ResultColumn {
+                name: name.to_string(),
+                values: cols[i].clone(),
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            })
+            .unwrap();
         }
         r
     }
@@ -360,14 +374,7 @@ mod tests {
             &["dept", "quarter", "amount"],
             &[vec![1, 1, 2], vec![1, 2, 1], vec![100, 200, 150]],
         );
-        let p = pivot(
-            &r,
-            "dept",
-            "quarter",
-            "amount",
-            &["1".into(), "2".into()],
-            "SUM",
-        );
+        let p = pivot(&r, "dept", "quarter", "amount", &["1".into(), "2".into()], "SUM");
         assert_eq!(p.row_count, 2);
         assert_eq!(p.columns.len(), 3); // dept + "1" + "2"
         assert_eq!(p.columns[0].values, vec![1, 2]);
@@ -379,17 +386,8 @@ mod tests {
     #[test]
     fn unpivot_basic() {
         // Input: (dept, Q1, Q2) = (1, 100, 200), (2, 150, 250)
-        let r = make_result(
-            &["dept", "Q1", "Q2"],
-            &[vec![1, 2], vec![100, 150], vec![200, 250]],
-        );
-        let u = unpivot(
-            &r,
-            &["dept".into()],
-            "amount",
-            "quarter",
-            &["Q1".into(), "Q2".into()],
-        );
+        let r = make_result(&["dept", "Q1", "Q2"], &[vec![1, 2], vec![100, 150], vec![200, 250]]);
+        let u = unpivot(&r, &["dept".into()], "amount", "quarter", &["Q1".into(), "Q2".into()]);
         assert_eq!(u.row_count, 4); // 2 rows × 2 quarters
         assert_eq!(u.columns[0].values, vec![1, 1, 2, 2]); // dept repeated
     }
@@ -402,32 +400,20 @@ mod tests {
             &[vec![1, 1, 2], vec![1, 2, 1], vec![100, 50, 200]],
         );
         // Group by dept only (set = [0]).
-        let gs = grouping_sets(
-            &r,
-            &["dept".into(), "team".into()],
-            "amount",
-            "SUM",
-            &[vec![0]],
-        );
+        let gs = grouping_sets(&r, &["dept".into(), "team".into()], "amount", "SUM", &[vec![0]]);
         assert!(gs.row_count > 0);
     }
 
     #[test]
     fn cube_basic() {
-        let r = make_result(
-            &["dept", "amount"],
-            &[vec![1, 1, 2], vec![100, 200, 150]],
-        );
+        let r = make_result(&["dept", "amount"], &[vec![1, 1, 2], vec![100, 200, 150]]);
         let c = cube(&r, &["dept".into()], "amount", "SUM");
         assert!(c.row_count > 0);
     }
 
     #[test]
     fn rollup_basic() {
-        let r = make_result(
-            &["dept", "amount"],
-            &[vec![1, 1, 2], vec![100, 200, 150]],
-        );
+        let r = make_result(&["dept", "amount"], &[vec![1, 1, 2], vec![100, 200, 150]]);
         let ru = rollup(&r, &["dept".into()], "amount", "SUM");
         assert!(ru.row_count > 0);
     }

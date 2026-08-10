@@ -45,7 +45,7 @@ fn parse_with_inner(sql: &str) -> Result<WithClause, String> {
     let upper = sql.to_uppercase();
     let with_pos = upper.find("WITH").ok_or("expected WITH")?;
     let mut pos = with_pos + 4; // skip "WITH"
-    // Skip optional RECURSIVE
+                                // Skip optional RECURSIVE
     let rest = &sql[pos..].trim_start();
     if rest.to_uppercase().starts_with("RECURSIVE ") {
         pos = sql.len() - rest.len() + "RECURSIVE ".len();
@@ -142,9 +142,8 @@ fn parse_with_inner(sql: &str) -> Result<WithClause, String> {
         if let Some(mr_pos) = after_opt.to_uppercase().find("MAXRECURSION") {
             // Parse the number after MAXRECURSION
             let after_mr = &after_opt[mr_pos + "MAXRECURSION".len()..].trim_start();
-            let num_end = after_mr
-                .find(|c: char| !c.is_ascii_digit() && c != ' ')
-                .unwrap_or(after_mr.len());
+            let num_end =
+                after_mr.find(|c: char| !c.is_ascii_digit() && c != ' ').unwrap_or(after_mr.len());
             if num_end > 0 {
                 let num_str = after_mr[..num_end].trim();
                 if let Ok(n) = num_str.parse::<u32>() {

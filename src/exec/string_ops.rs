@@ -26,28 +26,51 @@ impl LikePattern {
                 '\\' => {
                     if let Some(&next) = chars.peek() {
                         chars.next();
-                        if !prefix_done { literal_chars.push(next); }
-                        if "\\^$.+?()[]{}|*".contains(next) { regex_str.push('\\'); }
+                        if !prefix_done {
+                            literal_chars.push(next);
+                        }
+                        if "\\^$.+?()[]{}|*".contains(next) {
+                            regex_str.push('\\');
+                        }
                         regex_str.push(next);
                     }
                 }
-                '%' => { is_literal = false; prefix_done = true; regex_str.push_str(".*"); }
-                '_' => { is_literal = false; prefix_done = true; regex_str.push('.'); }
-                c if "\\^$.+?()[]{}|*".contains(c) => {
-                    if !prefix_done { literal_chars.push(c); }
-                    regex_str.push('\\'); regex_str.push(c);
+                '%' => {
+                    is_literal = false;
+                    prefix_done = true;
+                    regex_str.push_str(".*");
                 }
-                c => { if !prefix_done { literal_chars.push(c); } regex_str.push(c); }
+                '_' => {
+                    is_literal = false;
+                    prefix_done = true;
+                    regex_str.push('.');
+                }
+                c if "\\^$.+?()[]{}|*".contains(c) => {
+                    if !prefix_done {
+                        literal_chars.push(c);
+                    }
+                    regex_str.push('\\');
+                    regex_str.push(c);
+                }
+                c => {
+                    if !prefix_done {
+                        literal_chars.push(c);
+                    }
+                    regex_str.push(c);
+                }
             }
         }
         regex_str.push('$');
         let regex = Regex::new(&regex_str).map_err(|e| format!("invalid LIKE: {e}"))?;
-        let literal_form = if is_literal { literal_chars.into_iter().collect() } else { String::new() };
+        let literal_form =
+            if is_literal { literal_chars.into_iter().collect() } else { String::new() };
         Ok(LikePattern { source: pattern.to_string(), regex, is_literal, literal_form })
     }
 
     pub fn matches(&self, s: &str) -> bool {
-        if self.is_literal { return s == self.literal_form; }
+        if self.is_literal {
+            return s == self.literal_form;
+        }
         self.regex.is_match(s)
     }
 
@@ -60,9 +83,13 @@ impl LikePattern {
 pub fn substring(s: &str, start: i64, length: Option<i64>) -> String {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len() as i64;
-    if n == 0 || start > n { return String::new(); }
+    if n == 0 || start > n {
+        return String::new();
+    }
     let start_idx = if start <= 0 { 0 } else { (start - 1) as usize };
-    if start_idx >= chars.len() { return String::new(); }
+    if start_idx >= chars.len() {
+        return String::new();
+    }
     let end_idx = match length {
         Some(l) if l > 0 => (start_idx + l as usize).min(chars.len()),
         Some(_) => start_idx,
@@ -71,26 +98,46 @@ pub fn substring(s: &str, start: i64, length: Option<i64>) -> String {
     chars[start_idx..end_idx].iter().collect()
 }
 
-pub fn char_length(s: &str) -> usize { s.chars().count() }
-pub fn lower(s: &str) -> String { s.to_lowercase() }
-pub fn upper(s: &str) -> String { s.to_uppercase() }
+pub fn char_length(s: &str) -> usize {
+    s.chars().count()
+}
+pub fn lower(s: &str) -> String {
+    s.to_lowercase()
+}
+pub fn upper(s: &str) -> String {
+    s.to_uppercase()
+}
 pub fn replace(s: &str, from: &str, to: &str) -> String {
-    if from.is_empty() { return s.to_string(); }
+    if from.is_empty() {
+        return s.to_string();
+    }
     s.replace(from, to)
 }
-pub fn trim(s: &str) -> String { s.trim().to_string() }
-pub fn concat(args: &[&str]) -> String { args.concat() }
+pub fn trim(s: &str) -> String {
+    s.trim().to_string()
+}
+pub fn concat(args: &[&str]) -> String {
+    args.concat()
+}
 pub fn position(s: &str, sub: &str) -> usize {
-    if sub.is_empty() { return 1; }
+    if sub.is_empty() {
+        return 1;
+    }
     s.find(sub).map(|i| i + 1).unwrap_or(0)
 }
-pub fn reverse(s: &str) -> String { s.chars().rev().collect() }
+pub fn reverse(s: &str) -> String {
+    s.chars().rev().collect()
+}
 pub fn left(s: &str, n: i64) -> String {
-    if n <= 0 { return String::new(); }
+    if n <= 0 {
+        return String::new();
+    }
     s.chars().take(n as usize).collect()
 }
 pub fn right(s: &str, n: i64) -> String {
-    if n <= 0 { return String::new(); }
+    if n <= 0 {
+        return String::new();
+    }
     let chars: Vec<char> = s.chars().collect();
     let start = chars.len().saturating_sub(n as usize);
     chars[start..].iter().collect()

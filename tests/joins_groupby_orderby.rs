@@ -25,9 +25,9 @@ fn left_join_keeps_unmatched_left_rows() {
     // Only one matching return for order 1.
     e.execute("INSERT INTO returns (oid, reason) VALUES (1, 99)").unwrap();
 
-    let r = e.execute(
-        "SELECT * FROM orders o LEFT JOIN returns r ON o.id = r.oid"
-    ).expect("LEFT JOIN must execute");
+    let r = e
+        .execute("SELECT * FROM orders o LEFT JOIN returns r ON o.id = r.oid")
+        .expect("LEFT JOIN must execute");
     // All three orders must be returned; rows 2 and 3 have no match.
     assert_eq!(r.row_count, 3, "LEFT JOIN must preserve all left rows; got {}", r.row_count);
 }
@@ -40,9 +40,9 @@ fn inner_join_drops_unmatched_left_rows() {
     e.execute("INSERT INTO orders (id, cust) VALUES (1, 10), (2, 20), (3, 30)").unwrap();
     e.execute("INSERT INTO returns (oid, reason) VALUES (1, 99)").unwrap();
 
-    let r = e.execute(
-        "SELECT * FROM orders o INNER JOIN returns r ON o.id = r.oid"
-    ).expect("INNER JOIN must execute");
+    let r = e
+        .execute("SELECT * FROM orders o INNER JOIN returns r ON o.id = r.oid")
+        .expect("INNER JOIN must execute");
     // Only the matched row should be returned.
     assert_eq!(r.row_count, 1, "INNER JOIN must drop unmatched rows; got {}", r.row_count);
 }
@@ -69,7 +69,12 @@ fn group_by_emits_multiple_aggregates() {
     e.execute("INSERT INTO t (grp, a, b) VALUES (1, 10, 100), (1, 20, 200), (2, 30, 300)").unwrap();
 
     let r = e.execute("SELECT grp, sum(a), count(*), avg(b) FROM t GROUP BY grp").unwrap();
-    assert_eq!(r.columns.len(), 4, "must emit 4 columns: grp, sum, count, avg; got {}", r.columns.len());
+    assert_eq!(
+        r.columns.len(),
+        4,
+        "must emit 4 columns: grp, sum, count, avg; got {}",
+        r.columns.len()
+    );
     assert_eq!(r.row_count, 2, "must emit 2 groups");
 }
 

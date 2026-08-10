@@ -204,21 +204,10 @@ fn parse_create_procedure_inner(sql: &str) -> Result<ProcedureDef, String> {
     };
 
     // Clean up the body: strip BEGIN/END wrapper if present.
-    let clean_body = body
-        .trim()
-        .trim_start_matches("BEGIN")
-        .trim()
-        .trim_end_matches("END")
-        .trim()
-        .to_string();
+    let clean_body =
+        body.trim().trim_start_matches("BEGIN").trim().trim_end_matches("END").trim().to_string();
 
-    Ok(ProcedureDef {
-        name,
-        params,
-        body: clean_body,
-        is_function,
-        return_type,
-    })
+    Ok(ProcedureDef { name, params, body: clean_body, is_function, return_type })
 }
 
 fn parse_params(s: &str) -> Result<Vec<ParamDef>, String> {
@@ -385,7 +374,8 @@ mod tests {
 
     #[test]
     fn parse_create_type_table() {
-        let sql = "CREATE TYPE OrderItemType AS TABLE (ProductID INT, Quantity INT, UnitPrice DECIMAL)";
+        let sql =
+            "CREATE TYPE OrderItemType AS TABLE (ProductID INT, Quantity INT, UnitPrice DECIMAL)";
         let t = parse_create_type(sql).unwrap().unwrap();
         assert_eq!(t.name, "OrderItemType");
         assert_eq!(t.columns.len(), 3);

@@ -53,11 +53,7 @@ pub struct IndexManager {
 impl IndexManager {
     /// Create an empty index manager.
     pub fn new() -> Self {
-        Self {
-            indexes: HashMap::new(),
-            by_name: HashMap::new(),
-            hash_data: HashMap::new(),
-        }
+        Self { indexes: HashMap::new(), by_name: HashMap::new(), hash_data: HashMap::new() }
     }
 
     /// Register an index on a column (pre-Wave-66 API, no name).
@@ -149,21 +145,14 @@ impl IndexManager {
     /// `value`, using the in-memory hash index built by `build_hash_index`.
     /// Returns `None` if no hash index exists for this (table, column).
     pub fn lookup(&self, table: &str, column: &str, value: u64) -> Option<&Vec<usize>> {
-        self.hash_data
-            .get(&(table.to_string(), column.to_string()))
-            .and_then(|m| m.get(&value))
+        self.hash_data.get(&(table.to_string(), column.to_string())).and_then(|m| m.get(&value))
     }
 
     /// Decide whether to use an index for a predicate.
     ///
     /// Returns true if the index should be used (i.e., the column has an
     /// index and the selectivity is high enough to justify it).
-    pub fn should_use_index(
-        &self,
-        table: &str,
-        column: &str,
-        table_row_count: u64,
-    ) -> bool {
+    pub fn should_use_index(&self, table: &str, column: &str, table_row_count: u64) -> bool {
         if !self.has_index(table, column) {
             return false;
         }

@@ -169,7 +169,9 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
         // non-string columns `col_strings[i]` is empty → `string_search`
         // stays `None`.
         let string_search = if !col_strings[i].is_empty() {
-            Some(crate::exec::fm_index::StringSearchColumn::new(std::mem::take(&mut col_strings[i])))
+            Some(crate::exec::fm_index::StringSearchColumn::new(std::mem::take(
+                &mut col_strings[i],
+            )))
         } else {
             None
         };
@@ -238,7 +240,13 @@ pub fn read_parquet_column(path: &str, column_name: &str) -> Result<LoadedColumn
     } else {
         None
     };
-    Ok(LoadedColumn { name: column_name.to_string(), cells, row_count, string_search, null_bitmap: None })
+    Ok(LoadedColumn {
+        name: column_name.to_string(),
+        cells,
+        row_count,
+        string_search,
+        null_bitmap: None,
+    })
 }
 
 /// Convert an Arrow [`ArrayRef`] into turboGP's `Vec<u64>` cell format.
@@ -251,7 +259,9 @@ pub fn read_parquet_column(path: &str, column_name: &str) -> Result<LoadedColumn
 ///
 /// Null values are encoded as `0u64` (the sentinel — see the module
 /// docs).
-fn convert_array_to_u64(array: &ArrayRef) -> (Vec<u64>, Option<crate::exec::fm_index::StringSearchColumn>, Option<Vec<bool>>) {
+fn convert_array_to_u64(
+    array: &ArrayRef,
+) -> (Vec<u64>, Option<crate::exec::fm_index::StringSearchColumn>, Option<Vec<bool>>) {
     let len = array.len();
     let mut out = Vec::with_capacity(len);
     let mut string_search: Option<crate::exec::fm_index::StringSearchColumn> = None;
@@ -266,14 +276,22 @@ fn convert_array_to_u64(array: &ArrayRef) -> (Vec<u64>, Option<crate::exec::fm_i
         DataType::Int8 => {
             if let Some(a) = array.as_any().downcast_ref::<Int8Array>() {
                 for i in 0..len {
-                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i) as u64); }
+                    if a.is_null(i) {
+                        out.push(0);
+                    } else {
+                        out.push(a.value(i) as u64);
+                    }
                 }
             }
         }
         DataType::Int16 => {
             if let Some(a) = array.as_any().downcast_ref::<Int16Array>() {
                 for i in 0..len {
-                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i) as u64); }
+                    if a.is_null(i) {
+                        out.push(0);
+                    } else {
+                        out.push(a.value(i) as u64);
+                    }
                 }
             }
         }
@@ -306,28 +324,44 @@ fn convert_array_to_u64(array: &ArrayRef) -> (Vec<u64>, Option<crate::exec::fm_i
         DataType::UInt8 => {
             if let Some(a) = array.as_any().downcast_ref::<UInt8Array>() {
                 for i in 0..len {
-                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i) as u64); }
+                    if a.is_null(i) {
+                        out.push(0);
+                    } else {
+                        out.push(a.value(i) as u64);
+                    }
                 }
             }
         }
         DataType::UInt16 => {
             if let Some(a) = array.as_any().downcast_ref::<UInt16Array>() {
                 for i in 0..len {
-                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i) as u64); }
+                    if a.is_null(i) {
+                        out.push(0);
+                    } else {
+                        out.push(a.value(i) as u64);
+                    }
                 }
             }
         }
         DataType::UInt32 => {
             if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
                 for i in 0..len {
-                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i) as u64); }
+                    if a.is_null(i) {
+                        out.push(0);
+                    } else {
+                        out.push(a.value(i) as u64);
+                    }
                 }
             }
         }
         DataType::UInt64 => {
             if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
                 for i in 0..len {
-                    if a.is_null(i) { out.push(0); } else { out.push(a.value(i)); }
+                    if a.is_null(i) {
+                        out.push(0);
+                    } else {
+                        out.push(a.value(i));
+                    }
                 }
             }
         }
@@ -568,7 +602,13 @@ mod tests {
     /// the original for re-loads.
     #[test]
     fn loaded_types_are_clone() {
-        let col = LoadedColumn { name: "x".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None, null_bitmap: None };
+        let col = LoadedColumn {
+            name: "x".into(),
+            cells: vec![1, 2, 3],
+            row_count: 3,
+            string_search: None,
+            null_bitmap: None,
+        };
         let col2 = col.clone();
         assert_eq!(col.cells, col2.cells);
 

@@ -206,10 +206,14 @@ fn collect_keys(
 fn resolve_col(expr: &crate::sql::parser::Expr, table: &Table) -> Option<usize> {
     if let crate::sql::parser::Expr::Column(name) = expr {
         // Direct match
-        if let Some(idx) = table.column_idx(name) { return Some(idx); }
+        if let Some(idx) = table.column_idx(name) {
+            return Some(idx);
+        }
         // Try stripping table prefix from query: l_orderkey -> look for lineitem.l_orderkey
         if let Some(bare) = name.split('.').nth(1) {
-            if let Some(idx) = table.column_idx(bare) { return Some(idx); }
+            if let Some(idx) = table.column_idx(bare) {
+                return Some(idx);
+            }
         }
         // Try matching bare name against qualified column names in the table
         // e.g., name="l_orderkey", table has "lineitem.l_orderkey"
@@ -250,7 +254,8 @@ mod tests {
     fn test_inner_join() {
         let left = make_table("l", vec![("id", vec![1, 2, 3]), ("v", vec![10, 20, 30])]);
         let right = make_table("r", vec![("id", vec![2, 3, 4]), ("n", vec![200, 300, 400])]);
-        let result = hash_join(&left, &right, &[JoinKey { left: 0, right: 0 }], JoinType::Inner).unwrap();
+        let result =
+            hash_join(&left, &right, &[JoinKey { left: 0, right: 0 }], JoinType::Inner).unwrap();
         assert_eq!(result.row_count, 2);
         assert_eq!(result.columns[0], vec![2, 3]);
     }
@@ -259,7 +264,8 @@ mod tests {
     fn test_left_join() {
         let left = make_table("l", vec![("id", vec![1, 2, 3])]);
         let right = make_table("r", vec![("id", vec![2])]);
-        let result = hash_join(&left, &right, &[JoinKey { left: 0, right: 0 }], JoinType::Left).unwrap();
+        let result =
+            hash_join(&left, &right, &[JoinKey { left: 0, right: 0 }], JoinType::Left).unwrap();
         assert_eq!(result.row_count, 3);
     }
 
@@ -283,8 +289,12 @@ mod tests {
 
     #[test]
     fn test_multi_key_join() {
-        let left = make_table("l", vec![("a", vec![1, 1, 2]), ("b", vec![1, 2, 1]), ("v", vec![10, 20, 30])]);
-        let right = make_table("r", vec![("a", vec![1, 2]), ("b", vec![2, 1]), ("n", vec![100, 200])]);
+        let left = make_table(
+            "l",
+            vec![("a", vec![1, 1, 2]), ("b", vec![1, 2, 1]), ("v", vec![10, 20, 30])],
+        );
+        let right =
+            make_table("r", vec![("a", vec![1, 2]), ("b", vec![2, 1]), ("n", vec![100, 200])]);
         let keys = vec![JoinKey { left: 0, right: 0 }, JoinKey { left: 1, right: 1 }];
         let result = hash_join(&left, &right, &keys, JoinType::Inner).unwrap();
         assert_eq!(result.row_count, 2);
@@ -294,7 +304,8 @@ mod tests {
     fn test_no_match() {
         let left = make_table("l", vec![("id", vec![1, 2])]);
         let right = make_table("r", vec![("id", vec![3, 4])]);
-        let result = hash_join(&left, &right, &[JoinKey { left: 0, right: 0 }], JoinType::Inner).unwrap();
+        let result =
+            hash_join(&left, &right, &[JoinKey { left: 0, right: 0 }], JoinType::Inner).unwrap();
         assert_eq!(result.row_count, 0);
     }
 
@@ -302,7 +313,8 @@ mod tests {
     fn test_join_into_table() {
         let left = make_table("l", vec![("id", vec![1, 2])]);
         let right = make_table("r", vec![("id", vec![1, 2]), ("n", vec![100, 200])]);
-        let result = hash_join(&left, &right, &[JoinKey { left: 0, right: 0 }], JoinType::Inner).unwrap();
+        let result =
+            hash_join(&left, &right, &[JoinKey { left: 0, right: 0 }], JoinType::Inner).unwrap();
         let table = result.into_table("joined");
         assert_eq!(table.name, "joined");
         assert_eq!(table.row_count, 2);

@@ -230,11 +230,7 @@ pub fn sum_a_mul_one_minus_b_by_idx(a: &[u64], b: &[u64], indices: &[usize]) -> 
 }
 
 #[target_feature(enable = "avx512f")]
-unsafe fn sum_a_mul_one_minus_b_by_idx_avx512(
-    a: &[u64],
-    b: &[u64],
-    indices: &[usize],
-) -> f64 {
+unsafe fn sum_a_mul_one_minus_b_by_idx_avx512(a: &[u64], b: &[u64], indices: &[usize]) -> f64 {
     let a_ptr = a.as_ptr() as *const f64;
     let b_ptr = b.as_ptr() as *const f64;
     let n = indices.len();
@@ -271,8 +267,7 @@ unsafe fn sum_a_mul_one_minus_b_by_idx_avx512(
         ab_acc3 = _mm512_fmadd_pd(av3, bv3, ab_acc3);
         i += 32;
     }
-    let mut sum_a =
-        _mm512_add_pd(_mm512_add_pd(a_acc0, a_acc1), _mm512_add_pd(a_acc2, a_acc3));
+    let mut sum_a = _mm512_add_pd(_mm512_add_pd(a_acc0, a_acc1), _mm512_add_pd(a_acc2, a_acc3));
     let mut sum_ab =
         _mm512_add_pd(_mm512_add_pd(ab_acc0, ab_acc1), _mm512_add_pd(ab_acc2, ab_acc3));
     while i + 8 <= n {
@@ -321,9 +316,8 @@ pub fn sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(
     if !has_avx512f() {
         let mut sum = 0.0f64;
         for &i in indices {
-            sum += f64::from_bits(a[i])
-                * (1.0 - f64::from_bits(b[i]))
-                * (1.0 + f64::from_bits(c[i]));
+            sum +=
+                f64::from_bits(a[i]) * (1.0 - f64::from_bits(b[i])) * (1.0 + f64::from_bits(c[i]));
         }
         return sum;
     }
@@ -491,11 +485,7 @@ mod tests {
         let a = col(&a_vals);
         let b = col(&b_vals);
         let idx = idx_all(10000);
-        let expected: f64 = a_vals
-            .iter()
-            .zip(b_vals.iter())
-            .map(|(&a, &b)| a * (1.0 - b))
-            .sum();
+        let expected: f64 = a_vals.iter().zip(b_vals.iter()).map(|(&a, &b)| a * (1.0 - b)).sum();
         let got = sum_a_mul_one_minus_b_by_idx(&a, &b, &idx);
         // Distributive rewrite changes rounding; allow 1e-9 relative.
         assert!(
@@ -549,7 +539,13 @@ mod tests {
             let b_bits = col(&b_vals);
             let expected_ab: f64 = vals.iter().zip(b_vals.iter()).map(|(&a, &b)| a * b).sum();
             let got_ab = sum_a_mul_b_by_idx(&col_bits, &b_bits, &idx);
-            assert!(approx_eq(got_ab, expected_ab, 1e-10), "len {} sum_ab got {} expected {}", n, got_ab, expected_ab);
+            assert!(
+                approx_eq(got_ab, expected_ab, 1e-10),
+                "len {} sum_ab got {} expected {}",
+                n,
+                got_ab,
+                expected_ab
+            );
         }
     }
 }

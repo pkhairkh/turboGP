@@ -59,7 +59,9 @@ fn group_by_with_having() {
     // GROUP BY ... HAVING — the TPC-H interpreter supports HAVING clauses
     // that filter groups after aggregation.
     let mut e = make_engine();
-    let r = e.execute("SELECT region, count(*) FROM sales GROUP BY region HAVING count(*) > 1").unwrap();
+    let r = e
+        .execute("SELECT region, count(*) FROM sales GROUP BY region HAVING count(*) > 1")
+        .unwrap();
     // Regions 1 (2 rows) and 2 (2 rows) have count > 1; region 3 (1 row) is filtered out.
     assert_eq!(r.row_count, 2, "HAVING count(*) > 1 should filter out region 3");
 }
@@ -88,7 +90,9 @@ fn case_when_in_where_through_engine() {
     // CASE WHEN in WHERE: count rows where amount > 200.
     // CASE WHEN amount > 200 THEN 1 ELSE 0 END = 1
     // Rows with amount > 200: row 4 (300), row 5 (250). Total: 2.
-    let r = e.execute("SELECT count(*) FROM sales WHERE CASE WHEN amount > 200 THEN 1 ELSE 0 END = 1").unwrap();
+    let r = e
+        .execute("SELECT count(*) FROM sales WHERE CASE WHEN amount > 200 THEN 1 ELSE 0 END = 1")
+        .unwrap();
     assert_eq!(r.scalar_u64(), Some(2), "CASE WHEN in WHERE must match 2 rows (amount > 200)");
 }
 
@@ -136,7 +140,9 @@ fn subquery_in_where() {
     // Outer query: SELECT count(*) FROM sales WHERE region IN (subquery)
     // Rows matching region 2: rows 3 (region 2, amount 150) and 4 (region 2, amount 300).
     // Total: 2 rows.
-    let r = e.execute("SELECT count(*) FROM sales WHERE region IN (SELECT region FROM sales WHERE amount > 250)");
+    let r = e.execute(
+        "SELECT count(*) FROM sales WHERE region IN (SELECT region FROM sales WHERE amount > 250)",
+    );
     assert!(r.is_ok(), "subquery in WHERE must execute; got: {:?}", r.err());
     let r = r.unwrap();
     assert_eq!(r.scalar_u64(), Some(2), "subquery must filter to 2 rows (region 2)");
@@ -173,7 +179,9 @@ fn complex_where_with_or() {
 #[test]
 fn between_and_equality() {
     let mut e = make_engine();
-    let r = e.execute("SELECT count(*) FROM sales WHERE amount BETWEEN 100 AND 250 AND region = 1").unwrap();
+    let r = e
+        .execute("SELECT count(*) FROM sales WHERE amount BETWEEN 100 AND 250 AND region = 1")
+        .unwrap();
     // amount BETWEEN 100 AND 250: rows 1,2,3,5. region=1: rows 1,2. → 2
     assert_eq!(r.scalar_u64(), Some(2));
 }

@@ -74,7 +74,8 @@ impl ViewRegistry {
             let lower_result = result.to_lowercase();
             let lower_pattern = pattern.to_lowercase();
             if let Some(pos) = lower_result.find(&lower_pattern) {
-                result = format!("{}{}{}", &result[..pos], replacement, &result[pos + pattern.len()..]);
+                result =
+                    format!("{}{}{}", &result[..pos], replacement, &result[pos + pattern.len()..]);
             }
         }
         result
@@ -153,7 +154,11 @@ fn parse_create_view_inner(sql: &str) -> Result<ViewDef, String> {
         // Remove the WITH SCHEMABINDING from the select.
         let idx = clean_select.to_uppercase().find("WITH SCHEMABINDING");
         if let Some(i) = idx {
-            clean_select = format!("{}{}", &clean_select[..i], &clean_select[i + "WITH SCHEMABINDING".len()..]);
+            clean_select = format!(
+                "{}{}",
+                &clean_select[..i],
+                &clean_select[i + "WITH SCHEMABINDING".len()..]
+            );
             clean_select = clean_select.trim().to_string();
         }
     }
@@ -161,18 +166,13 @@ fn parse_create_view_inner(sql: &str) -> Result<ViewDef, String> {
         check_option = true;
         let idx = clean_select.to_uppercase().find("WITH CHECK OPTION");
         if let Some(i) = idx {
-            clean_select = format!("{}{}", &clean_select[..i], &clean_select[i + "WITH CHECK OPTION".len()..]);
+            clean_select =
+                format!("{}{}", &clean_select[..i], &clean_select[i + "WITH CHECK OPTION".len()..]);
             clean_select = clean_select.trim().to_string();
         }
     }
 
-    Ok(ViewDef {
-        name,
-        select_sql: clean_select,
-        column_aliases,
-        schemabinding,
-        check_option,
-    })
+    Ok(ViewDef { name, select_sql: clean_select, column_aliases, schemabinding, check_option })
 }
 
 /// Parse a DROP VIEW statement. Returns None if not a DROP VIEW.

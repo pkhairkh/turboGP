@@ -248,7 +248,9 @@ fn parse_drop(tokens: &[Token]) -> Result<DdlStatement, String> {
     }
     match &tokens[0] {
         Token::Keyword(k) if k == "TABLE" => parse_drop_table(&tokens[1..]).map(DdlStatement::Drop),
-        Token::Keyword(k) if k == "INDEX" => parse_drop_index(&tokens[1..]).map(DdlStatement::DropIndex),
+        Token::Keyword(k) if k == "INDEX" => {
+            parse_drop_index(&tokens[1..]).map(DdlStatement::DropIndex)
+        }
         other => Err(format!("expected TABLE or INDEX after DROP, got {other:?}")),
     }
 }
@@ -279,7 +281,9 @@ fn parse_alter_table(tokens: &[Token]) -> Result<AlterTable, String> {
             // Optional COLUMN keyword
             if pos < tokens.len() {
                 if let Token::Keyword(k) = &tokens[pos] {
-                    if k == "COLUMN" { pos += 1; }
+                    if k == "COLUMN" {
+                        pos += 1;
+                    }
                 }
             }
             // Parse a single column definition.
@@ -290,7 +294,9 @@ fn parse_alter_table(tokens: &[Token]) -> Result<AlterTable, String> {
             pos += 1;
             if pos < tokens.len() {
                 if let Token::Keyword(k) = &tokens[pos] {
-                    if k == "COLUMN" { pos += 1; }
+                    if k == "COLUMN" {
+                        pos += 1;
+                    }
                 }
             }
             if pos >= tokens.len() {
@@ -306,7 +312,9 @@ fn parse_alter_table(tokens: &[Token]) -> Result<AlterTable, String> {
             pos += 1;
             if pos < tokens.len() {
                 if let Token::Keyword(k) = &tokens[pos] {
-                    if k == "COLUMN" { pos += 1; }
+                    if k == "COLUMN" {
+                        pos += 1;
+                    }
                 }
             }
             if pos >= tokens.len() {
@@ -341,12 +349,16 @@ fn parse_create_index(tokens: &[Token]) -> Result<CreateIndex, String> {
         if let Token::Keyword(k) = &tokens[pos] {
             if k == "IF" {
                 pos += 1;
-                if pos >= tokens.len() { return Err("expected NOT after IF".into()); }
+                if pos >= tokens.len() {
+                    return Err("expected NOT after IF".into());
+                }
                 match &tokens[pos] {
                     Token::Keyword(k) if k == "NOT" => pos += 1,
                     other => return Err(format!("expected NOT, got {other:?}")),
                 }
-                if pos >= tokens.len() { return Err("expected EXISTS after NOT".into()); }
+                if pos >= tokens.len() {
+                    return Err("expected EXISTS after NOT".into());
+                }
                 match &tokens[pos] {
                     Token::Keyword(k) if k == "EXISTS" => pos += 1,
                     other => return Err(format!("expected EXISTS, got {other:?}")),
@@ -356,14 +368,18 @@ fn parse_create_index(tokens: &[Token]) -> Result<CreateIndex, String> {
         }
     }
     // Index name
-    if pos >= tokens.len() { return Err("expected index name after CREATE INDEX".into()); }
+    if pos >= tokens.len() {
+        return Err("expected index name after CREATE INDEX".into());
+    }
     let index_name = match &tokens[pos] {
         Token::Ident(s) => s.clone(),
         other => return Err(format!("expected index name, got {other:?}")),
     };
     pos += 1;
     // Expect ON
-    if pos >= tokens.len() { return Err("expected ON after index name".into()); }
+    if pos >= tokens.len() {
+        return Err("expected ON after index name".into());
+    }
     match &tokens[pos] {
         Token::Keyword(k) if k == "ON" => pos += 1,
         other => return Err(format!("expected ON, got {other:?}")),
@@ -371,18 +387,24 @@ fn parse_create_index(tokens: &[Token]) -> Result<CreateIndex, String> {
     // Table name
     let (_table_schema, table) = parse_qualified_name(tokens, &mut pos)?;
     // Expect ( column )
-    if pos >= tokens.len() { return Err("expected ( after table name".into()); }
+    if pos >= tokens.len() {
+        return Err("expected ( after table name".into());
+    }
     match &tokens[pos] {
         Token::LParen => pos += 1,
         other => return Err(format!("expected (, got {other:?}")),
     }
-    if pos >= tokens.len() { return Err("expected column name".into()); }
+    if pos >= tokens.len() {
+        return Err("expected column name".into());
+    }
     let column = match &tokens[pos] {
         Token::Ident(s) => s.clone(),
         other => return Err(format!("expected column name, got {other:?}")),
     };
     pos += 1;
-    if pos >= tokens.len() { return Err("expected ) after column name".into()); }
+    if pos >= tokens.len() {
+        return Err("expected ) after column name".into());
+    }
     match &tokens[pos] {
         Token::RParen => pos += 1,
         other => return Err(format!("expected ), got {other:?}")),
@@ -398,7 +420,9 @@ fn parse_drop_index(tokens: &[Token]) -> Result<DropIndex, String> {
         if let Token::Keyword(k) = &tokens[pos] {
             if k == "IF" {
                 pos += 1;
-                if pos >= tokens.len() { return Err("expected EXISTS after IF".into()); }
+                if pos >= tokens.len() {
+                    return Err("expected EXISTS after IF".into());
+                }
                 match &tokens[pos] {
                     Token::Keyword(k) if k == "EXISTS" => pos += 1,
                     other => return Err(format!("expected EXISTS, got {other:?}")),
@@ -407,7 +431,9 @@ fn parse_drop_index(tokens: &[Token]) -> Result<DropIndex, String> {
             }
         }
     }
-    if pos >= tokens.len() { return Err("expected index name after DROP INDEX".into()); }
+    if pos >= tokens.len() {
+        return Err("expected index name after DROP INDEX".into());
+    }
     let index_name = match &tokens[pos] {
         Token::Ident(s) => s.clone(),
         Token::Keyword(k) => k.clone(),
@@ -618,7 +644,10 @@ fn parse_column_def(tokens: &[Token], pos: &mut usize) -> Result<ColumnDef, Stri
                         // Skip until matching )
                         while *pos < tokens.len() {
                             match &tokens[*pos] {
-                                Token::RParen => { *pos += 1; break; }
+                                Token::RParen => {
+                                    *pos += 1;
+                                    break;
+                                }
                                 _ => *pos += 1,
                             }
                         }
@@ -666,15 +695,7 @@ fn parse_column_def(tokens: &[Token], pos: &mut usize) -> Result<ColumnDef, Stri
         }
     }
 
-    Ok(ColumnDef {
-        name,
-        col_type,
-        not_null,
-        primary_key,
-        default,
-        identity,
-        references,
-    })
+    Ok(ColumnDef { name, col_type, not_null, primary_key, default, identity, references })
 }
 
 fn parse_type(tokens: &[Token], pos: &mut usize) -> Result<ColumnType, String> {
@@ -920,10 +941,7 @@ mod tests {
         let ddl = parse_ddl(sql).unwrap().unwrap();
         match ddl {
             DdlStatement::Create(ct) => {
-                assert_eq!(
-                    ct.columns[1].references,
-                    Some(("users".into(), "id".into()))
-                );
+                assert_eq!(ct.columns[1].references, Some(("users".into(), "id".into())));
             }
             _ => panic!("expected Create"),
         }

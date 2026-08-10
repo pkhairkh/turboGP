@@ -99,7 +99,11 @@ pub fn try_cast(s: &str, type_name: &str) -> Option<String> {
 
 /// IIF: immediate if. Returns true_val if condition is true, else false_val.
 pub fn iif<'a>(condition: bool, true_val: &'a str, false_val: &'a str) -> &'a str {
-    if condition { true_val } else { false_val }
+    if condition {
+        true_val
+    } else {
+        false_val
+    }
 }
 
 /// Execute a MERGE against a QueryResult (representing the target table).
@@ -132,11 +136,7 @@ pub fn execute_merge(target: &mut QueryResult, merge: &Merge) -> MergeResult {
         // Find matching target row.
         let mut found_match = false;
         for row in 0..target.row_count {
-            let target_val = target.columns[target_col_idx]
-                .values
-                .get(row)
-                .copied()
-                .unwrap_or(0);
+            let target_val = target.columns[target_col_idx].values.get(row).copied().unwrap_or(0);
             if target_val == source_val {
                 matched_mask[row] = true;
                 found_match = true;
@@ -146,7 +146,8 @@ pub fn execute_merge(target: &mut QueryResult, merge: &Merge) -> MergeResult {
                     for (col_name, val_str) in assigns {
                         if let Some(idx) = target.columns.iter().position(|c| c.name == *col_name) {
                             if row < target.columns[idx].values.len() {
-                                let resolved = resolve_val(val_str, &merge.source_col_names, source_row);
+                                let resolved =
+                                    resolve_val(val_str, &merge.source_col_names, source_row);
                                 target.columns[idx].values[row] = parse_cell(&resolved);
                             }
                         }
@@ -214,7 +215,9 @@ fn resolve_val(val: &str, source_col_names: &[String], source_row: &[String]) ->
         let col_part = val[dot_pos + 1..].trim();
         // Skip if either side is empty or col_part is not a simple identifier.
         if !col_part.is_empty() && col_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            if let Some(idx) = source_col_names.iter().position(|c| c.eq_ignore_ascii_case(col_part)) {
+            if let Some(idx) =
+                source_col_names.iter().position(|c| c.eq_ignore_ascii_case(col_part))
+            {
                 if let Some(v) = source_row.get(idx) {
                     return v.clone();
                 }
@@ -253,8 +256,14 @@ mod tests {
     fn make_result(names: &[&str], cols: &[Vec<u64>]) -> QueryResult {
         let mut r = QueryResult::empty();
         for (i, name) in names.iter().enumerate() {
-            r.push_column(ResultColumn { name: name.to_string(), values: cols[i].clone(), string_values: None, type_oid: 0, null_mask: None })
-                .unwrap();
+            r.push_column(ResultColumn {
+                name: name.to_string(),
+                values: cols[i].clone(),
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            })
+            .unwrap();
         }
         r
     }

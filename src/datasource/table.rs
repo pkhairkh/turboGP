@@ -52,9 +52,14 @@ impl Table {
     pub fn from_loaded(loaded: LoadedTable) -> Self {
         let row_count = loaded.row_count;
         let column_names: Vec<String> = loaded.columns.iter().map(|c| c.name.clone()).collect();
-        let columns: Vec<std::sync::Arc<Vec<u64>>> = loaded.columns.iter().map(|c| std::sync::Arc::new(c.cells.clone())).collect();
+        let columns: Vec<std::sync::Arc<Vec<u64>>> =
+            loaded.columns.iter().map(|c| std::sync::Arc::new(c.cells.clone())).collect();
         let string_columns: Vec<Option<std::sync::Arc<crate::exec::fm_index::StringSearchColumn>>> =
-            loaded.columns.iter().map(|c| c.string_search.clone().map(std::sync::Arc::new)).collect();
+            loaded
+                .columns
+                .iter()
+                .map(|c| c.string_search.clone().map(std::sync::Arc::new))
+                .collect();
 
         // Defensive invariant check: every column should match
         // `row_count`. If a caller hand-built a bad `LoadedTable`,
@@ -63,17 +68,31 @@ impl Table {
         let actual_min = columns.iter().map(|c| c.len()).min().unwrap_or(0);
         let row_count = row_count.min(actual_min);
 
-        let null_bitmaps: Vec<Option<crate::types::null_bitmap::NullBitmap>> = loaded.columns.iter().map(|c| {
-            c.null_bitmap.as_ref().map(|bits| {
-                let mut bm = crate::types::null_bitmap::NullBitmap::new(bits.len());
-                for (i, &is_null) in bits.iter().enumerate() {
-                    if is_null { bm.set_null(i); }
-                }
-                bm
+        let null_bitmaps: Vec<Option<crate::types::null_bitmap::NullBitmap>> = loaded
+            .columns
+            .iter()
+            .map(|c| {
+                c.null_bitmap.as_ref().map(|bits| {
+                    let mut bm = crate::types::null_bitmap::NullBitmap::new(bits.len());
+                    for (i, &is_null) in bits.iter().enumerate() {
+                        if is_null {
+                            bm.set_null(i);
+                        }
+                    }
+                    bm
+                })
             })
-        }).collect();
+            .collect();
 
-        Table { name: loaded.name, columns, column_names, row_count, string_columns, null_bitmaps, schema: None }
+        Table {
+            name: loaded.name,
+            columns,
+            column_names,
+            row_count,
+            string_columns,
+            null_bitmaps,
+            schema: None,
+        }
     }
 
     /// Look up a column by name, returning a slice over its cells.
@@ -117,8 +136,20 @@ mod tests {
         LoadedTable {
             name: "t".into(),
             columns: vec![
-                LoadedColumn { name: "id".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None, null_bitmap: None },
-                LoadedColumn { name: "v".into(), cells: vec![10, 20, 30], row_count: 3, string_search: None, null_bitmap: None },
+                LoadedColumn {
+                    name: "id".into(),
+                    cells: vec![1, 2, 3],
+                    row_count: 3,
+                    string_search: None,
+                    null_bitmap: None,
+                },
+                LoadedColumn {
+                    name: "v".into(),
+                    cells: vec![10, 20, 30],
+                    row_count: 3,
+                    string_search: None,
+                    null_bitmap: None,
+                },
             ],
             row_count: 3,
         }
@@ -168,8 +199,20 @@ mod tests {
         let loaded = LoadedTable {
             name: "bad".into(),
             columns: vec![
-                LoadedColumn { name: "a".into(), cells: vec![1, 2, 3], row_count: 3, string_search: None, null_bitmap: None },
-                LoadedColumn { name: "b".into(), cells: vec![10, 20], row_count: 2, string_search: None, null_bitmap: None },
+                LoadedColumn {
+                    name: "a".into(),
+                    cells: vec![1, 2, 3],
+                    row_count: 3,
+                    string_search: None,
+                    null_bitmap: None,
+                },
+                LoadedColumn {
+                    name: "b".into(),
+                    cells: vec![10, 20],
+                    row_count: 2,
+                    string_search: None,
+                    null_bitmap: None,
+                },
             ],
             row_count: 5, // lie about row count
         };

@@ -87,15 +87,13 @@ fn parquet_null_bitmap_populated() {
     // Simulate a loaded column with NULL bitmap
     let loaded = LoadedTable {
         name: "t".into(),
-        columns: vec![
-            LoadedColumn {
-                name: "val".into(),
-                cells: vec![10, 0, 30],
-                row_count: 3,
-                string_search: None,
-                null_bitmap: Some(vec![false, true, false]),
-            },
-        ],
+        columns: vec![LoadedColumn {
+            name: "val".into(),
+            cells: vec![10, 0, 30],
+            row_count: 3,
+            string_search: None,
+            null_bitmap: Some(vec![false, true, false]),
+        }],
         row_count: 3,
     };
     let table = Table::from_loaded(loaded);
@@ -103,7 +101,7 @@ fn parquet_null_bitmap_populated() {
     assert!(table.null_bitmaps[0].is_some());
     let bm = table.null_bitmaps[0].as_ref().unwrap();
     assert!(!bm.is_null(0)); // val=10, non-null
-    assert!(bm.is_null(1));  // NULL
+    assert!(bm.is_null(1)); // NULL
     assert!(!bm.is_null(2)); // val=30, non-null
 }
 
@@ -157,8 +155,20 @@ fn expr_mixed_int_float() {
     let table = Table::from_loaded(LoadedTable {
         name: "t".into(),
         columns: vec![
-            LoadedColumn { name: "price".into(), cells: vec![100, 200], row_count: 2, string_search: None, null_bitmap: None },
-            LoadedColumn { name: "discount".into(), cells: vec![5, 10], row_count: 2, string_search: None, null_bitmap: None },
+            LoadedColumn {
+                name: "price".into(),
+                cells: vec![100, 200],
+                row_count: 2,
+                string_search: None,
+                null_bitmap: None,
+            },
+            LoadedColumn {
+                name: "discount".into(),
+                cells: vec![5, 10],
+                row_count: 2,
+                string_search: None,
+                null_bitmap: None,
+            },
         ],
         row_count: 2,
     });

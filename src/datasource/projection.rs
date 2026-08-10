@@ -31,17 +31,11 @@ pub fn needed_columns(sql: &str, all_columns: &[String]) -> HashSet<String> {
 /// Prune the column list to only those needed for the query.
 ///
 /// Returns (needed_columns, pruned_count).
-pub fn prune_columns(
-    sql: &str,
-    all_columns: &[String],
-) -> (Vec<String>, usize) {
+pub fn prune_columns(sql: &str, all_columns: &[String]) -> (Vec<String>, usize) {
     let needed = needed_columns(sql, all_columns);
     let pruned = all_columns.len() - needed.len();
-    let mut result: Vec<String> = all_columns
-        .iter()
-        .filter(|c| needed.contains(*c))
-        .cloned()
-        .collect();
+    let mut result: Vec<String> =
+        all_columns.iter().filter(|c| needed.contains(*c)).cloned().collect();
     // Preserve original column order.
     result.sort_by_key(|c| all_columns.iter().position(|a| a == c).unwrap_or(usize::MAX));
     (result, pruned)
@@ -69,9 +63,16 @@ mod tests {
 
     fn cols() -> Vec<String> {
         vec![
-            "id".into(), "name".into(), "email".into(), "age".into(),
-            "address".into(), "phone".into(), "salary".into(), "dept".into(),
-            "title".into(), "manager".into(),
+            "id".into(),
+            "name".into(),
+            "email".into(),
+            "age".into(),
+            "address".into(),
+            "phone".into(),
+            "salary".into(),
+            "dept".into(),
+            "title".into(),
+            "manager".into(),
         ]
     }
 
@@ -80,9 +81,9 @@ mod tests {
         let sql = "SELECT * FROM users";
         let (needed, pruned) = prune_columns(sql, &cols());
         assert_eq!(needed.len(), 0); // SELECT * doesn't match any column name
-        // Actually, SELECT * doesn't contain any column name in the SQL text,
-        // so no columns are "needed" by the text scan. The caller should
-        // handle SELECT * by loading all columns.
+                                     // Actually, SELECT * doesn't contain any column name in the SQL text,
+                                     // so no columns are "needed" by the text scan. The caller should
+                                     // handle SELECT * by loading all columns.
         assert_eq!(pruned, 10);
     }
 

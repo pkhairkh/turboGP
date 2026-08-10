@@ -65,20 +65,23 @@ pub fn backup(engine: &QueryEngine, backup_dir: &Path) -> Result<usize, String> 
 /// Reads the manifest, creates each table, then loads data from the CSV files.
 pub fn restore(engine: &mut QueryEngine, backup_dir: &Path) -> Result<usize, String> {
     let manifest_path = backup_dir.join("manifest.json");
-    let manifest_str = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("read manifest: {e}"))?;
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_str)
-        .map_err(|e| format!("parse manifest: {e}"))?;
+    let manifest_str =
+        std::fs::read_to_string(&manifest_path).map_err(|e| format!("read manifest: {e}"))?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(&manifest_str).map_err(|e| format!("parse manifest: {e}"))?;
 
     let mut total_rows = 0;
     if let Some(tables) = manifest.get("tables").and_then(|t| t.as_array()) {
         for table in tables {
-            let table_name = table.get("name").and_then(|n| n.as_str())
+            let table_name = table
+                .get("name")
+                .and_then(|n| n.as_str())
                 .ok_or("table name missing in manifest")?;
             let csv_path = backup_dir.join(format!("{}.csv", table_name));
             if csv_path.exists() {
                 let sql = format!("COPY {} FROM '{}'", table_name, csv_path.display());
-                let result = engine.execute(&sql).map_err(|e| format!("restore {}: {}", table_name, e))?;
+                let result =
+                    engine.execute(&sql).map_err(|e| format!("restore {}: {}", table_name, e))?;
                 total_rows += result.row_count;
             }
         }
@@ -108,8 +111,7 @@ impl WalStreamer {
     /// Serialize and "send" a WAL record to the replica.
     /// Returns the number of bytes sent.
     pub fn stream_record(&mut self, record: &WalRecord) -> Result<usize, String> {
-        let serialized = serde_json::to_string(record)
-            .map_err(|e| format!("serialize: {e}"))?;
+        let serialized = serde_json::to_string(record).map_err(|e| format!("serialize: {e}"))?;
         let bytes = serialized.len() + 1; // +1 for newline
         self.bytes_sent += bytes as u64;
         self.records_sent += 1;

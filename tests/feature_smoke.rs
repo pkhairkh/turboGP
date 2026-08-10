@@ -3,10 +3,10 @@
 //! Exercises every SQL feature implemented in Waves 0–14 to verify they
 //! work together correctly through the QueryEngine::execute API.
 
-use turbogp::engine::QueryEngine;
-use turbogp::exec::{json, merge, pivot, temporal, window};
 use turbogp::catalog::views::{ViewDef, ViewRegistry};
+use turbogp::engine::QueryEngine;
 use turbogp::exec::procedure::{ProcedureDef, SessionContext};
+use turbogp::exec::{json, merge, pivot, temporal, window};
 
 // -----------------------------------------------------------------------
 // Wave 2: Server mode (tested separately in tests/server_pgwire.rs)
@@ -36,12 +36,15 @@ fn smoke_ddl_create_drop_table() {
 #[test]
 fn smoke_ddl_all_types() {
     let mut e = QueryEngine::new();
-    e.execute("CREATE TABLE t (
+    e.execute(
+        "CREATE TABLE t (
         a INT, b BIGINT, c SMALLINT, d TINYINT,
         e VARCHAR(50), f NVARCHAR(100), g TEXT,
         h FLOAT, i REAL, j DECIMAL(18,2), k NUMERIC(10,4),
         l BIT, m BOOLEAN, n DATE, o TIMESTAMP
-    )").expect("create with all types");
+    )",
+    )
+    .expect("create with all types");
     let r = e.execute("SELECT count(*) FROM t").unwrap();
     assert_eq!(r.scalar_u64(), Some(0));
 }
@@ -67,7 +70,10 @@ fn smoke_dml_insert_update_delete() {
     assert_eq!(e.execute("SELECT count(*) FROM users").unwrap().scalar_u64(), Some(3));
 
     e.execute("UPDATE users SET active = 1 WHERE id = 2").unwrap();
-    assert_eq!(e.execute("SELECT count(*) FROM users WHERE active = 1").unwrap().scalar_u64(), Some(3));
+    assert_eq!(
+        e.execute("SELECT count(*) FROM users WHERE active = 1").unwrap().scalar_u64(),
+        Some(3)
+    );
 
     e.execute("DELETE FROM users WHERE active = 0").unwrap();
     assert_eq!(e.execute("SELECT count(*) FROM users").unwrap().scalar_u64(), Some(3));
@@ -137,7 +143,14 @@ fn smoke_window_functions() {
     use turbogp::engine::{QueryResult, ResultColumn};
     let r = {
         let mut r = QueryResult::empty();
-        r.push_column(ResultColumn { name: "v".into(), values: vec![30, 10, 20], string_values: None, type_oid: 0, null_mask: None }).unwrap();
+        r.push_column(ResultColumn {
+            name: "v".into(),
+            values: vec![30, 10, 20],
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        })
+        .unwrap();
         r
     };
     let spec = window::WindowSpec {
@@ -163,9 +176,30 @@ fn smoke_pivot_unpivot() {
     use turbogp::engine::{QueryResult, ResultColumn};
     let r = {
         let mut r = QueryResult::empty();
-        r.push_column(ResultColumn { name: "dept".into(), values: vec![1, 1, 2], string_values: None, type_oid: 0, null_mask: None }).unwrap();
-        r.push_column(ResultColumn { name: "qtr".into(), values: vec![1, 2, 1], string_values: None, type_oid: 0, null_mask: None }).unwrap();
-        r.push_column(ResultColumn { name: "amt".into(), values: vec![100, 200, 150], string_values: None, type_oid: 0, null_mask: None }).unwrap();
+        r.push_column(ResultColumn {
+            name: "dept".into(),
+            values: vec![1, 1, 2],
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        })
+        .unwrap();
+        r.push_column(ResultColumn {
+            name: "qtr".into(),
+            values: vec![1, 2, 1],
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        })
+        .unwrap();
+        r.push_column(ResultColumn {
+            name: "amt".into(),
+            values: vec![100, 200, 150],
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        })
+        .unwrap();
         r
     };
     let p = pivot::pivot(&r, "dept", "qtr", "amt", &["1".into(), "2".into()], "SUM");
@@ -266,8 +300,10 @@ fn smoke_procedures_and_session() {
     assert_eq!(ctx.get("DEPT"), Some("Engineering"));
 
     let proc = turbogp::exec::procedure::parse_create_procedure(
-        "CREATE PROCEDURE get_count AS SELECT count(*) FROM users"
-    ).unwrap().unwrap();
+        "CREATE PROCEDURE get_count AS SELECT count(*) FROM users",
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(proc.name, "get_count");
     assert!(!proc.is_function);
 }
@@ -289,7 +325,8 @@ fn smoke_durability_wal() {
         is_commit: false,
         is_rollback: false,
         physical_change: None,
-    }).unwrap();
+    })
+    .unwrap();
     wal.sync().unwrap();
 
     let records = wal.read_all().unwrap();

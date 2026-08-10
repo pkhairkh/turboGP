@@ -81,10 +81,8 @@ fn json_path_exists_check() {
 #[test]
 fn openjson_array_to_rows() {
     let j = r#"[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]"#;
-    let rows = openjson_with_schema(
-        j,
-        &[("id".into(), "$.id".into()), ("name".into(), "$.name".into())],
-    );
+    let rows =
+        openjson_with_schema(j, &[("id".into(), "$.id".into()), ("name".into(), "$.name".into())]);
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0], "1");
     assert_eq!(rows[0][1], "Alice");

@@ -4,16 +4,14 @@ use turbogp::engine::QueryEngine;
 
 fn make_engine() -> QueryEngine {
     let mut e = QueryEngine::new();
-    e.execute("CREATE TABLE users (id INT, name VARCHAR(50), active BIT)")
-        .unwrap();
+    e.execute("CREATE TABLE users (id INT, name VARCHAR(50), active BIT)").unwrap();
     e
 }
 
 #[test]
 fn insert_single_row() {
     let mut e = make_engine();
-    e.execute("INSERT INTO users (id, name, active) VALUES (1, 'Alice', 1)")
-        .unwrap();
+    e.execute("INSERT INTO users (id, name, active) VALUES (1, 'Alice', 1)").unwrap();
     let r = e.execute("SELECT count(*) FROM users").unwrap();
     assert_eq!(r.scalar_u64(), Some(1));
 }
@@ -38,8 +36,7 @@ fn insert_without_column_list() {
 #[test]
 fn insert_null() {
     let mut e = make_engine();
-    e.execute("INSERT INTO users (id, name, active) VALUES (1, NULL, 0)")
-        .unwrap();
+    e.execute("INSERT INTO users (id, name, active) VALUES (1, NULL, 0)").unwrap();
     let r = e.execute("SELECT count(*) FROM users").unwrap();
     assert_eq!(r.scalar_u64(), Some(1));
 }

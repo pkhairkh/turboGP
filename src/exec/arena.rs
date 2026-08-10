@@ -25,11 +25,7 @@ impl JoinArena {
     /// The buffer is allocated once; growth is rare (2x when needed).
     pub fn new(ncol: usize, est_rows: usize) -> Self {
         let cap = ncol * est_rows.max(64);
-        JoinArena {
-            buf: vec![0u64; cap],
-            ncol,
-            pos: 0,
-        }
+        JoinArena { buf: vec![0u64; cap], ncol, pos: 0 }
     }
 
     /// Reserve space for one row. Returns a mutable slice of length `ncol`

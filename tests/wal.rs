@@ -196,8 +196,7 @@ fn wal_does_not_append_failed_dml() {
     let wal = Wal::open(tmp.path()).unwrap();
     let records = wal.read_all().unwrap();
     let has_failed = records.iter().any(|r| r.sql.contains("nonexistent"));
-    assert!(!has_failed,
-        "WAL must not contain failed INSERT, but found: {records:?}");
+    assert!(!has_failed, "WAL must not contain failed INSERT, but found: {records:?}");
 }
 
 #[test]
@@ -212,8 +211,7 @@ fn wal_does_not_append_failed_ddl() {
 
     let wal = Wal::open(tmp.path()).unwrap();
     let records = wal.read_all().unwrap();
-    assert!(records.is_empty(),
-        "WAL must be empty after failed DDL, got: {records:?}");
+    assert!(records.is_empty(), "WAL must be empty after failed DDL, got: {records:?}");
 }
 
 // -----------------------------------------------------------------------
@@ -260,8 +258,10 @@ fn wal_sql_with_backslash_n_round_trips() {
 
     let records = wal.read_all().unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].sql, sql,
-        "literal backslash-n must round-trip unchanged (was ambiguous before Wave 51)");
+    assert_eq!(
+        records[0].sql, sql,
+        "literal backslash-n must round-trip unchanged (was ambiguous before Wave 51)"
+    );
 }
 
 #[test]

@@ -45,7 +45,9 @@ fn case_when_in_where() {
     let mut e = make_engine();
     // WHERE CASE WHEN salary > 200 THEN 1 ELSE 0 END = 1
     // Matches rows where salary > 200: rows 3, 5, 6 → 3 rows.
-    let r = e.execute("SELECT count(*) FROM t WHERE CASE WHEN salary > 200 THEN 1 ELSE 0 END = 1").unwrap();
+    let r = e
+        .execute("SELECT count(*) FROM t WHERE CASE WHEN salary > 200 THEN 1 ELSE 0 END = 1")
+        .unwrap();
     assert_eq!(r.scalar_u64(), Some(3), "CASE WHEN in WHERE must match 3 rows (salary > 200)");
 }
 
@@ -54,7 +56,9 @@ fn case_when_with_multiple_when_clauses() {
     let mut e = make_engine();
     // CASE WHEN salary > 300 THEN 3 WHEN salary > 200 THEN 2 ELSE 1 END
     // Rows: 1(100→1), 2(200→1), 3(300→1, not > 300, not > 200), 4(150→1), 5(250→2), 6(350→3)
-    let r = e.execute("SELECT CASE WHEN salary > 300 THEN 3 WHEN salary > 200 THEN 2 ELSE 1 END FROM t").unwrap();
+    let r = e
+        .execute("SELECT CASE WHEN salary > 300 THEN 3 WHEN salary > 200 THEN 2 ELSE 1 END FROM t")
+        .unwrap();
     assert_eq!(r.row_count, 6);
     let col = &r.columns[0];
     assert_eq!(col.values[0], 1, "salary=100 → 1");
@@ -125,8 +129,13 @@ fn union_all_with_table_data() {
     let mut e = make_engine();
     // SELECT id FROM t WHERE dept = 1 UNION ALL SELECT id FROM t WHERE dept = 3
     // Dept 1: ids 1, 2, 3. Dept 3: id 6. Total: 4 rows.
-    let r = e.execute("SELECT id FROM t WHERE dept = 1 UNION ALL SELECT id FROM t WHERE dept = 3").unwrap();
-    assert_eq!(r.row_count, 4, "UNION ALL must concatenate 3 rows from dept=1 and 1 row from dept=3");
+    let r = e
+        .execute("SELECT id FROM t WHERE dept = 1 UNION ALL SELECT id FROM t WHERE dept = 3")
+        .unwrap();
+    assert_eq!(
+        r.row_count, 4,
+        "UNION ALL must concatenate 3 rows from dept=1 and 1 row from dept=3"
+    );
     let id_col = &r.columns[0];
     // Should contain ids 1, 2, 3 (from dept=1) and 6 (from dept=3).
     assert!(id_col.values.contains(&1), "must contain id=1");

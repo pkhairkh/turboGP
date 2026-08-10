@@ -11,8 +11,14 @@ use turbogp::exec::window::*;
 fn make_result(names: &[&str], cols: &[Vec<u64>]) -> QueryResult {
     let mut r = QueryResult::empty();
     for (i, name) in names.iter().enumerate() {
-        r.push_column(ResultColumn { name: name.to_string(), values: cols[i].clone(), string_values: None, type_oid: 0, null_mask: None })
-            .unwrap();
+        r.push_column(ResultColumn {
+            name: name.to_string(),
+            values: cols[i].clone(),
+            string_values: None,
+            type_oid: 0,
+            null_mask: None,
+        })
+        .unwrap();
     }
     r
 }
@@ -60,10 +66,7 @@ fn dense_rank_no_gaps() {
 #[test]
 fn running_total_per_partition() {
     // Dept 1: salaries 100, 200, 300. Dept 2: 50, 150.
-    let r = make_result(
-        &["dept", "salary"],
-        &[vec![1, 1, 1, 2, 2], vec![100, 200, 300, 50, 150]],
-    );
+    let r = make_result(&["dept", "salary"], &[vec![1, 1, 1, 2, 2], vec![100, 200, 300, 50, 150]]);
     let spec = empty_spec(&["dept"], &[("salary", true)]);
     let rt = sum_over(&r, "salary", &spec);
     // Dept 1 sorted ASC: 100→100, 200→300, 300→600.
@@ -97,10 +100,7 @@ fn lead_next_value() {
 
 #[test]
 fn first_value_in_partition() {
-    let r = make_result(
-        &["dept", "v"],
-        &[vec![1, 1, 2, 2], vec![30, 10, 50, 20]],
-    );
+    let r = make_result(&["dept", "v"], &[vec![1, 1, 2, 2], vec![30, 10, 50, 20]]);
     let spec = empty_spec(&["dept"], &[("v", true)]);
     let fv = first_value(&r, "v", &spec);
     // Dept 1 sorted ASC: first = 10. Dept 2 sorted ASC: first = 20.
@@ -114,10 +114,7 @@ fn parse_complex_window_spec() {
     )
     .unwrap();
     assert_eq!(spec.partition_by, vec!["dept", "team"]);
-    assert_eq!(
-        spec.order_by,
-        vec![("salary".into(), false), ("hire_date".into(), true)]
-    );
+    assert_eq!(spec.order_by, vec![("salary".into(), false), ("hire_date".into(), true)]);
     assert_eq!(spec.frame_type, Some("ROWS".into()));
     assert_eq!(spec.frame_start, Some("2 PRECEDING".into()));
     assert_eq!(spec.frame_end, Some("CURRENT ROW".into()));

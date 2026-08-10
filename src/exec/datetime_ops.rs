@@ -8,9 +8,23 @@ use crate::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DateTimeField {
-    Year, Month, Day, Hour, Minute, Second,
-    Millisecond, Microsecond, Dow, Isodow, Doy, Week,
-    Quarter, Epoch, Decade, Century, Millennium,
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Millisecond,
+    Microsecond,
+    Dow,
+    Isodow,
+    Doy,
+    Week,
+    Quarter,
+    Epoch,
+    Decade,
+    Century,
+    Millennium,
 }
 
 pub fn extract_from_date(d: Date, field: DateTimeField) -> i64 {
@@ -25,8 +39,20 @@ pub fn extract_from_date(d: Date, field: DateTimeField) -> i64 {
         DateTimeField::Quarter => d.quarter() as i64,
         DateTimeField::Epoch => d.epoch_seconds(),
         DateTimeField::Decade => (y / 10) as i64,
-        DateTimeField::Century => if y > 0 { ((y - 1) / 100 + 1) as i64 } else { (y / 100) as i64 },
-        DateTimeField::Millennium => if y > 0 { ((y - 1) / 1000 + 1) as i64 } else { (y / 1000) as i64 },
+        DateTimeField::Century => {
+            if y > 0 {
+                ((y - 1) / 100 + 1) as i64
+            } else {
+                (y / 100) as i64
+            }
+        }
+        DateTimeField::Millennium => {
+            if y > 0 {
+                ((y - 1) / 1000 + 1) as i64
+            } else {
+                (y / 1000) as i64
+            }
+        }
         _ => 0,
     }
 }
@@ -34,10 +60,17 @@ pub fn extract_from_date(d: Date, field: DateTimeField) -> i64 {
 pub fn extract_from_timestamp(ts: Timestamp, field: DateTimeField) -> i64 {
     let (d, t) = ts.to_date_time();
     match field {
-        DateTimeField::Year | DateTimeField::Month | DateTimeField::Day
-        | DateTimeField::Dow | DateTimeField::Isodow | DateTimeField::Doy
-        | DateTimeField::Week | DateTimeField::Quarter | DateTimeField::Decade
-        | DateTimeField::Century | DateTimeField::Millennium => extract_from_date(d, field),
+        DateTimeField::Year
+        | DateTimeField::Month
+        | DateTimeField::Day
+        | DateTimeField::Dow
+        | DateTimeField::Isodow
+        | DateTimeField::Doy
+        | DateTimeField::Week
+        | DateTimeField::Quarter
+        | DateTimeField::Decade
+        | DateTimeField::Century
+        | DateTimeField::Millennium => extract_from_date(d, field),
         DateTimeField::Hour => (t.0 / 3_600_000_000) as i64,
         DateTimeField::Minute => ((t.0 / 60_000_000) % 60) as i64,
         DateTimeField::Second => ((t.0 / 1_000_000) % 60) as i64,
@@ -121,7 +154,10 @@ mod tests {
 
     #[test]
     fn extract_quarter() {
-        assert_eq!(extract_from_date(Date::from_ymd(2024, 7, 15).unwrap(), DateTimeField::Quarter), 3);
+        assert_eq!(
+            extract_from_date(Date::from_ymd(2024, 7, 15).unwrap(), DateTimeField::Quarter),
+            3
+        );
     }
 
     #[test]

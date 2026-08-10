@@ -20,10 +20,7 @@ pub fn eval_expr(expr: &str, table: &Table, row_idx: usize) -> u64 {
         return eval_token(tokens[0], table, row_idx);
     }
     // Use a recursive descent parser for the expression.
-    let mut parser = ExprParser {
-        tokens: &tokens,
-        pos: 0,
-    };
+    let mut parser = ExprParser { tokens: &tokens, pos: 0 };
     let result = parser.parse_expr(table, row_idx);
     result
 }
@@ -55,9 +52,8 @@ pub fn is_simple_column(expr: &str) -> bool {
 
 /// Check if an expression contains arithmetic operators.
 pub fn is_arithmetic_expr(expr: &str) -> bool {
-    expr.split_whitespace().any(|t| {
-        t == "+" || t == "-" || t == "*" || t == "/" || t == "(" || t == ")"
-    })
+    expr.split_whitespace()
+        .any(|t| t == "+" || t == "-" || t == "*" || t == "/" || t == "(" || t == ")")
 }
 
 /// A typed value: either an integer or a float (stored as bits).
@@ -110,7 +106,8 @@ fn eval_token_typed(token: &str, table: &Table, row_idx: usize) -> TypedVal {
         // Heuristic: if the value looks like an f64 bit pattern (> 2^60 and not a
         // small negative i64), treat as float. This is a fallback for loaded tables
         // that don't have a schema.
-        if val > (1u64 << 62) && f64::from_bits(val).is_finite() && f64::from_bits(val).abs() < 1e15 {
+        if val > (1u64 << 62) && f64::from_bits(val).is_finite() && f64::from_bits(val).abs() < 1e15
+        {
             return TypedVal::Float(val);
         }
         TypedVal::Int(val)
@@ -130,7 +127,13 @@ fn eval_binop_typed(op: &str, left: TypedVal, right: TypedVal) -> TypedVal {
             "+" => l + r,
             "-" => l - r,
             "*" => l * r,
-            "/" => if r == 0.0 { 0.0 } else { l / r },
+            "/" => {
+                if r == 0.0 {
+                    0.0
+                } else {
+                    l / r
+                }
+            }
             _ => 0.0,
         };
         TypedVal::Float(result.to_bits())
@@ -142,7 +145,13 @@ fn eval_binop_typed(op: &str, left: TypedVal, right: TypedVal) -> TypedVal {
             "+" => l.wrapping_add(r),
             "-" => l.wrapping_sub(r),
             "*" => l.wrapping_mul(r),
-            "/" => if r == 0 { 0 } else { l / r },
+            "/" => {
+                if r == 0 {
+                    0
+                } else {
+                    l / r
+                }
+            }
             _ => 0,
         };
         TypedVal::Int(result)
@@ -226,8 +235,20 @@ mod tests {
         Table::from_loaded(LoadedTable {
             name: "t".into(),
             columns: vec![
-                LoadedColumn { name: "price".into(), cells: vec![100, 200, 300], row_count: 3, string_search: None, null_bitmap: None },
-                LoadedColumn { name: "discount".into(), cells: vec![10, 20, 30], row_count: 3, string_search: None, null_bitmap: None },
+                LoadedColumn {
+                    name: "price".into(),
+                    cells: vec![100, 200, 300],
+                    row_count: 3,
+                    string_search: None,
+                    null_bitmap: None,
+                },
+                LoadedColumn {
+                    name: "discount".into(),
+                    cells: vec![10, 20, 30],
+                    row_count: 3,
+                    string_search: None,
+                    null_bitmap: None,
+                },
             ],
             row_count: 3,
         })

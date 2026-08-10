@@ -28,7 +28,9 @@ fn parse_row_number_over() {
     // ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC)
     // The parser must accept the OVER clause and the engine must execute it.
     let mut e = make_engine();
-    let r = e.execute("SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) FROM scores").unwrap();
+    let r = e
+        .execute("SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) FROM scores")
+        .unwrap();
     // The query returns 5 rows (one per input row), with a row_number column appended.
     assert_eq!(r.row_count, 5, "ROW_NUMBER must return one row per input row");
     // The window function column is the last column.
@@ -87,7 +89,9 @@ fn window_function_with_string_partition() {
     e.execute("INSERT INTO emp (name, dept, salary) VALUES ('Alice', 'Eng', 100)").unwrap();
     e.execute("INSERT INTO emp (name, dept, salary) VALUES ('Bob', 'Eng', 200)").unwrap();
     e.execute("INSERT INTO emp (name, dept, salary) VALUES ('Carol', 'Sales', 150)").unwrap();
-    let r = e.execute("SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) FROM emp").unwrap();
+    let r = e
+        .execute("SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) FROM emp")
+        .unwrap();
     assert_eq!(r.row_count, 3, "window query must return 3 rows");
     let rn_col = r.columns.last().expect("row_number column");
     assert!(rn_col.values.contains(&1), "row_number must contain 1 (first in each partition)");

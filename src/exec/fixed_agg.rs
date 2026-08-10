@@ -45,10 +45,10 @@ pub struct FixedAccumulator {
     /// Per-slot sum accumulators (f64::to_bits stored as u64).
     /// Layout: [sum0_slot0, sum0_slot1, ..., sum0_slot255, sum1_slot0, ...]
     /// This SoA layout enables SIMD accumulation across slots.
-    pub sums: Vec<f64>,    // num_aggs × MAX_FIXED_GROUPS
-    pub counts: Vec<u64>,  // MAX_FIXED_GROUPS
-    pub mins: Vec<f64>,    // num_aggs × MAX_FIXED_GROUPS
-    pub maxs: Vec<f64>,    // num_aggs × MAX_FIXED_GROUPS
+    pub sums: Vec<f64>, // num_aggs × MAX_FIXED_GROUPS
+    pub counts: Vec<u64>,     // MAX_FIXED_GROUPS
+    pub mins: Vec<f64>,       // num_aggs × MAX_FIXED_GROUPS
+    pub maxs: Vec<f64>,       // num_aggs × MAX_FIXED_GROUPS
     pub group_keys: Vec<u64>, // MAX_FIXED_GROUPS (the actual key per slot)
     pub num_aggs: usize,
     pub num_active: usize,
@@ -76,7 +76,9 @@ impl FixedAccumulator {
         loop {
             match self.slots[slot] {
                 Some(k) if k == key => return slot,
-                Some(_) => { slot = (slot + 1) & (MAX_FIXED_GROUPS - 1); }
+                Some(_) => {
+                    slot = (slot + 1) & (MAX_FIXED_GROUPS - 1);
+                }
                 None => {
                     self.slots[slot] = Some(key);
                     self.group_keys[slot] = key;
@@ -103,14 +105,18 @@ impl FixedAccumulator {
     #[inline]
     pub fn update_min(&mut self, agg_idx: usize, slot: usize, value: f64) {
         let idx = agg_idx * MAX_FIXED_GROUPS + slot;
-        if value < self.mins[idx] { self.mins[idx] = value; }
+        if value < self.mins[idx] {
+            self.mins[idx] = value;
+        }
     }
 
     /// Update max for a given slot/agg.
     #[inline]
     pub fn update_max(&mut self, agg_idx: usize, slot: usize, value: f64) {
         let idx = agg_idx * MAX_FIXED_GROUPS + slot;
-        if value > self.maxs[idx] { self.maxs[idx] = value; }
+        if value > self.maxs[idx] {
+            self.maxs[idx] = value;
+        }
     }
 
     /// Finalize: emit (group_key, sum_values, count, min_values, max_values)
@@ -120,15 +126,12 @@ impl FixedAccumulator {
         for slot in 0..MAX_FIXED_GROUPS {
             if self.slots[slot].is_some() {
                 let key = self.group_keys[slot];
-                let sums: Vec<f64> = (0..self.num_aggs)
-                    .map(|a| self.sums[a * MAX_FIXED_GROUPS + slot])
-                    .collect();
-                let mins: Vec<f64> = (0..self.num_aggs)
-                    .map(|a| self.mins[a * MAX_FIXED_GROUPS + slot])
-                    .collect();
-                let maxs: Vec<f64> = (0..self.num_aggs)
-                    .map(|a| self.maxs[a * MAX_FIXED_GROUPS + slot])
-                    .collect();
+                let sums: Vec<f64> =
+                    (0..self.num_aggs).map(|a| self.sums[a * MAX_FIXED_GROUPS + slot]).collect();
+                let mins: Vec<f64> =
+                    (0..self.num_aggs).map(|a| self.mins[a * MAX_FIXED_GROUPS + slot]).collect();
+                let maxs: Vec<f64> =
+                    (0..self.num_aggs).map(|a| self.maxs[a * MAX_FIXED_GROUPS + slot]).collect();
                 let count = self.counts[slot];
                 result.push((key, sums, count, mins, maxs));
             }
