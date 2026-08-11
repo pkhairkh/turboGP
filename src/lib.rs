@@ -8,6 +8,9 @@
 //!
 //! ## Modules
 //!
+//! - [`admin`] — Wave 9 operational tooling: `turboGP admin` CLI with
+//!   `backup`, `restore`, `cluster-status`, `vacuum`, and `checkpoint`
+//!   subcommands.
 //! - [`kernel`] — the kernel table: hand-tuned instruction sequences per
 //!   (CPU, tier) tuple. The engine's competitive moat.
 //! - [`memory`] — tier-aware memory manager. Placement, migration, NUMA.
@@ -59,6 +62,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod admin;
 pub mod catalog;
 pub mod datasource;
 pub mod engine;
