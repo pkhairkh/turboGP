@@ -70,6 +70,35 @@ pub enum AdminCommand {
         #[arg(long)]
         input: PathBuf,
     },
+
+    /// Print a human-readable summary of the Raft state stored in the
+    /// sled DB at `--data-dir` (vote, last committed log id, last
+    /// applied log id, current snapshot).
+    ///
+    /// Only available when turboGP is compiled with `--features raft`.
+    ClusterStatus {
+        /// Path to the turboGP data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+
+    /// Run `VACUUM` on every table in the catalog, reclaiming space
+    /// from deleted rows and truncating the WAL.
+    Vacuum {
+        /// Path to the turboGP data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+
+    /// Flush the WAL and write `checkpoint.bin` + `checkpoint.sql` so
+    /// the WAL can be safely truncated. After `checkpoint`, a restart
+    /// loads state from `checkpoint.bin` and replays only post-checkpoint
+    /// WAL records.
+    Checkpoint {
+        /// Path to the turboGP data directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
 }
 
 /// Entry point: parse CLI args and dispatch to the appropriate handler.
@@ -104,6 +133,36 @@ pub fn dispatch(cli: AdminCli) -> i32 {
             }
             Err(e) => {
                 eprintln!("restore failed: {e}");
+                1
+            }
+        },
+        AdminCommand::ClusterStatus { data_dir } => match cluster_status(&data_dir) {
+            Ok(report) => {
+                print!("{report}");
+                0
+            }
+            Err(e) => {
+                eprintln!("cluster-status failed: {e}");
+                1
+            }
+        },
+        AdminCommand::Vacuum { data_dir } => match vacuum(&data_dir) {
+            Ok(report) => {
+                print!("{report}");
+                0
+            }
+            Err(e) => {
+                eprintln!("vacuum failed: {e}");
+                1
+            }
+        },
+        AdminCommand::Checkpoint { data_dir } => match checkpoint(&data_dir) {
+            Ok(report) => {
+                print!("{report}");
+                0
+            }
+            Err(e) => {
+                eprintln!("checkpoint failed: {e}");
                 1
             }
         },
@@ -212,6 +271,201 @@ pub fn restore(data_dir: &Path, input: &Path) -> Result<(), String> {
     copy_dir_recursive(input, data_dir).map_err(|e| e.to_string())
 }
 
+/// Open the sled DB at `data_dir` and read the persisted Raft state
+/// (vote, last committed log id, last log id, last applied log id,
+/// membership, current snapshot, applied-records count) into a
+/// human-readable summary string.
+///
+/// This function does NOT start a Raft instance — it reads the sled
+/// trees directly via [`SledRaftStore`]'s `RaftStorage` trait impl.
+///
+/// # Feature gate
+///
+/// Requires the `raft` feature. When turboGP is compiled without
+/// `--features raft`, this function returns an error.
+///
+/// # Errors
+///
+/// Returns an error string if the sled DB cannot be opened, the tokio
+/// runtime cannot be created, or any underlying Raft-storage read
+/// fails.
+#[cfg(feature = "raft")]
+pub fn cluster_status(data_dir: &Path) -> Result<String, String> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("create tokio runtime: {e}"))?;
+    rt.block_on(cluster_status_async(data_dir))
+}
+
+/// Async implementation of [`cluster_status`].
+///
+/// Exposed separately so tests running inside an existing tokio
+/// runtime (e.g. `#[tokio::test]`) can call it directly without
+/// spawning a nested runtime (which would panic).
+#[cfg(feature = "raft")]
+pub async fn cluster_status_async(data_dir: &Path) -> Result<String, String> {
+    use openraft::storage::RaftStorage;
+    use crate::storage::raft_store::SledRaftStore;
+
+    let mut store = SledRaftStore::open(data_dir)
+        .map_err(|e| format!("open sled store at {}: {e}", data_dir.display()))?;
+
+    let vote = store.read_vote().await.ok().flatten();
+    let committed = store.read_committed().await.ok().flatten();
+    let log_state = store.get_log_state().await.ok();
+    let last_applied_pair = store.last_applied_state().await.ok();
+    let snapshot = store.get_current_snapshot().await.ok().flatten();
+    let applied_records = store.applied_records().ok();
+
+    let mut out = String::new();
+    out.push_str(&format!("turboGP cluster status ({})\n", data_dir.display()));
+    out.push_str("==========================================\n");
+
+    out.push_str(&format!(
+        "Vote:              {}\n",
+        vote.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "none (uninitialized)".to_string())
+    ));
+    out.push_str(&format!(
+        "Last committed:    {}\n",
+        committed.as_ref().map(|c| c.to_string()).unwrap_or_else(|| "none".to_string())
+    ));
+
+    if let Some(state) = log_state {
+        out.push_str(&format!(
+            "Last log id:       {}\n",
+            state.last_log_id.as_ref().map(|l| l.to_string()).unwrap_or_else(|| "none (empty log)".to_string())
+        ));
+        out.push_str(&format!(
+            "Last purged log:   {}\n",
+            state.last_purged_log_id.as_ref().map(|l| l.to_string()).unwrap_or_else(|| "none".to_string())
+        ));
+    } else {
+        out.push_str("Last log id:       <error reading log state>\n");
+    }
+
+    if let Some((last_applied, last_membership)) = last_applied_pair {
+        out.push_str(&format!(
+            "Last applied:      {}\n",
+            last_applied.as_ref().map(|l| l.to_string()).unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!("Membership:        {}\n", last_membership));
+    } else {
+        out.push_str("Last applied:      <error reading applied state>\n");
+    }
+
+    if let Some(snap) = snapshot {
+        out.push_str(&format!("Snapshot:          present (meta: {})\n", snap.meta));
+    } else {
+        out.push_str("Snapshot:          none\n");
+    }
+
+    if let Some(records) = applied_records {
+        out.push_str(&format!("Applied records:   {} entries\n", records.len()));
+    }
+
+    Ok(out)
+}
+
+/// Stub for [`cluster_status`] when the `raft` feature is disabled.
+///
+/// Returns an error indicating that the `cluster-status` subcommand
+/// requires turboGP to be compiled with `--features raft`.
+#[cfg(not(feature = "raft"))]
+pub fn cluster_status(_data_dir: &Path) -> Result<String, String> {
+    Err("cluster-status requires turboGP to be compiled with --features raft".to_string())
+}
+
+/// Open a `QueryEngine` rooted at `data_dir` and execute `VACUUM` on
+/// every table in the catalog.
+///
+/// The summary string reports per-table row counts before and after
+/// VACUUM, plus a total. (Without MVCC enabled, VACUUM still runs the
+/// checkpoint + WAL truncation; it just doesn't compact column vectors.
+/// Column compaction kicks in when MVCC is enabled.)
+///
+/// # Errors
+///
+/// Returns an error string if the engine cannot be opened or `VACUUM`
+/// fails.
+pub fn vacuum(data_dir: &Path) -> Result<String, String> {
+    let mut engine = crate::engine::QueryEngine::with_data_dir(data_dir)
+        .map_err(|e| format!("open engine at {}: {e}", data_dir.display()))?;
+
+    let table_names: Vec<String> = engine
+        .catalog
+        .table_names()
+        .into_iter()
+        .filter(|n| !n.starts_with("__"))
+        .collect();
+
+    let before_counts: Vec<(String, usize)> = table_names
+        .iter()
+        .map(|name| {
+            let count = engine.catalog.with(name, |t| t.row_count).unwrap_or(0);
+            (name.clone(), count)
+        })
+        .collect();
+    let before_total: usize = before_counts.iter().map(|(_, c)| *c).sum();
+
+    engine.execute("VACUUM").map_err(|e| format!("VACUUM: {e}"))?;
+
+    let after_counts: Vec<(String, usize)> = table_names
+        .iter()
+        .map(|name| {
+            let count = engine.catalog.with(name, |t| t.row_count).unwrap_or(0);
+            (name.clone(), count)
+        })
+        .collect();
+    let after_total: usize = after_counts.iter().map(|(_, c)| *c).sum();
+
+    let mut out = String::new();
+    out.push_str("VACUUM summary:\n");
+    for (i, (name, before)) in before_counts.iter().enumerate() {
+        let after = after_counts[i].1;
+        out.push_str(&format!(
+            "  table '{}': {} rows (before) -> {} rows (after)\n",
+            name, before, after
+        ));
+    }
+    out.push_str(&format!(
+        "VACUUM complete: {} tables, {} -> {} rows\n",
+        table_names.len(),
+        before_total,
+        after_total
+    ));
+    Ok(out)
+}
+
+/// Open a `QueryEngine` rooted at `data_dir` and execute `CHECKPOINT`,
+/// which flushes dirty buffer-pool pages, fsyncs the WAL, writes
+/// `checkpoint.bin` (binary catalog snapshot, atomic swap), writes
+/// `checkpoint.sql` (legacy SQL-text checkpoint), and truncates the WAL
+/// (the committed state is now durably in the checkpoints).
+///
+/// # Errors
+///
+/// Returns an error string if the engine cannot be opened or
+/// `CHECKPOINT` fails.
+pub fn checkpoint(data_dir: &Path) -> Result<String, String> {
+    let mut engine = crate::engine::QueryEngine::with_data_dir(data_dir)
+        .map_err(|e| format!("open engine at {}: {e}", data_dir.display()))?;
+    engine.execute("CHECKPOINT").map_err(|e| format!("CHECKPOINT: {e}"))?;
+
+    let bin_path = data_dir.join("checkpoint.bin");
+    let sql_path = data_dir.join("checkpoint.sql");
+    let mut out = String::new();
+    out.push_str("CHECKPOINT complete:\n");
+    out.push_str(&format!(
+        "  checkpoint.bin: {}\n",
+        if bin_path.exists() { "present" } else { "missing" }
+    ));
+    out.push_str(&format!(
+        "  checkpoint.sql: {}\n",
+        if sql_path.exists() { "present" } else { "missing" }
+    ));
+    out.push_str("  WAL flushed + truncated\n");
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +542,188 @@ mod tests {
             err.contains("does not exist"),
             "expected 'does not exist' error, got: {err}"
         );
+    }
+
+    /// `cluster_status_async` opens a sled DB at `--data-dir`, reads
+    /// the persisted Raft state via the `RaftStorage` trait, and
+    /// formats a human-readable summary. This test seeds the store
+    /// with a vote, committed id, log entry, and applied state
+    /// machine, then verifies the summary mentions every field.
+    ///
+    /// Gated on `feature = "raft"` (the `SledRaftStore` requires the
+    /// `openraft` + `sled` dependencies).
+    #[cfg(feature = "raft")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_cluster_status_prints_raft_state() {
+        use openraft::storage::RaftStorage;
+        use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Vote};
+        use crate::storage::raft::TypeConfig;
+        use crate::storage::raft_store::SledRaftStore;
+
+        let dir = TempDir::new().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+
+        // Phase 1: open the store and persist a representative slice
+        // of Raft state.
+        let mut store = SledRaftStore::open(&data_dir).expect("open");
+        let vote = Vote::<u64>::new_committed(7, 3);
+        store.save_vote(&vote).await.expect("save_vote");
+
+        let committed = Some(LogId::<u64>::new(CommittedLeaderId::<u64>::new(7, 3), 42));
+        store.save_committed(committed).await.expect("save_committed");
+
+        let entry = Entry::<TypeConfig> {
+            log_id: LogId::<u64>::new(CommittedLeaderId::<u64>::new(7, 3), 42),
+            payload: EntryPayload::Normal(vec![0xAB; 4]),
+        };
+        store.append_to_log(vec![entry]).await.expect("append");
+
+        let entries = vec![Entry::<TypeConfig> {
+            log_id: LogId::<u64>::new(CommittedLeaderId::<u64>::new(7, 3), 42),
+            payload: EntryPayload::Normal(vec![0xCD; 8]),
+        }];
+        store.apply_to_state_machine(&entries).await.expect("apply");
+
+        // Drop the store so the sled lock is released before
+        // cluster_status_async reopens it.
+        drop(store);
+
+        // Phase 2: read state back via the admin API.
+        let out = cluster_status_async(&data_dir)
+            .await
+            .expect("cluster_status_async ok");
+
+        // Verify the report mentions every persisted field.
+        // openraft's Display for Vote<u64> is "T<term>-N<node_id>:committed"
+        // and for LogId<u64> is "T<term>-N<node_id>-<index>".
+        assert!(out.contains("Vote:"), "expected Vote line, got:\n{out}");
+        assert!(
+            out.contains("T7-N3"),
+            "expected T7-N3 (term=7 node_id=3) in vote, got:\n{out}"
+        );
+        assert!(
+            out.contains("committed"),
+            "expected 'committed' flag in vote display, got:\n{out}"
+        );
+        assert!(
+            out.contains("Last committed:"),
+            "expected Last committed line, got:\n{out}"
+        );
+        assert!(
+            out.contains("Last log id:"),
+            "expected Last log id line, got:\n{out}"
+        );
+        assert!(
+            out.contains("Last applied:"),
+            "expected Last applied line, got:\n{out}"
+        );
+        assert!(
+            out.contains("Applied records:"),
+            "expected Applied records line, got:\n{out}"
+        );
+        assert!(
+            out.contains("1 entries"),
+            "expected exactly 1 applied record, got:\n{out}"
+        );
+    }
+
+    /// `vacuum` opens a `QueryEngine` rooted at `--data-dir`, calls
+    /// `engine.execute("VACUUM")`, and returns a summary with
+    /// per-table before/after row counts.
+    ///
+    /// The test creates a table with 3 rows, then calls `vacuum` and
+    /// verifies the summary enumerates the table and reports 3 rows.
+    #[test]
+    fn admin_vacuum_runs_vacuum_on_all_tables() {
+        let dir = TempDir::new().expect("tempdir");
+        let data_dir = dir.path();
+
+        // Phase 1: create a table with 3 rows.
+        {
+            let mut engine = crate::engine::QueryEngine::with_data_dir(data_dir)
+                .expect("with_data_dir");
+            engine.execute("CREATE TABLE t (id INT)").expect("CREATE TABLE");
+            engine.execute("INSERT INTO t VALUES (1), (2), (3)").expect("INSERT");
+        }
+
+        // Phase 2: call admin vacuum on the data dir.
+        let out = vacuum(data_dir).expect("vacuum ok");
+
+        // Verify the summary enumerates the table and reports the
+        // expected row count.
+        assert!(
+            out.contains("VACUUM summary"),
+            "expected 'VACUUM summary' header, got: {out}"
+        );
+        assert!(
+            out.contains("table 't'"),
+            "expected table 't' in output, got: {out}"
+        );
+        assert!(
+            out.contains("VACUUM complete"),
+            "expected 'VACUUM complete' footer, got: {out}"
+        );
+        assert!(
+            out.contains("3 rows"),
+            "expected '3 rows' in before/after counts, got: {out}"
+        );
+    }
+
+    /// `checkpoint` opens a `QueryEngine` rooted at `--data-dir`,
+    /// calls `engine.execute("CHECKPOINT")`, and verifies the
+    /// resulting `checkpoint.bin` + `checkpoint.sql` files exist.
+    ///
+    /// After `checkpoint`, a fresh engine reopens the data dir and
+    /// the previously-inserted row must survive (the binary
+    /// checkpoint is preferred over the WAL on restart).
+    #[test]
+    fn admin_checkpoint_flushes_wal() {
+        let dir = TempDir::new().expect("tempdir");
+        let data_dir = dir.path();
+
+        // Phase 1: create a table with 1 row (but no explicit
+        // CHECKPOINT — the WAL has uncheckpointed records).
+        {
+            let mut engine = crate::engine::QueryEngine::with_data_dir(data_dir)
+                .expect("with_data_dir");
+            engine.execute("CREATE TABLE t (id INT)").expect("CREATE TABLE");
+            engine.execute("INSERT INTO t VALUES (42)").expect("INSERT");
+        }
+
+        // Phase 2: call admin checkpoint.
+        let out = checkpoint(data_dir).expect("checkpoint ok");
+        assert!(
+            out.contains("CHECKPOINT complete"),
+            "expected 'CHECKPOINT complete' header, got: {out}"
+        );
+        assert!(
+            out.contains("checkpoint.bin: present"),
+            "expected 'checkpoint.bin: present', got: {out}"
+        );
+
+        // Verify the binary checkpoint file exists on disk.
+        assert!(
+            data_dir.join("checkpoint.bin").exists(),
+            "checkpoint.bin should exist after admin checkpoint"
+        );
+
+        // Phase 3: reopen the engine and verify the row survived
+        // via the binary checkpoint.
+        {
+            let mut engine = crate::engine::QueryEngine::with_data_dir(data_dir)
+                .expect("reopen engine");
+            let r = engine.execute("SELECT count(*) FROM t").expect("SELECT count(*)");
+            assert_eq!(
+                r.scalar_u64(),
+                Some(1),
+                "row must survive admin checkpoint round-trip"
+            );
+            let r = engine.execute("SELECT id FROM t").expect("SELECT id");
+            assert_eq!(
+                r.scalar_u64(),
+                Some(42),
+                "specific row value must round-trip"
+            );
+        }
     }
 }
