@@ -1674,12 +1674,14 @@ impl QueryEngine {
             return self.execute_merge_stmt(merge, start);
         }
 
-        // Wave 60c: UNION ALL. Detect `UNION ALL` in the SQL, split into
-        // two SELECT statements, execute both, and concatenate the results.
-        if let Some((left_sql, right_sql)) = split_union_all(sql) {
-            let left_result = self.execute_inner(&left_sql, start, txn_id)?;
-            let right_result = self.execute_inner(&right_sql, start, txn_id)?;
-            return Ok(concatenate_results(left_result, right_result, start));
+        // Wave 7 (Task 7.1): UNION / UNION ALL via the formal `SetQuery`
+        // AST. `try_parse_as_set_query` tokenizes the SQL and runs it
+        // through `parse_set`. If it's a top-level set operation, we
+        // dispatch through `execute_set_query`, which walks the tree and
+        // concatenates (or concatenates + dedupes) the leaf SELECTs.
+        // Replaces the previous `split_union_all` string-scan hack.
+        if let Some((set, ext)) = try_parse_as_set_query(sql) {
+            return self.execute_set_query(&set, &ext, start, txn_id);
         }
 
         // Wave 56b: PIVOT clause. Detect `PIVOT (` in the SQL and route to
@@ -1978,12 +1980,9 @@ impl Default for QueryEngine {
 // DML helper functions (Wave 4) — moved to `src/engine/helpers.rs` in
 // Task 8.2-fix to satisfy the 2000-LOC file-size limit.
 //
-// The three impl-QueryEngine methods that used to live here:
-//   - `materialize_views_in_sql`
-//   - `execute_merge_stmt`
-//   - `execute_with_json_value`
-// are now defined in `helpers.rs` and declared `pub(crate)` so this
-// module (and the rest of the crate) can call them via `self.<method>`.
+// The impl-QueryEngine methods (`materialize_views_in_sql`,
+// `execute_merge_stmt`, `execute_with_json_value`, `execute_set_query`,
+// `execute_select_query`) live in `helpers.rs` (declared `pub(crate)`).
 // -----------------------------------------------------------------------
 
 // -----------------------------------------------------------------------

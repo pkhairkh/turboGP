@@ -1238,36 +1238,39 @@ pub(crate) fn contains_json_value_call(sql: &str) -> bool {
 }
 
 // -----------------------------------------------------------------------
-// Wave 60c: UNION ALL wiring.
+// Wave 7 (Task 7.1): Formal UNION / UNION ALL dispatch via `SetQuery`.
+//
+// The previous `split_union_all` string hack has been deleted. UNION and
+// UNION ALL now go through the formal `parse_set` parser, which produces
+// a `SetQuery::Union` / `SetQuery::UnionAll` AST. `execute_set_query`
+// walks that tree and concatenates the results of each leaf SELECT.
 // -----------------------------------------------------------------------
 
-/// Split a SQL string at the first top-level `UNION ALL` keyword
-/// (case-insensitive). Returns (left_sql, right_sql) if found, else None.
+/// Try to parse a SQL string as a top-level set operation
+/// (`UNION` / `UNION ALL`). Returns `Some((set, ext))` if the SQL parses
+/// as a `SetQuery::Union` or `SetQuery::UnionAll`, otherwise `None`.
 ///
-/// "Top-level" means the UNION ALL is not inside parentheses (e.g. not in a
-/// subquery). This is a simple heuristic — it doesn't handle UNION (without
-/// ALL) or INTERSECT/EXCEPT.
-pub(crate) fn split_union_all(sql: &str) -> Option<(String, String)> {
-    let lower = sql.to_lowercase();
-    let mut search_from = 0;
-    loop {
-        let pos = lower[search_from..].find("union all")?;
-        let abs_pos = search_from + pos;
-        // Check that this is a top-level UNION ALL (not inside parens).
-        let before = &sql[..abs_pos];
-        let depth = before.chars().fold(0i32, |acc, c| match c {
-            '(' => acc + 1,
-            ')' => acc - 1,
-            _ => acc,
-        });
-        if depth == 0 {
-            let left = sql[..abs_pos].trim().to_string();
-            let right = sql[abs_pos + "union all".len()..].trim().to_string();
-            if !left.is_empty() && !right.is_empty() {
-                return Some((left, right));
-            }
-        }
-        search_from = abs_pos + "union all".len();
+/// This is used by `execute_inner` to dispatch UNION/UNION ALL via the
+/// formal `SetQuery` AST instead of the previous `split_union_all` string
+/// hack. Plain `SELECT` statements (without a set operation) return `None`
+/// so the caller falls through to the normal SELECT path.
+///
+/// INTERSECT and EXCEPT are valid set operations but are not yet wired
+/// through `execute_set_query`; this function returns `None` for them so
+/// the caller can fall back to the interpreter.
+pub(crate) fn try_parse_as_set_query(
+    sql: &str,
+) -> Option<(crate::sql::parser::SetQuery, crate::sql::extensions::QueryExtensions)> {
+    use crate::sql::extensions::parse_extensions_and_strip;
+    use crate::sql::lexer::tokenize;
+    use crate::sql::parser::{parse_set, SetQuery};
+
+    let tokens = tokenize(sql).ok()?;
+    let (ext, stripped) = parse_extensions_and_strip(tokens).ok()?;
+    let set = parse_set(stripped).ok()?;
+    match &set {
+        SetQuery::Union(_, _) | SetQuery::UnionAll(_, _) => Some((set, ext)),
+        _ => None,
     }
 }
 
@@ -1725,6 +1728,95 @@ impl QueryEngine {
         result.elapsed_us = start.elapsed().as_micros() as u64;
         Ok(result)
     }
+
+    /// Execute a parsed `SetQuery` tree (Wave 7 — formal UNION/UNION ALL
+    /// support, replacing the `split_union_all` string hack).
+    ///
+    /// Recursively walks the tree:
+    /// - `Select(q)` leaf → [`Self::execute_select_query`] (calls
+    ///   `execute_select` directly with the parsed `SelectQuery`).
+    /// - `UnionAll(left, right)` → execute both sides, concatenate via
+    ///   [`concatenate_results`].
+    /// - `Union(left, right)` → execute both sides, concatenate, then
+    ///   deduplicate via [`deduplicate_rows`].
+    /// - `Intersect` / `Except` → `Err` (not yet implemented through
+    ///   this path; the caller should fall back to the interpreter).
+    ///
+    /// The `extensions` (turboGP query extensions like APPROXIMATE, TIER,
+    /// etc.) are passed down to each leaf SELECT so they apply uniformly
+    /// across the set operation.
+    pub(crate) fn execute_set_query(
+        &mut self,
+        set: &crate::sql::parser::SetQuery,
+        extensions: &crate::sql::extensions::QueryExtensions,
+        start: &Instant,
+        txn_id: Option<u64>,
+    ) -> Result<QueryResult> {
+        use crate::sql::parser::SetQuery;
+        let _ = txn_id; // currently unused; reserved for future MVCC propagation.
+        match set {
+            SetQuery::Select(q) => self.execute_select_query(q, extensions, start),
+            SetQuery::UnionAll(left, right) => {
+                let left_result = self.execute_set_query(left, extensions, start, txn_id)?;
+                let right_result = self.execute_set_query(right, extensions, start, txn_id)?;
+                Ok(concatenate_results(left_result, right_result, start))
+            }
+            SetQuery::Union(left, right) => {
+                let left_result = self.execute_set_query(left, extensions, start, txn_id)?;
+                let right_result = self.execute_set_query(right, extensions, start, txn_id)?;
+                let combined = concatenate_results(left_result, right_result, start);
+                Ok(deduplicate_rows(combined))
+            }
+            _ => Err(Error::Other(
+                "INTERSECT/EXCEPT set operations are not yet supported via the formal parser".into(),
+            )),
+        }
+    }
+
+    /// Execute a single parsed `SelectQuery` (the leaf of a `SetQuery` tree).
+    ///
+    /// Mirrors the relevant portion of `execute_inner`'s SELECT path: it
+    /// computes the MVCC visibility filter, calls `execute_select` with
+    /// the parsed query and extensions, and applies window functions and
+    /// DISTINCT post-processing. It does NOT run the indexed-lookup fast
+    /// path or the interpreter fallback (those are the responsibility of
+    /// `execute_inner` for top-level SELECTs; for set-operation leaves
+    /// we go straight to `execute_select`).
+    pub(crate) fn execute_select_query(
+        &mut self,
+        query: &crate::sql::parser::SelectQuery,
+        extensions: &crate::sql::extensions::QueryExtensions,
+        start: &Instant,
+    ) -> Result<QueryResult> {
+        use crate::engine::executor::execute_select;
+        let mvcc_for_select = if self.mvcc_enabled {
+            Some(&self.mvcc_txn_manager)
+        } else {
+            None
+        };
+        let mut result = execute_select(
+            query,
+            extensions,
+            &self.catalog,
+            &self.kernel_table,
+            &self.cost_model,
+            mvcc_for_select,
+        )?;
+        // Apply window functions if any SelectItem::Window is present.
+        if query
+            .select
+            .iter()
+            .any(|s| matches!(s, crate::sql::parser::SelectItem::Window { .. }))
+        {
+            result = apply_window_functions(&result, query);
+        }
+        // Apply DISTINCT deduplication if requested.
+        if query.distinct {
+            result = deduplicate_rows(result);
+        }
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
 }
 
 impl QueryEngine {
@@ -1801,5 +1893,106 @@ impl QueryEngine {
         }
         result.elapsed_us = start.elapsed().as_micros() as u64;
         Ok(result)
+    }
+}
+
+// -----------------------------------------------------------------------
+// Wave 7 (Task 7.1) — formal UNION ALL dispatch tests.
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod wave7_union_tests {
+    use super::*;
+
+    /// `try_parse_as_set_query` recognises `SELECT ... UNION ALL SELECT ...`
+    /// as a `SetQuery::UnionAll` and returns the parsed AST.
+    #[test]
+    fn try_parse_as_set_query_detects_union_all() {
+        let parsed = try_parse_as_set_query("SELECT * FROM t1 UNION ALL SELECT * FROM t2");
+        assert!(parsed.is_some(), "UNION ALL should be detected");
+        let (set, _ext) = parsed.expect("parsed");
+        assert!(
+            matches!(set, crate::sql::parser::SetQuery::UnionAll(_, _)),
+            "expected UnionAll, got {set:?}"
+        );
+    }
+
+    /// `try_parse_as_set_query` recognises `UNION` (without `ALL`) as a
+    /// `SetQuery::Union`.
+    #[test]
+    fn try_parse_as_set_query_detects_union() {
+        let parsed = try_parse_as_set_query("SELECT id FROM t1 UNION SELECT id FROM t2");
+        assert!(parsed.is_some(), "UNION should be detected");
+        let (set, _ext) = parsed.expect("parsed");
+        assert!(
+            matches!(set, crate::sql::parser::SetQuery::Union(_, _)),
+            "expected Union, got {set:?}"
+        );
+    }
+
+    /// A plain `SELECT` (no set operation) returns `None`, so the caller
+    /// falls through to the normal SELECT path.
+    #[test]
+    fn try_parse_as_set_query_returns_none_for_plain_select() {
+        assert!(try_parse_as_set_query("SELECT * FROM t").is_none());
+        assert!(try_parse_as_set_query("SELECT COUNT(*) FROM t WHERE x = 1").is_none());
+    }
+
+    /// A nested UNION ALL (`a UNION ALL b UNION ALL c`) parses as a left-
+    /// associative chain of `UnionAll` nodes.
+    #[test]
+    fn try_parse_as_set_query_handles_nested_union_all() {
+        let parsed = try_parse_as_set_query(
+            "SELECT 1 FROM t1 UNION ALL SELECT 2 FROM t2 UNION ALL SELECT 3 FROM t3",
+        );
+        let (set, _) = parsed.expect("parsed");
+        // The outer UnionAll should have an inner UnionAll on the left.
+        match set {
+            crate::sql::parser::SetQuery::UnionAll(left, _right) => {
+                assert!(
+                    matches!(*left, crate::sql::parser::SetQuery::UnionAll(_, _)),
+                    "expected nested UnionAll on the left, got {left:?}"
+                );
+            }
+            other => panic!("expected outer UnionAll, got {other:?}"),
+        }
+    }
+
+    /// End-to-end: `engine.execute("SELECT * FROM t1 UNION ALL SELECT * FROM t2")`
+    /// returns the concatenated rows via the formal AST path.
+    #[test]
+    fn union_all_uses_formal_ast() {
+        let mut engine = QueryEngine::in_memory();
+        engine.execute("CREATE TABLE t1 (id INT)").unwrap();
+        engine.execute("CREATE TABLE t2 (id INT)").unwrap();
+        engine.execute("INSERT INTO t1 VALUES (1), (2)").unwrap();
+        engine.execute("INSERT INTO t2 VALUES (3), (4)").unwrap();
+
+        let r = engine
+            .execute("SELECT * FROM t1 UNION ALL SELECT * FROM t2")
+            .expect("UNION ALL should execute");
+        assert_eq!(r.row_count, 4, "expected 4 concatenated rows, got {}", r.row_count);
+        // Verify the values are present (order is preserved: t1 rows first).
+        let ids: Vec<u64> = r.columns[0].values.iter().copied().collect();
+        assert!(ids.contains(&1), "ids = {ids:?}");
+        assert!(ids.contains(&2), "ids = {ids:?}");
+        assert!(ids.contains(&3), "ids = {ids:?}");
+        assert!(ids.contains(&4), "ids = {ids:?}");
+    }
+
+    /// End-to-end: `UNION` (without `ALL`) deduplicates.
+    #[test]
+    fn union_uses_formal_ast_dedup() {
+        let mut engine = QueryEngine::in_memory();
+        engine.execute("CREATE TABLE t1 (id INT)").unwrap();
+        engine.execute("CREATE TABLE t2 (id INT)").unwrap();
+        // Both tables have id=1; UNION (not UNION ALL) should dedup.
+        engine.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        engine.execute("INSERT INTO t2 VALUES (1)").unwrap();
+
+        let r = engine
+            .execute("SELECT * FROM t1 UNION SELECT * FROM t2")
+            .expect("UNION should execute");
+        assert_eq!(r.row_count, 1, "UNION should dedup, got {}", r.row_count);
     }
 }
