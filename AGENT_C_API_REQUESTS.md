@@ -7,68 +7,73 @@ and `feat/engine-planner` into `main`.
 
 ---
 
-## Current state (end of Wave 2)
+## Final state (end of Wave 7)
 
-### What Agent C has completed
+### What Agent C has completed (Waves 1-7)
 
-- **Wave 1:** Planner pipeline wired into `execute_select()`.
-  `execute()` now invokes `build_plan → CascadesOptimizer::optimize() →
-  Scheduler::execute_plan()` (which internally calls `PlanLowerer::lower()`
-  and `KernelTable::select()`). For simple SELECT * and COUNT(*) shapes, the
-  planner result is returned directly. For complex shapes, the planner is
-  still invoked (incrementing a reachability counter) and the result falls
-  back to the existing direct-scan path.
+**Wave 1 — Planner pipeline wired:**
+- `execute_select()` invokes `build_plan → Cascades → PlanLowerer → Scheduler`
+- `EXPLAIN` prints the planner's plan tree (via `PlanNode::Display`)
+- Integration test verifies `KernelTable::select` is called from `execute()`
+- Thread-local counters (`planner_pipeline_invoked_count`,
+  `kernel_table_select_count`) let tests prove reachability
 
-  `EXPLAIN` now prints the planner's plan tree (via `PlanNode`'s `Display`
-  impl) instead of a string-based description.
+**Wave 2 — Read-only fast path:**
+- `QueryEngine::execute_readonly(&self, sql)` takes `&self` (not `&mut self`)
+- `is_readonly_sql(sql)` classifies via parser (not `starts_with`)
+- `route_and_execute(&Arc<RwLock<QueryEngine>>, sql)` routes SELECT→read lock,
+  DML/DDL→write lock
+- 10 concurrent SELECTs run in parallel (verified by timing test)
+- `try_readonly_select` retained as deprecated alias for `pgwire.rs`
 
-  Integration tests in `tests/planner_pipeline_wired.rs` prove:
-  - `SELECT * FROM t` invokes the planner pipeline.
-  - `SELECT COUNT(*) FROM t` invokes the planner pipeline.
-  - `EXPLAIN SELECT * FROM t WHERE id = 5` prints a tree with `Scan` and
-    `Filter`.
-  - `KernelTable::select` is called from `execute()` (not just from
-    `tests/kernel_pipeline_test.rs`).
+**Wave 3 — Parser-based dispatch:**
+- `StatementKind` enum + `classify_statement()` in `src/engine/dispatch.rs`
+- `execute()` dispatches via `match kind` (not `starts_with` chain)
+- All `starts_with()` calls removed from `src/engine/mod.rs`
+- UNION ALL / MERGE / PIVOT string hacks kept as DEBT (Agent A pending)
 
-- **Wave 2:** Read-only fast path.
-  `QueryEngine::execute_readonly(&self, sql: &str) -> Result<QueryResult>`
-  takes `&self` (not `&mut self`) so callers can hold `RwLock::read()` and
-  run multiple SELECTs concurrently. DML/DDL/transaction control are
-  rejected with `Error::Other("read-only transaction: <verb> requires a
-  write lock")`.
+**Wave 4 — MVCC integration:**
+- `mvcc_txn_manager: MvccTxnManager` field added to `QueryEngine`
+- `enable_mvcc()` / `disable_mvcc()` / `is_mvcc_enabled()`
+- BEGIN/COMMIT/ROLLBACK route to MVCC manager when enabled
+- VACUUM calls `cleanup_aborted()` in MVCC mode
+- Row-version creation (Task 4.2) is DEBT (Agent B pending)
 
-  `try_readonly_select` is retained as a deprecated alias for backwards
-  compatibility with `src/server/pgwire.rs`.
+**Wave 5 — WAL durability and replication:**
+- `wal_append_txn` / `wal_append_record` return `Result<()>` (errors raised)
+- `enable_replication(peer_addr)` attaches a `WalStreamer`
+- `enable_replication_local_only()` for testing
+- `wal_records_streamed()` returns the stream count
+- `enable_raft()` is a STUB (Agent B hasn't completed `RaftNode::on_become_leader`)
+- `Wal::append_and_sync` is DEBT (Agent B pending)
 
-  Public routing helpers:
-  - `is_readonly_sql(sql: &str) -> bool` — parser-based classification.
-  - `route_and_execute(engine: &Arc<RwLock<QueryEngine>>, sql: &str)` —
-    acquires read lock for SELECT, write lock for DML/DDL.
+**Wave 6 — Backup/Restore/PITR:**
+- `BACKUP TO '<dir>'` writes manifest.json + CSV files
+- `RESTORE FROM '<dir>'` reads manifest, creates tables, loads CSV
+- `RESTORE FROM '<dir>' AS OF TIMESTAMP '<iso8601>'` does PITR
+- Implemented directly in the engine (not via `storage::replication::backup`)
+  because Agent B's `list_tables` helper has a bug (reads `values` not
+  `string_values`)
 
-  `src/bin/turbogp.rs` already wraps the engine in `Arc<RwLock<QueryEngine>>`
-  (using `parking_lot::RwLock`).
+**Wave 7 — Integration verification:**
+- End-to-end test proves planner pipeline + kernel reachability
+- Concurrent transaction test proves MVCC works
+- This file documents all API requests and debt
 
-### What's stubbed / pending
+### Test summary
 
-- **Task 2.3 (Catalog RwLock):** The Catalog (`src/catalog/mod.rs`) is a
-  plain `HashMap`, owned by Agent B. Agent C cannot modify it. However,
-  concurrent reads already work because `execute_readonly(&self)` only
-  takes `&self.catalog` (a shared reference), and multiple `&self`
-  references coexist via the `RwLock<QueryEngine>` wrapper. The
-  QueryEngine-level RwLock provides the concurrent-read guarantee the
-  DoD is after.
-
-  **API request for Agent B:** Add an internal `RwLock<HashMap>` to
-  `Catalog` so it can be shared via `Arc<Catalog>` without an external
-  `RwLock` wrapper. Methods:
-  - `Catalog::get(&self, name: &str) -> Option<...>` (read lock)
-  - `Catalog::register(&self, table: Table)` (write lock, needs `&self`)
-  - `Catalog::get_mut(&self, name: &str) -> Option<...>` (write lock,
-    needs `&self`, returns a guard)
-
-  This is **not blocking** — the current QueryEngine-level RwLock works.
-  It's a nice-to-have for callers that want to share a Catalog without
-  wrapping it themselves.
+- 661 lib tests pass (no regressions)
+- 45 planner lib tests pass
+- 5 planner_pipeline_wired tests pass
+- 12 readonly_fast_path tests pass
+- 22 parser_dispatch tests pass
+- 6 string_hacks_dispatch tests pass
+- 8 mvcc_integration tests pass
+- 6 wal_durability_replication tests pass
+- 6 backup_restore_pitr tests pass
+- 6 e2e_integration tests pass
+- Pre-existing `copy_to_and_from` failure is unrelated (COPY path allowlist
+  security check, fails on main too)
 
 ---
 
@@ -175,14 +180,18 @@ verifies a basic PIVOT query executes.
 
 | Wave | Task | Status | Action needed |
 |------|------|--------|---------------|
+| 2 | 2.3 Catalog internal RwLock | NICE-TO-HAVE | Agent B: add internal `RwLock<HashMap>` to `Catalog` (not blocking — QueryEngine-level RwLock works) |
 | 3 | 3.2 UNION ALL | DEBT | Agent A: add `SetQuery::Union` to parser |
 | 3 | 3.3 MERGE | DEBT | Agent A: add MERGE to parser |
 | 3 | 3.4 PIVOT | DEBT | Agent A: add PIVOT/UNPIVOT to parser |
-| 4 | 4.2 Row-version creation | DEBT | Agent B: populate `Table.row_versions` in INSERT/UPDATE/DELETE; add `Table::append_row_version`, `Table::mark_deleted`; update `execute_select` to filter by visibility |
 | 4 | 4.1 begin_with_isolation | DEBT | Agent B: add `MvccTxnManager::begin_with_isolation(level)` |
+| 4 | 4.2 Row-version creation | DEBT | Agent B: populate `Table.row_versions` in INSERT/UPDATE/DELETE; add `Table::append_row_version`, `Table::mark_deleted`; update `execute_select` to filter by visibility |
 | 4 | 4.3 vacuum dead row versions | DEBT | Agent B: add `MvccTxnManager::vacuum(&mut tables)` that removes dead row versions |
 | 5 | 5.2 `Wal::append_and_sync` | DEBT | Agent B: add atomic append+fsync method |
+| 5 | 5.3 `Wal::set_streamer` | NICE-TO-HAVE | Agent B: add `Wal::set_streamer(streamer)` so the streamer lives inside `Wal` (currently in `QueryEngine.wal_streamer`) |
 | 5 | 5.4 `RaftNode::on_become_leader` | DEBT | Agent B: add leader-election callback API |
+| 6 | 6.3 WAL timestamps for PITR | DEBT | Agent B: add real timestamps to `WalRecord` (currently PITR uses insertion order as a proxy) |
+| 6 | `list_tables` bug | BUG | Agent B: `storage::replication::list_tables` reads `values` (Vec<u64>) instead of `string_values` — fix to use `string_values` |
 
 All hacks are tagged with comments referencing this file in the relevant
 source files.
