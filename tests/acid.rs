@@ -203,3 +203,36 @@ fn test_acid_durability_wal_recovery() {
     let count = result.columns[0].values[0];
     assert_eq!(count, 3, "Durability: all 3 rows should be recovered from WAL");
 }
+
+/// Task 1.3 DoD: insert 10 rows, checkpoint, insert 5 more rows, restart
+/// → exactly 15 rows (not 20). This verifies the LSN-based idempotent
+/// replay: the 10 pre-checkpoint records are in the checkpoint; the 5
+/// post-checkpoint records are in the WAL. On restart, the checkpoint
+/// loads 10 rows, and the WAL replays 5 records (LSNs strictly greater
+/// than the checkpoint's last_lsn). No duplicates.
+#[test]
+fn test_acid_durability_checkpoint_then_insert_no_duplicates() {
+    let data_dir = "/tmp/turbogp_acid_ckpt_insert_test";
+    let _ = std::fs::remove_dir_all(data_dir);
+    std::fs::create_dir_all(data_dir).unwrap();
+
+    {
+        let mut engine = QueryEngine::with_data_dir(data_dir).unwrap();
+        engine.execute("CREATE TABLE t (id INT)").unwrap();
+        // Insert 10 rows, then checkpoint.
+        for i in 0..10 {
+            engine.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap();
+        }
+        engine.execute("CHECKPOINT").unwrap();
+        // Insert 5 more rows AFTER the checkpoint.
+        for i in 10..15 {
+            engine.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap();
+        }
+    }
+
+    // Restart and verify exactly 15 rows.
+    let mut engine = QueryEngine::with_data_dir(data_dir).unwrap();
+    let result = engine.execute("SELECT COUNT(*) FROM t").unwrap();
+    let count = result.columns[0].values[0];
+    assert_eq!(count, 15, "Task 1.3: should have exactly 15 rows (10 checkpointed + 5 WAL), got {}", count);
+}

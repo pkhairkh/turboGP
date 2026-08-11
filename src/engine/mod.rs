@@ -274,8 +274,19 @@ impl QueryEngine {
         if let Err(e) = crate::storage::recovery::Checkpoint::load(&mut engine, &checkpoint_path) {
             log::warn!("checkpoint load failed: {e}");
         }
+        // Task 1.3: read the checkpoint's last_lsn (if the sidecar exists)
+        // and use it to skip already-checkpointed records on replay. Also
+        // bump the WAL's next_lsn past it so new records get LSNs strictly
+        // greater than the checkpoint's last_lsn.
+        let checkpoint_last_lsn =
+            crate::storage::recovery::Checkpoint::read_last_lsn(&checkpoint_path);
+        if let Some(lsn) = checkpoint_last_lsn {
+            if let Some(ref mut wal) = engine.wal {
+                wal.advance_lsn_to(lsn);
+            }
+        }
         // Replay the WAL to restore committed state after the checkpoint.
-        engine.replay_wal()?;
+        engine.replay_wal_with_lsn_filter(checkpoint_last_lsn)?;
         Ok(engine)
     }
 
@@ -283,7 +294,19 @@ impl QueryEngine {
     /// This re-executes SQL records and applies physical page changes.
     /// Only committed transactions are replayed; uncommitted (no COMMIT
     /// marker after the DML) are discarded.
+    #[allow(dead_code)]
     fn replay_wal(&mut self) -> Result<()> {
+        self.replay_wal_with_lsn_filter(None)
+    }
+
+    /// Replay the WAL with an optional LSN filter (Task 1.3).
+    ///
+    /// If `checkpoint_last_lsn` is `Some(lsn)`, records with `lsn <= lsn`
+    /// are skipped — they are already included in the checkpoint. This
+    /// makes replay idempotent: even if the WAL wasn't truncated (e.g.
+    /// crash between checkpoint rename and WAL truncate), replay won't
+    /// duplicate rows.
+    fn replay_wal_with_lsn_filter(&mut self, checkpoint_last_lsn: Option<u64>) -> Result<()> {
         let wal = match &self.wal {
             Some(w) => w,
             None => return Ok(()),
@@ -302,6 +325,12 @@ impl QueryEngine {
 
         // Re-execute SQL records for committed transactions.
         for record in &records {
+            // Task 1.3: skip records already included in the checkpoint.
+            if let Some(last_lsn) = checkpoint_last_lsn {
+                if record.lsn <= last_lsn && record.lsn > 0 {
+                    continue;
+                }
+            }
             // Skip rollback records and their transactions.
             if record.is_rollback {
                 continue;

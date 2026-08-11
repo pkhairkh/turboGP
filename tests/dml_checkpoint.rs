@@ -398,6 +398,7 @@ fn wal_replays_after_wave50_changes() {
     let tmp = NamedTempFile::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     wal.append(&WalRecord {
+        lsn: 0,
         txn_id: 0,
         sql: "CREATE TABLE t (id INT)".into(),
         is_commit: false,
@@ -406,6 +407,7 @@ fn wal_replays_after_wave50_changes() {
     })
     .unwrap();
     wal.append(&WalRecord {
+        lsn: 0,
         txn_id: 0,
         sql: "INSERT INTO t VALUES (1)".into(),
         is_commit: false,
@@ -414,6 +416,7 @@ fn wal_replays_after_wave50_changes() {
     })
     .unwrap();
     wal.append(&WalRecord {
+        lsn: 0,
         txn_id: 0,
         sql: "INSERT INTO t VALUES (2)".into(),
         is_commit: false,
