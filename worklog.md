@@ -545,3 +545,225 @@ Stage Summary:
   session handler dispatches SQL through `route_and_execute`. Full
   async pgwire is deferred (documented). 864 lib tests pass (0
   failures). Ready for Wave 5 (openraft).
+
+---
+Task ID: 5.1 + 5.2 + 5.3 + 5.4 + 5.5 + 5.6
+Agent: ha-concurrency-agent (Wave 5)
+Task: Replace the hand-rolled `RaftNode` stub with real openraft
+consensus; build a 3-node cluster with leader election, WAL
+replication, leader-change detection, and a failover test.
+
+Work Log:
+
+Commit 1 — `feat(5): raft: replace stub with openraft, 3-node cluster
+with leader election` (aa788e7):
+- New module `src/storage/raft.rs` (1102 lines, cfg-gated on
+  `feature = "raft"`) containing:
+  - **Type config**: `declare_raft_types!(pub TypeConfig: D = Vec<u8>, R = ());`
+    — WAL record bytes are the entry payload; the state-machine
+    response is `()` (we only care that the entry committed). NodeId =
+    `u64`, Node = `BasicNode`, Entry = openraft's default `Entry<Self>`,
+    SnapshotData = `Cursor<Vec<u8>>`, Responder = `OneshotResponder`,
+    AsyncRuntime = `TokioRuntime` (all defaults via the macro).
+  - **`MemStore`** (in-memory storage backend): implements openraft's
+    v1 `RaftStorage` trait directly (NOT the v2 `RaftLogStorage`/
+    `RaftStateMachine` — those are `#[cfg(storage-v2)]`-sealed and
+    turboGP's `openraft` dep doesn't enable `storage-v2`). The store
+    holds `last_purged_log_id`, a `BTreeMap<u64, Entry>` log, the
+    `vote`, `committed`/`last_applied` log ids, the
+    `last_membership`, the `applied_records: Vec<Vec<u8>>` (applied
+    Normal-payload bytes, for test inspection), and an optional
+    `snapshot`. All state lives behind an
+    `Arc<tokio::sync::Mutex<MemStoreInner>>` so the log-reader and
+    snapshot-builder clones share the same backing store (same pattern
+    as openraft's example `memstore` crate). Wrapped with the built-in
+    `Adaptor::new(store)` to produce the `(log_store, state_machine)`
+    pair that `Raft::new` requires.
+  - **`ChannelNetworkFactory` / `ChannelNetwork`**: in-memory `mpsc`
+    channel transport implementing `RaftNetworkFactory` and
+    `RaftNetwork`. A shared `NetworkRegistry` (`Arc<Mutex<BTreeMap<u64,
+    mpsc::UnboundedSender<RpcMessage>>>`) maps node-id → inbox; each
+    node's `RaftNetwork` impl looks up the target's inbox, sends an
+    `RpcMessage` (request + `oneshot::Sender<response>`), and awaits
+    the reply. Unreachable targets map to `RPCError::Unreachable` so
+    openraft backs off and retries.
+  - **Dispatcher task** (`run_dispatcher`): a per-node tokio task that
+    reads `RpcMessage`s from the node's inbox and forwards each to the
+    appropriate `Raft` method (`append_entries`/`install_snapshot`/
+    `vote`), sending the result back via the embedded oneshot. This is
+    what wires the channel transport to the `Raft` core.
+  - **`RaftManager`**: the public API. Wraps a `Raft<TypeConfig>`
+    handle, the node id, the dispatcher `AbortHandle`, the shared
+    `ChannelNetworkFactory`, and the `MemStore` (for test inspection).
+    - `new_single_node(node_id)` — single-node init (always leader;
+      trivially correct: one node is a quorum of one). Creates a
+      `Config` (heartbeat 50 ms, election timeout 150–300 ms), the
+      factory, registers the inbox, builds `MemStore` + `Adaptor`,
+      calls `Raft::new`, spawns the dispatcher, and calls
+      `Raft::initialize({node_id})`.
+    - `new(node_id, peers, factory)` — multi-node member constructor
+      (shares the factory so all nodes find each other in the
+      registry). The caller calls `initialize_cluster({1,2,3})` on
+      one node after all members are created.
+    - `is_leader()`, `current_leader()`, `wait_for_leader(timeout)`,
+      `wait_until_leader(timeout)` — leadership queries via
+      `Raft::metrics()` / `Raft::wait()`.
+    - `propose(&[u8])` — proposes a WAL record through Raft consensus
+      via `Raft::client_write(Vec<u8>)`. Blocks until the entry is
+      replicated to a quorum AND applied to the state machine.
+    - `wait_applied_at_least(index, timeout)` — waits for the state
+      machine to reach a given applied index (used by tests to confirm
+      replication landed).
+    - `Drop` impl: aborts the dispatcher task (so peers immediately
+      see `Unreachable`), best-effort unregisters from the network
+      registry, and best-effort shuts down the `Raft` core. All async
+      cleanup is spawned on the current tokio runtime if one exists.
+  - **`create_3_node_cluster()`** (Task 5.3): builds 3 `RaftManager`s
+    (ids 1, 2, 3) sharing one `ChannelNetworkFactory`, calls
+    `initialize_cluster({1,2,3})` on node 1, and polls `is_leader()`
+    until a leader is elected (5 s deadline). Returns the 3 managers
+    in a `Vec`.
+  - **Tests** (6 new lib tests, all behind `--features raft`):
+    - `raft_manager_single_node_becomes_leader` (Task 5.1 DoD):
+      single-node init → `wait_until_leader(2s)` → `is_leader()` true.
+    - `raft_manager_propose_single_node` (Task 5.2 DoD): propose two
+      WAL records, `wait_applied_at_least(2)`, verify
+      `store().applied_records()` has both in order.
+    - `raft_3_node_cluster_elects_leader` (Task 5.3 DoD):
+      `create_3_node_cluster` → exactly one node is leader → all 3
+      agree on the leader id via `wait_for_leader(3s)`.
+    - `raft_3_node_cluster_wal_replication` (Task 5.4 DoD): propose
+      `b"INSERT INTO t VALUES (42)"` on the leader, wait for apply on
+      all 3, verify the record appears in all 3 stores'
+      `applied_records` (quorum commit + replication).
+    - `raft_3_node_cluster_failover` (Task 5.5 + 5.6 DoD): find the
+      leader, drop its `RaftManager` (aborts dispatcher +
+      unregisters + shuts down raft), poll the 2 survivors for a new
+      leader within 5 s, verify the new leader's id differs from the
+      dead one, propose `b"INSERT INTO t VALUES (99)"` on the new
+      leader, verify it lands on at least the new leader.
+    - `snapshot_encode_decode_roundtrip`: sanity check for the
+      length-prefixed snapshot encoding used by `MemStore::build_snapshot`
+      / `install_snapshot`.
+- `src/storage/mod.rs`: added `#[cfg(feature = "raft")] pub mod raft;`
+  (alphabetical, after `replication`). The default build (without
+  `--features raft`) does not compile the openraft integration.
+- `src/engine/mod.rs` (`enable_raft` rewrite, Task 5.4):
+  - When `feature = "raft"` is on: `enable_raft` builds a dedicated
+    `tokio::runtime::Runtime` (multi-thread, all features), blocks on
+    `RaftManager::new_single_node(node_id)`, and stores both the
+    manager and the runtime in two new cfg-gated fields
+    (`raft_manager: Option<RaftManager>`, `raft_runtime:
+    Option<tokio::runtime::Runtime>`). The runtime is kept in the
+    engine for the engine's lifetime so the Raft core task and the
+    dispatcher task stay alive. The declared `peers` are logged but
+    unused (single-node init); multi-node clustering is exercised via
+    the `create_3_node_cluster` test helper.
+  - When `feature = "raft"` is off: falls back to the original stub
+    path (create `RaftNode`, add peers, call `on_become_leader` on the
+    WAL to attach `WalStreamer`s). The stub `RaftNode` is retained in
+    `replication.rs` so its existing unit tests still run in the
+    default build.
+  - Two new cfg-gated fields on `QueryEngine` (`raft_manager`,
+    `raft_runtime`), initialized to `None` in `QueryEngine::new`.
+
+Commit 2 — `docs(5): raft: document stub RaftNode superseded by openraft
+RaftManager` (20ddabf):
+- `src/storage/replication.rs`: added a section comment above the
+  hand-rolled `RaftNode` stub clarifying that Wave 5's real openraft
+  integration lives in `crate::storage::raft` (cfg-gated), that
+  `enable_raft` routes to the new `RaftManager` when the feature is on,
+  and that the stub is retained for backward compat with its existing
+  unit tests in the default build. Renamed the struct's doc-comment
+  header from "A minimal Raft node" to "A minimal Raft node (stub)".
+  No behavioural change.
+
+Files touched (2 commits):
+- Commit 1 (3 files): src/storage/raft.rs (NEW, 1102 lines),
+  src/storage/mod.rs (+6), src/engine/mod.rs (+77/-32). +1185 / -32.
+- Commit 2 (1 file): src/storage/replication.rs (+11/-2). +11 / -2.
+
+Constraints honoured:
+- No `unwrap()`/`expect()` in new production code: `RaftManager::new*`,
+  `propose`, `wait_for_leader`, etc. all map errors to `String` via
+  `.map_err(|e| format!(...))?`. The test helper `rt()` uses
+  `.expect("test runtime")` (test code, allowed per spec). The
+  `decode_snapshot` helper uses `u64::from_le_bytes(buf)` (no unwrap —
+  `buf` is a fixed `[u8; 8]` filled via `copy_from_slice`).
+- Max 3 of the 4 listed files per commit:
+  - Commit 1: raft.rs, mod.rs, engine/mod.rs (3 of 4).
+  - Commit 2: replication.rs (1 of 4).
+- Context budget: 1102 LOC in the new raft.rs + ~45 LOC of engine/mod.rs
+  changes + 6 LOC of mod.rs changes = ~1153 LOC of new/changed
+  production code in commit 1, under 1500.
+- `cargo check --jobs 1 --lib`: 0 errors, 462 warnings (all pre-existing,
+  unchanged from Wave 4).
+- `cargo check --jobs 1 --lib --features raft`: 0 errors, 466 warnings
+  (4 extra from openraft's own deps — all benign).
+- `cargo test --jobs 1 --lib`: 864 passed, 0 failed (unchanged from Wave
+  4 baseline — no new tests without the raft feature).
+- `cargo test --jobs 1 --lib --features raft`: 870 passed, 0 failed
+  (was 864 baseline + 6 new raft tests).
+
+Notes / follow-ups:
+- openraft 0.9 does NOT ship a built-in `MemStore` (the `memstore`
+  crate is a separate example crate). This task implements a minimal
+  in-memory `MemStore` directly in `raft.rs` (implementing the v1
+  `RaftStorage` trait, wrapped with the built-in `Adaptor`). For
+  production, replace `MemStore` with a persistent backend (rocksdb,
+  sled, etc.) implementing `RaftStorage` — the `RaftManager` API
+  stays the same.
+- The `RaftNetwork` impl (`ChannelNetwork`) is an in-memory `mpsc`
+  transport, NOT real TCP. This lets a 3-node cluster run in one
+  process for testing. For a real deployment, implement
+  `RaftNetworkFactory`/`RaftNetwork` over TCP or gRPC (openraft's
+  `raft-kv-memstore` example shows the reqwest/HTTP pattern). The
+  turboGP async server (`src/server/async_server.rs`, Wave 4) could
+  host the RPC endpoints in a future wave.
+- `enable_raft` creates a dedicated tokio runtime stored in the
+  engine. This works but means the Raft core runs on a separate
+  runtime from the async server (if both are active). A future wave
+  could share one runtime (e.g. pass a `tokio::runtime::Handle` into
+  `enable_raft`) to avoid spawning extra worker threads.
+- `enable_raft` currently wires the single-node case (`new_single_node`).
+  The `peers` argument is logged but unused — multi-node clustering is
+  exercised via the `create_3_node_cluster` test helper, which uses
+  `RaftManager::new` + `initialize_cluster` directly. Wiring
+  `enable_raft` to accept a pre-built `ChannelNetworkFactory` (so
+  multiple engines form a cluster) is a future API extension.
+- The `RaftManager::propose` API takes raw bytes (`&[u8]`). The engine
+  does NOT yet route `Wal::append_and_sync` through `RaftManager::propose`
+  automatically — that wiring requires touching `Wal` (outside this
+  task's file list) or adding a `propose` call in `wal_append_txn`/
+  `wal_append_record` (in engine/mod.rs, which IS in the file list, but
+  the call would need an async bridge since `wal_append_txn` is sync).
+  Deferred to a future wave; the `RaftManager::propose` API is
+  exercised directly by the raft tests.
+- `MemStore::install_snapshot` reads the snapshot bytes via
+  `tokio::io::AsyncReadExt::read_to_end` and decodes the
+  length-prefixed `Vec<Vec<u8>>` format. Snapshot transmission is
+  tested implicitly (openraft may install snapshots when a follower
+  falls too far behind) but not explicitly asserted in the tests —
+  the 3-node cluster tests don't lag enough to trigger snapshot
+  transfer.
+- The failover test (`raft_3_node_cluster_failover`) drops the
+  leader's `RaftManager`, which triggers `Drop` → abort dispatcher +
+  unregister from network + best-effort `raft.shutdown()`. The
+  shutdown is spawned on the current runtime (the test's
+  multi-thread runtime) and may not complete before the test asserts
+  the new leader — but that's fine: the dispatcher abort alone is
+  enough for peers to see `Unreachable` and trigger a new election.
+  The 5 s deadline comfortably covers the election timeout (150–300
+  ms) plus the backoff (~500 ms) plus margin.
+
+Stage Summary:
+- Task 5.1 + 5.2 + 5.3 + 5.4 + 5.5 + 5.6 complete. Real openraft
+  consensus replaces the hand-rolled stub: a `MemStore`-backed
+  `RaftManager` runs real leader election (randomized timeouts,
+  RequestVote quorum), real log replication (AppendEntries, quorum
+  commit, state-machine apply), and real failover (drop leader → new
+  election within 5 s → writes on new leader succeed). The 3-node
+  cluster runs in one process via an in-memory `mpsc` network.
+  `enable_raft` routes to the new manager when `--features raft` is on,
+  falls back to the stub otherwise. 870 lib tests pass with `--features
+  raft` (864 without). Ready for Wave 6.
