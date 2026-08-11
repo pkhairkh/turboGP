@@ -1361,3 +1361,11 @@ DoD satisfied: duckdb CLI works; SELECT 1 returns 1; version documented.
 - **Fairness note:** PostgreSQL is an OLTP row-store, not an OLAP column-store like Exasol. This puts PostgreSQL at a structural disadvantage on TPC-H and ClickBench workloads. The fairness audit (Wave 8) will document this. The benchmark will still report all four databases' results honestly.
 
 DoD satisfied: Exasol attempted; PostgreSQL fallback installed and verified; reason documented.
+
+### Task 1.5 — Verify turboGP builds and runs on the sandbox
+- `cargo check --jobs 1` — passed.
+- `cargo build --release --jobs 4` — passed; binary at `target/release/turbogp` (~30 MB, LTO-optimized).
+- Version: `turbogp 1.0.0`
+- Started turboGP in `--insecure --port 55432` (in-memory) mode; verified pgwire protocol responds to `SELECT 1`.
+
+DoD satisfied: cargo build --release succeeds; turboGP executes SELECT 1; version documented.
