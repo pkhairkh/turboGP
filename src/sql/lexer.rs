@@ -174,6 +174,12 @@ pub enum Token {
     String(String),
     /// A hex literal `x'...'` decoded into raw bytes.
     Hex(Vec<u8>),
+    /// A positional parameter placeholder (`$1`, `$2`, ...). The number
+    /// is the 1-based parameter index.
+    Param(u16),
+    /// An anonymous parameter placeholder `?` (used by prepared-statement
+    /// APIs that bind parameters positionally).
+    QuestionMark,
     /// A non-punctuation operator: `=`, `!=`, `<`, `>`, `<=`, `>=`, `+`, `-`,
     /// `*`, `/`.
     Op(String),
@@ -231,6 +237,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             ';' => {
                 chars.next();
                 tokens.push(Token::Semicolon);
+            }
+            // Anonymous parameter placeholder `?`.
+            '?' => {
+                chars.next();
+                tokens.push(Token::QuestionMark);
+            }
+            // Positional parameter placeholder `$1`, `$2`, ...
+            '$' => {
+                chars.next();
+                let n = read_param_index(&mut chars)?;
+                tokens.push(Token::Param(n));
             }
             // Operators.
             '=' => {
@@ -393,6 +410,30 @@ fn push_word(tokens: &mut Vec<Token>, word: String) {
     } else {
         tokens.push(Token::Ident(word));
     }
+}
+
+/// Read the digits of a positional parameter placeholder (`$1`, `$2`, ...).
+/// The leading `$` is assumed to be already consumed. Returns `Err` if no
+/// digits follow, or if the number overflows `u16`.
+fn read_param_index(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<u16, String> {
+    let mut s = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            s.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if s.is_empty() {
+        return Err("expected digit after '$'".to_string());
+    }
+    let n: u16 = s
+        .parse()
+        .map_err(|e: std::num::ParseIntError| format!("invalid parameter index {s:?}: {e}"))?;
+    Ok(n)
 }
 
 /// Skip the body of a line comment. The opening `--` is assumed to be
@@ -925,6 +966,65 @@ mod tests {
     #[test]
     fn tokenize_unterminated_quoted_identifier_errors() {
         assert!(tokenize("\"never closed").is_err());
+    }
+
+    #[test]
+    fn tokenize_positional_param() {
+        let toks = tokenize("SELECT $1, $2").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("SELECT".into()),
+                Token::Param(1),
+                Token::Comma,
+                Token::Param(2),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_anonymous_param() {
+        let toks = tokenize("SELECT ?").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("SELECT".into()),
+                Token::QuestionMark,
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_param_in_where() {
+        let toks = tokenize("WHERE id = $1 AND name = ?").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("WHERE".into()),
+                Token::Ident("id".into()),
+                Token::Op("=".into()),
+                Token::Param(1),
+                Token::Keyword("AND".into()),
+                Token::Ident("name".into()),
+                Token::Op("=".into()),
+                Token::QuestionMark,
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_param_large_index() {
+        let toks = tokenize("$65535").unwrap();
+        assert_tokens_eq(&toks, &[Token::Param(65535), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_param_missing_digit_errors() {
+        assert!(tokenize("SELECT $").is_err());
+        assert!(tokenize("SELECT $abc").is_err());
     }
 
     #[test]
