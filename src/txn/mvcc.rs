@@ -774,8 +774,9 @@ impl MvccTxnManager {
         self.oldest_active_snapshot()
     }
 
-    /// Remove dead row versions from a [`Table`]'s version chains
-    /// (Task 3.4).
+    /// Remove dead row versions from a [`Table`]'s version chains AND
+    /// reclaim column space from tombstoned rows (Task 3.4 + Wave 6
+    /// Task 6.2).
     ///
     /// A version is **dead** — and therefore removed — when EITHER:
     /// - its `xmin` is `Aborted` (the creating transaction rolled back,
@@ -785,16 +786,36 @@ impl MvccTxnManager {
     ///   (the version was superseded by a committed delete that no active
     ///   transaction can see anymore).
     ///
-    /// This **only** cleans the version chains — it does NOT compact the
-    /// column data (`table.columns`). Column compaction is a separate
-    /// step (reclaiming space from tombstoned rows) that a future wave
-    /// will wire into `execute_vacuum`.
+    /// A **row** is dead when ALL versions in its chain are dead — i.e.
+    /// the latest version has a committed `xmax` (or the chain is empty
+    /// after the dead-version retain). Wave 6 Task 6.2 extends the
+    /// vacuum to also reclaim the column space occupied by dead rows:
     ///
-    /// Returns the total number of versions removed across all chains.
+    /// 1. Existing dead-version retain runs on every chain.
+    /// 2. Rows whose chain is empty after step 1 are dropped from
+    ///    `table.columns` (every `Vec<u64>` is rebuilt to exclude the
+    ///    dead row's cells) and from `table.null_bitmaps`.
+    /// 3. `table.row_versions` is rebuilt in lock-step: only chains
+    ///    for surviving rows are kept (in original relative order, so
+    ///    `row_versions[i]` still corresponds to `columns[c][i]`).
+    /// 4. `table.row_count` is decremented to match the surviving row
+    ///    count.
+    ///
+    /// After VACUUM, `table.columns[0].len() == table.row_count == the
+    /// number of surviving rows`. `SELECT COUNT(*) FROM <table>` returns
+    /// the same value (assuming all surviving rows are visible to the
+    /// reader).
+    ///
+    /// Returns the total number of versions removed across all chains
+    /// (does NOT include the count of fully-removed dead rows in the
+    /// column compaction).
     pub fn vacuum_table(&mut self, table: &mut crate::datasource::Table) -> usize {
         let oldest = self.oldest_active_snapshot_or_current();
         let mut removed = 0;
-        for chain in &mut table.row_versions {
+        // Step 1: existing dead-version retain. A row is dead iff its
+        // chain becomes empty after this retain.
+        let mut live_indices: Vec<usize> = Vec::new();
+        for (i, chain) in table.row_versions.iter_mut().enumerate() {
             let before = chain.len();
             chain.retain(|version| {
                 // Remove versions whose creating transaction aborted.
@@ -814,6 +835,61 @@ impl MvccTxnManager {
                 true
             });
             removed += before - chain.len();
+            if !chain.is_empty() {
+                live_indices.push(i);
+            }
+        }
+        // Step 2: column compaction. Rebuild every column to keep only
+        // cells for surviving rows. If every row survived (no dead rows),
+        // skip the rebuild to avoid an unnecessary clone of the column
+        // vectors (the `Arc<Vec<u64>>` strong-count stays at 1).
+        let live_count = live_indices.len();
+        let row_count_before = table.row_count;
+        if live_count < row_count_before {
+            // Rebuild each column vector.
+            let new_columns: Vec<std::sync::Arc<Vec<u64>>> = table
+                .columns
+                .iter()
+                .map(|col| {
+                    let old = col.as_ref();
+                    let mut new_vec = Vec::with_capacity(live_count);
+                    for &i in &live_indices {
+                        new_vec.push(old[i]);
+                    }
+                    std::sync::Arc::new(new_vec)
+                })
+                .collect();
+            table.columns = new_columns;
+            // Rebuild null_bitmaps (each Some bitmap is filtered to keep
+            // only bits for surviving rows).
+            for bm_opt in table.null_bitmaps.iter_mut() {
+                if let Some(bm) = bm_opt.take() {
+                    let mut new_bm = crate::types::null_bitmap::NullBitmap::new(live_count);
+                    for (new_i, &old_i) in live_indices.iter().enumerate() {
+                        if bm.is_null(old_i) {
+                            new_bm.set_null(new_i);
+                        }
+                    }
+                    *bm_opt = Some(new_bm);
+                }
+            }
+            // Step 3: rebuild row_versions — keep only the surviving
+            // rows' chains (in original relative order).
+            let mut new_row_versions: Vec<Vec<RowVersion>> =
+                Vec::with_capacity(live_count);
+            for &i in &live_indices {
+                if let Some(chain) = table.row_versions.get_mut(i) {
+                    // Move the chain out (replace with empty Vec) and
+                    // push into new_row_versions.
+                    let chain = std::mem::take(chain);
+                    new_row_versions.push(chain);
+                } else {
+                    new_row_versions.push(Vec::new());
+                }
+            }
+            table.row_versions = new_row_versions;
+            // Step 4: row_count reflects the surviving rows.
+            table.row_count = live_count;
         }
         removed
     }

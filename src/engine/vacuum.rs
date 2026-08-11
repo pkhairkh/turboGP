@@ -676,3 +676,113 @@ fn parse_iso8601_to_micros(s: &str) -> Option<u64> {
 fn is_leap_year(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
+
+#[cfg(test)]
+mod vacuum_tests {
+    //! Tests for the Production Wiring Wave 6 Task 6.2 DoD: VACUUM
+    //! removes dead rows from `Table::columns` (not just version chains).
+
+    use crate::datasource::parquet::{LoadedColumn, LoadedTable};
+    use crate::datasource::Table;
+    use crate::txn::mvcc::{MvccTxnManager, RowVersion, TxnState};
+    use std::sync::Arc;
+
+    /// Build a 1-column `Table` of `n` rows with `id = 0..n` and an
+    /// empty `row_versions` (caller fills in version chains after).
+    fn build_table_with_rows(n: usize) -> Table {
+        let cells: Vec<u64> = (0..n).map(|i| i as u64).collect();
+        let loaded = LoadedTable {
+            name: "t".into(),
+            columns: vec![LoadedColumn {
+                name: "id".into(),
+                cells: cells.clone(),
+                row_count: n,
+                string_search: None,
+                null_bitmap: None,
+            }],
+            row_count: n,
+        };
+        let mut table = Table::from_loaded(loaded);
+        // Initialize a fresh single-version chain for each row (xmin = 0,
+        // xmax = None — "live, created by T0").
+        table.row_versions = (0..n)
+            .map(|i| vec![RowVersion::new(0, vec![i as u64])])
+            .collect();
+        table
+    }
+
+    /// Wave 6 Task 6.2 DoD: insert 100 rows, delete 50 (committed),
+    /// VACUUM, verify `row_count == 50` and `columns[0].len() == 50`.
+    ///
+    /// The 50 deleted rows (rows 0..50) have their latest version's
+    /// `xmax` set to a committed transaction whose commit_id is at or
+    /// below `oldest_active_snapshot_or_current` — they are dead and
+    /// must be reclaimed from `columns` (not just version chains).
+    #[test]
+    fn vacuum_removes_dead_rows_from_columns() {
+        let mut mgr = MvccTxnManager::new();
+        // T1 inserts all 100 rows. We model this by registering T1 in
+        // `txn_states` as Committed with commit_id = 1.
+        let t1 = 1u64;
+        mgr.commit(t1); // commit_id advances to 1, txn_states[t1] = Committed(1)
+                        // Rewrite each row's xmin to t1 so the existing
+                        // retain logic keeps them (xmin is committed).
+        // T2 deletes rows 0..50 (marks their xmax = t2). Register T2 as
+        // committed with commit_id = 2.
+        let t2 = 2u64;
+        mgr.commit(t2); // commit_id = 2, txn_states[t2] = Committed(2)
+
+        // Build the table and rewrite the version chains: rows 0..50
+        // have xmax = t2 (deleted, committed), rows 50..100 are live.
+        let n = 100usize;
+        let mut table = build_table_with_rows(n);
+        for (i, chain) in table.row_versions.iter_mut().enumerate() {
+            let v = &mut chain[0];
+            v.xmin = t1;
+            if i < 50 {
+                v.xmax = Some(t2);
+            }
+        }
+        // Sanity before vacuum: 100 rows, columns have 100 cells, 50
+        // chains have a deleted version and 50 have a live version.
+        assert_eq!(table.row_count, 100);
+        assert_eq!(table.columns[0].len(), 100);
+        assert_eq!(table.row_versions.len(), 100);
+
+        // VACUUM.
+        let removed = mgr.vacuum_table(&mut table);
+
+        // The 50 dead versions are removed (one per dead row).
+        assert_eq!(removed, 50, "vacuum_table must remove 50 dead versions");
+
+        // row_count and columns[0].len() must drop to 50.
+        assert_eq!(table.row_count, 50, "row_count must be 50 after VACUUM");
+        assert_eq!(
+            table.columns[0].len(),
+            50,
+            "columns[0].len() must be 50 after VACUUM"
+        );
+
+        // row_versions must have 50 chains (one per surviving row), each
+        // containing exactly one live version with xmax = None.
+        assert_eq!(table.row_versions.len(), 50);
+        for chain in &table.row_versions {
+            assert_eq!(chain.len(), 1, "each surviving chain must have 1 version");
+            assert!(chain[0].xmax.is_none(), "surviving version must be live");
+        }
+
+        // The surviving cells must be the original rows 50..100, in
+        // order (no shuffling, no duplicates).
+        let surviving: Vec<u64> = table.columns[0].as_ref().clone();
+        let expected: Vec<u64> = (50..100u64).collect();
+        assert_eq!(surviving, expected, "surviving cells must be rows 50..100");
+
+        // Txn state sanity: t1 and t2 must be committed.
+        assert!(matches!(mgr.txn_state(t1), TxnState::Committed(_)));
+        assert!(matches!(mgr.txn_state(t2), TxnState::Committed(_)));
+
+        // Suppress unused-import warning for `Arc` (kept for clarity in
+        // case future tests in this module need `Arc`-wrapped columns).
+        let _: Option<Arc<Vec<u64>>> = None;
+    }
+}
