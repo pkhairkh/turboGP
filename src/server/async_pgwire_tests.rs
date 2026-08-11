@@ -622,3 +622,128 @@ async fn async_pgwire_pool_releases_permit_on_disconnect() {
 
     task.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Task 5.4: end-to-end integration test
+// ---------------------------------------------------------------------------
+
+/// Helper: send a simple Query ('Q') and return the messages up to and
+/// including ReadyForQuery.
+async fn simple_query(stream: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+    stream.write_all(&build_query(sql)).await.expect("write query");
+    read_until_ready(stream).await
+}
+
+/// Helper: extract the integer value of the first column of a DataRow.
+/// Body format: int16(num_cols) + int32(col_len) + col_bytes. Returns
+/// the parsed i64 (panics on malformed input).
+fn first_col_as_i64(body: &[u8]) -> i64 {
+    assert!(body.len() >= 6, "DataRow too short: {body:?}");
+    let _num_cols = u16::from_be_bytes([body[0], body[1]]);
+    let col_len = i32::from_be_bytes([body[2], body[3], body[4], body[5]]) as usize;
+    let col_bytes = &body[6..6 + col_len];
+    let s = std::str::from_utf8(col_bytes).expect("col utf8");
+    s.parse::<i64>().unwrap_or_else(|_| panic!("col not an i64: {s:?}"))
+}
+
+/// Task 5.4 DoD — comprehensive end-to-end test: start an async pgwire
+/// server, connect with a raw TCP client, execute CREATE TABLE t (id
+/// INTEGER), INSERT 3 rows, SELECT all 3 back, verify row count and
+/// column count. Then run 3 concurrent SELECTs and verify all return
+/// the correct results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_pgwire_end_to_end_integration() {
+    let engine = Arc::new(RwLock::new(QueryEngine::in_memory()));
+    let server = AsyncPgwireServer::bind("127.0.0.1:0", engine)
+        .await
+        .expect("bind");
+    let addr = server.local_addr;
+    let task = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // ---- Phase 1: single connection CREATE + INSERT*3 + SELECT. ----
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(&build_startup("alice")).await.expect("startup");
+    let _ = read_until_ready(&mut s).await;
+
+    // CREATE TABLE t (id INTEGER)
+    let msgs = simple_query(&mut s, "CREATE TABLE t (id INTEGER)").await;
+    let cc = msgs
+        .iter()
+        .find(|(t, _)| *t == b'C')
+        .map(|(_, b)| cc_tag(b))
+        .expect("expected CommandComplete for CREATE");
+    assert_eq!(cc, "CREATE", "create command tag, got {cc:?}");
+
+    // INSERT 3 rows.
+    for i in 1..=3i64 {
+        let msgs = simple_query(&mut s, &format!("INSERT INTO t VALUES ({i})")).await;
+        let cc = msgs
+            .iter()
+            .find(|(t, _)| *t == b'C')
+            .map(|(_, b)| cc_tag(b))
+            .expect("expected CommandComplete for INSERT");
+        assert_eq!(cc, "INSERT 0 1", "insert {i} command tag, got {cc:?}");
+    }
+
+    // SELECT * FROM t — expect RowDescription (1 col) + 3 DataRows +
+    // CommandComplete ("SELECT 3") + ReadyForQuery.
+    let msgs = simple_query(&mut s, "SELECT * FROM t").await;
+    let row_desc = msgs
+        .iter()
+        .find(|(t, _)| *t == b'T')
+        .expect("expected RowDescription for SELECT");
+    let num_fields = u16::from_be_bytes([row_desc.1[0], row_desc.1[1]]);
+    assert_eq!(num_fields, 1, "expected 1 column, got {num_fields}");
+
+    let data_rows: Vec<_> = msgs.iter().filter(|(t, _)| *t == b'D').collect();
+    assert_eq!(data_rows.len(), 3, "expected 3 DataRows, got {}", data_rows.len());
+
+    // Verify the actual row values are 1, 2, 3 (in some order — the
+    // engine doesn't guarantee order without ORDER BY, but for an
+    // INSERT-then-SELECT it typically preserves insertion order).
+    let mut values: Vec<i64> = data_rows
+        .iter()
+        .map(|(_, b)| first_col_as_i64(b))
+        .collect();
+    values.sort();
+    assert_eq!(values, vec![1, 2, 3], "row values should be 1, 2, 3, got {values:?}");
+
+    let cc = msgs
+        .iter()
+        .find(|(t, _)| *t == b'C')
+        .map(|(_, b)| cc_tag(b))
+        .expect("expected CommandComplete for SELECT");
+    assert_eq!(cc, "SELECT 3", "select command tag, got {cc:?}");
+
+    drop(s);
+
+    // ---- Phase 2: 3 concurrent SELECTs, each returns 3 rows. ----
+    let mut handles = Vec::new();
+    for i in 0..3 {
+        let addr_clone = addr;
+        handles.push(tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr_clone).await.expect("connect");
+            s.write_all(&build_startup(&format!("concurrent_{i}"))).await.expect("startup");
+            let _ = read_until_ready(&mut s).await;
+            let msgs = simple_query(&mut s, "SELECT * FROM t").await;
+            let n_data = msgs.iter().filter(|(t, _)| *t == b'D').count();
+            let cc = msgs
+                .iter()
+                .find(|(t, _)| *t == b'C')
+                .map(|(_, b)| cc_tag(b))
+                .unwrap_or_default();
+            (i, n_data, cc)
+        }));
+    }
+
+    for h in handles {
+        let (i, n_data, cc) = h.await.expect("join");
+        assert_eq!(n_data, 3, "concurrent client {i} should see 3 rows, got {n_data}");
+        assert_eq!(cc, "SELECT 3", "concurrent client {i} command tag, got {cc:?}");
+    }
+
+    task.abort();
+}
