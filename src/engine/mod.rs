@@ -288,6 +288,9 @@ impl QueryEngine {
             }
         }
         // Replay the WAL to restore committed state after the checkpoint.
+        // Task 3.2: try physical replay first (fast path — applies
+        // PhysicalChange records directly to the buffer pool). Then fall
+        // back to SQL replay for records without physical changes.
         engine.replay_wal_with_lsn_filter(checkpoint_last_lsn)?;
         Ok(engine)
     }
@@ -374,6 +377,16 @@ impl QueryEngine {
 
     /// Apply a physical page-level change to the buffer pool (Wave 63).
     fn apply_physical_change(
+        &mut self,
+        change: &crate::storage::recovery::PhysicalChange,
+    ) -> Result<()> {
+        self.apply_physical_change_public(change)
+    }
+
+    /// Public wrapper for `apply_physical_change` (Task 3.2).
+    /// Exposed so `replay_wal_physical()` in src/storage/recovery.rs can
+    /// call it without going through the private method.
+    pub fn apply_physical_change_public(
         &mut self,
         change: &crate::storage::recovery::PhysicalChange,
     ) -> Result<()> {
