@@ -10,20 +10,29 @@
 //!
 //! 1. `OR`
 //! 2. `AND`
-//! 3. comparison (`=`, `!=`, `<`, `>`, `<=`, `>=`)
-//! 4. additive (`+`, `-`)
-//! 5. multiplicative (`*`, `/`)
-//! 6. primary (literal, column, parenthesized)
+//! 3. `NOT` (prefix)
+//! 4. comparison (`=`, `!=`, `<`, `>`, `<=`, `>=`, `LIKE`, `IN`, `BETWEEN`)
+//! 5. additive (`+`, `-`)
+//! 6. multiplicative (`*`, `/`, `%`)
+//! 7. unary (`-`, `+`)
+//! 8. primary (literal, column, parenthesized, function call)
 //!
-//! ## Not yet supported
+//! ## Unified AST
 //!
-//! - `JOIN` (the spec defers joins to a later wave)
-//! - `NOT` (the [`Expr`] enum has no `Unary` variant)
-//! - implicit aliases (require `AS` keyword)
-//! - subqueries
-//! - `INSERT` / `UPDATE` / `DELETE` (only `SELECT` is parsed)
+//! Since Wave 2 of the SQL Frontend Remediation, this module produces the
+//! unified [`crate::sql::ast::Expr`] type. The historical 7-variant
+//! `parser::Expr` has been deleted; `parser::Expr` and `parser::Value` are
+//! now re-exports of `ast::Expr` and `ast::Value` so existing call sites
+//! (`use crate::sql::parser::Expr`) continue to resolve.
 
 use crate::sql::lexer::Token;
+
+/// Re-export of the unified [`crate::sql::ast::Expr`] type.
+///
+/// Historical code that wrote `crate::sql::parser::Expr` continues to
+/// resolve via this re-export. The old 7-variant `parser::Expr` enum
+/// has been deleted.
+pub use crate::sql::ast::{BinOp, Expr, UnaryOp, Value};
 
 /// A parsed SELECT query.
 #[derive(Debug, Clone)]
@@ -106,75 +115,6 @@ pub enum SelectItem {
         expr: Expr,
         /// Optional output alias.
         alias: Option<String>,
-    },
-}
-
-/// A literal value extracted from a [`Token`].
-#[derive(Debug, Clone)]
-pub enum Value {
-    /// An integer literal.
-    Int(i64),
-    /// A floating-point literal.
-    Float(f64),
-    /// A single-quoted string literal.
-    String(String),
-    /// A hex literal `x'...'`.
-    Hex(Vec<u8>),
-}
-
-/// A boolean expression in WHERE / ON.
-#[derive(Debug, Clone)]
-pub enum Expr {
-    /// A column reference.
-    Column(String),
-    /// A literal value.
-    Literal(Value),
-    /// A binary operator application: `left op right`.
-    Binary {
-        /// Left operand.
-        left: Box<Expr>,
-        /// Operator: `=`, `!=`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/`,
-        /// `AND`, or `OR`.
-        op: String,
-        /// Right operand.
-        right: Box<Expr>,
-    },
-    /// A CASE WHEN expression (Wave 60a).
-    /// Evaluates WHEN clauses in order; returns the first matching THEN
-    /// value, or the ELSE value if no WHEN matches.
-    Case {
-        /// List of (condition, result) pairs.
-        when_clauses: Vec<(Expr, Expr)>,
-        /// Optional ELSE clause (defaults to NULL/0).
-        else_clause: Option<Box<Expr>>,
-    },
-    /// A function call (Wave 62 fix). Used in HAVING expressions to represent
-    /// aggregate calls like `count(*)`, `sum(col)`, `avg(col)`. The executor
-    /// evaluates the function against the current group's row set.
-    /// The `arg` is `*` for COUNT(*), a column name, or empty for no-arg funcs.
-    Function {
-        /// The function name, uppercased (e.g. `COUNT`, `SUM`, `AVG`).
-        name: String,
-        /// The function argument as a raw string (e.g. `*`, `col`, `col1 * col2`).
-        arg: String,
-    },
-    /// `EXTRACT(field FROM expr)` (Wave 67). Extracts a sub-field (YEAR,
-    /// MONTH, DAY, etc.) from a date/timestamp expression. The field is
-    /// stored as an uppercased string; the expr is the date source.
-    Extract {
-        /// The field name, uppercased (e.g. `YEAR`, `MONTH`, `DAY`).
-        field: String,
-        /// The date/timestamp expression to extract from.
-        expr: Box<Expr>,
-    },
-    /// `CAST(expr AS target_type)` (Wave 67). Converts the expr to the
-    /// target type. The target_type is stored as an uppercased string
-    /// (e.g. `INT`, `FLOAT`, `VARCHAR`, `BIGINT`).
-    Cast {
-        /// The expression to convert.
-        expr: Box<Expr>,
-        /// The target type name, uppercased.
-        target_type: String,
     },
 }
 
@@ -375,7 +315,7 @@ impl Parser {
                 // CROSS JOIN has no ON clause — synthesize a trivially-true
                 // predicate (literal 1) so the downstream executor's
                 // `extract_join_keys` / `hash_join` path does not require one.
-                let on = crate::sql::parser::Expr::Literal(crate::sql::parser::Value::Int(1));
+                let on = Expr::Literal(Value::Int(1));
                 joins.push(JoinClause { table, on, join_type: "CROSS".to_string() });
             } else {
                 break;
@@ -705,78 +645,76 @@ impl Parser {
         let mut left = self.parse_and_expr()?;
         while self.match_keyword("OR") {
             let right = self.parse_and_expr()?;
-            left =
-                Expr::Binary { left: Box::new(left), op: "OR".to_string(), right: Box::new(right) };
+            left = Expr::binary(left, BinOp::Or, right);
         }
         Ok(left)
     }
 
     fn parse_and_expr(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_comparison_expr()?;
+        let mut left = self.parse_not_expr()?;
         while self.match_keyword("AND") {
-            let right = self.parse_comparison_expr()?;
-            left = Expr::Binary {
-                left: Box::new(left),
-                op: "AND".to_string(),
-                right: Box::new(right),
-            };
+            let right = self.parse_not_expr()?;
+            left = Expr::binary(left, BinOp::And, right);
         }
         Ok(left)
+    }
+
+    /// Parse a prefix `NOT` expression. NOT has lower precedence than
+    /// comparison but higher than AND, so `NOT a = 1 AND b = 2` parses as
+    /// `(NOT (a = 1)) AND (b = 2)`.
+    fn parse_not_expr(&mut self) -> Result<Expr, String> {
+        if self.match_keyword("NOT") {
+            let inner = self.parse_not_expr()?;
+            return Ok(Expr::Not(Box::new(inner)));
+        }
+        self.parse_comparison_expr()
     }
 
     fn parse_comparison_expr(&mut self) -> Result<Expr, String> {
         let left = self.parse_additive_expr()?;
         // Comparison operators: = != <> < > <= >=
         if let Token::Op(op) = self.peek().clone() {
-            if matches!(op.as_str(), "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=") {
-                self.next();
-                let right = self.parse_additive_expr()?;
-                // Normalize <> to != so the executor's existing arm handles it.
-                let op = if op == "<>" { "!=".to_string() } else { op };
-                return Ok(Expr::Binary { left: Box::new(left), op, right: Box::new(right) });
+            if let Some(binop) = BinOp::from_str(&op) {
+                if binop.is_comparison() {
+                    self.next();
+                    let right = self.parse_additive_expr()?;
+                    return Ok(Expr::binary(left, binop, right));
+                }
             }
         }
-        // LIKE keyword
+        // LIKE / NOT LIKE
         if self.match_ident("LIKE") {
             let right = self.parse_additive_expr()?;
-            return Ok(Expr::Binary {
-                left: Box::new(left),
-                op: "LIKE".to_string(),
-                right: Box::new(right),
+            return Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(right),
+                negated: false,
             });
         }
-        // NOT LIKE
         if self.match_keyword("NOT") {
             if self.match_ident("LIKE") {
                 let right = self.parse_additive_expr()?;
-                return Ok(Expr::Binary {
-                    left: Box::new(left),
-                    op: "NOT LIKE".to_string(),
-                    right: Box::new(right),
+                return Ok(Expr::Like {
+                    expr: Box::new(left),
+                    pattern: Box::new(right),
+                    negated: true,
                 });
             }
             // NOT could be part of another construct; put it back
             self.pos -= 1;
         }
-        // BETWEEN x AND y — lower to (expr >= x AND expr <= y)
+        // BETWEEN x AND y
         if self.match_keyword("BETWEEN") {
             let low = self.parse_additive_expr()?;
-            // Expect AND
             if !self.match_keyword("AND") {
                 return Err("expected AND after BETWEEN low".into());
             }
             let high = self.parse_additive_expr()?;
-            let ge = Expr::Binary {
-                left: Box::new(left.clone()),
-                op: ">=".to_string(),
-                right: Box::new(low),
-            };
-            let le =
-                Expr::Binary { left: Box::new(left), op: "<=".to_string(), right: Box::new(high) };
-            return Ok(Expr::Binary {
-                left: Box::new(ge),
-                op: "AND".to_string(),
-                right: Box::new(le),
+            return Ok(Expr::Between {
+                expr: Box::new(left),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated: false,
             });
         }
         // NOT BETWEEN
@@ -787,49 +725,24 @@ impl Parser {
                     return Err("expected AND after NOT BETWEEN low".into());
                 }
                 let high = self.parse_additive_expr()?;
-                // NOT BETWEEN → (expr < low OR expr > high)
-                let lt = Expr::Binary {
-                    left: Box::new(left.clone()),
-                    op: "<".to_string(),
-                    right: Box::new(low),
-                };
-                let gt = Expr::Binary {
-                    left: Box::new(left),
-                    op: ">".to_string(),
-                    right: Box::new(high),
-                };
-                return Ok(Expr::Binary {
-                    left: Box::new(lt),
-                    op: "OR".to_string(),
-                    right: Box::new(gt),
+                return Ok(Expr::Between {
+                    expr: Box::new(left),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    negated: true,
                 });
             }
             self.pos -= 1;
         }
-        // IN (val1, val2, ...) — lower to (expr = val1 OR expr = val2 OR ...)
+        // IN (val1, val2, ...)
         if self.match_keyword("IN") {
             if self.peek() != &Token::LParen {
                 return Err("expected ( after IN".into());
             }
             self.next(); // consume (
-            let mut or_expr: Option<Expr> = None;
+            let mut list: Vec<Expr> = Vec::new();
             loop {
-                let val = self.parse_additive_expr()?;
-                let eq = Expr::Binary {
-                    left: Box::new(left.clone()),
-                    op: "=".to_string(),
-                    right: Box::new(val),
-                };
-                match or_expr {
-                    None => or_expr = Some(eq),
-                    Some(existing) => {
-                        or_expr = Some(Expr::Binary {
-                            left: Box::new(existing),
-                            op: "OR".to_string(),
-                            right: Box::new(eq),
-                        });
-                    }
-                }
+                list.push(self.parse_additive_expr()?);
                 match self.peek() {
                     Token::Comma => {
                         self.next();
@@ -841,7 +754,7 @@ impl Parser {
                     other => return Err(format!("expected , or ) in IN list, got {other:?}")),
                 }
             }
-            return Ok(or_expr.unwrap_or(left));
+            return Ok(Expr::InList { expr: Box::new(left), list, negated: false });
         }
         // NOT IN
         if self.match_keyword("NOT") {
@@ -850,24 +763,9 @@ impl Parser {
                     return Err("expected ( after NOT IN".into());
                 }
                 self.next();
-                let mut and_expr: Option<Expr> = None;
+                let mut list: Vec<Expr> = Vec::new();
                 loop {
-                    let val = self.parse_additive_expr()?;
-                    let ne = Expr::Binary {
-                        left: Box::new(left.clone()),
-                        op: "!=".to_string(),
-                        right: Box::new(val),
-                    };
-                    match and_expr {
-                        None => and_expr = Some(ne),
-                        Some(existing) => {
-                            and_expr = Some(Expr::Binary {
-                                left: Box::new(existing),
-                                op: "AND".to_string(),
-                                right: Box::new(ne),
-                            });
-                        }
-                    }
+                    list.push(self.parse_additive_expr()?);
                     match self.peek() {
                         Token::Comma => {
                             self.next();
@@ -881,7 +779,7 @@ impl Parser {
                         }
                     }
                 }
-                return Ok(and_expr.unwrap_or(left));
+                return Ok(Expr::InList { expr: Box::new(left), list, negated: true });
             }
             self.pos -= 1;
         }
@@ -892,10 +790,19 @@ impl Parser {
         let mut left = self.parse_multiplicative_expr()?;
         loop {
             if let Token::Op(op) = self.peek().clone() {
-                if matches!(op.as_str(), "+" | "-") {
+                if let Some(binop) = BinOp::from_str(&op) {
+                    if binop == BinOp::Add || binop == BinOp::Sub {
+                        self.next();
+                        let right = self.parse_multiplicative_expr()?;
+                        left = Expr::binary(left, binop, right);
+                        continue;
+                    }
+                }
+                // String concatenation ||
+                if op == "||" {
                     self.next();
                     let right = self.parse_multiplicative_expr()?;
-                    left = Expr::Binary { left: Box::new(left), op, right: Box::new(right) };
+                    left = Expr::binary(left, BinOp::Concat, right);
                     continue;
                 }
             }
@@ -905,19 +812,39 @@ impl Parser {
     }
 
     fn parse_multiplicative_expr(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_primary()?;
+        let mut left = self.parse_unary_expr()?;
         loop {
             if let Token::Op(op) = self.peek().clone() {
-                if matches!(op.as_str(), "*" | "/") {
-                    self.next();
-                    let right = self.parse_primary()?;
-                    left = Expr::Binary { left: Box::new(left), op, right: Box::new(right) };
-                    continue;
+                if let Some(binop) = BinOp::from_str(&op) {
+                    if binop == BinOp::Mul || binop == BinOp::Div || binop == BinOp::Mod {
+                        self.next();
+                        let right = self.parse_unary_expr()?;
+                        left = Expr::binary(left, binop, right);
+                        continue;
+                    }
                 }
             }
             break;
         }
         Ok(left)
+    }
+
+    /// Parse a unary prefix expression: `-expr`, `+expr`. Falls through
+    /// to `parse_primary` if no unary operator is present.
+    fn parse_unary_expr(&mut self) -> Result<Expr, String> {
+        if let Token::Op(op) = self.peek().clone() {
+            if op == "-" {
+                self.next();
+                let inner = self.parse_unary_expr()?;
+                return Ok(Expr::Unary { op: UnaryOp::Neg, expr: Box::new(inner) });
+            }
+            if op == "+" {
+                self.next();
+                let inner = self.parse_unary_expr()?;
+                return Ok(Expr::Unary { op: UnaryOp::Pos, expr: Box::new(inner) });
+            }
+        }
+        self.parse_primary()
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
@@ -945,11 +872,15 @@ impl Parser {
                     if let Token::String(s) = self.peek().clone() {
                         self.next();
                         if let Ok(d) = crate::types::Date::from_str(&s) {
-                            return Ok(Expr::Literal(Value::Int(d.0 as i64)));
+                            return Ok(Expr::Literal(Value::Date(d.0)));
                         }
                         return Ok(Expr::Literal(Value::String(s)));
                     }
                     return Ok(Expr::Column(kw));
+                }
+                if kw_upper == "NULL" {
+                    self.next();
+                    return Ok(Expr::Literal(Value::Null));
                 }
                 // Wave 60a: CASE WHEN expression.
                 if kw_upper == "CASE" {
@@ -972,12 +903,30 @@ impl Parser {
                 // Wave 62 fix: if the next token is '(', this is a function
                 // call (e.g. count(*), sum(col), avg(col)). Parse it as
                 // Expr::Function so HAVING expressions can reference aggregates.
-                // Previously, parse_primary returned Expr::Column(name) and
-                // left the '(' unconsumed, causing "unexpected trailing token:
-                // LParen" errors.
                 if matches!(self.peek(), Token::LParen) {
                     self.next(); // consume (
-                    let arg = self.parse_agg_arg()?;
+                    let distinct = self.match_ident("DISTINCT");
+                    let mut args: Vec<Expr> = Vec::new();
+                    // COUNT(*) — single wildcard arg.
+                    if self.match_op("*") {
+                        args.push(Expr::Wildcard);
+                    } else if !matches!(self.peek(), Token::RParen) {
+                        // Parse comma-separated argument list.
+                        loop {
+                            args.push(self.parse_expr()?);
+                            match self.peek() {
+                                Token::Comma => {
+                                    self.next();
+                                }
+                                Token::RParen => break,
+                                other => {
+                                    return Err(format!(
+                                        "expected , or ) in function args, got {other:?}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     if !matches!(self.peek(), Token::RParen) {
                         return Err(format!(
                             "expected ) after function args, got {:?}",
@@ -985,7 +934,11 @@ impl Parser {
                         ));
                     }
                     self.next(); // consume )
-                    return Ok(Expr::Function { name: name.to_uppercase(), arg });
+                    return Ok(Expr::Function {
+                        name: name.to_uppercase(),
+                        args,
+                        distinct,
+                    });
                 }
                 Ok(Expr::Column(name))
             }
@@ -996,7 +949,7 @@ impl Parser {
                     return Err(format!("expected ), got {:?}", self.peek()));
                 }
                 self.next();
-                Ok(e)
+                Ok(Expr::Paren(Box::new(e)))
             }
             other => Err(format!("expected expression, got {other:?}")),
         }
@@ -1108,7 +1061,7 @@ mod tests {
         let w = q.where_clause.expect("WHERE clause");
         match w {
             Expr::Binary { left, op, right } => {
-                assert_eq!(op, "=");
+                assert!(op == BinOp::Eq);
                 match *left {
                     Expr::Column(c) => assert_eq!(c, "x"),
                     other => panic!("expected Column, got {other:?}"),
@@ -1188,15 +1141,15 @@ mod tests {
         let w = q.where_clause.unwrap();
         match w {
             Expr::Binary { left, op, right } => {
-                assert_eq!(op, "OR");
+                assert!(op == BinOp::Or);
                 // Left should be AND.
                 match *left {
-                    Expr::Binary { op, .. } => assert_eq!(op, "AND"),
+                    Expr::Binary { op, .. } => { assert!(op == BinOp::And) }
                     other => panic!("expected AND, got {other:?}"),
                 }
                 // Right should be a comparison.
                 match *right {
-                    Expr::Binary { op, .. } => assert_eq!(op, "="),
+                    Expr::Binary { op, .. } => { assert!(op == BinOp::Eq) }
                     other => panic!("expected =, got {other:?}"),
                 }
             }
@@ -1211,13 +1164,13 @@ mod tests {
         let w = q.where_clause.unwrap();
         match w {
             Expr::Binary { left, op: op_eq, right } => {
-                assert_eq!(op_eq, "=");
+                assert!(op_eq == BinOp::Eq);
                 assert!(matches!(*left, Expr::Column(_)));
                 match *right {
                     Expr::Binary { op, right: mul_right, .. } => {
-                        assert_eq!(op, "+");
+                        assert!(op == BinOp::Add);
                         match *mul_right {
-                            Expr::Binary { op, .. } => assert_eq!(op, "*"),
+                            Expr::Binary { op, .. } => { assert!(op == BinOp::Mul) }
                             other => panic!("expected *, got {other:?}"),
                         }
                     }
@@ -1234,10 +1187,15 @@ mod tests {
         let w = q.where_clause.unwrap();
         match w {
             Expr::Binary { left, op, .. } => {
-                assert_eq!(op, "AND");
+                assert!(op == BinOp::And);
+                // The left side is now wrapped in Expr::Paren since Wave 2
+                // preserves the source grouping for AST fidelity.
                 match *left {
-                    Expr::Binary { op, .. } => assert_eq!(op, "OR"),
-                    other => panic!("expected OR, got {other:?}"),
+                    Expr::Paren(inner) => match *inner {
+                        Expr::Binary { op, .. } => { assert!(op == BinOp::Or) }
+                        other => panic!("expected OR inside Paren, got {other:?}"),
+                    },
+                    other => panic!("expected Paren, got {other:?}"),
                 }
             }
             other => panic!("expected AND at top, got {other:?}"),
@@ -1402,12 +1360,12 @@ mod tests {
         // Verify the HAVING expression is a Binary comparison.
         match &q.having {
             Some(Expr::Binary { left, op, right }) => {
-                assert_eq!(op, ">");
-                // Left should be Expr::Function { name: "COUNT", arg: "*" }
+                assert!(*op == BinOp::Gt);
+                // Left should be Expr::Function { name: "COUNT", args: [Wildcard] }
                 match left.as_ref() {
-                    Expr::Function { name, arg } => {
+                    Expr::Function { name, args, .. } => {
                         assert_eq!(name, "COUNT");
-                        assert_eq!(arg, "*");
+                        assert!(args.iter().any(|a| *a == Expr::Wildcard), "args should contain Wildcard");
                     }
                     other => panic!("expected Function, got {other:?}"),
                 }
@@ -1428,11 +1386,12 @@ mod tests {
         assert!(q.having.is_some());
         match &q.having {
             Some(Expr::Binary { left, op, .. }) => {
-                assert_eq!(op, ">");
+                assert!(*op == BinOp::Gt);
                 match left.as_ref() {
-                    Expr::Function { name, arg } => {
+                    Expr::Function { name, args, .. } => {
                         assert_eq!(name, "SUM");
-                        assert_eq!(arg, "salary");
+                        // args[0] should be Column("salary")
+                        assert!(args.iter().any(|a| matches!(a, Expr::Column(c) if c == "salary")));
                     }
                     other => panic!("expected Function, got {other:?}"),
                 }
@@ -1593,7 +1552,7 @@ mod tests {
         let w = q.where_clause.expect("WHERE clause");
         match w {
             Expr::Binary { left, op, .. } => {
-                assert_eq!(op, "=");
+                assert!(op == BinOp::Eq);
                 match *left {
                     Expr::Extract { field, .. } => assert_eq!(field, "YEAR"),
                     other => panic!("expected Extract in WHERE left, got {other:?}"),

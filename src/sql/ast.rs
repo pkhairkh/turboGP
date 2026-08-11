@@ -41,7 +41,7 @@ use std::fmt;
 ///
 /// Replaces the former `Value` (in `sql::parser`) and `Value2` (in
 /// `engine::query_interpreter`). Every value is one of: 64-bit integer, 64-bit float,
-/// UTF-8 string, days-since-epoch date, or NULL.
+/// UTF-8 string, days-since-epoch date, hex byte string, or NULL.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// A 64-bit signed integer literal (e.g., `42`, `-1`).
@@ -49,9 +49,11 @@ pub enum Value {
     /// A 64-bit floating-point literal (e.g., `3.14`, `1e10`).
     Float(f64),
     /// A string literal (e.g., `'hello'`).
-    Str(String),
+    String(String),
     /// A date literal stored as days since the Unix epoch (e.g., `DATE '2024-01-15'`).
     Date(i32),
+    /// A hex literal `x'...'` decoded into raw bytes.
+    Hex(Vec<u8>),
     /// SQL NULL.
     Null,
 }
@@ -63,14 +65,15 @@ impl Value {
     }
 
     /// Convert this value to a `u64` cell (the engine's universal storage format).
-    /// Int → as-is, Float → `to_bits`, Date → as u64, Str → 0 (strings are
-    /// stored in a sidecar), Null → 0.
+    /// Int → as-is, Float → `to_bits`, Date → as u64, String → 0 (strings are
+    /// stored in a sidecar), Hex → 0, Null → 0.
     pub fn to_cell(&self) -> u64 {
         match self {
             Value::Int(n) => *n as u64,
             Value::Float(f) => f.to_bits(),
             Value::Date(d) => *d as u64,
-            Value::Str(_) => 0, // String hash stored in sidecar
+            Value::String(_) => 0, // String hash stored in sidecar
+            Value::Hex(_) => 0,
             Value::Null => 0,
         }
     }
@@ -81,8 +84,15 @@ impl fmt::Display for Value {
         match self {
             Value::Int(n) => write!(f, "{n}"),
             Value::Float(fl) => write!(f, "{fl}"),
-            Value::Str(s) => write!(f, "'{}'", s.replace('\'', "''")),
+            Value::String(s) => write!(f, "'{}'", s.replace('\'', "''")),
             Value::Date(d) => write!(f, "DATE '{d}'"),
+            Value::Hex(bytes) => {
+                write!(f, "x'")?;
+                for b in bytes {
+                    write!(f, "{b:02X}")?;
+                }
+                write!(f, "'")
+            }
             Value::Null => write!(f, "NULL"),
         }
     }
@@ -369,7 +379,7 @@ impl Expr {
 
     /// Convenience constructor for a string literal.
     pub fn str(s: impl Into<String>) -> Self {
-        Expr::Literal(Value::Str(s.into()))
+        Expr::Literal(Value::String(s.into()))
     }
 
     /// Convenience constructor for NULL.
@@ -546,8 +556,8 @@ mod tests {
     #[test]
     fn test_value_display() {
         assert_eq!(Value::Int(42).to_string(), "42");
-        assert_eq!(Value::Str("hello".into()).to_string(), "'hello'");
-        assert_eq!(Value::Str("it's".into()).to_string(), "'it''s'");
+        assert_eq!(Value::String("hello".into()).to_string(), "'hello'");
+        assert_eq!(Value::String("it's".into()).to_string(), "'it''s'");
         assert_eq!(Value::Null.to_string(), "NULL");
     }
 
@@ -576,7 +586,7 @@ mod tests {
         assert_eq!(Expr::col("name"), Expr::Column("name".into()));
         assert_eq!(Expr::int(42), Expr::Literal(Value::Int(42)));
         assert_eq!(Expr::float(3.14), Expr::Literal(Value::Float(3.14)));
-        assert_eq!(Expr::str("hi"), Expr::Literal(Value::Str("hi".into())));
+        assert_eq!(Expr::str("hi"), Expr::Literal(Value::String("hi".into())));
         assert_eq!(Expr::null(), Expr::Literal(Value::Null));
     }
 
