@@ -1496,7 +1496,7 @@ impl QueryEngine {
 
         // Try DML (INSERT, UPDATE, DELETE).
         if let Some(dml) = crate::sql::parse_dml(sql).map_err(Error::Parse)? {
-            let mut result = self.execute_dml(dml)?;
+            let mut result = self.execute_dml(dml, txn_id)?;
             // Wave 51 fix: append AFTER successful execute. If execute_dml
             // returns Err, we never reach this line, so the WAL stays clean.
             self.wal_append_txn(sql, txn_id)?;
