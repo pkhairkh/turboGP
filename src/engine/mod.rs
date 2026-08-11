@@ -1105,8 +1105,21 @@ impl QueryEngine {
             // Production Wiring Wave 4: wire the Raft handle into the Wal
             // so append_and_sync routes through Raft consensus before the
             // local WAL append.
+            //
+            // Production Wiring Wave 6 Task 6.1: when Raft is enabled, also
+            // default `sync_mode = Synchronous` AND attach an empty
+            // `MultiWalStreamSink` (default `QuorumPolicy::Majority`). The
+            // combined effect: every commit goes through Raft consensus
+            // (Wave 4) AND the sync-mode + quorum policy is the default,
+            // so a user who calls `enable_raft` gets durable sync
+            // replication out of the box. The empty sink is a no-op until
+            // replicas are added (via `MultiWalStreamSink::add`), but the
+            // defaults are set so the operator only needs to add replicas.
             if let Some(ref mut wal) = self.wal {
                 wal.set_raft_handle(mgr.raft.clone(), runtime.handle().clone());
+                wal.set_sync_mode(crate::storage::recovery::SyncMode::Synchronous);
+                let sink = crate::storage::replication::MultiWalStreamSink::new();
+                wal.set_stream_sink(std::sync::Arc::new(std::sync::Mutex::new(sink)));
             }
             self.raft_manager = Some(mgr);
             self.raft_runtime = Some(runtime);
@@ -1982,3 +1995,5 @@ impl Default for QueryEngine {
 #[cfg(test)]
 mod binary_checkpoint_tests;
 
+#[cfg(all(test, feature = "raft"))]
+mod enable_raft_tests;

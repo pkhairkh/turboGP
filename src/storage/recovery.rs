@@ -56,6 +56,17 @@ pub trait WalStreamSink: Send {
     fn sync_wait(&mut self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Return the concrete type name of this sink (Wave 6 Task 6.1).
+    ///
+    /// Used by `Wal::stream_sink_type_name()` so tests can assert which
+    /// sink implementation is attached (e.g. `MultiWalStreamSink` after
+    /// `enable_raft()` is called). The default returns the type's full
+    /// path via `std::any::type_name`, so concrete sinks do not need to
+    /// override it unless they want to hide the path.
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 /// Replication sync mode (Task 6.1).
@@ -265,10 +276,7 @@ pub struct Wal {
     /// the local WAL append. The record is committed only after a quorum of
     /// nodes ACK it. The local WAL write happens after the Raft commit.
     #[cfg(feature = "raft")]
-    raft_handle: Option<(
-        crate::storage::raft::RaftType,
-        tokio::runtime::Handle,
-    )>,
+    raft_handle: Option<(crate::storage::raft::RaftType, tokio::runtime::Handle)>,
 }
 
 impl Wal {
@@ -528,6 +536,34 @@ impl Wal {
     /// Detach the replication sink (Task 5.1).
     pub fn clear_stream_sink(&mut self) {
         self.stream_sink = None;
+    }
+
+    /// Return `true` if a replication sink is attached (Wave 6 Task 6.1).
+    ///
+    /// Used by tests to assert that `enable_raft()` attached a
+    /// `MultiWalStreamSink`. A `false` return means `append_and_sync`
+    /// will not stream records to any replica.
+    #[must_use]
+    pub fn has_stream_sink(&self) -> bool {
+        self.stream_sink.is_some()
+    }
+
+    /// Return the concrete type name of the attached sink, if any
+    /// (Wave 6 Task 6.1).
+    ///
+    /// Delegates to `WalStreamSink::type_name`. Returns `None` when no
+    /// sink is attached. Tests use this to assert that the attached sink
+    /// is a `MultiWalStreamSink` (the type name contains
+    /// `MultiWalStreamSink`).
+    #[must_use]
+    pub fn stream_sink_type_name(&self) -> Option<&'static str> {
+        match self.stream_sink.as_ref() {
+            Some(sink) => {
+                let guard = sink.lock().ok()?;
+                Some(guard.type_name())
+            }
+            None => None,
+        }
     }
 
     /// Set the replication sync mode (Task 6.1).
