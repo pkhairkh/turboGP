@@ -267,6 +267,97 @@ impl QueryEngine {
     pub fn try_readonly_select(&self, sql: &str) -> Result<QueryResult> {
         self.execute_readonly(sql)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2 Task 2.2 — SELECT-vs-DML routing helper.
+//
+// The production pattern wraps `QueryEngine` in `Arc<RwLock<QueryEngine>>`.
+// This free function checks the SQL verb (via the formal parser, not string
+// match) and acquires the appropriate lock:
+//   - SELECT / EXPLAIN / SHOW  →  RwLock::read()   → execute_readonly
+//   - INSERT / UPDATE / DELETE / CREATE / DROP / ...  →  RwLock::write()  → execute
+//
+// Callers that already hold a lock should call `execute_readonly` or
+// `execute` directly instead of this helper.
+// ---------------------------------------------------------------------------
+
+/// Classify a SQL statement as readonly (SELECT-like) or write (DML/DDL).
+///
+/// Returns `true` if the statement can be executed with a read lock via
+/// [`QueryEngine::execute_readonly`], `false` if it needs a write lock.
+///
+/// This uses the formal parser (`crate::sql::parse_ddl` / `parse_dml`) to
+/// classify, not string-prefix matching — so `SELECT INTO ...` (which is
+/// actually DML) is correctly classified as a write statement.
+#[must_use]
+pub fn is_readonly_sql(sql: &str) -> bool {
+    let trimmed = sql.trim();
+    let lower = trimmed.to_lowercase();
+
+    // Quick reject: anything that doesn't start with SELECT/EXPLAIN/SHOW/WITH
+    // is definitely not readonly.
+    if !(lower.starts_with("select")
+        || lower.starts_with("explain")
+        || lower.starts_with("show")
+        || lower.starts_with("with"))
+    {
+        return false;
+    }
+
+    // DDL/DML disguised as SELECT (e.g. SELECT INTO) — must use the parser.
+    if crate::sql::parse_ddl(sql).ok().flatten().is_some() {
+        return false;
+    }
+    if crate::sql::parse_dml(sql).ok().flatten().is_some() {
+        return false;
+    }
+
+    // WITH ... SELECT ... is a CTE — needs write lock (temp-table registration).
+    if crate::sql::parse_with(sql).is_some() {
+        return false;
+    }
+
+    true
+}
+
+/// Route a SQL statement to the appropriate lock + execute path.
+///
+/// This is the production entry point for `Arc<RwLock<QueryEngine>>`:
+///
+/// ```ignore
+/// let engine: Arc<RwLock<QueryEngine>> = ...;
+/// let result = turbogp::engine::route_and_execute(&engine, sql)?;
+/// ```
+///
+/// - For SELECT / EXPLAIN / SHOW, acquires `RwLock::read()` and calls
+///   [`QueryEngine::execute_readonly`].
+/// - For DML / DDL / transaction control, acquires `RwLock::write()` and
+///   calls [`QueryEngine::execute`].
+///
+/// This maximizes read concurrency: 10 concurrent SELECTs run in parallel
+/// (sharing the read lock), while DML/DDL is serialized via the write lock.
+pub fn route_and_execute(
+    engine: &std::sync::Arc<std::sync::RwLock<QueryEngine>>,
+    sql: &str,
+) -> Result<QueryResult> {
+    use std::sync::RwLock;
+    if is_readonly_sql(sql) {
+        // Read path: multiple readers can hold the lock concurrently.
+        let guard = engine.read().map_err(|e| {
+            Error::Other(format!("route_and_execute: read lock poisoned: {e}"))
+        })?;
+        guard.execute_readonly(sql)
+    } else {
+        // Write path: serialized via the write lock.
+        let mut guard = engine.write().map_err(|e| {
+            Error::Other(format!("route_and_execute: write lock poisoned: {e}"))
+        })?;
+        guard.execute(sql)
+    }
+}
+
+impl QueryEngine {
 
     /// Construct an empty engine with the default kernel table and cost
     /// model. The catalog starts empty — register tables via
