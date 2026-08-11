@@ -170,6 +170,15 @@ pub struct MvccTransaction {
     pub state: TxnState,
 }
 
+/// Error type for MVCC write-write conflicts (Task 4.4).
+#[derive(Debug, Clone)]
+pub struct ConflictError {
+    /// Human-readable description of the conflict.
+    pub message: String,
+    /// The transaction ID that caused the conflict.
+    pub conflicting_txn: TxnId,
+}
+
 /// The MVCC transaction manager.
 ///
 /// Tracks:
@@ -326,6 +335,166 @@ impl MvccTxnManager {
             }
         }
         result
+    }
+
+    // -----------------------------------------------------------------
+    // Task 4.4: write-write conflict detection (first-committer-wins)
+    // -----------------------------------------------------------------
+
+    /// Check if a transaction can update/delete a row without conflicting
+    /// with concurrent transactions (Task 4.4 — first-committer-wins).
+    ///
+    /// The check finds the version VISIBLE TO `txn` (the one `txn` would
+    /// read). A conflict occurs if:
+    /// - That visible version has `xmax` set by a concurrent UNCOMMITTED
+    ///   transaction (another active txn is modifying this row), OR
+    /// - That visible version has `xmax` set by a transaction that
+    ///   committed AFTER `txn`'s snapshot (the row was modified by a txn
+    ///   `txn` can't see — first-committer-wins).
+    ///
+    /// Returns `Ok(())` if the write can proceed, or `Err(ConflictError)`
+    /// if there's a conflict.
+    pub fn check_write_conflict(
+        &self,
+        table: &MvccTable,
+        txn: &MvccTransaction,
+        row_idx: usize,
+    ) -> Result<(), ConflictError> {
+        let chain = match table.rows.get(row_idx) {
+            Some(c) => c,
+            None => return Ok(()), // Row doesn't exist — no conflict.
+        };
+        // Find the version visible to `txn` (the one it would read).
+        // Iterate in reverse to get the newest visible version.
+        let visible_version = chain.iter().rev().find(|v| self.visible(v, txn));
+        let version = match visible_version {
+            Some(v) => v,
+            None => {
+                // No visible version — the row doesn't exist from txn's
+                // perspective. Not a conflict (it's a "row not found").
+                return Ok(());
+            }
+        };
+        // If the visible version is already deleted (xmax is Some), check
+        // who deleted it.
+        if let Some(xmax) = version.xmax {
+            if xmax == txn.id {
+                // We already deleted it — no conflict (idempotent).
+                return Ok(());
+            }
+            match self.txn_states.get(&xmax) {
+                Some(TxnState::InProgress) => {
+                    // Another active transaction is modifying this row.
+                    return Err(ConflictError {
+                        message: format!(
+                            "write-write conflict: row {} is being modified by active transaction {}",
+                            row_idx, xmax
+                        ),
+                        conflicting_txn: xmax,
+                    });
+                }
+                Some(TxnState::Committed(cid)) => {
+                    // The deleting txn committed. If it committed AFTER our
+                    // snapshot, we have a conflict (the row changed under us).
+                    if *cid > txn.snapshot_id {
+                        return Err(ConflictError {
+                            message: format!(
+                                "write-write conflict: row {} was modified by transaction {} (committed after our snapshot)",
+                                row_idx, xmax
+                            ),
+                            conflicting_txn: xmax,
+                        });
+                    }
+                    // It committed before our snapshot — the row is already
+                    // deleted from our perspective. Not a conflict per se,
+                    // but we can't update a deleted row.
+                    return Err(ConflictError {
+                        message: format!(
+                            "write-write conflict: row {} was already deleted before our snapshot",
+                            row_idx
+                        ),
+                        conflicting_txn: xmax,
+                    });
+                }
+                Some(TxnState::Aborted) | None => {
+                    // The deleting txn aborted — the version is still live.
+                    return Ok(());
+                }
+            }
+        }
+        // The visible version is live (xmax is None) — no conflict.
+        Ok(())
+    }
+
+    /// Update a row with conflict detection (Task 4.4). Returns
+    /// `Err(ConflictError)` if a concurrent transaction has modified the
+    /// row. On success, the old version is marked deleted and a new
+    /// version is appended.
+    pub fn update_with_conflict_check(
+        &self,
+        table: &mut MvccTable,
+        txn: &MvccTransaction,
+        row_idx: usize,
+        new_values: Vec<u64>,
+    ) -> Result<(), ConflictError> {
+        self.check_write_conflict(table, txn, row_idx)?;
+        table.update(txn.id, row_idx, new_values);
+        Ok(())
+    }
+
+    /// Delete a row with conflict detection (Task 4.4).
+    pub fn delete_with_conflict_check(
+        &self,
+        table: &mut MvccTable,
+        txn: &MvccTransaction,
+        row_idx: usize,
+    ) -> Result<(), ConflictError> {
+        self.check_write_conflict(table, txn, row_idx)?;
+        table.delete(txn.id, row_idx);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Task 4.5: garbage collection (VACUUM)
+    // -----------------------------------------------------------------
+
+    /// Remove dead row versions from the given tables (Task 4.5).
+    ///
+    /// A version is "dead" if:
+    /// - Its `xmax` is `Some(tid)` where `tid` is committed (Committed
+    ///   state) AND `tid`'s commit_id < oldest_active_snapshot (no active
+    ///   transaction can see this version anymore).
+    /// - OR its `xmin` is `Aborted` (the creating transaction rolled back).
+    ///
+    /// Returns the total number of versions removed across all tables.
+    pub fn vacuum(&mut self, tables: &mut [MvccTable]) -> usize {
+        let oldest = self.oldest_active_snapshot();
+        let mut removed = 0;
+        for table in tables.iter_mut() {
+            for chain in table.rows.iter_mut() {
+                let before = chain.len();
+                chain.retain(|version| {
+                    // Keep versions whose xmin is aborted? No — aborted
+                    // versions should be removed.
+                    if matches!(self.txn_states.get(&version.xmin), Some(TxnState::Aborted)) {
+                        return false; // Remove aborted inserts.
+                    }
+                    // If the version is deleted (xmax is Some), check if
+                    // the deleting txn is committed before the oldest
+                    // active snapshot. If so, the version is dead.
+                    if let Some(xmax) = version.xmax {
+                        if let Some(TxnState::Committed(cid)) = self.txn_states.get(&xmax) {
+                            if *cid <= oldest {
+                                return false; // Dead version — remove.
+                            }
+                        }
+                    }
+                    true // Keep all other versions.
+                });
+                removed += before - chain.len();
+            }
+        }
+        removed
     }
 }
 
@@ -551,5 +720,137 @@ mod tests {
         let t3 = mgr.begin();
         let visible = mgr.scan_visible(&table, &t3);
         assert_eq!(visible.len(), 1, "T3 must see the row (T2's delete is uncommitted)");
+    }
+
+    // -----------------------------------------------------------------
+    // Task 4.4: write-write conflict detection
+    // -----------------------------------------------------------------
+
+    /// Task 4.4 DoD: T1 and T2 both read row R; T1 updates R and commits;
+    /// T2 tries to update R → fails with conflict.
+    #[test]
+    fn mvcc_write_write_conflict_committed() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into(), "v".into()]);
+
+        // Setup: insert a row and commit.
+        let t0 = mgr.begin();
+        let row0 = table.insert(t0.id, vec![1, 100]);
+        mgr.commit(t0.id);
+
+        // T1 and T2 both begin (both see the row).
+        let t1 = mgr.begin();
+        let t2 = mgr.begin();
+
+        // T1 updates the row and commits.
+        mgr.update_with_conflict_check(&mut table, &t1, row0, vec![1, 200]).unwrap();
+        mgr.commit(t1.id);
+
+        // T2 tries to update the same row — must fail (T1 committed after T2's snapshot).
+        let result = mgr.update_with_conflict_check(&mut table, &t2, row0, vec![1, 300]);
+        assert!(result.is_err(), "T2 must fail with a write-write conflict");
+        let err = result.unwrap_err();
+        assert_eq!(err.conflicting_txn, t1.id);
+    }
+
+    /// Task 4.4 DoD: T1 is updating a row (uncommitted); T2 tries to
+    /// update the same row → fails (T1 is active).
+    #[test]
+    fn mvcc_write_write_conflict_uncommitted() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into()]);
+
+        let t0 = mgr.begin();
+        let row0 = table.insert(t0.id, vec![1]);
+        mgr.commit(t0.id);
+
+        // T1 starts updating but doesn't commit.
+        let t1 = mgr.begin();
+        mgr.update_with_conflict_check(&mut table, &t1, row0, vec![99]).unwrap();
+
+        // T2 tries to update the same row — must fail (T1 is active).
+        let t2 = mgr.begin();
+        let result = mgr.update_with_conflict_check(&mut table, &t2, row0, vec![100]);
+        assert!(result.is_err(), "T2 must fail — T1 is actively modifying the row");
+    }
+
+    /// Task 4.4 DoD: no conflict when two transactions update different rows.
+    #[test]
+    fn mvcc_no_conflict_different_rows() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into()]);
+
+        let t0 = mgr.begin();
+        let row0 = table.insert(t0.id, vec![1]);
+        let row1 = table.insert(t0.id, vec![2]);
+        mgr.commit(t0.id);
+
+        let t1 = mgr.begin();
+        let t2 = mgr.begin();
+
+        // T1 updates row0, T2 updates row1 — no conflict.
+        mgr.update_with_conflict_check(&mut table, &t1, row0, vec![10]).unwrap();
+        mgr.update_with_conflict_check(&mut table, &t2, row1, vec![20]).unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Task 4.5: garbage collection (VACUUM)
+    // -----------------------------------------------------------------
+
+    /// Task 4.5 DoD: insert 100 rows, update all 100, commit, vacuum →
+    /// 100 old versions removed, 100 new versions remain.
+    #[test]
+    fn mvcc_vacuum_removes_dead_versions() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into(), "v".into()]);
+
+        // Insert 100 rows.
+        let t1 = mgr.begin();
+        for i in 0..100 {
+            table.insert(t1.id, vec![i as u64, i as u64 * 10]);
+        }
+        mgr.commit(t1.id);
+
+        // Update all 100 rows (each row now has 2 versions: old + new).
+        let t2 = mgr.begin();
+        for i in 0..100 {
+            table.update(t2.id, i, vec![i as u64, i as u64 * 100]);
+        }
+        mgr.commit(t2.id);
+
+        // Verify each row has 2 versions before vacuum.
+        let total_before: usize = (0..100).map(|i| table.row_versions(i).len()).sum();
+        assert_eq!(total_before, 200, "100 rows × 2 versions each");
+
+        // VACUUM — should remove the 100 old (dead) versions.
+        let mut tables = [table];
+        let removed = mgr.vacuum(&mut tables);
+        assert_eq!(removed, 100, "100 old versions removed");
+        let table = &tables[0];
+        let total_after: usize = (0..100).map(|i| table.row_versions(i).len()).sum();
+        assert_eq!(total_after, 100, "100 new versions remain");
+    }
+
+    /// Task 4.5 DoD: aborted transactions' versions are removed by VACUUM.
+    #[test]
+    fn mvcc_vacuum_removes_aborted_versions() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into()]);
+
+        // T1 inserts a row but rolls back.
+        let t1 = mgr.begin();
+        table.insert(t1.id, vec![42]);
+        mgr.rollback(t1.id);
+
+        // The version exists but is from an aborted txn.
+        assert_eq!(table.row_count(), 1);
+        assert_eq!(table.row_versions(0).len(), 1);
+
+        // VACUUM removes the aborted version.
+        let mut tables = [table];
+        let removed = mgr.vacuum(&mut tables);
+        assert_eq!(removed, 1, "1 aborted version removed");
+        let table = &tables[0];
+        assert_eq!(table.row_versions(0).len(), 0);
     }
 }
