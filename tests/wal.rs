@@ -21,7 +21,7 @@ use turbogp::storage::recovery::{replay_wal, Wal, WalRecord};
 
 #[test]
 fn wal_begin_commit_markers_round_trip() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     // Simulate: BEGIN; INSERT; INSERT; COMMIT;
     wal.append(&WalRecord::begin(1)).unwrap();
@@ -42,7 +42,7 @@ fn wal_begin_commit_markers_round_trip() {
 
 #[test]
 fn wal_rollback_marker_round_trip() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     wal.append(&WalRecord::begin(1)).unwrap();
     wal.append(&WalRecord::txn_dml(1, "INSERT INTO t VALUES (1)")).unwrap();
@@ -57,7 +57,7 @@ fn wal_rollback_marker_round_trip() {
 
 #[test]
 fn wal_replay_commit_marker_replays_transaction() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     // BEGIN; CREATE TABLE; INSERT; INSERT; COMMIT;
     wal.append(&WalRecord::begin(1)).unwrap();
@@ -79,7 +79,7 @@ fn wal_replay_commit_marker_replays_transaction() {
 
 #[test]
 fn wal_replay_rollback_marker_skips_transaction() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     // Autocommit: CREATE TABLE.
     wal.append(&WalRecord::autocommit("CREATE TABLE t (id INT)")).unwrap();
@@ -102,7 +102,7 @@ fn wal_replay_rollback_marker_skips_transaction() {
 
 #[test]
 fn wal_replay_uncommitted_transaction_is_skipped() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     // Autocommit: CREATE TABLE.
     wal.append(&WalRecord::autocommit("CREATE TABLE t (id INT)")).unwrap();
@@ -125,7 +125,7 @@ fn wal_replay_uncommitted_transaction_is_skipped() {
 fn engine_writes_begin_commit_markers_through_execute() {
     // End-to-end: engine.execute("BEGIN"); execute("INSERT"); execute("COMMIT")
     // must produce BEGIN/txn_dml/COMMIT records in the WAL.
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut engine = QueryEngine::in_memory();
     engine.enable_wal(tmp.path()).unwrap();
     engine.execute("CREATE TABLE t (id INT)").unwrap();
@@ -161,7 +161,7 @@ fn engine_writes_begin_commit_markers_through_execute() {
 
 #[test]
 fn engine_writes_rollback_marker_through_execute() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut engine = QueryEngine::in_memory();
     engine.enable_wal(tmp.path()).unwrap();
     engine.execute("CREATE TABLE t (id INT)").unwrap();
@@ -183,7 +183,7 @@ fn engine_writes_rollback_marker_through_execute() {
 
 #[test]
 fn wal_does_not_append_failed_dml() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut engine = QueryEngine::in_memory();
     engine.enable_wal(tmp.path()).unwrap();
     engine.execute("CREATE TABLE t (id INT)").unwrap();
@@ -201,7 +201,7 @@ fn wal_does_not_append_failed_dml() {
 
 #[test]
 fn wal_does_not_append_failed_ddl() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut engine = QueryEngine::in_memory();
     engine.enable_wal(tmp.path()).unwrap();
 
@@ -220,7 +220,7 @@ fn wal_does_not_append_failed_ddl() {
 
 #[test]
 fn wal_sql_with_pipe_round_trips() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     let sql = "INSERT INTO t VALUES ('a|b|c')";
     wal.append(&WalRecord::autocommit(sql)).unwrap();
@@ -233,7 +233,7 @@ fn wal_sql_with_pipe_round_trips() {
 
 #[test]
 fn wal_sql_with_newline_round_trips() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     // SQL containing a literal newline (e.g. multi-line INSERT).
     let sql = "INSERT INTO t VALUES ('line1\nline2')";
@@ -250,7 +250,7 @@ fn wal_sql_with_backslash_n_round_trips() {
     // The crucial test for Bug 10: a SQL string containing the literal
     // two-byte sequence `\n` (backslash + n) must NOT be confused with a
     // real newline on replay. The old escaping couldn't distinguish them.
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     let sql = r"INSERT INTO t VALUES ('has\nliteral')";
     wal.append(&WalRecord::autocommit(sql)).unwrap();
@@ -266,7 +266,7 @@ fn wal_sql_with_backslash_n_round_trips() {
 
 #[test]
 fn wal_sql_with_pipe_and_newline_round_trips() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     let sql = "INSERT INTO t VALUES ('a|b\nc|d')";
     wal.append(&WalRecord::autocommit(sql)).unwrap();
@@ -279,7 +279,7 @@ fn wal_sql_with_pipe_and_newline_round_trips() {
 
 #[test]
 fn wal_replay_handles_sql_with_special_chars() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     wal.append(&WalRecord::autocommit("CREATE TABLE t (id INT, name VARCHAR)")).unwrap();
     // Insert a value containing a pipe and a backslash-n.
