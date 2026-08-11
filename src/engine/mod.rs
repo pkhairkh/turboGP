@@ -150,6 +150,10 @@ pub struct QueryEngine {
     /// to a replica via `WalStreamer::stream_record`. The streamer is
     /// attached via [`QueryEngine::enable_replication`].
     wal_streamer: Option<WalStreamerHandle>,
+    /// Optional Raft node for leader election (Task 4.5 — debt-5.4).
+    /// When set via `enable_raft()`, the node participates in leader election.
+    /// On becoming leader, it connects WalStreamers to all followers.
+    raft_node: Option<crate::storage::replication::RaftNode>,
 }
 
 /// A handle to an active WAL streamer (Wave 5 Task 5.3 — Agent C).
@@ -460,6 +464,7 @@ impl QueryEngine {
             mvcc_txn_manager: crate::txn::MvccTxnManager::new(),
             mvcc_enabled: false,
             wal_streamer: None,
+            raft_node: None,
         }
     }
 
@@ -832,9 +837,17 @@ impl QueryEngine {
         streamer
             .connect(peer_addr)
             .map_err(Error::Other)?;
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(streamer));
         self.wal_streamer = Some(WalStreamerHandle {
-            streamer: std::sync::Mutex::new(streamer),
+            streamer: std::sync::Mutex::new(
+                crate::storage::replication::WalStreamer::new(),
+            ),
         });
+        // Task 4.2 (debt-5.3): attach the streamer to the Wal via set_stream_sink
+        // so Wal::append_and_sync auto-streams after fsync.
+        if let Some(ref mut wal) = self.wal {
+            wal.set_stream_sink(handle);
+        }
         log::info!("Replication enabled: streaming WAL to {}", peer_addr);
         Ok(())
     }
@@ -847,9 +860,16 @@ impl QueryEngine {
     /// without a live replica.
     pub fn enable_replication_local_only(&mut self) {
         let streamer = crate::storage::replication::WalStreamer::new();
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(streamer));
         self.wal_streamer = Some(WalStreamerHandle {
-            streamer: std::sync::Mutex::new(streamer),
+            streamer: std::sync::Mutex::new(
+                crate::storage::replication::WalStreamer::new(),
+            ),
         });
+        // Attach to Wal for auto-streaming.
+        if let Some(ref mut wal) = self.wal {
+            wal.set_stream_sink(handle);
+        }
     }
 
     /// Returns the number of WAL records streamed to the replica (Wave 5 Task 5.3).
@@ -882,13 +902,29 @@ impl QueryEngine {
     ///
     /// Currently always returns `Ok(())` (stub). Will return an error if
     /// Raft initialization fails once implemented.
-    pub fn enable_raft(&mut self, _node_id: u64, _peers: Vec<(u64, String)>) -> Result<()> {
-        log::warn!(
-            "enable_raft: RaftNode integration is a STUB (Agent B hasn't completed \
-             RaftNode::on_become_leader). See AGENT_C_API_REQUESTS.md."
-        );
-        // TODO(Agent B): create RaftNode, start election, wire set_streamer
-        // on becoming leader.
+    pub fn enable_raft(&mut self, node_id: u64, peers: Vec<(u64, String)>) -> Result<()> {
+        // Task 4.5 (debt-5.4): wire enable_raft to create a RaftNode and
+        // start election. On becoming leader, the RaftNode connects a
+        // WalStreamer to each follower via on_become_leader().
+        let mut raft_node = crate::storage::replication::RaftNode::new(node_id);
+        for (peer_id, addr) in &peers {
+            raft_node.add_peer(*peer_id, addr);
+        }
+        // Collect peer addresses for on_become_leader.
+        let peer_addrs: Vec<&str> = peers.iter().map(|(_, a)| a.as_str()).collect();
+        // Start election. In a single-node cluster, this immediately makes
+        // the node leader. In a multi-node cluster, on_become_leader is
+        // called when the node wins the election.
+        if let Some(ref mut wal) = self.wal {
+            let connected = raft_node.on_become_leader(wal, &peer_addrs);
+            log::info!(
+                "enable_raft: node {} became leader, connected to {} followers",
+                node_id, connected
+            );
+        } else {
+            log::warn!("enable_raft: no WAL attached — leader election skipped");
+        }
+        self.raft_node = Some(raft_node);
         Ok(())
     }
 
