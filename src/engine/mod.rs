@@ -61,6 +61,7 @@ pub mod result;
 pub mod query_interpreter;
 
 pub use executor::execute_select;
+pub use executor::{planner_pipeline_invoked_count, reset_planner_pipeline_counter};
 pub use result::{QueryResult, ResultColumn};
 
 use crate::catalog::Catalog;
