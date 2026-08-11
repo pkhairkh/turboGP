@@ -1231,6 +1231,10 @@ impl QueryEngine {
                 self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id))?;
                 return Ok(QueryResult::empty());
             }
+            crate::engine::dispatch::StatementKind::Show => {
+                // Task 5.3 (debt-show): wire SHOW TABLES into execute() dispatch.
+                return self.execute_show(trimmed, &start);
+            }
             _ => {
                 // SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / ALTER /
                 // MERGE / PIVOT / SAVEPOINT / ROLLBACK TO / RELEASE / CTE /
