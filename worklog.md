@@ -1381,3 +1381,34 @@ DoD satisfied: cargo build --release succeeds; turboGP executes SELECT 1; versio
 - Row counts documented in `benchmarks/tpch/data/ROW_COUNTS.md`.
 
 DoD satisfied: dbgen compiled and run; 8 tables at SF=1 and SF=10; CSV files in `data/sf{1,10}/`; row counts documented.
+
+### Task 2.2 — TPC-H schema DDL for all 4 databases
+- `benchmarks/tpch/schema/turbogp.sql` — VARCHAR + DECIMAL(15,2) + DATE + BIGINT/INTEGER.
+- `benchmarks/tpch/schema/clickhouse.sql` — String + Decimal(15,2) + Date + Int64/Int32, MergeTree engine, ORDER BY primary key for storage index.
+- `benchmarks/tpch/schema/duckdb.sql` — VARCHAR + DECIMAL(15,2) + DATE + BIGINT/INTEGER (SQL standard).
+- `benchmarks/tpch/schema/exasol.sql` — DECIMAL(18,0) + DECIMAL(15,2) + DATE + VARCHAR. Exasol was unavailable; schema preserved for reference.
+- `benchmarks/tpch/schema/postgres.sql` — Same column types as DuckDB (PostgreSQL native); PRIMARY KEYs defined; FKs omitted.
+- All schemas are semantically identical (same columns, same logical types).
+- Foreign keys omitted (DuckDB/ClickHouse don't enforce them; row counts unaffected).
+
+### Task 2.3 — Load TPC-H SF=1 into all 4 databases
+- Loaded via `benchmarks/tpch/load_tpch.py --sf 1`.
+- CSV .tbl files (pipe-separated, trailing pipe stripped via `sed 's/|$//'`).
+- Row counts verified per database (see load log).
+
+### Task 2.2 — TPC-H schema DDL for all 4 databases
+- `benchmarks/tpch/schema/turbogp.sql` — VARCHAR + DECIMAL(15,2) + DATE + BIGINT/INTEGER.
+- `benchmarks/tpch/schema/clickhouse.sql` — String + Decimal(15,2) + Date + Int64/Int32, MergeTree engine, ORDER BY primary key for storage index.
+- `benchmarks/tpch/schema/duckdb.sql` — VARCHAR + DECIMAL(15,2) + DATE + BIGINT/INTEGER (SQL standard).
+- `benchmarks/tpch/schema/exasol.sql` — DECIMAL(18,0) + DECIMAL(15,2) + DATE + VARCHAR. Exasol was unavailable; schema preserved for reference.
+- `benchmarks/tpch/schema/postgres.sql` — Same column types as DuckDB (PostgreSQL native); PRIMARY KEYs defined; FKs omitted.
+- All schemas are semantically identical (same columns, same logical types).
+- Foreign keys omitted (DuckDB/ClickHouse don't enforce them; row counts unaffected).
+
+### Task 2.3 — Load TPC-H SF=1 into all 4 databases
+- Loaded via `benchmarks/tpch/load_tpch.py --sf 1`.
+- **turboGP**: pre-converted .tbl → proper CSV (header + comma-separated, quoted strings) in `/srv/turbogp_csv/sf1/`. Started turboGP with `--allow-copy-dir /srv/turbogp_csv/sf1` (a small CLI patch added in this branch — see `src/bin/turbogp.rs` `allow_copy_dir` field). `COPY <tbl> FROM '<csv>' WITH (FORMAT csv, HEADER true)`.
+- **ClickHouse**: `INSERT INTO <tbl> FORMAT CustomSeparated` with `--format_custom_field_delimiter="|"`.
+- **DuckDB**: `COPY <tbl> FROM '<stripped>' (DELIMITER '|', HEADER false, NULL '')`.
+- **PostgreSQL**: `\COPY <tbl> FROM STDIN WITH (FORMAT csv, DELIMITER '|', NULL '')`.
+- Row counts verified per database (see load log).
