@@ -28,7 +28,7 @@ impl QueryEngine {
                     row_count: 0,
                     string_columns: vec![None; ct.columns.len()],
                     null_bitmaps: vec![None; ct.columns.len()],
-                    schema: Some(crate::schema::table_schema::TableSchema::from_ddl(&ct.columns)),
+                    schema: Some(crate::schema::table_schema::TableSchema::from_create_table(&ct)),
                     row_versions: Vec::new(),
                 };
                 self.catalog.register(table);
@@ -93,6 +93,9 @@ impl QueryEngine {
                         col_type: col_def.col_type.clone(),
                         not_null: col_def.not_null,
                         primary_key: col_def.primary_key,
+                        // Task 3.2 + 3.5: preserve column-level UNIQUE / CHECK.
+                        unique: col_def.unique,
+                        check: col_def.check.clone(),
                     });
                 }
                 Ok(QueryResult::empty())

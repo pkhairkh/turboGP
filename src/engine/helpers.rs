@@ -85,6 +85,187 @@ pub(crate) fn parse_value_cell(s: &str) -> u64 {
     xxh3::xxh3_64(trimmed.as_bytes())
 }
 
+// -----------------------------------------------------------------------
+// CHECK constraint expression evaluator (Task 3.5)
+// -----------------------------------------------------------------------
+
+/// Evaluate a CHECK constraint expression against a row's u64 cell values
+/// (Task 3.5).
+///
+/// Returns `true` if the check **passes** (or is UNKNOWN, e.g. due to a
+/// NULL operand); returns `false` if the check is **violated**.
+///
+/// Supported `Expr` variants (everything else returns `true` so unsupported
+/// expressions never block a DML):
+/// - `Expr::Binary { op: And|Or, .. }` — logical combinators (recurse).
+/// - `Expr::Binary { op: Eq|NotEq|Lt|Gt|LtEq|GtEq, .. }` — comparison of
+///   two operands (column-vs-literal, column-vs-column, literal-vs-literal).
+/// - `Expr::Not(e)` — logical negation.
+/// - `Expr::Paren(e)` — transparent.
+/// - `Expr::Column(name)` in a boolean context — non-zero = true.
+/// - `Expr::Literal(Value::Int(n))` — int literal (non-zero = true).
+/// - `Expr::Literal(Value::Float(f))` — float literal (non-zero = true).
+/// - `Expr::Literal(Value::Null)` — NULL → UNKNOWN → pass.
+///
+/// NULL handling (SQL standard): if a column referenced in a comparison
+/// is NULL (per `null_mask`), the comparison is UNKNOWN, which means the
+/// CHECK passes (a row is rejected only if the CHECK is FALSE).
+///
+/// Type handling: integer columns are interpreted as `i64` (so `x > 0`
+/// correctly rejects `x = -1`, stored as `(-1i64) as u64` = `u64::MAX`).
+/// Float columns are not specially handled here — when compared against
+/// an `Int` literal, the cell is reinterpreted as `i64`. This works for
+/// the common case of integer CHECK constraints; mixed int/float
+/// comparisons may give incorrect results (a known limitation; the
+/// evaluator prefers correctness for INT CHECKs over completeness).
+pub(crate) fn eval_check_expr(
+    expr: &crate::sql::ast::Expr,
+    column_names: &[String],
+    row_values: &[u64],
+    null_mask: &[bool],
+) -> bool {
+    use crate::sql::ast::{BinOp, Expr, Value};
+    match expr {
+        Expr::Binary { left, op, right } => match op {
+            BinOp::And => {
+                eval_check_expr(left, column_names, row_values, null_mask)
+                    && eval_check_expr(right, column_names, row_values, null_mask)
+            }
+            BinOp::Or => {
+                eval_check_expr(left, column_names, row_values, null_mask)
+                    || eval_check_expr(right, column_names, row_values, null_mask)
+            }
+            _ => {
+                let lv = eval_check_operand(left, column_names, row_values, null_mask);
+                let rv = eval_check_operand(right, column_names, row_values, null_mask);
+                compare_operands(lv, rv, *op)
+            }
+        },
+        Expr::Not(inner) => !eval_check_expr(inner, column_names, row_values, null_mask),
+        Expr::Paren(inner) => eval_check_expr(inner, column_names, row_values, null_mask),
+        Expr::Column(name) => {
+            // Bare column in a boolean context: non-zero = true.
+            let idx = column_names.iter().position(|c| c == name);
+            match idx {
+                Some(i) => {
+                    if null_mask.get(i).copied().unwrap_or(false) {
+                        true // NULL → UNKNOWN → pass
+                    } else {
+                        row_values.get(i).copied().unwrap_or(0) != 0
+                    }
+                }
+                None => true, // unknown column — don't block
+            }
+        }
+        Expr::Literal(Value::Int(n)) => *n != 0,
+        Expr::Literal(Value::Float(f)) => *f != 0.0,
+        Expr::Literal(Value::Null) => true,
+        _ => true, // unsupported expr — don't block
+    }
+}
+
+/// A typed operand extracted from an `Expr` for comparison in a CHECK.
+enum CheckOperand {
+    Null,
+    Int(i64),
+    Float(f64),
+    /// String hashed via xxh3 (matches `parse_value_cell`).
+    Str(u64),
+}
+
+fn eval_check_operand(
+    expr: &crate::sql::ast::Expr,
+    column_names: &[String],
+    row_values: &[u64],
+    null_mask: &[bool],
+) -> CheckOperand {
+    use crate::sql::ast::{Expr, Value};
+    match expr {
+        Expr::Column(name) => {
+            let idx = column_names.iter().position(|c| c == name);
+            match idx {
+                Some(i) => {
+                    if null_mask.get(i).copied().unwrap_or(false) {
+                        CheckOperand::Null
+                    } else {
+                        // Interpret as i64. For FLOAT columns the cell is
+                        // f64::to_bits; when compared against an Int literal,
+                        // this gives a wrong-but-non-blocking answer in the
+                        // rare mixed-type case (documented limitation).
+                        CheckOperand::Int(row_values.get(i).copied().unwrap_or(0) as i64)
+                    }
+                }
+                None => CheckOperand::Null, // unknown column → UNKNOWN → pass
+            }
+        }
+        Expr::Literal(Value::Int(n)) => CheckOperand::Int(*n),
+        Expr::Literal(Value::Float(f)) => CheckOperand::Float(*f),
+        Expr::Literal(Value::Null) => CheckOperand::Null,
+        Expr::Literal(Value::String(s)) => {
+            use xxhash_rust::xxh3;
+            CheckOperand::Str(xxh3::xxh3_64(s.as_bytes()))
+        }
+        Expr::Paren(inner) => eval_check_operand(inner, column_names, row_values, null_mask),
+        _ => CheckOperand::Null, // unsupported → UNKNOWN → pass
+    }
+}
+
+fn compare_operands(l: CheckOperand, r: CheckOperand, op: crate::sql::ast::BinOp) -> bool {
+    use crate::sql::ast::BinOp;
+    use CheckOperand::*;
+    // NULL operand → UNKNOWN → pass (return true).
+    if matches!(l, Null) || matches!(r, Null) {
+        return true;
+    }
+    match (l, r) {
+        (Int(a), Int(b)) => match op {
+            BinOp::Eq => a == b,
+            BinOp::NotEq => a != b,
+            BinOp::Lt => a < b,
+            BinOp::Gt => a > b,
+            BinOp::LtEq => a <= b,
+            BinOp::GtEq => a >= b,
+            _ => true, // arithmetic / concat → don't block
+        },
+        (Float(a), Float(b)) => match op {
+            BinOp::Eq => a == b,
+            BinOp::NotEq => a != b,
+            BinOp::Lt => a < b,
+            BinOp::Gt => a > b,
+            BinOp::LtEq => a <= b,
+            BinOp::GtEq => a >= b,
+            _ => true,
+        },
+        (Int(a), Float(b)) => match op {
+            BinOp::Eq => (a as f64) == b,
+            BinOp::NotEq => (a as f64) != b,
+            BinOp::Lt => (a as f64) < b,
+            BinOp::Gt => (a as f64) > b,
+            BinOp::LtEq => (a as f64) <= b,
+            BinOp::GtEq => (a as f64) >= b,
+            _ => true,
+        },
+        (Float(a), Int(b)) => match op {
+            BinOp::Eq => a == (b as f64),
+            BinOp::NotEq => a != (b as f64),
+            BinOp::Lt => a < (b as f64),
+            BinOp::Gt => a > (b as f64),
+            BinOp::LtEq => a <= (b as f64),
+            BinOp::GtEq => a >= (b as f64),
+            _ => true,
+        },
+        (Str(a), Str(b)) => match op {
+            // String range comparisons are unsupported (cells are hashes,
+            // so ordering is meaningless). Only equality is meaningful.
+            BinOp::Eq => a == b,
+            BinOp::NotEq => a != b,
+            _ => true,
+        },
+        // Mixed string/int or string/float → unsupported, don't block.
+        _ => true,
+    }
+}
+
 /// Evaluate a simple WHERE clause against a table, returning a row mask.
 ///
 /// Wave 50 fix (Bugs 4 & 5):

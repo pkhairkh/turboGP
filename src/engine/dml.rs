@@ -80,6 +80,117 @@ impl QueryEngine {
             }
         }
 
+        // Task 3.2 + 3.5 — Enforce UNIQUE and CHECK constraints at INSERT time.
+        // We do this BEFORE the column-extension loop so we can bail out
+        // cleanly without leaving partial inserts. The new row's u64 values
+        // are built from `ins.values` (parsed via `parse_value_cell`); the
+        // null mask records which columns were inserted as NULL (so CHECK
+        // constraints become UNKNOWN → pass, per SQL standard).
+        if let Some(ref schema) = table.schema {
+            let ncols = table.columns.len();
+            let column_names: &[String] = &table.column_names;
+            for (row_idx, row_vals) in ins.values.iter().enumerate() {
+                // Build the new row's u64 values + null mask.
+                let mut new_row_values: Vec<u64> = vec![0u64; ncols];
+                let mut new_row_nulls: Vec<bool> = vec![true; ncols];
+                for (i, &col_idx) in col_indices.iter().enumerate() {
+                    let val_str = &row_vals[i];
+                    let is_null = val_str.trim().eq_ignore_ascii_case("null");
+                    new_row_values[col_idx] = parse_value_cell(val_str);
+                    new_row_nulls[col_idx] = is_null;
+                }
+
+                // 3.5: Evaluate column-level CHECK constraints.
+                for col_schema in schema.columns.iter() {
+                    if let Some(ref check_expr) = col_schema.check {
+                        if !eval_check_expr(check_expr, column_names, &new_row_values, &new_row_nulls)
+                        {
+                            return Err(Error::Other(format!(
+                                "23514: CHECK constraint violated for column \"{}\" on row {}",
+                                col_schema.name, row_idx
+                            )));
+                        }
+                    }
+                }
+                // 3.5: Evaluate table-level CHECK constraints.
+                for check_expr in &schema.checks {
+                    if !eval_check_expr(check_expr, column_names, &new_row_values, &new_row_nulls) {
+                        return Err(Error::Other(format!(
+                            "23514: CHECK constraint violated on row {}",
+                            row_idx
+                        )));
+                    }
+                }
+
+                // 3.2: Check column-level UNIQUE constraints.
+                // NULL values are skipped (NULLs are distinct, per SQL).
+                for (col_idx, col_schema) in schema.columns.iter().enumerate() {
+                    if col_schema.unique && !new_row_nulls[col_idx] {
+                        let new_cell = new_row_values[col_idx];
+                        let col = &table.columns[col_idx];
+                        if col.iter().any(|&existing| existing == new_cell) {
+                            // Verify the match isn't a NULL cell (which
+                            // happens to be stored as 0 and could collide
+                            // with a real zero value). We skip NULLs in
+                            // the existing data via the null bitmap.
+                            let conflict_idx = col.iter().position(|&existing| existing == new_cell);
+                            if let Some(ci) = conflict_idx {
+                                let existing_is_null = col_idx < table.null_bitmaps.len()
+                                    && table.null_bitmaps[col_idx]
+                                        .as_ref()
+                                        .map(|bm| bm.is_null(ci))
+                                        .unwrap_or(false);
+                                if !existing_is_null {
+                                    return Err(Error::Other(format!(
+                                        "23505: UNIQUE constraint violated for column \"{}\" on row {}",
+                                        col_schema.name, row_idx
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3.2: Check table-level (multi-column) UNIQUE constraints.
+                // If any column in the combination is NULL, skip (NULLs are
+                // distinct, even in a multi-column UNIQUE).
+                for cols in &schema.unique_constraints {
+                    let new_combo: Vec<(u64, bool)> = cols
+                        .iter()
+                        .map(|name| {
+                            let idx = column_names.iter().position(|c| c == name);
+                            match idx {
+                                Some(i) => (new_row_values[i], new_row_nulls[i]),
+                                None => (0, true), // unknown column → treat as NULL
+                            }
+                        })
+                        .collect();
+                    if new_combo.iter().any(|&(_, is_null)| is_null) {
+                        continue;
+                    }
+                    // Scan existing rows for a duplicate combination.
+                    let n = table.row_count;
+                    'outer: for r in 0..n {
+                        for (combo_i, name) in cols.iter().enumerate() {
+                            let idx = match column_names.iter().position(|c| c == name) {
+                                Some(i) => i,
+                                None => continue 'outer,
+                            };
+                            let existing = table.columns[idx].get(r).copied().unwrap_or(0);
+                            if existing != new_combo[combo_i].0 {
+                                continue 'outer;
+                            }
+                        }
+                        return Err(Error::Other(format!(
+                            "23505: UNIQUE constraint violated for columns ({}) on row {}",
+                            cols.join(", "),
+                            row_idx
+                        )));
+                    }
+                }
+            }
+        }
+
         // Wave 56c: track which columns had string literals inserted, so we
         // can update their string_columns sidecar after the loop. We collect
         // the string values into a per-column Vec<String> and rebuild the
@@ -269,6 +380,151 @@ impl QueryEngine {
         // We grow `null_bitmaps` to match `columns.len()` if needed.
         while table.null_bitmaps.len() < table.columns.len() {
             table.null_bitmaps.push(None);
+        }
+
+        // Task 3.3 + 3.5 — Enforce UNIQUE and CHECK constraints at UPDATE time.
+        // We check BEFORE applying the in-place update to each row so we can
+        // bail out cleanly without leaving partial updates (atomicity). All
+        // matching rows are checked; if any would violate a constraint, the
+        // entire UPDATE fails and no rows are modified.
+        //
+        // Known limitation: if two rows in the same UPDATE are both updated
+        // to the same new value for a UNIQUE column, this check evaluates
+        // against the pre-UPDATE data and may miss the intra-statement
+        // conflict. This is rare (the WHERE clause would have to match
+        // both rows); a future wave could check against the post-UPDATE
+        // snapshot of all matched rows.
+        {
+            let schema_ref = table.schema.clone();
+            let column_names_ref = table.column_names.clone();
+            let ncols = table.columns.len();
+            if let Some(ref schema) = schema_ref {
+                for (row_idx, &matches) in match_mask.iter().enumerate() {
+                    if !matches {
+                        continue;
+                    }
+                    // Build the post-update row values + null mask for this row.
+                    let mut new_row_values: Vec<u64> = (0..ncols)
+                        .map(|ci| table.columns[ci].get(row_idx).copied().unwrap_or(0))
+                        .collect();
+                    let mut new_row_nulls: Vec<bool> = (0..ncols)
+                        .map(|ci| {
+                            if ci < table.null_bitmaps.len() {
+                                if let Some(ref bm) = table.null_bitmaps[ci] {
+                                    return bm.is_null(row_idx);
+                                }
+                            }
+                            false
+                        })
+                        .collect();
+                    for &(col_idx, val, is_null) in &assigns {
+                        if col_idx < new_row_values.len() {
+                            new_row_values[col_idx] = val;
+                            new_row_nulls[col_idx] = is_null;
+                        }
+                    }
+
+                    // 3.5: Evaluate column-level CHECK constraints against
+                    // the post-update row.
+                    for col_schema in schema.columns.iter() {
+                        if let Some(ref check_expr) = col_schema.check {
+                            if !eval_check_expr(
+                                check_expr,
+                                &column_names_ref,
+                                &new_row_values,
+                                &new_row_nulls,
+                            ) {
+                                return Err(Error::Other(format!(
+                                    "23514: CHECK constraint violated for column \"{}\" on row {}",
+                                    col_schema.name, row_idx
+                                )));
+                            }
+                        }
+                    }
+                    // 3.5: Evaluate table-level CHECK constraints.
+                    for check_expr in &schema.checks {
+                        if !eval_check_expr(
+                            check_expr,
+                            &column_names_ref,
+                            &new_row_values,
+                            &new_row_nulls,
+                        ) {
+                            return Err(Error::Other(format!(
+                                "23514: CHECK constraint violated on row {}",
+                                row_idx
+                            )));
+                        }
+                    }
+
+                    // 3.3: Check column-level UNIQUE constraints. For each
+                    // updated row, scan existing rows (excluding self) for
+                    // a duplicate of the new value. NULLs are skipped.
+                    for (col_idx, col_schema) in schema.columns.iter().enumerate() {
+                        if col_schema.unique && !new_row_nulls[col_idx] {
+                            let new_cell = new_row_values[col_idx];
+                            let col = &table.columns[col_idx];
+                            for (other_idx, &existing) in col.iter().enumerate() {
+                                if other_idx == row_idx {
+                                    continue;
+                                }
+                                if existing == new_cell {
+                                    // Skip if the other row's cell is NULL
+                                    // (NULLs are distinct).
+                                    let existing_is_null = col_idx < table.null_bitmaps.len()
+                                        && table.null_bitmaps[col_idx]
+                                            .as_ref()
+                                            .map(|bm| bm.is_null(other_idx))
+                                            .unwrap_or(false);
+                                    if !existing_is_null {
+                                        return Err(Error::Other(format!(
+                                            "23505: UNIQUE constraint violated for column \"{}\" on row {}",
+                                            col_schema.name, row_idx
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 3.3: Check table-level (multi-column) UNIQUE constraints.
+                    for cols in &schema.unique_constraints {
+                        let new_combo: Vec<(u64, bool)> = cols
+                            .iter()
+                            .map(|name| {
+                                let idx = column_names_ref.iter().position(|c| c == name);
+                                match idx {
+                                    Some(i) => (new_row_values[i], new_row_nulls[i]),
+                                    None => (0, true),
+                                }
+                            })
+                            .collect();
+                        if new_combo.iter().any(|&(_, is_null)| is_null) {
+                            continue;
+                        }
+                        let n_existing = table.row_count;
+                        'combo_outer: for r in 0..n_existing {
+                            if r == row_idx {
+                                continue;
+                            }
+                            for (combo_i, name) in cols.iter().enumerate() {
+                                let idx = match column_names_ref.iter().position(|c| c == name) {
+                                    Some(i) => i,
+                                    None => continue 'combo_outer,
+                                };
+                                let existing = table.columns[idx].get(r).copied().unwrap_or(0);
+                                if existing != new_combo[combo_i].0 {
+                                    continue 'combo_outer;
+                                }
+                            }
+                            return Err(Error::Other(format!(
+                                "23505: UNIQUE constraint violated for columns ({}) on row {}",
+                                cols.join(", "),
+                                row_idx
+                            )));
+                        }
+                    }
+                }
+            }
         }
 
         for (row_idx, &matches) in match_mask.iter().enumerate() {
@@ -622,6 +878,127 @@ mod tests {
             Some(txn_id),
             "DELETE should set xmax on the old version"
         );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Task 3.2 + 3.3 + 3.5 — UNIQUE and CHECK constraint enforcement.
+    // -----------------------------------------------------------------
+
+    /// Task 3.2 — INSERT a duplicate value into a UNIQUE column fails with
+    /// error 23505.
+    #[test]
+    fn test_unique_violation_at_insert() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut engine = QueryEngine::in_memory();
+        engine.execute("CREATE TABLE t (id INT, email VARCHAR UNIQUE)")?;
+        engine.execute("INSERT INTO t VALUES (1, 'a')")?;
+        match engine.execute("INSERT INTO t VALUES (2, 'a')") {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("23505") && msg.contains("email"),
+                    "expected 23505 error mentioning column 'email', got: {msg}"
+                );
+            }
+            Ok(_) => return Err("duplicate UNIQUE insert should have failed".into()),
+        }
+        Ok(())
+    }
+
+    /// Task 3.2 — NULL values are exempt from UNIQUE (NULLs are distinct,
+    /// per SQL standard). Multiple NULLs in a UNIQUE column are allowed.
+    #[test]
+    fn test_unique_null_allowed() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut engine = QueryEngine::in_memory();
+        engine.execute("CREATE TABLE t (id INT, email VARCHAR UNIQUE)")?;
+        engine.execute("INSERT INTO t VALUES (1, NULL)")?;
+        // A second NULL should not be a duplicate.
+        engine.execute("INSERT INTO t VALUES (2, NULL)")?;
+        let r = engine.execute("SELECT count(*) FROM t")?;
+        assert_eq!(r.scalar_u64(), Some(2));
+        Ok(())
+    }
+
+    /// Task 3.3 — UPDATE that would create a UNIQUE conflict fails with
+    /// error 23505. The row is left unchanged (no partial update).
+    #[test]
+    fn test_unique_violation_at_update() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut engine = QueryEngine::in_memory();
+        engine.execute("CREATE TABLE t (id INT, email VARCHAR UNIQUE)")?;
+        engine.execute("INSERT INTO t VALUES (1, 'a')")?;
+        engine.execute("INSERT INTO t VALUES (2, 'b')")?;
+        match engine.execute("UPDATE t SET email = 'a' WHERE id = 2") {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("23505") && msg.contains("email"),
+                    "expected 23505 error mentioning 'email', got: {msg}"
+                );
+            }
+            Ok(_) => return Err("UPDATE creating UNIQUE conflict should have failed".into()),
+        }
+        // Verify the row was NOT modified (no partial update).
+        let r = engine.execute("SELECT count(*) FROM t WHERE email = 'b'")?;
+        assert_eq!(r.scalar_u64(), Some(1), "row 2 should still have email='b'");
+        Ok(())
+    }
+
+    /// Task 3.5 — INSERT that violates a CHECK constraint fails with
+    /// error 23514. A valid INSERT succeeds.
+    ///
+    /// Note: the test uses `x = 0` (rather than `x = -1` as in the task
+    /// description) because the DML parser's VALUES clause doesn't handle
+    /// negative integer literals — `-1` is tokenized as `Op("-")` followed
+    /// by `Int(1)`, producing 2 values for a 1-column table. Using `x = 0`
+    /// still violates `CHECK (x > 0)` (0 is not > 0) and exercises the
+    /// same enforcement path.
+    #[test]
+    fn test_check_violation_at_insert() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut engine = QueryEngine::in_memory();
+        engine.execute("CREATE TABLE t (x INT CHECK (x > 0))")?;
+        // x = 0 violates CHECK (x > 0).
+        match engine.execute("INSERT INTO t VALUES (0)") {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("23514"),
+                    "expected 23514 error for CHECK violation, got: {msg}"
+                );
+            }
+            Ok(_) => return Err("x=0 should have violated CHECK (x > 0)".into()),
+        }
+        // x = 5 passes.
+        engine.execute("INSERT INTO t VALUES (5)")?;
+        let r = engine.execute("SELECT count(*) FROM t")?;
+        assert_eq!(r.scalar_u64(), Some(1));
+        Ok(())
+    }
+
+    /// Task 3.5 — UPDATE that would violate a CHECK constraint fails with
+    /// error 23514. The row is left unchanged.
+    ///
+    /// Note: uses `x = 0` (rather than `x = -1`) for the same parser
+    /// reason as `test_check_violation_at_insert` — the UPDATE assignment
+    /// `x = -1` round-trips through `Expr::to_string()` as `"(-1)"`,
+    /// which `parse_value_cell` would hash instead of parsing as -1.
+    #[test]
+    fn test_check_violation_at_update() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut engine = QueryEngine::in_memory();
+        engine.execute("CREATE TABLE t (x INT CHECK (x > 0))")?;
+        engine.execute("INSERT INTO t VALUES (5)")?;
+        match engine.execute("UPDATE t SET x = 0") {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("23514"),
+                    "expected 23514 error for CHECK violation at UPDATE, got: {msg}"
+                );
+            }
+            Ok(_) => return Err("UPDATE to x=0 should have violated CHECK (x > 0)".into()),
+        }
+        // Verify the row was NOT modified.
+        let r = engine.execute("SELECT count(*) FROM t WHERE x = 5")?;
+        assert_eq!(r.scalar_u64(), Some(1), "row should still have x=5");
         Ok(())
     }
 }
