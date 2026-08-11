@@ -149,9 +149,23 @@ impl WalRecord {
     }
 }
 
-/// The WAL: appends records to a file and provides a reader for replay.
+/// Default segment size limit: 64 MB (Task 2.3).
+pub const DEFAULT_SEGMENT_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// The WAL: appends records to a directory of segment files and provides
+/// a reader for replay.
+///
+/// Task 2.3: WAL segmentation. Records are written to segment files named
+/// `wal-<N>.log` inside `dir`. When a segment reaches `segment_limit`
+/// bytes (default 64 MB), a new segment is created. `read_all()` reads
+/// across all segments in order. `truncate()` deletes all segments and
+/// starts fresh at segment 0.
 pub struct Wal {
-    path: String,
+    /// Directory holding the segment files (`wal-0.log`, `wal-1.log`, ...).
+    dir: std::path::PathBuf,
+    /// The segment number currently being appended to.
+    current_segment: u64,
+    /// The file handle for the current segment (None if closed).
     file: Option<File>,
     /// Monotonic LSN counter. The next record appended gets this LSN.
     /// On `open()`, initialised by scanning the existing WAL for the max
@@ -160,17 +174,39 @@ pub struct Wal {
     /// `advance_lsn_to()` lets the engine bump this past the checkpoint's
     /// `last_lsn` when the WAL was truncated to empty.
     next_lsn: u64,
+    /// Rotate to a new segment when the current one reaches this many bytes.
+    segment_limit: u64,
 }
 
 impl Wal {
-    /// Open (or create) a WAL at the given path.
+    /// Open (or create) a segmented WAL in the given directory.
+    ///
+    /// Segment files are named `wal-<N>.log`. On open, scans for the
+    /// highest segment number and opens it for append. If no segments
+    /// exist, creates segment 0.
     ///
     /// Task 1.3: scans the existing WAL to find the max LSN, so newly
     /// appended records continue the LSN sequence monotonically.
-    pub fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        let path_str = path.as_ref().to_string_lossy().to_string();
-        let file = OpenOptions::new().create(true).append(true).read(true).open(&path)?;
-        let mut wal = Wal { path: path_str, file: Some(file), next_lsn: 1 };
+    pub fn open<P: AsRef<Path>>(dir: P) -> std::io::Result<Self> {
+        Self::open_with_segment_limit(dir, DEFAULT_SEGMENT_LIMIT)
+    }
+
+    /// Open a segmented WAL with a custom segment size limit (for tests).
+    pub fn open_with_segment_limit<P: AsRef<Path>>(dir: P, segment_limit: u64) -> std::io::Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+        // Scan for existing segments to find the highest segment number.
+        let max_seg = scan_max_segment(&dir)?;
+        let current_segment = max_seg;
+        let seg_path = segment_path(&dir, current_segment);
+        let file = OpenOptions::new().create(true).append(true).read(true).open(&seg_path)?;
+        let mut wal = Wal {
+            dir,
+            current_segment,
+            file: Some(file),
+            next_lsn: 1,
+            segment_limit,
+        };
         // Scan existing records to find the max LSN.
         if let Ok(records) = wal.read_all() {
             let max_lsn = records.iter().map(|r| r.lsn).max().unwrap_or(0);
@@ -200,19 +236,15 @@ impl Wal {
     /// Append a record to the WAL. Does NOT fsync — call `sync()` to
     /// durably persist.
     ///
-    /// Wave 51 fix (Bug 10): the SQL payload is base64-encoded so that
-    /// pipe characters, newlines, and backslashes inside SQL strings
-    /// round-trip unambiguously.
-    ///
-    /// Wave 2 fix: an xxh3_64 checksum is appended as the last field so
-    /// that torn writes and bit-flips are detectable on replay. The
-    /// checksum is computed over the entire line (excluding the checksum
-    /// field and the trailing newline).
+    /// Task 2.3: if the current segment file has reached `segment_limit`
+    /// bytes, rotate to a new segment before appending.
     ///
     /// Task 1.3: the LSN is written as the FIRST field. The in-memory
     /// `record.lsn` is ignored — the Wal assigns its own monotonic LSN
     /// from `next_lsn`. On `read_all()`, the LSN is populated from disk.
     pub fn append(&mut self, record: &WalRecord) -> std::io::Result<()> {
+        // Task 2.3: rotate if the current segment is full.
+        self.maybe_rotate()?;
         if let Some(ref mut file) = self.file {
             // Assign the LSN from the Wal's monotonic counter.
             let lsn = self.next_lsn;
@@ -236,6 +268,21 @@ impl Wal {
             let checksum = xxhash_rust::xxh3::xxh3_64(data_line.as_bytes());
             let line = format!("{data_line}|{checksum:016x}\n");
             file.write_all(line.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Check if the current segment has reached `segment_limit`; if so,
+    /// close it and open a new segment. (Task 2.3)
+    fn maybe_rotate(&mut self) -> std::io::Result<()> {
+        if let Some(ref file) = self.file {
+            let size = file.metadata()?.len();
+            if size >= self.segment_limit {
+                self.current_segment += 1;
+                let seg_path = segment_path(&self.dir, self.current_segment);
+                let new_file = OpenOptions::new().create(true).append(true).read(true).open(&seg_path)?;
+                self.file = Some(new_file);
+            }
         }
         Ok(())
     }
@@ -273,13 +320,10 @@ impl Wal {
 
     /// Read all records from the WAL (for replay on startup).
     ///
-    /// Wave 51 fix: the SQL field is base64-decoded. Records that fail to
-    /// decode are skipped (with a warning logged).
-    ///
-    /// Wave 2 fix: the last field is an xxh3_64 checksum. Records whose
-    /// checksum does not match are skipped with a warning (torn write /
-    /// bit-flip detection). Legacy records without a checksum field are
-    /// accepted without verification for backward compatibility.
+    /// Task 2.3: reads across ALL segment files in order (wal-0.log,
+    /// wal-1.log, ...). Records from each segment are appended in order,
+    /// so the final vec is in LSN order (assuming segments were written
+    /// in order).
     ///
     /// Task 1.3: the first field is the LSN. New format (6 data fields +
     /// checksum) is `lsn|txn_id|commit|rollback|base64(sql)|physical_json|xxh3`.
@@ -287,100 +331,107 @@ impl Wal {
     /// `txn_id|commit|rollback|base64(sql)|physical_json|xxh3` — parsed
     /// with `lsn = 0`.
     pub fn read_all(&self) -> std::io::Result<Vec<WalRecord>> {
-        let file = File::open(&self.path)?;
-        let reader = BufReader::new(file);
         let mut records = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            // Wave 2: try to split off the checksum (last `|<hex>` field).
-            // If the last field is a 16-char hex string, treat it as a checksum.
-            let (data_line, checksum_opt) = match line.rsplit_once('|') {
-                Some((data, last_field))
-                    if last_field.len() == 16
-                        && last_field.chars().all(|c| c.is_ascii_hexdigit()) =>
-                {
-                    (data.to_string(), Some(last_field.to_string()))
-                }
-                _ => (line.clone(), None), // Legacy record without checksum.
-            };
-            // Verify checksum if present.
-            if let Some(ref expected_hex) = checksum_opt {
-                let expected = u64::from_str_radix(expected_hex, 16).unwrap_or(0);
-                let actual = xxhash_rust::xxh3::xxh3_64(data_line.as_bytes());
-                if expected != actual {
-                    log::warn!(
-                        "WAL checksum mismatch: expected {expected:016x}, got {actual:016x}, skipping record"
-                    );
+        // List and sort segment files by number.
+        let segments = list_segments(&self.dir)?;
+        for seg in segments {
+            let seg_path = segment_path(&self.dir, seg);
+            let file = File::open(&seg_path)?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
                     continue;
                 }
-            }
-            // Parse the data line (now without the checksum field).
-            // Task 1.3: try the new 6-field format (lsn first) first.
-            let parts: Vec<&str> = data_line.splitn(6, '|').collect();
-            if parts.len() == 6 {
-                // New format: lsn|txn_id|commit|rollback|base64(sql)|physical_json
-                let lsn: u64 = parts[0].parse().unwrap_or(0);
-                let txn_id: u64 = parts[1].parse().unwrap_or(0);
-                let is_commit = parts[2] == "1";
-                let is_rollback = parts[3] == "1";
-                let sql = match general_purpose::STANDARD.decode(parts[4].as_bytes()) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                    Err(_) => decode_legacy_sql(parts[4]),
+                // Wave 2: try to split off the checksum (last `|<hex>` field).
+                let (data_line, checksum_opt) = match line.rsplit_once('|') {
+                    Some((data, last_field))
+                        if last_field.len() == 16
+                            && last_field.chars().all(|c| c.is_ascii_hexdigit()) =>
+                    {
+                        (data.to_string(), Some(last_field.to_string()))
+                    }
+                    _ => (line.clone(), None),
                 };
-                let physical_change = if !parts[5].is_empty() {
-                    serde_json::from_str::<PhysicalChange>(parts[5]).ok()
+                // Verify checksum if present.
+                if let Some(ref expected_hex) = checksum_opt {
+                    let expected = u64::from_str_radix(expected_hex, 16).unwrap_or(0);
+                    let actual = xxhash_rust::xxh3::xxh3_64(data_line.as_bytes());
+                    if expected != actual {
+                        log::warn!(
+                            "WAL checksum mismatch: expected {expected:016x}, got {actual:016x}, skipping record"
+                        );
+                        continue;
+                    }
+                }
+                // Task 1.3: try the new 6-field format (lsn first) first.
+                let parts: Vec<&str> = data_line.splitn(6, '|').collect();
+                if parts.len() == 6 {
+                    let lsn: u64 = parts[0].parse().unwrap_or(0);
+                    let txn_id: u64 = parts[1].parse().unwrap_or(0);
+                    let is_commit = parts[2] == "1";
+                    let is_rollback = parts[3] == "1";
+                    let sql = match general_purpose::STANDARD.decode(parts[4].as_bytes()) {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                        Err(_) => decode_legacy_sql(parts[4]),
+                    };
+                    let physical_change = if !parts[5].is_empty() {
+                        serde_json::from_str::<PhysicalChange>(parts[5]).ok()
+                    } else {
+                        None
+                    };
+                    records.push(WalRecord { lsn, txn_id, sql, is_commit, is_rollback, physical_change });
+                    continue;
+                }
+                // Fall back to the legacy 5-field format (no LSN).
+                let parts: Vec<&str> = data_line.splitn(5, '|').collect();
+                if parts.len() < 4 {
+                    if parts.len() >= 1 {
+                        if let Ok(rec) = parse_legacy_record(&data_line) {
+                            records.push(rec);
+                        }
+                    }
+                    continue;
+                }
+                let txn_id: u64 = parts[0].parse().unwrap_or(0);
+                let is_commit = parts[1] == "1";
+                let is_rollback = parts[2] == "1";
+                let sql = match general_purpose::STANDARD.decode(parts[3].as_bytes()) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(_) => decode_legacy_sql(parts[3]),
+                };
+                let physical_change = if parts.len() >= 5 && !parts[4].is_empty() {
+                    serde_json::from_str::<PhysicalChange>(parts[4]).ok()
                 } else {
                     None
                 };
-                records.push(WalRecord { lsn, txn_id, sql, is_commit, is_rollback, physical_change });
-                continue;
+                records.push(WalRecord { lsn: 0, txn_id, sql, is_commit, is_rollback, physical_change });
             }
-            // Fall back to the legacy 5-field format (no LSN).
-            let parts: Vec<&str> = data_line.splitn(5, '|').collect();
-            if parts.len() < 4 {
-                // Legacy record format (pre-Wave-51) — try the old escaping.
-                if parts.len() >= 1 {
-                    if let Ok(rec) = parse_legacy_record(&data_line) {
-                        records.push(rec);
-                    }
-                }
-                continue;
-            }
-            let txn_id: u64 = parts[0].parse().unwrap_or(0);
-            let is_commit = parts[1] == "1";
-            let is_rollback = parts[2] == "1";
-            let sql = match general_purpose::STANDARD.decode(parts[3].as_bytes()) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(_) => decode_legacy_sql(parts[3]),
-            };
-            let physical_change = if parts.len() >= 5 && !parts[4].is_empty() {
-                serde_json::from_str::<PhysicalChange>(parts[4]).ok()
-            } else {
-                None
-            };
-            records.push(WalRecord { lsn: 0, txn_id, sql, is_commit, is_rollback, physical_change });
         }
         Ok(records)
     }
 
     /// Truncate the WAL (after a successful checkpoint).
     ///
+    /// Task 2.3: deletes ALL segment files and starts fresh at segment 0.
+    ///
     /// Task 1.3: does NOT reset `next_lsn` — LSNs must remain monotonic
     /// across the checkpoint boundary so that post-checkpoint records get
     /// LSNs strictly greater than the checkpoint's `last_lsn` (otherwise
     /// they'd be skipped by the LSN filter on replay).
     pub fn truncate(&mut self) -> std::io::Result<()> {
-        // Close the current file, truncate it, and reopen for append.
+        // Close the current file handle.
         self.file = None;
-        // First truncate: open with write+truncate.
-        {
-            let _ = OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)?;
+        // Delete all segment files.
+        let segments = list_segments(&self.dir)?;
+        for seg in segments {
+            let seg_path = segment_path(&self.dir, seg);
+            std::fs::remove_file(&seg_path)?;
         }
-        // Then reopen for append+read.
-        let file = OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
+        // Open segment 0 fresh.
+        self.current_segment = 0;
+        let seg_path = segment_path(&self.dir, 0);
+        let file = OpenOptions::new().create(true).append(true).read(true).open(&seg_path)?;
         self.file = Some(file);
         // Intentionally do NOT reset self.next_lsn.
         Ok(())
@@ -390,6 +441,46 @@ impl Wal {
     pub fn close(&mut self) {
         self.file = None;
     }
+
+    /// Return the number of segment files currently on disk (Task 2.3).
+    pub fn segment_count(&self) -> std::io::Result<usize> {
+        Ok(list_segments(&self.dir)?.len())
+    }
+
+    /// Return the current segment number (Task 2.3).
+    pub fn current_segment(&self) -> u64 {
+        self.current_segment
+    }
+}
+
+/// Build the path for segment `n` in `dir`: `<dir>/wal-<n>.log` (Task 2.3).
+fn segment_path(dir: &std::path::Path, n: u64) -> std::path::PathBuf {
+    dir.join(format!("wal-{}.log", n))
+}
+
+/// List all segment numbers in `dir`, sorted ascending (Task 2.3).
+fn list_segments(dir: &std::path::Path) -> std::io::Result<Vec<u64>> {
+    let mut segments = Vec::new();
+    if !dir.exists() {
+        return Ok(segments);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if let Some(n_str) = name_str.strip_prefix("wal-").and_then(|s| s.strip_suffix(".log")) {
+            if let Ok(n) = n_str.parse::<u64>() {
+                segments.push(n);
+            }
+        }
+    }
+    segments.sort();
+    Ok(segments)
+}
+
+/// Find the highest segment number in `dir`, or 0 if none exist (Task 2.3).
+fn scan_max_segment(dir: &std::path::Path) -> std::io::Result<u64> {
+    Ok(list_segments(dir)?.into_iter().max().unwrap_or(0))
 }
 
 /// Decode a legacy (pre-Wave-51) SQL field that used the ambiguous
@@ -776,11 +867,11 @@ impl Checkpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     #[test]
     fn wal_append_and_read() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
         lsn: 0,
@@ -820,7 +911,7 @@ mod tests {
 
     #[test]
     fn wal_truncate() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
             lsn: 0,
@@ -841,7 +932,7 @@ mod tests {
     /// Task 2.1 DoD: append_and_sync appends AND fsyncs, returning any error.
     #[test]
     fn wal_append_and_sync_roundtrips() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
         wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
@@ -857,7 +948,7 @@ mod tests {
 
     #[test]
     fn wal_special_chars() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
         lsn: 0,
@@ -877,7 +968,7 @@ mod tests {
 
     #[test]
     fn replay_autocommit() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
         lsn: 0,
@@ -920,7 +1011,7 @@ mod tests {
 
     #[test]
     fn replay_skips_uncommitted() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
         lsn: 0,
@@ -951,7 +1042,7 @@ mod tests {
 
     #[test]
     fn replay_skips_rolled_back() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
         lsn: 0,
@@ -1007,12 +1098,12 @@ mod tests {
         });
         cat.register(t);
 
-        let tmp = NamedTempFile::new().unwrap();
-        let count = Checkpoint::save(&cat, tmp.path()).unwrap();
+        let ckpt_file = NamedTempFile::new().unwrap();
+        let count = Checkpoint::save(&cat, ckpt_file.path()).unwrap();
         assert_eq!(count, 1);
 
         // Read the file and verify it has CREATE TABLE and INSERT statements.
-        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let content = std::fs::read_to_string(ckpt_file.path()).unwrap();
         assert!(content.contains("CREATE TABLE users"));
         assert!(content.contains("INSERT INTO users VALUES (1)"));
         assert!(content.contains("INSERT INTO users VALUES (2)"));
@@ -1022,7 +1113,7 @@ mod tests {
     /// Task 1.1 DoD: save_and_truncate writes the checkpoint AND empties the WAL.
     #[test]
     fn checkpoint_save_and_truncate_empties_wal() {
-        let wal_tmp = NamedTempFile::new().unwrap();
+        let wal_tmp = TempDir::new().unwrap();
         let ckpt_tmp = NamedTempFile::new().unwrap();
         let mut wal = Wal::open(wal_tmp.path()).unwrap();
         // Append a few records to the WAL.
@@ -1057,7 +1148,7 @@ mod tests {
     /// and the checkpoint file is fully written (not partially).
     #[test]
     fn checkpoint_atomic_swap_no_tmp_left_behind() {
-        let wal_tmp = NamedTempFile::new().unwrap();
+        let wal_tmp = TempDir::new().unwrap();
         let ckpt_dir = tempfile::TempDir::new().unwrap();
         let ckpt_path = ckpt_dir.path().join("checkpoint.sql");
         let tmp_path = ckpt_path.with_extension("sql.tmp");
@@ -1142,7 +1233,7 @@ mod tests {
     /// Task 1.3 DoD: WAL records carry a monotonic LSN assigned by Wal::append().
     #[test]
     fn wal_assigns_monotonic_lsns() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         assert_eq!(wal.current_lsn(), 0, "no records appended yet");
         wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
@@ -1160,7 +1251,7 @@ mod tests {
     /// so new records get LSNs strictly greater than pre-truncate records.
     #[test]
     fn wal_truncate_preserves_next_lsn() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
         wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
@@ -1178,7 +1269,7 @@ mod tests {
     /// Task 1.3 DoD: Wal::open() scans the existing WAL to recover next_lsn.
     #[test]
     fn wal_open_recovers_next_lsn_from_existing_records() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         {
             let mut wal = Wal::open(tmp.path()).unwrap();
             wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
@@ -1195,7 +1286,7 @@ mod tests {
     /// Task 1.3 DoD: advance_lsn_to bumps next_lsn past the given LSN.
     #[test]
     fn wal_advance_lsn_to() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         assert_eq!(wal.current_lsn(), 0);
         wal.advance_lsn_to(10);
@@ -1212,7 +1303,7 @@ mod tests {
     /// Task 1.3 DoD: Checkpoint::save_and_truncate writes the last_lsn sidecar.
     #[test]
     fn checkpoint_writes_last_lsn_sidecar() {
-        let wal_tmp = NamedTempFile::new().unwrap();
+        let wal_tmp = TempDir::new().unwrap();
         let ckpt_dir = tempfile::TempDir::new().unwrap();
         let ckpt_path = ckpt_dir.path().join("checkpoint.sql");
         let mut wal = Wal::open(wal_tmp.path()).unwrap();
@@ -1239,5 +1330,60 @@ mod tests {
         Checkpoint::save_and_truncate(&cat, &ckpt_path, &mut wal).unwrap();
         let last_lsn = Checkpoint::read_last_lsn(&ckpt_path);
         assert_eq!(last_lsn, Some(2), "sidecar must contain last_lsn=2");
+    }
+
+    /// Task 2.3 DoD: segment rotation. When a segment reaches the size
+    /// limit, a new segment is created.
+    #[test]
+    fn wal_segment_rotation() {
+        let tmp = TempDir::new().unwrap();
+        // Use a tiny segment limit (1 byte) so every record triggers rotation.
+        let mut wal = Wal::open_with_segment_limit(tmp.path(), 1).unwrap();
+        wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
+        wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
+        wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (3)")).unwrap();
+        wal.sync().unwrap();
+        // After 3 appends with a 1-byte limit, we should have rotated at least
+        // once (likely 3 segments: wal-0.log, wal-1.log, wal-2.log).
+        let seg_count = wal.segment_count().unwrap();
+        assert!(seg_count >= 2, "expected at least 2 segments after rotation, got {}", seg_count);
+    }
+
+    /// Task 2.3 DoD: multi-segment replay. Records spread across multiple
+    /// segments are read back in LSN order.
+    #[test]
+    fn wal_multi_segment_replay() {
+        let tmp = TempDir::new().unwrap();
+        // Tiny limit to force rotation.
+        let mut wal = Wal::open_with_segment_limit(tmp.path(), 1).unwrap();
+        for i in 1..=10 {
+            wal.append(&WalRecord::autocommit(format!("INSERT INTO t VALUES ({})", i))).unwrap();
+        }
+        wal.sync().unwrap();
+        assert!(wal.segment_count().unwrap() >= 2, "must have rotated");
+        // Read all — records must come back in LSN order.
+        let records = wal.read_all().unwrap();
+        assert_eq!(records.len(), 10);
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.lsn, (i + 1) as u64, "LSNs must be monotonic");
+            assert_eq!(r.sql, format!("INSERT INTO t VALUES ({})", i + 1));
+        }
+    }
+
+    /// Task 2.3 DoD: after truncate, all segments are deleted and a fresh
+    /// segment 0 is created. next_lsn is preserved.
+    #[test]
+    fn wal_truncate_deletes_all_segments() {
+        let tmp = TempDir::new().unwrap();
+        let mut wal = Wal::open_with_segment_limit(tmp.path(), 1).unwrap();
+        wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
+        wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
+        wal.sync().unwrap();
+        assert!(wal.segment_count().unwrap() >= 2);
+        let lsn_before = wal.current_lsn();
+        wal.truncate().unwrap();
+        assert_eq!(wal.segment_count().unwrap(), 1, "only segment 0 after truncate");
+        assert_eq!(wal.read_all().unwrap().len(), 0, "WAL empty after truncate");
+        assert_eq!(wal.current_lsn(), lsn_before, "next_lsn preserved");
     }
 }

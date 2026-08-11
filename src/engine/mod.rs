@@ -264,8 +264,10 @@ impl QueryEngine {
         let bp = crate::storage::buffer_pool::BufferPool::new(data_dir, 256)?;
         engine.buffer_pool = Some(bp);
         // Also open a WAL in the same data directory.
-        let wal_path = data_dir.join("wal.log");
-        let wal = crate::storage::recovery::Wal::open(&wal_path)?;
+        // Task 2.3: the WAL is now segmented — it manages `wal-<N>.log`
+        // files inside a dedicated `wal/` subdirectory of the data dir.
+        let wal_dir = data_dir.join("wal");
+        let wal = crate::storage::recovery::Wal::open(&wal_dir)?;
         engine.wal = Some(wal);
         // Wave 5 (A4 fix): Load checkpoint BEFORE replaying WAL.
         // The checkpoint contains the catalog state at the last VACUUM;
@@ -489,6 +491,7 @@ impl QueryEngine {
     }
 
     /// Enable WAL on an existing engine.
+    /// Task 2.3: `wal_path` is now a directory (segmented WAL).
     pub fn enable_wal<P: AsRef<std::path::Path>>(&mut self, wal_path: P) -> Result<()> {
         let wal = crate::storage::recovery::Wal::open(&wal_path)?;
         self.wal = Some(wal);
