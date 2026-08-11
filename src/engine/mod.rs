@@ -137,35 +137,82 @@ pub mod transaction;
 pub mod vacuum;
 
 impl QueryEngine {
-    pub fn try_readonly_select(&self, sql: &str) -> Result<QueryResult> {
+    /// Execute a SQL statement in **read-only mode** (Wave 2 — Agent C).
+    ///
+    /// Takes `&self` (not `&mut self`) so callers can hold a `RwLock::read()`
+    /// guard and run multiple SELECTs concurrently without blocking other
+    /// readers. DML/DDL statements are rejected with an error so a
+    /// read-only caller can never accidentally mutate the catalog.
+    ///
+    /// # Accepted statements
+    ///
+    /// - `SELECT ...` (no interpreter fallback — see below)
+    /// - `EXPLAIN SELECT ...` (uses the planner pipeline from Wave 1)
+    /// - `SHOW ...` (treated as a SELECT against `__dummy__`)
+    /// - `WITH ... SELECT ...` is rejected (the CTE executor needs `&mut
+    ///   self` to register temp tables); callers should acquire a write
+    ///   lock for CTEs.
+    ///
+    /// # Rejected statements
+    ///
+    /// `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `ALTER`, `BEGIN`,
+    /// `COMMIT`, `ROLLBACK`, `COPY`, `VACUUM`, `CHECKPOINT`, `MERGE`,
+    /// `SAVEPOINT`, `RELEASE`, `BACKUP`, `RESTORE` — all return
+    /// `Error::Other("read-only transaction: <verb> requires a write lock")`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Other`] if the SQL is a write statement, requires
+    ///   interpreter fallback, or fails during execution.
+    /// - [`Error::Parse`] if the SQL is malformed.
+    /// - [`Error::NotFound`] if the source table or a referenced column
+    ///   does not exist in the catalog.
+    pub fn execute_readonly(&self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let trimmed = sql.trim();
         let lower = trimmed.to_lowercase();
 
-        // Only SELECT queries can be readonly.
-        if !lower.starts_with("select") && !lower.starts_with("with") {
-            return Err(Error::Other("not a readonly query".into()));
+        // EXPLAIN is read-only (uses the planner, doesn't touch catalog).
+        // We re-use the planner-pipeline EXPLAIN path from Wave 1 Task 1.2,
+        // but we need &mut self to call execute_explain (which currently
+        // lives in the QueryEngine impl that takes &mut self). Since we
+        // only have &self here, we inline the planner path.
+        if lower.starts_with("explain ") {
+            return self.execute_readonly_explain(&trimmed[8..], &start);
         }
 
-        // Try DDL/DML — these are NOT readonly.
+        // Only SELECT and SHOW can be readonly.
+        if !lower.starts_with("select") && !lower.starts_with("show") {
+            // Identify the offending verb for a nicer error message.
+            let verb = trimmed.split_whitespace().next().unwrap_or("unknown");
+            return Err(Error::Other(format!(
+                "read-only transaction: {verb} requires a write lock"
+            )));
+        }
+
+        // DDL/DML are not readonly even if they happen to start with SELECT
+        // (e.g. SELECT INTO). Reject them.
         if crate::sql::parse_ddl(sql).map_err(Error::Parse)?.is_some() {
-            return Err(Error::Other("DDL requires write lock".into()));
+            return Err(Error::Other("read-only transaction: DDL requires a write lock".into()));
         }
         if crate::sql::parse_dml(sql).map_err(Error::Parse)?.is_some() {
-            return Err(Error::Other("DML requires write lock".into()));
+            return Err(Error::Other("read-only transaction: DML requires a write lock".into()));
         }
 
-        // Try CTE.
-        if let Some(with_result) = crate::sql::parse_with(sql) {
-            return Err(Error::Other("CTE requires write lock".into()));
+        // CTEs need &mut self (temp-table registration), so reject them.
+        if crate::sql::parse_with(sql).is_some() {
+            return Err(Error::Other("read-only transaction: CTE requires a write lock".into()));
         }
 
         // Parse as SELECT and execute against the current catalog.
         let (query, extensions) = match crate::sql::parse_with_extensions(sql) {
             Ok(qe) => qe,
             Err(_parse_err) => {
-                // Basic parser failed — need interpreter fallback, which requires &mut self.
-                return Err(Error::Other("query needs interpreter fallback — requires write lock".into()));
+                // Basic parser failed — would need interpreter fallback
+                // (which requires &mut self). Reject.
+                return Err(Error::Other(
+                    "read-only transaction: query needs interpreter fallback, requires a write lock".into(),
+                ));
             }
         };
 
@@ -181,10 +228,44 @@ impl QueryEngine {
                 Ok(result)
             }
             Err(_exec_err) => {
-                // execute_select failed — need interpreter fallback.
-                Err(Error::Other("query failed in execute_select — needs interpreter fallback".into()))
+                // execute_select failed — would need interpreter fallback.
+                Err(Error::Other(
+                    "read-only transaction: query failed in execute_select, requires a write lock".into(),
+                ))
             }
         }
+    }
+
+    /// Internal helper: EXPLAIN path that runs with only `&self` (used by
+    /// `execute_readonly`). Mirrors the planner-based EXPLAIN from Wave 1
+    /// Task 1.2 but doesn't require `&mut self`.
+    fn execute_readonly_explain(&self, sql: &str, start: &Instant) -> Result<QueryResult> {
+        let (query, _extensions) = crate::sql::parse_with_extensions(sql)
+            .map_err(Error::Parse)?;
+        let plan = crate::planner::build_plan(&query)?;
+        let optimizer = crate::planner::CascadesOptimizer::new();
+        let optimized = optimizer.optimize(plan);
+        let plan_text = format!("{}", optimized);
+
+        let mut result = QueryResult::empty();
+        result.row_count = 1;
+        result.columns = vec![ResultColumn {
+            name: "QUERY PLAN".into(),
+            values: vec![xxhash_rust::xxh3::xxh3_64(plan_text.as_bytes())],
+            string_values: Some(vec![plan_text]),
+            type_oid: 25,
+            null_mask: None,
+        }];
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+
+    /// Deprecated alias for [`QueryEngine::execute_readonly`].
+    ///
+    /// retained for backwards compatibility with `src/server/pgwire.rs`
+    /// (owned by another agent). New callers should use `execute_readonly`.
+    pub fn try_readonly_select(&self, sql: &str) -> Result<QueryResult> {
+        self.execute_readonly(sql)
     }
 
     /// Construct an empty engine with the default kernel table and cost
