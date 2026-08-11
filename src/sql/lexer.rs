@@ -399,6 +399,21 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     push_word(&mut tokens, s);
                 }
             }
+            // Escape string literal `E'...'` or `e'...'`. Inside, C-style
+            // backslash escapes (\n, \t, \\, \', etc.) are processed.
+            'e' | 'E' => {
+                let mut peek_iter = chars.clone();
+                peek_iter.next(); // consume e/E
+                if peek_iter.peek() == Some(&'\'') {
+                    chars.next(); // consume e
+                    chars.next(); // consume '
+                    let s = read_escape_string_literal(&mut chars)?;
+                    tokens.push(Token::String(s));
+                } else {
+                    let s = read_identifier(&mut chars);
+                    push_word(&mut tokens, s);
+                }
+            }
             // Identifier or keyword.
             'a'..='z' | 'A'..='Z' | '_' => {
                 let s = read_identifier(&mut chars);
@@ -503,6 +518,115 @@ fn skip_block_comment(
         }
     }
     Err("unterminated block comment".to_string())
+}
+
+/// Read an escape string literal body (the text after `E'`), processing
+/// C-style backslash escapes. Consumes the closing `'`. Returns `Err` if
+/// the string is unterminated or contains an unknown escape sequence.
+///
+/// Supported escapes (PostgreSQL `E'...'` syntax):
+/// - `\b` → backspace (U+0008)
+/// - `\f` → form feed (U+000C)
+/// - `\n` → newline (U+000A)
+/// - `\r` → carriage return (U+000D)
+/// - `\t` → tab (U+0009)
+/// - `\v` → vertical tab (U+000B)
+/// - `\\` → backslash
+/// - `\'` → single quote
+/// - `\0` → NUL (U+0000)
+/// - `\xHH` → single byte with hex value HH (two hex digits required)
+/// - `\uXXXX` → Unicode code point (4 hex digits)
+/// - `\UXXXXXXXX` → Unicode code point (8 hex digits)
+/// - Any other `\c` is an error.
+fn read_escape_string_literal(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, String> {
+    let mut s = String::new();
+    let mut closed = false;
+    while let Some(&c) = chars.peek() {
+        chars.next();
+        if c == '\'' {
+            // In escape strings, `''` is still a literal single quote.
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                s.push('\'');
+            } else {
+                closed = true;
+                break;
+            }
+        } else if c == '\\' {
+            let escaped = chars
+                .next()
+                .ok_or_else(|| "unterminated escape string literal".to_string())?;
+            match escaped {
+                'b' => s.push('\u{0008}'),
+                'f' => s.push('\u{000C}'),
+                'n' => s.push('\n'),
+                'r' => s.push('\r'),
+                't' => s.push('\t'),
+                'v' => s.push('\u{000B}'),
+                '\\' => s.push('\\'),
+                '\'' => s.push('\''),
+                '0' => s.push('\u{0000}'),
+                'x' => {
+                    let b = read_hex_escape(chars, 2)?;
+                    // \xHH is a single byte; only ASCII bytes map to a char.
+                    let ch = u8::try_from(b)
+                        .ok()
+                        .and_then(|byte| byte.try_into().ok())
+                        .ok_or_else(|| format!("invalid byte escape \\x{b:02X}"))?;
+                    s.push(ch);
+                }
+                'u' => {
+                    let b = read_hex_escape(chars, 4)?;
+                    if let Some(ch) = char::from_u32(b) {
+                        s.push(ch);
+                    } else {
+                        return Err(format!("invalid Unicode code point U+{b:04X}"));
+                    }
+                }
+                'U' => {
+                    let b = read_hex_escape(chars, 8)?;
+                    if let Some(ch) = char::from_u32(b) {
+                        s.push(ch);
+                    } else {
+                        return Err(format!("invalid Unicode code point U+{b:08X}"));
+                    }
+                }
+                other => {
+                    return Err(format!("unknown escape sequence \\{other}"));
+                }
+            }
+        } else {
+            s.push(c);
+        }
+    }
+    if !closed {
+        return Err("unterminated escape string literal".to_string());
+    }
+    Ok(s)
+}
+
+/// Read `n` hex digits and return the resulting `u32`. Used by escape
+/// string literals for `\xHH`, `\uXXXX`, and `\UXXXXXXXX`.
+fn read_hex_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    n: usize,
+) -> Result<u32, String> {
+    let mut value: u32 = 0;
+    for _ in 0..n {
+        let c = chars
+            .next()
+            .ok_or_else(|| "unterminated hex escape".to_string())?;
+        let d = c
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex digit in escape: {c:?}"))?;
+        value = value
+            .checked_mul(16)
+            .and_then(|v| v.checked_add(d))
+            .ok_or_else(|| "hex escape overflow".to_string())?;
+    }
+    Ok(value)
 }
 
 /// Read a double-quoted identifier body, starting *after* the opening `"`.
@@ -1154,6 +1278,105 @@ mod tests {
             &[
                 Token::Ident("a".into()),
                 Token::Op("->".into()),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_escape_string_basic() {
+        // Escape sequences are processed: \n becomes an actual newline.
+        let toks = tokenize("E'hello\\n'").unwrap();
+        assert_tokens_eq(&toks, &[Token::String("hello\n".into()), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_escape_string_lowercase_e() {
+        let toks = tokenize("e'tab\\there'").unwrap();
+        assert_tokens_eq(&toks, &[Token::String("tab\there".into()), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_escape_string_all_escapes() {
+        let toks = tokenize("E'\\b\\f\\n\\r\\t\\v\\\\\\'\\0'").unwrap();
+        let expected: String = [
+            '\u{0008}', '\u{000C}', '\n', '\r', '\t', '\u{000B}', '\\', '\'', '\u{0000}',
+        ]
+        .iter()
+        .collect();
+        assert_tokens_eq(&toks, &[Token::String(expected), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_escape_string_hex_escape() {
+        let toks = tokenize("E'\\x41\\x42'").unwrap();
+        // 0x41 = 'A', 0x42 = 'B'
+        assert_tokens_eq(&toks, &[Token::String("AB".into()), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_escape_string_unicode_escape() {
+        let toks = tokenize("E'\\u00e9'").unwrap();
+        // U+00E9 = é
+        assert_tokens_eq(&toks, &[Token::String("é".into()), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_escape_string_doubled_quote() {
+        // `''` inside an escape string is still a literal single quote.
+        let toks = tokenize("E'a''b'").unwrap();
+        assert_tokens_eq(&toks, &[Token::String("a'b".into()), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_escape_string_unknown_escape_errors() {
+        assert!(tokenize("E'\\z'").is_err());
+    }
+
+    #[test]
+    fn tokenize_escape_string_unterminated_errors() {
+        assert!(tokenize("E'unterminated").is_err());
+        assert!(tokenize("E'unterminated\\").is_err());
+    }
+
+    #[test]
+    fn tokenize_escape_string_does_not_swallow_identifier() {
+        // `email` is an identifier, not an escape string.
+        let toks = tokenize("email = 'x'").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Ident("email".into()),
+                Token::Op("=".into()),
+                Token::String("x".into()),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_typed_date_literal() {
+        // `DATE '...'` is left as a keyword followed by a string; the
+        // parser handles the typed-literal semantics.
+        let toks = tokenize("DATE '2024-01-01'").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("DATE".into()),
+                Token::String("2024-01-01".into()),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_typed_timestamp_literal() {
+        let toks = tokenize("TIMESTAMP '2024-01-01 12:00:00'").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("TIMESTAMP".into()),
+                Token::String("2024-01-01 12:00:00".into()),
                 Token::EOF,
             ],
         );
