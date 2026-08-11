@@ -179,6 +179,35 @@ impl fmt::Display for BinOp {
     }
 }
 
+/// A unary operator.
+///
+/// Used by `Expr::Unary`. Currently only `Neg` (prefix `-`) is supported;
+/// `Pos` (prefix `+`) is included for completeness and may be used by
+/// future parsers that distinguish `+x` from `x`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryOp {
+    /// Unary negation: `-expr`.
+    Neg,
+    /// Unary plus: `+expr` (no-op, preserved for AST fidelity).
+    Pos,
+}
+
+impl UnaryOp {
+    /// Returns the SQL string representation of this operator.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UnaryOp::Neg => "-",
+            UnaryOp::Pos => "+",
+        }
+    }
+}
+
+impl fmt::Display for UnaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// The unified SQL expression AST.
 ///
 /// This single type replaces the former `sql::parser::Expr` (6 variants)
@@ -211,6 +240,14 @@ pub enum Expr {
         op: BinOp,
         /// Right operand.
         right: Box<Expr>,
+    },
+
+    /// A unary operator application: `op expr` (e.g., `-x`, `+x`).
+    Unary {
+        /// The operator (typed).
+        op: UnaryOp,
+        /// The operand.
+        expr: Box<Expr>,
     },
 
     /// Logical NOT: `NOT expr`.
@@ -372,7 +409,7 @@ impl Expr {
                 cols.extend(right.columns());
                 cols
             }
-            Expr::Not(e) | Expr::Paren(e) => e.columns(),
+            Expr::Unary { expr: e, .. } | Expr::Not(e) | Expr::Paren(e) => e.columns(),
             Expr::Case { when_clauses, else_clause } => {
                 let mut cols = Vec::new();
                 for (cond, val) in when_clauses {
@@ -417,6 +454,7 @@ impl fmt::Display for Expr {
             Expr::Column(name) => write!(f, "{name}"),
             Expr::Literal(v) => write!(f, "{v}"),
             Expr::Binary { left, op, right } => write!(f, "({left} {op} {right})"),
+            Expr::Unary { op, expr } => write!(f, "({op}{expr})"),
             Expr::Not(e) => write!(f, "NOT {e}"),
             Expr::Case { when_clauses, else_clause } => {
                 write!(f, "CASE")?;
@@ -606,6 +644,31 @@ mod tests {
             negated: true,
         };
         assert_eq!(e.to_string(), "name NOT LIKE '%foo%'");
+    }
+
+    #[test]
+    fn test_expr_display_unary() {
+        let e = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(Expr::int(1)),
+        };
+        assert_eq!(e.to_string(), "(-1)");
+    }
+
+    #[test]
+    fn test_expr_unary_columns() {
+        let e = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(Expr::col("x")),
+        };
+        let cols = e.columns();
+        assert_eq!(cols, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn test_unary_op_display() {
+        assert_eq!(UnaryOp::Neg.to_string(), "-");
+        assert_eq!(UnaryOp::Pos.to_string(), "+");
     }
 
     #[test]
