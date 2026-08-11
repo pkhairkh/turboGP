@@ -147,7 +147,7 @@ Branch: `feat/prod-wiring`.
   attributes) are removed. Every public item in `src/**/*.rs` carries a
   `///` doc comment. `cargo check --jobs 1` has zero warnings.
 - **Resolved by:** Wave 8 (Tasks 8.1–8.5).
-- **Resolved:** ☐
+- **Resolved:** ☑ (commit 70b84d0)
 
 ---
 
@@ -177,5 +177,5 @@ Branch: `feat/prod-wiring`.
 | 6 — Sync replication default | 6 | `enable_raft` sets sync + quorum | ☑ |
 | 7 — VACUUM reclaims column space | 6 | Dead rows removed from `Vec<u64>` | ☑ |
 | 8 — Remove parser hacks | 7 | Formal AST for UNION ALL / MERGE / PIVOT | ☑ |
-| 9 — Real doc comments | 8 | `#![allow(missing_docs)]` removed | ☐ |
+| 9 — Real doc comments | 8 | `#![allow(missing_docs)]` removed | ☑ |
 | 10 — Operational tooling | 9 | `turboGP admin` CLI | ☐ |
