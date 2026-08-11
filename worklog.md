@@ -2012,3 +2012,115 @@ Stage Summary:
 - Ready for downstream Wave 6+ tasks (e.g. real replica ACK
   protocol, Raft quorum-based sync replication, automated
   failover).
+
+---
+Task ID: 6.2-deferred + 6.3-deferred + 6.5-deferred + fix-pre-existing
+Wave: 6
+Agent: general-purpose
+Task: Fix enable_replication_local_only wiring + document openraft deferral.
+
+Work Log:
+- Read the existing `WalStreamerHandle` struct and the two engine-side
+  `enable_replication*` methods in `src/engine/mod.rs`.
+- Confirmed the pre-existing wiring bug (documented in the Task 6.1/6.4
+  worklog entry above):
+    * `WalStreamerHandle.streamer` was typed `Mutex<WalStreamer>`.
+    * Both `enable_replication` and `enable_replication_local_only`
+      created a fresh `Arc<Mutex<WalStreamer>>`, attached THAT to the
+      Wal via `set_stream_sink`, BUT stored a SEPARATE, brand-new
+      `WalStreamer` (wrapped in a plain `Mutex`) in `self.wal_streamer`.
+    * `wal_records_streamed()` queried the never-written streamer in
+      `self.wal_streamer`, so it always returned 0 even after records
+      were streamed through the Wal's sink.
+- Root-cause fix (single conceptual change, applied symmetrically to
+  both methods):
+    * Changed `WalStreamerHandle.streamer` from
+      `Mutex<WalStreamer>` to `Arc<Mutex<WalStreamer>>` so the same
+      `Arc` can be shared between `self.wal_streamer` and the Wal's
+      `stream_sink` (`Arc<Mutex<dyn WalStreamSink>>`, via unsizing).
+    * In `enable_replication_local_only`: build ONE
+      `Arc<Mutex<WalStreamer>>`, clone it into both
+      `self.wal_streamer` and the Wal's sink. Both now point at the
+      SAME underlying `WalStreamer`, so `records_sent` updates by
+      `Wal::append_and_sync` are visible to `wal_records_streamed()`.
+    * In `enable_replication` (peer_addr variant): same fix.
+    * `wal_records_streamed()` is unchanged — locking an
+      `Arc<Mutex<T>>` works identically to locking a `Mutex<T>`.
+- Updated the doc-comment on `WalStreamerHandle` to explain the
+  shared-Arc invariant and why it matters.
+- Documented the openraft deferral in `INTEG_DEBT_LOG.md`:
+    * Added a new "Debt: openraft integration (Wave 6 Tasks 6.2, 6.3,
+      6.5)" section with the verbatim template from the task brief
+      (status = DEFERRED; what was done instead = Tasks 6.1 + 6.4;
+      what openraft would add; recommended next step = async runtime
+      refactor + replace stub `RaftNode` with `openraft::Raft`).
+    * Added a new summary-table row
+      `debt-6.2/6.3/6.5 (openraft) | DEFERRED | Requires async runtime
+      (tokio) refactor — see section below`.
+
+Files touched (3, exactly as the brief allowed):
+- `src/engine/mod.rs` (+63 / -18): `WalStreamerHandle.streamer` retyped
+  to `Arc<Mutex<WalStreamer>>`; both `enable_replication*` methods now
+  share one `Arc` between the engine and the Wal; doc-comments updated.
+- `INTEG_DEBT_LOG.md` (+26): new openraft-deferral section + summary row.
+- `tests/wal_durability_replication.rs`: NOT modified — only ran the
+  existing tests to confirm they pass after the engine fix.
+
+Constraints honoured:
+- Max 3 files touched: exactly 2 source files modified + 1 test file
+  verified (not modified).
+- No `unwrap()`/`expect()` in new code (verified via
+  `git diff | grep -E '^\+' | grep -E 'unwrap\(|expect\('` — 0 matches).
+- `cargo check --jobs 1` → 466 pre-existing warnings, 0 errors, 0 new
+  warnings introduced (warning count unchanged from Task 6.1/6.4
+  baseline).
+- `cargo test --jobs 1 --test wal_durability_replication` →
+  **12 passed, 0 failed** (was 10 passed / 2 failed pre-task). The 2
+  previously-failing tests
+  (`test_enable_replication_local_only`,
+  `test_wal_streamer_records_after_commit`) now pass:
+    * `test_enable_replication_local_only`: after the fix, the local-
+      only streamer attached to the Wal IS the same one queried by
+      `wal_records_streamed()`. The first INSERT bumps
+      `records_sent` to ≥1, the second to ≥2 — assertions hold.
+    * `test_wal_streamer_records_after_commit`: BEGIN + INSERT + COMMIT
+      produces ≥3 records, `after - before >= 3` holds.
+- `cargo test --jobs 1 --lib` → **850 passed, 0 failed** (no regressions;
+  matches the Task 6.1/6.4 baseline).
+- Committed on `feat/prod-hardening` as `3bdfb0c` with the
+  task-specified commit-message template. NOT pushed to origin.
+
+Stage Summary:
+- DoD met for this task:
+  - **Pre-existing replication test failures fixed:** the wiring bug in
+    `enable_replication` / `enable_replication_local_only` is resolved
+    by sharing a single `Arc<Mutex<WalStreamer>>` between the engine's
+    `wal_streamer` field and the Wal's `stream_sink`. Both pre-existing
+    failing tests now pass.
+  - **openraft deferral documented:** `INTEG_DEBT_LOG.md` records that
+    Tasks 6.2 (openraft crate integration), 6.3 (multi-node leader
+    election), and 6.5 (real quorum-based log replication / failover)
+    are DEFERRED — they require migrating the engine/server layer to
+    an async runtime (tokio) and replacing the hand-rolled stub
+    `RaftNode` with `openraft::Raft`, which is a separate workstream.
+- What remains of Wave 6:
+  - Task 6.1 (sync mode): DONE in commit `9c79d40`.
+  - Task 6.4 (LSN-based replica resume): DONE in commit `9c79d40`.
+  - Tasks 6.2 / 6.3 / 6.5 (openraft): DEFERRED (documented here + in
+    `INTEG_DEBT_LOG.md`).
+  - Pre-existing engine wiring bug (tracked under this task): FIXED.
+- Known limitations (carried forward from prior entries):
+  - `sync_wait` is "flush to OS socket buffer", not a true replica ACK
+    (forward-compatible with a future `<ACK lsn=N>` wire-protocol
+    extension).
+  - `MultiWalStreamSink::sync_wait` is best-effort; a single follower
+    flush failure is logged but doesn't fail the call (configurable
+    quorum/all/any ACK is a future task).
+  - The stub `RaftNode` remains; `enable_raft` creates the node and
+    invokes `on_become_leader` (which connects WalStreamers to
+    followers) but does NOT implement real multi-node election,
+    quorum commits, or automatic failover. Replacing it with openraft
+    is the documented deferral.
+- Ready for downstream Waves (e.g. Wave 7: async runtime + openraft
+  migration; or any task that depends on `wal_records_streamed()`
+  returning a non-zero count after replication is enabled).
