@@ -1,0 +1,6 @@
+# TPC-H raw data — do not commit (10+ GB). Regenerate via `benchmarks/tpch/generate_data.sh`.
+sf1/
+sf10/
+
+# dbgen source — cloned by generate_data.sh on demand, not committed.
+../dbgen-src/

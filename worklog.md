@@ -1369,3 +1369,15 @@ DoD satisfied: Exasol attempted; PostgreSQL fallback installed and verified; rea
 - Started turboGP in `--insecure --port 55432` (in-memory) mode; verified pgwire protocol responds to `SELECT 1`.
 
 DoD satisfied: cargo build --release succeeds; turboGP executes SELECT 1; version documented.
+
+## Wave 2 — TPC-H Data Generation & Loading
+
+### Task 2.1 — Generate TPC-H data at SF=1 and SF=10
+- Cloned [electrum/tpch-dbgen](https://github.com/electrum/tpch-dbgen) to `benchmarks/tpch/dbgen-src/`.
+- Patched `varsub.h` (`@:char` → `@:string`) for compatibility.
+- Compiled `dbgen` with `make -j4` (gcc).
+- Generated SF=1 (8 .tbl files, ~1 GB total) at `benchmarks/tpch/data/sf1/`.
+- Generated SF=10 (8 .tbl files, ~10 GB total) at `benchmarks/tpch/data/sf10/`.
+- Row counts documented in `benchmarks/tpch/data/ROW_COUNTS.md`.
+
+DoD satisfied: dbgen compiled and run; 8 tables at SF=1 and SF=10; CSV files in `data/sf{1,10}/`; row counts documented.

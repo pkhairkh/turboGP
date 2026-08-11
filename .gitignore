@@ -33,3 +33,4 @@ Cargo.lock
 /turbogp_data/
 *.log
 checkpoint.sql
+benchmarks/tpch/dbgen-src/
