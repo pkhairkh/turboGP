@@ -53,11 +53,13 @@ pub trait WalStreamSink: Send {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WalRecord {
     /// Log sequence number — monotonic across the WAL's lifetime.
-    /// Assigned by `Wal::append()`. Zero for records constructed in-memory
-    /// before being appended (the Wal overwrites this on append). On
-    /// `read_all()`, the LSN is populated from disk.
     #[serde(default)]
     pub lsn: u64,
+    /// Epoch microseconds when this record was appended (Task 4.3 — debt-6.3).
+    /// Used by `replay_wal_to_timestamp()` for point-in-time recovery.
+    /// Zero for records constructed before being appended (the Wal sets it).
+    #[serde(default)]
+    pub timestamp_us: u64,
     /// Transaction ID (0 for autocommit, non-zero for explicit transactions).
     pub txn_id: u64,
     /// The SQL statement. Empty for BEGIN/COMMIT/ROLLBACK markers and for
@@ -115,7 +117,7 @@ impl WalRecord {
     /// Construct an autocommit DML record (txn_id = 0).
     pub fn autocommit(sql: impl Into<String>) -> Self {
         Self {
-            lsn: 0,
+            lsn: 0, timestamp_us: 0,
             txn_id: 0,
             sql: sql.into(),
             is_commit: false,
@@ -127,7 +129,7 @@ impl WalRecord {
     /// Construct a BEGIN marker for the given transaction ID.
     pub fn begin(txn_id: u64) -> Self {
         Self {
-            lsn: 0,
+            lsn: 0, timestamp_us: 0,
             txn_id,
             sql: String::new(),
             is_commit: false,
@@ -139,7 +141,7 @@ impl WalRecord {
     /// Construct a COMMIT marker for the given transaction ID.
     pub fn commit(txn_id: u64) -> Self {
         Self {
-            lsn: 0,
+            lsn: 0, timestamp_us: 0,
             txn_id,
             sql: String::new(),
             is_commit: true,
@@ -151,7 +153,7 @@ impl WalRecord {
     /// Construct a ROLLBACK marker for the given transaction ID.
     pub fn rollback(txn_id: u64) -> Self {
         Self {
-            lsn: 0,
+            lsn: 0, timestamp_us: 0,
             txn_id,
             sql: String::new(),
             is_commit: false,
@@ -163,7 +165,7 @@ impl WalRecord {
     /// Construct a DML record inside an explicit transaction.
     pub fn txn_dml(txn_id: u64, sql: impl Into<String>) -> Self {
         Self {
-            lsn: 0,
+            lsn: 0, timestamp_us: 0,
             txn_id,
             sql: sql.into(),
             is_commit: false,
@@ -175,7 +177,7 @@ impl WalRecord {
     /// Construct a page-level physical change record (Wave 63).
     pub fn physical(txn_id: u64, change: PhysicalChange) -> Self {
         Self {
-            lsn: 0,
+            lsn: 0, timestamp_us: 0,
             txn_id,
             sql: String::new(),
             is_commit: false,
@@ -287,15 +289,21 @@ impl Wal {
             // Assign the LSN from the Wal's monotonic counter.
             let lsn = self.next_lsn;
             self.next_lsn += 1;
-            // Format: lsn|txn_id|commit|rollback|base64(sql)|physical_json|xxh3\n
+            // Task 4.3 (debt-6.3): set timestamp_us to current epoch microseconds.
+            let timestamp_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
+            // Format: lsn|timestamp_us|txn_id|commit|rollback|base64(sql)|physical_json|xxh3\n
             let sql_b64 = general_purpose::STANDARD.encode(record.sql.as_bytes());
             let physical_json = match &record.physical_change {
                 Some(change) => serde_json::to_string(change).unwrap_or_default(),
                 None => String::new(),
             };
             let data_line = format!(
-                "{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}",
                 lsn,
+                timestamp_us,
                 record.txn_id,
                 if record.is_commit { 1 } else { 0 },
                 if record.is_rollback { 1 } else { 0 },
@@ -470,7 +478,27 @@ impl Wal {
                         continue;
                     }
                 }
-                // Task 1.3: try the new 6-field format (lsn first) first.
+                // Task 4.3: try the new 7-field format (lsn|timestamp_us|...) first.
+                let parts: Vec<&str> = data_line.splitn(7, '|').collect();
+                if parts.len() == 7 {
+                    let lsn: u64 = parts[0].parse().unwrap_or(0);
+                    let timestamp_us: u64 = parts[1].parse().unwrap_or(0);
+                    let txn_id: u64 = parts[2].parse().unwrap_or(0);
+                    let is_commit = parts[3] == "1";
+                    let is_rollback = parts[4] == "1";
+                    let sql = match general_purpose::STANDARD.decode(parts[5].as_bytes()) {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                        Err(_) => decode_legacy_sql(parts[5]),
+                    };
+                    let physical_change = if !parts[6].is_empty() {
+                        serde_json::from_str::<PhysicalChange>(parts[6]).ok()
+                    } else {
+                        None
+                    };
+                    records.push(WalRecord { lsn, timestamp_us, txn_id, sql, is_commit, is_rollback, physical_change });
+                    continue;
+                }
+                // Fall back to the 6-field format (lsn first, no timestamp_us).
                 let parts: Vec<&str> = data_line.splitn(6, '|').collect();
                 if parts.len() == 6 {
                     let lsn: u64 = parts[0].parse().unwrap_or(0);
@@ -486,7 +514,7 @@ impl Wal {
                     } else {
                         None
                     };
-                    records.push(WalRecord { lsn, txn_id, sql, is_commit, is_rollback, physical_change });
+                    records.push(WalRecord { lsn, timestamp_us: 0, txn_id, sql, is_commit, is_rollback, physical_change });
                     continue;
                 }
                 // Fall back to the legacy 5-field format (no LSN).
@@ -511,7 +539,7 @@ impl Wal {
                 } else {
                     None
                 };
-                records.push(WalRecord { lsn: 0, txn_id, sql, is_commit, is_rollback, physical_change });
+                records.push(WalRecord { lsn: 0, timestamp_us: 0, txn_id, sql, is_commit, is_rollback, physical_change });
             }
         }
         Ok(records)
@@ -608,7 +636,7 @@ fn parse_legacy_record(line: &str) -> std::io::Result<WalRecord> {
     let is_commit = parts.get(1).map(|s| *s == "1").unwrap_or(false);
     let is_rollback = parts.get(2).map(|s| *s == "1").unwrap_or(false);
     let sql = parts.get(3).map(|s| decode_legacy_sql(s)).unwrap_or_default();
-    Ok(WalRecord { lsn: 0, txn_id, sql, is_commit, is_rollback, physical_change: None })
+    Ok(WalRecord { lsn: 0, timestamp_us: 0, txn_id, sql, is_commit, is_rollback, physical_change: None })
 }
 
 /// Replay WAL records against an engine. Only committed transactions
@@ -1029,7 +1057,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 0,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
@@ -1038,7 +1066,7 @@ mod tests {
         })
         .unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 1,
             sql: "INSERT INTO t VALUES (2)".into(),
             is_commit: false,
@@ -1047,7 +1075,7 @@ mod tests {
         })
         .unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 1,
             sql: "".into(),
             is_commit: true,
@@ -1069,7 +1097,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
-            lsn: 0,
+            lsn: 0, timestamp_us: 0,
             txn_id: 0,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
@@ -1106,7 +1134,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 0,
             sql: "INSERT INTO t VALUES ('a|b\nc')".into(),
             is_commit: false,
@@ -1126,7 +1154,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 0,
             sql: "CREATE TABLE t (id INT)".into(),
             is_commit: false,
@@ -1135,7 +1163,7 @@ mod tests {
         })
         .unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 0,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
@@ -1144,7 +1172,7 @@ mod tests {
         })
         .unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 0,
             sql: "INSERT INTO t VALUES (2)".into(),
             is_commit: false,
@@ -1169,7 +1197,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 0,
             sql: "CREATE TABLE t (id INT)".into(),
             is_commit: false,
@@ -1179,7 +1207,7 @@ mod tests {
         .unwrap();
         // Transaction 1: INSERT but no COMMIT.
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 1,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
@@ -1200,7 +1228,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 0,
             sql: "CREATE TABLE t (id INT)".into(),
             is_commit: false,
@@ -1210,7 +1238,7 @@ mod tests {
         .unwrap();
         // Transaction 1: INSERT + ROLLBACK.
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 1,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
@@ -1219,7 +1247,7 @@ mod tests {
         })
         .unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
             txn_id: 1,
             sql: "".into(),
             is_commit: false,
