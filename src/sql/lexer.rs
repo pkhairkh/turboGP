@@ -269,9 +269,33 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::Op(">".to_string()));
                 }
             }
-            '+' | '-' | '*' | '/' => {
+            '+' => {
                 chars.next();
-                tokens.push(Token::Op(c.to_string()));
+                tokens.push(Token::Op("+".to_string()));
+            }
+            '-' => {
+                chars.next();
+                if chars.peek() == Some(&'-') {
+                    // Line comment: `-- ...` skips until newline (or EOF).
+                    chars.next(); // consume second '-'
+                    skip_line_comment(&mut chars);
+                } else {
+                    tokens.push(Token::Op("-".to_string()));
+                }
+            }
+            '*' => {
+                chars.next();
+                tokens.push(Token::Op("*".to_string()));
+            }
+            '/' => {
+                chars.next();
+                if chars.peek() == Some(&'*') {
+                    // Block comment: `/* ... */` with nesting support.
+                    chars.next(); // consume '*'
+                    skip_block_comment(&mut chars)?;
+                } else {
+                    tokens.push(Token::Op("/".to_string()));
+                }
             }
             // String literal.
             '\'' => {
@@ -360,6 +384,45 @@ fn push_word(tokens: &mut Vec<Token>, word: String) {
     } else {
         tokens.push(Token::Ident(word));
     }
+}
+
+/// Skip the body of a line comment. The opening `--` is assumed to be
+/// already consumed; this function reads characters until it hits a
+/// newline (which is left in the stream so the caller's whitespace
+/// branch can consume it) or end of input.
+fn skip_line_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(&c) = chars.peek() {
+        if c == '\n' {
+            break;
+        }
+        chars.next();
+    }
+}
+
+/// Skip the body of a block comment, supporting nesting. The opening
+/// `/*` is assumed to be already consumed; this function consumes
+/// characters until it reaches the matching `*/` (the depth counter
+/// tracks nested `/* ... */` pairs). Returns `Err` if the comment is
+/// unterminated.
+fn skip_block_comment(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<(), String> {
+    let mut depth: u32 = 1;
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next(); // consume '*'
+            depth = depth
+                .checked_add(1)
+                .ok_or_else(|| "block comment nesting too deep".to_string())?;
+        } else if c == '*' && chars.peek() == Some(&'/') {
+            chars.next(); // consume '/'
+            depth -= 1;
+            if depth == 0 {
+                return Ok(());
+            }
+        }
+    }
+    Err("unterminated block comment".to_string())
 }
 
 /// Read a single-quoted string literal starting *after* the opening quote.
@@ -686,6 +749,95 @@ mod tests {
     #[test]
     fn tokenize_lone_bang_errors() {
         assert!(tokenize("!").is_err());
+    }
+
+    #[test]
+    fn tokenize_line_comment() {
+        // `-- comment` to end of line is discarded; the trailing newline
+        // becomes whitespace.
+        let toks = tokenize("SELECT 1 -- comment\n").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("SELECT".into()),
+                Token::Int(1),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_line_comment_at_eof() {
+        // No trailing newline: comment runs to EOF.
+        let toks = tokenize("SELECT 1 -- no newline").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("SELECT".into()),
+                Token::Int(1),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_block_comment() {
+        let toks = tokenize("SELECT /* block */ 1").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("SELECT".into()),
+                Token::Int(1),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_nested_block_comment() {
+        // Nested block comments must be tracked by depth, not by string scan.
+        let toks = tokenize("SELECT /* outer /* inner */ still outer */ 1").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("SELECT".into()),
+                Token::Int(1),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_block_comment_between_tokens() {
+        let toks = tokenize("SELECT/*c*/1").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("SELECT".into()),
+                Token::Int(1),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_unterminated_block_comment_errors() {
+        assert!(tokenize("SELECT /* never closed").is_err());
+    }
+
+    #[test]
+    fn tokenize_block_comment_does_not_eat_division() {
+        // `a / b` is division, not a comment.
+        let toks = tokenize("a / b").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Ident("a".into()),
+                Token::Op("/".into()),
+                Token::Ident("b".into()),
+                Token::EOF,
+            ],
+        );
     }
 
     #[test]
