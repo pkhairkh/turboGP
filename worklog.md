@@ -444,3 +444,124 @@ Stage Summary:
   `Vec<Vec<RowVersion>>`, thread `MvccTransaction` through
   `execute_select` for full snapshot isolation).
 
+
+---
+Task ID: 3.1
+Agent: general-purpose
+Task: Fix MVCC-mode ROLLBACK so that rows inserted by the rolled-back
+transaction become invisible (atomicity).
+
+Work Log:
+- Read `worklog.md` (Tasks 2.1–2.6 context), `src/txn/mvcc.rs`
+  (`is_row_visible_to_active`, `rollback_compat`, `rollback`,
+  `txn_state`), `src/engine/mod.rs` (the `StatementKind::Rollback`
+  dispatch at line 1254 and the `mvcc_for_select` computation in
+  `execute_inner` at line 1610), `src/engine/dml.rs` (`execute_insert`'s
+  `xmin = txn_id.unwrap_or(0)` for autocommit inserts), and
+  `tests/mvcc_integration.rs` / `tests/acid.rs` (existing tests to check
+  for regressions).
+- **Verification of `is_row_visible_to_active` (Task 2.4):** the method
+  correctly returns `false` for any version whose `xmin` is in the
+  `Aborted` state. Logic:
+  `xmin_visible = version.xmin == active_id || matches!(xmin_state, TxnState::Committed(_))`.
+  For an Aborted xmin (not the active txn, not Committed), this is
+  `false` → the version is filtered out. ✓ No change needed in
+  `src/txn/mvcc.rs` (out of the allowed-files list anyway).
+- **Verification of the ROLLBACK dispatch:** `StatementKind::Rollback`
+  (line 1254) calls `mvcc_txn_manager.rollback_compat()` when
+  `mvcc_enabled`. `rollback_compat()` (mvcc.rs line 331) takes
+  `current_active` and calls `rollback(id)`, which inserts
+  `TxnState::Aborted` for that txn_id. ✓ The txn state is correctly
+  marked Aborted.
+- **The gap (atomicity violation):** `execute_inner` computed
+  `mvcc_for_select = if self.mvcc_enabled && txn_id.is_some() { Some(...) } else { None }`.
+  After `BEGIN; INSERT; ROLLBACK;`, `current_active` is `None`, so the
+  next `SELECT COUNT(*) FROM t` (autocommit) ran with
+  `mvcc_for_select = None` → `execute_select` did NOT apply visibility
+  filtering → the rolled-back insert (still in `columns` and
+  `row_versions`, with `xmin = aborted_txn_id`) was counted.
+  `SELECT COUNT(*) FROM t` returned 1, not 0. **Atomicity violated.**
+- **Fix:** changed the gate in `src/engine/mod.rs` `execute_inner` from
+  `self.mvcc_enabled && txn_id.is_some()` to just `self.mvcc_enabled`.
+  Now MVCC visibility filtering is applied whenever MVCC mode is on,
+  regardless of whether a transaction is active. In autocommit mode,
+  `is_row_visible_to_active` uses `active_id = 0` (the `unwrap_or(0)`
+  fallback), so:
+    - Aborted `xmin` (rolled-back insert) → `xmin != 0` and
+      `txn_state(xmin) = Aborted` (not Committed) → `xmin_visible = false`
+      → invisible. ✓
+    - Committed `xmin` (prior committed insert) → `txn_state = Committed(_)`
+      → `xmin_visible = true` → visible. ✓
+    - Autocommit `xmin = 0` (autocommit INSERT) → `xmin == active_id`
+      → `xmin_visible = true` → visible. ✓ (preserves autocommit
+      semantics — verified by `test_mvcc_mode_does_not_break_normal_queries`).
+- **Added test** `test_mvcc_rollback_marks_inserts_invisible` to
+  `tests/mvcc_integration.rs`:
+    - `enable_mvcc(); CREATE TABLE t (id INT); BEGIN; INSERT INTO t VALUES (1); ROLLBACK;`.
+    - Asserts the rolled-back txn's state is `TxnState::Aborted`.
+    - Asserts `SELECT COUNT(*) FROM t` (autocommit) returns **0** (the
+      core DoD — atomicity: rolled-back insert is invisible).
+    - Regression guard #1: a subsequent `BEGIN; INSERT (42); COMMIT;`
+      then `SELECT COUNT(*)` returns **1** (Committed xmin is visible —
+      the filter doesn't over-aggressively hide committed data).
+    - Regression guard #2: an autocommit `INSERT INTO t VALUES (99)`
+      then `SELECT COUNT(*)` returns **2** (autocommit xmin = 0 is
+      visible to autocommit reader).
+  - All assertions use `expect()` / `assert_eq!` / `assert!(...)` — no
+    `unwrap()` in new code (per the constraint). The test uses the
+    existing `engine.mvcc_txn_manager()` accessor and the
+    `TxnState::Aborted` pattern-match for the sanity check.
+- **Verified `cargo check --jobs 1`** passes — 466 pre-existing
+  warnings, no new warnings introduced by the modified files.
+- **Verified `cargo test --jobs 1 --lib`** → 822 passed, 0 failed
+  (matches the Task 2.4/2.5/2.6 baseline; no regressions).
+- **Verified `cargo test --jobs 1 --test mvcc_integration`** → 12
+  passed, 0 failed (the new `test_mvcc_rollback_marks_inserts_invisible`
+  is green; the 11 pre-existing MVCC tests still pass — including
+  `test_mvcc_begin_commit`, `test_mvcc_mode_does_not_break_normal_queries`,
+  `test_mvcc_concurrent_transactions_two_writers`,
+  `test_execute_select_filters_uncommitted`,
+  `test_mvcc_snapshot_isolation_enforced`,
+  `test_write_write_conflict_aborts`).
+- **Verified `cargo test --jobs 1 --test acid --test dml --test txn
+  --test concurrency_test --test readonly_fast_path --test e2e_integration`**
+  → all pass (50 tests total across the suites; no regressions in the
+  non-MVCC paths or the read-only fast path — `execute_readonly` still
+  passes `None` for `mvcc`, unchanged).
+- Committed on `feat/prod-hardening` as `50732ca` with the task
+  commit-message template.
+
+Stage Summary:
+- 2 files modified:
+    - `src/engine/mod.rs`: +18/-6 LOC (the `mvcc_for_select` gate in
+      `execute_inner` widened from `mvcc_enabled && txn_id.is_some()` to
+      `mvcc_enabled`; comment updated to document the Task 3.1 fix and
+      the autocommit-reader semantics).
+    - `tests/mvcc_integration.rs`: +90 LOC, 0 deletions (1 new test
+      `test_mvcc_rollback_marks_inserts_invisible` with detailed doc
+      comment + 2 regression guards).
+- DoD met: MVCC ROLLBACK leaves no visible partial effects. Verified by
+  `test_mvcc_rollback_marks_inserts_invisible` — after `BEGIN; INSERT;
+  ROLLBACK;`, an autocommit `SELECT COUNT(*) FROM t` returns 0.
+- The fix is minimal (1-line gate change + comment) and aligns with the
+  task's verification logic: `is_row_visible_to_active` was already
+  correct (Aborted xmin → invisible); the only gap was that the
+  autocommit-SELECT path bypassed the filter entirely.
+- Known limitations (out of scope for Task 3.1, documented in earlier
+  worklog entries):
+    - The `execute_readonly(&self)` path still passes `None` for `mvcc`
+      (it holds `&self`, can't have an active MVCC txn). A future wave
+      could thread `mvcc_txn_manager` through `execute_readonly` so
+      read-only autocommit SELECTs also see MVCC-correct state when
+      `mvcc_enabled`. The current Task 3.1 test goes through `execute()`
+      (`&mut self`), so it's unaffected.
+    - The flat `row_versions: Vec<RowVersion>` design (Task 2.2/2.3
+      limitation) means UPDATE's appended new version is not found by
+      `filter_indices`. ROLLBACK of an UPDATE would leave the old
+      version tombstoned by the aborted txn's `xmax` — but since
+      `is_row_visible_to_active` already treats Aborted `xmax` as "not
+      committed → version still live", the old version remains visible
+      (correct atomicity for the UPDATE case is preserved by the
+      Aborted-xmax rule, not by the new-version scan).
+- Ready for downstream Wave 3 tasks (e.g. ROLLBACK of UPDATE/DELETE,
+  VACUUM compaction of Aborted txns' tombstones).
