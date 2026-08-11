@@ -767,3 +767,248 @@ Stage Summary:
   `enable_raft` routes to the new manager when `--features raft` is on,
   falls back to the stub otherwise. 870 lib tests pass with `--features
   raft` (864 without). Ready for Wave 6.
+
+---
+Task ID: 6.1 + 6.2 + 6.3 + 6.4
+Agent: ha-concurrency-agent (Wave 6)
+Task: ACK wire protocol, WalStreamer waits for ACK in sync mode,
+quorum-based sync replication, integration test.
+
+Work Log:
+- Wave 6 replaces the Wave 5 "flush-only" approximation of synchronous
+  replication with a real application-level ACK protocol, adds a
+  `QuorumPolicy` for multi-replica sync, and ships an end-to-end
+  integration test that kills replicas mid-stream to verify quorum.
+
+Commit `fc80b76` — `feat(6): replication: ACK wire protocol, sync mode
+waits for ACK, quorum-based sync` (3 files, +661/-68):
+
+- `src/storage/replication.rs` (+558/-58):
+  - **ACK wire protocol (Task 6.1)**: `WalStreamer::stream_record` now
+    sends `REPLICATE <lsn> <record_json>\n` (was: plain `<json>\n`).
+    The record's `lsn` is stashed in a new `pending_ack_lsn: Option<u64>`
+    field so a subsequent `sync_wait` knows which ACK to expect. The
+    receiver accepts BOTH the new `REPLICATE <lsn> <json>` format
+    (parses the wire-LSN, applies the record, writes `ACK <lsn>\n`
+    back) and the legacy plain-`<json>` format (applies, no ACK) for
+    backward compat with older senders — `parse_replicate_line` is the
+    single parser, returning `(wire_lsn, record, is_new_format)`.
+  - **`WalStreamer::stream_and_wait_ack(&mut self, record, timeout_ms)`
+    (Task 6.1)**: convenience wrapper — calls `stream_record`, then
+    reads `ACK <lsn>\n` within `timeout_ms` and verifies the LSN
+    matches the record's LSN. Returns `Ok(bytes_sent)` on match, `Err`
+    on timeout / mismatch / send failure. For the local-only
+    (not-connected) case, returns `Ok` without reading (no ACK to wait
+    for).
+  - **`WalStreamer::sync_wait` rewrite (Task 6.1 + 6.2)**: now calls
+    `wait_for_ack(5000)` (was: `flush()`). `wait_for_ack` checks the
+    kill switch first (returns `Err` if killed), then takes
+    `pending_ack_lsn` (falls back to `flush()` if None — backward
+    compat with pre-6.1 callers), then — if the streamer is connected —
+    calls `read_and_verify_ack(expected_lsn, 5000)`. That helper sets a
+    5 s read timeout on the underlying `TcpStream` (via
+    `BufReader::get_ref().set_read_timeout`), reads one line with
+    `BufRead::read_line`, strips the trailing newline, parses it with
+    `parse_ack_lsn` (expects `ACK <lsn>`), and verifies the LSN. A
+    timeout / EOF / parse error / LSN mismatch all return `Err`. In
+    `SyncMode::Synchronous`, `Wal::append_and_sync` propagates this
+    `Err` as `io::Error(ErrorKind::Other, ...)` → the commit fails
+    (Task 6.2 — already wired in Wave 5's `append_and_sync`, now the
+    `sync_wait` actually blocks on a real ACK instead of just flushing).
+  - **`WalStreamer` struct restructure**: the single `stream:
+    Option<TcpStream>` field is split into `writer: Option<TcpStream>`
+    and `reader: Option<BufReader<TcpStream>>` (the reader is a
+    `try_clone` of the writer's socket). This is needed because
+    `BufRead::read_line` requires a `BufReader`, and holding the reader
+    separately lets `sync_wait` read ACKs without interfering with
+    `stream_record`'s writes. `connect` creates both halves; `flush`
+    and `stream_record` use `writer`; `read_and_verify_ack` uses
+    `reader`.
+  - **`WalStreamer::kill(&mut self)` + `is_alive(&self)` (Task 6.4
+    test helpers)**: `kill` sets a `kill_switch: Arc<AtomicBool>`
+    field, calls `writer.shutdown(Shutdown::Both)` (so the receiver
+    sees EOF), and drops both halves. All subsequent `stream_record` /
+    `sync_wait` calls check the kill switch first and return
+    `Err("streamer killed (simulated replica down)")`. This simulates a
+    replica crash for the quorum test without having to actually kill
+    the receiver thread (the spec's note explicitly allows this
+    simulation). `is_alive` returns `!kill_switch`.
+  - **`QuorumPolicy` enum (Task 6.3)**: `Majority` (ceil(N/2)+1),
+    `All` (N), `Any` (1, clamped to N). `required(n)` computes the
+    ACK count needed for a fan-out set of `n` streamers.
+  - **`MultiWalStreamSink` quorum fields + accessors (Task 6.3)**: new
+    `quorum: QuorumPolicy` field (default `Majority`).
+    `with_quorum(policy)` constructor, `set_quorum(policy)` /
+    `quorum()` getter / setter. `streamer(i)` / `streamer_mut(i)`
+    accessors (test helpers to call `kill()` on individual streamers).
+  - **`MultiWalStreamSink::sync_wait` rewrite (Task 6.3)**: spawns one
+    thread per streamer (the streamers are `Send` because `TcpStream`
+    is `Send`), each calling `WalStreamer::sync_wait` (the trait method
+    → `wait_for_ack(5000)`). Results (Ok/Err) are sent over an
+    `mpsc::channel<bool>`. The main thread counts successes via
+    `recv_timeout` against a 6 s overall deadline (1 s slack over the
+    per-streamer 5 s ACK timeout). Returns `Ok` once
+    `success_count >= required`, `Err("quorum not met: x/N ACKs
+    (required R, policy P)")` if the deadline passes or all threads
+    report without reaching quorum. The streamers are moved into the
+    threads and reclaimed via `join` before returning, so the sink is
+    reusable for the next record. The `stream` method is unchanged
+    (best-effort fan-out, logs per-streamer errors) — only `sync_wait`
+    enforces quorum.
+  - **`WalReceiver` ACK handling (Task 6.1)**: both `accept_and_apply`
+    and `run_apply_loop` now use `parse_replicate_line` (was:
+    `serde_json::from_str::<WalRecord>(&line)`). For the new
+    `REPLICATE` format, after applying the record they write
+    `ACK <wire_lsn>\n` back to the stream (`run_apply_loop` sends the
+    ACK even on apply-error so the primary isn't blocked — best-effort).
+    The accepted `TcpStream` has `set_nodelay(true)` so ACKs aren't
+    delayed by Nagle. A new `is_conn_closed(io::Error)` helper makes
+    the read loop treat `ConnectionReset` / `ConnectionAborted` /
+    `BrokenPipe` / `UnexpectedEof` as clean EOF — needed because when
+    the primary drops a `WalStreamer` while ACKs are still buffered in
+    its receive window (the async-mode case where the streamer sends
+    records but never reads ACKs), the kernel sends a RST and the
+    replica's `read` returns `ConnectionReset` instead of `Ok(0)`.
+    Without this, the existing `wal_receiver_run_apply_loop` and
+    `raft_leader_streams_to_followers` lib tests would panic on the
+    `run_apply_loop(...).unwrap()` when the streamer is dropped.
+
+- `src/storage/recovery.rs` (+11/-3):
+  - **`Wal::append_and_sync` LSN fix (Task 6.1)**: after `self.append`
+    + `self.sync`, the method now clones the record and sets
+    `streamed.lsn = self.current_lsn()` before calling
+    `sink.stream(&streamed)`. This is necessary because `Wal::append`
+    assigns the LSN from `self.next_lsn` and writes it to disk, but
+    does NOT write it back to the in-memory `record` (the param is
+    `&WalRecord`, immutable). Without this fix, the wire protocol's
+    `<lsn>` would always be 0 (since callers construct records via
+    `WalRecord::autocommit` with `lsn == 0`), and the ACK correlation
+    would still work (0 == 0) but the receiver's `last_applied_lsn`
+    tracking would be wrong (all records would have lsn 0). The clone
+    is a one-shot per `append_and_sync` — acceptable for replication.
+    The rest of `append_and_sync` (the `SyncMode::Synchronous` branch
+    calling `sink.sync_wait()` and propagating `Err` as `io::Error`)
+    was already wired in Wave 5 and is unchanged.
+
+- `tests/wal_durability_replication.rs` (+160/-1):
+  - **`test_sync_replication_quorum` (Task 6.4 DoD)**: binds 3
+    `WalReceiver`s on random localhost ports, spawns 3 receiver
+    threads (each pushing applied LSNs to a shared
+    `Arc<Mutex<Vec<u64>>>`), creates 3 `WalStreamer`s connected to
+    them, wraps them in a `MultiWalStreamSink::with_quorum(Majority)`,
+    attaches the sink to a `Wal` in `SyncMode::Synchronous`. Then:
+    (1) `append_and_sync` a record → all 3 receivers apply + ACK →
+    quorum 2/3 met → `Ok`; (2) verify all 3 receivers' applied lists
+    are non-empty (by the time `sync_wait` returned Ok, at least 2 had
+    ACK'd, and the 3rd applies before sending its ACK, so all 3 have
+    applied); (3) kill streamer 0 → `append_and_sync` → quorum 2/3
+    still met (2 alive) → `Ok`; (4) kill streamer 1 → only 1 alive →
+    quorum 2/3 NOT met → `Err` (asserts the error message mentions
+    "quorum" / "sync_wait" / "ACK"). Cleanup drops the Wal first
+    (detaches the sink), then the sink (drops the remaining streamer →
+    receiver 2 sees EOF and exits; the killed streamers' receivers
+    already saw EOF from `kill()`'s `shutdown`), then joins all 3
+    receiver threads. The test runs in ~0.10 s (no long timeouts: the
+    killed streamers' `sync_wait` threads return `Err` immediately via
+    the kill switch, the alive streamers' ACKs come back in
+    milliseconds, and the quorum-failure case exits as soon as all 3
+    threads report — well before the 6 s overall deadline). Verified
+    stable across 5 consecutive runs.
+
+Files touched (1 commit): src/storage/replication.rs (+558/-58),
+src/storage/recovery.rs (+11/-3), tests/wal_durability_replication.rs
+(+160/-1). +661 / -68 total.
+
+Constraints honoured:
+- No `unwrap()`/`expect()` in new production code: all `WalStreamer`
+  / `WalReceiver` / `MultiWalStreamSink` / `Wal::append_and_sync`
+  changes use `?` / `map_err` / `match` / `if let`. The
+  `is_conn_closed` helper and `parse_replicate_line` / `parse_ack_lsn`
+  parsers return `Option` / `Result` without panicking. The test uses
+  `.expect(...)` (test code, allowed per spec).
+- Max 3 files per commit: exactly 3 (replication.rs, recovery.rs,
+  wal_durability_replication.rs).
+- Context budget: ~558 LOC of new/changed production code in
+  replication.rs + ~11 LOC in recovery.rs + ~160 LOC of new test code
+  = ~729 LOC total, under 1500.
+- `cargo check --jobs 1 --lib`: 0 errors, 462 warnings (all
+  pre-existing, unchanged from Wave 5).
+- `cargo check --jobs 1 --lib --features raft`: 0 errors, 466 warnings
+  (unchanged).
+- `cargo test --jobs 1 --lib`: 864 passed, 0 failed (unchanged from
+  Wave 5 baseline — no new lib tests; the existing
+  `wal_receiver_run_apply_loop` and `raft_leader_streams_to_followers`
+  tests pass with the new wire format + ACK handling + RST-tolerant
+  read loop).
+- `cargo test --jobs 1 --lib --features raft`: 870 passed, 0 failed
+  (unchanged).
+- `cargo test --jobs 1 --test wal_durability_replication`: 13 passed
+  (was 12 + 1 new `test_sync_replication_quorum`), 0 failed.
+
+Notes / follow-ups:
+- The ACK protocol uses a 5 s per-streamer read timeout and a 6 s
+  overall quorum deadline. For a real deployment, these should be
+  configurable (e.g. via `Wal::set_sync_timeout` or a config struct).
+  The current constants (5000 ms, 6000 ms) are hardcoded in
+  `WalStreamer::sync_wait` and `MultiWalStreamSink::sync_wait`.
+- `MultiWalStreamSink::sync_wait` spawns one OS thread per streamer
+  per `append_and_sync` call. For high-throughput primaries this is
+  wasteful (thread creation cost). A future optimization: use a
+  thread pool or `tokio` tasks (the engine already has a tokio runtime
+  under `--features raft`). The current implementation is correct but
+  not optimized for throughput.
+- `WalStreamer::kill` is a test helper (used by
+  `test_sync_replication_quorum` to simulate replica crashes). In a
+  real deployment, a streamer fails because the TCP connection breaks
+  (the receiver crashes or the network partitions). The kill switch
+  approximates this from the primary's perspective — `stream_record`
+  and `sync_wait` return `Err` just as they would if the TCP writes /
+  reads failed. A production deployment would detect the broken
+  connection via `write_all` returning `BrokenPipe` or `read_line`
+  returning `Err(ConnectionReset)`, which the existing error paths
+  already handle (returning `Err` from `sync_wait` → quorum failure).
+- The `WalStreamer::reader` (`BufReader<TcpStream>`) holds a clone of
+  the writer's socket. Both halves share the same underlying file
+  descriptor (via `dup`). Dropping one half does NOT close the
+  connection (the other half keeps it open). `kill()` explicitly drops
+  both halves AND calls `shutdown(Shutdown::Both)` to ensure the
+  receiver sees EOF immediately. A `Drop` impl for `WalStreamer` that
+  calls `shutdown` would be more robust, but the current
+  `kill()` + `is_conn_closed` combo is sufficient for the tests.
+- The wire protocol is text-based (`REPLICATE <lsn> <json>\n` /
+  `ACK <lsn>\n`) for simplicity and debuggability. A binary protocol
+  (length-prefixed) would be more efficient but harder to inspect with
+  `nc` / `tcpdump`. The text format is unambiguous because `<json>`
+  is JSON (no newlines) and `<lsn>` is a decimal integer (no spaces).
+- `enable_replication_local_only` (in `engine/mod.rs`) attaches a
+  `WalStreamer` that is NOT connected to any peer. With the new ACK
+  protocol, `stream_record` sets `pending_ack_lsn`, but `sync_wait`'s
+  `wait_for_ack` sees `reader.is_none()` and returns `Ok` (local-only
+  case). So synchronous mode with a local-only streamer succeeds
+  (treated as "ACK'd immediately") — this is what
+  `test_sync_mode_waits_for_flush` verifies. A future task might make
+  this stricter (require a real ACK even for local-only), but that
+  would break the existing test.
+- The `MultiWalStreamSink` is attached to the `Wal` via
+  `set_stream_sink(Arc<Mutex<dyn WalStreamSink>>)`. The `QuorumPolicy`
+  is NOT part of the `WalStreamSink` trait — it's a field on
+  `MultiWalStreamSink`. To change the quorum policy at runtime, the
+  caller must downcast the trait object back to
+  `MultiWalStreamSink` (or hold a typed `Arc<Mutex<MultiWalStreamSink>>`
+  alongside the trait object, as the integration test does). A future
+  API improvement could add `set_quorum` to the trait (with a default
+  no-op for single-streamer sinks).
+
+Stage Summary:
+- Task 6.1 + 6.2 + 6.3 + 6.4 complete. Synchronous replication now
+  uses a real application-level ACK protocol: the primary sends
+  `REPLICATE <lsn> <json>\n`, the replica applies and responds
+  `ACK <lsn>\n`, and `Wal::append_and_sync` in `SyncMode::Synchronous`
+  blocks on the ACK (5 s timeout) — a missing/mismatched ACK fails the
+  commit. `MultiWalStreamSink::sync_wait` enforces a `QuorumPolicy`
+  (`Majority` / `All` / `Any`): the commit succeeds only if at least
+  `policy.required(N)` replicas ACK. The integration test
+  (`test_sync_replication_quorum`) verifies the full flow: 3 replicas
+  → quorum 2/3 → kill 1 (still 2/3, Ok) → kill 2 (only 1, Err). 870
+  lib tests pass with `--features raft` (864 without); 13 integration
+  tests pass (was 12). Ready for Wave 7.
