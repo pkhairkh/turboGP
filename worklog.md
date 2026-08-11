@@ -1337,3 +1337,15 @@ cat >> /root/turboGP/worklog.md << 'WORKLOG'
 - Connection string used by benchmarks: `clickhouse-client --host 127.0.0.1 --port 9000 --user default --password ''`.
 
 DoD satisfied: ClickHouse runs via Docker; clickhouse-client connects; SELECT 1 returns 1; version documented.
+
+### Task 1.3 — Install and verify DuckDB
+- Installed DuckDB CLI v1.1.0 (linux-amd64) to `/usr/local/bin/duckdb`.
+- **Note:** The download URL in the original prompt (`duckdb-cli-linux-amd64.zip`, with hyphen) returned HTTP 404. The correct asset name is `duckdb_cli-linux-amd64.zip` (underscore). This is a typo in the prompt, not a behavioural deviation.
+- `SELECT 1` returns 1; `CREATE TABLE / INSERT / SELECT SUM` works.
+- Version: `WORKLOG
+echo "  - Version: \`$DUCKDB_VERSION\`" >> /root/turboGP/worklog.md
+cat >> /root/turboGP/worklog.md << 'WORKLOG'
+`.
+- Benchmark scripts will invoke DuckDB via subprocess; each run uses a file-backed database at `/srv/duckdb/tpch.duckdb` (or `clickbench.duckdb`).
+
+DoD satisfied: duckdb CLI works; SELECT 1 returns 1; version documented.
