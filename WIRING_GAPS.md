@@ -132,7 +132,7 @@ Branch: `feat/prod-wiring`.
   `grep 'split_union_all\|parse_merge\|parse_pivot_clause\|strip_pivot_clause'`
   on `src/engine/` returns zero matches.
 - **Resolved by:** Wave 7 (Tasks 7.1–7.4).
-- **Resolved:** ☐
+- **Resolved:** ☑ (commits 3ba550d, 3400d41, c95786f)
 
 ---
 
@@ -172,10 +172,10 @@ Branch: `feat/prod-wiring`.
 | 1 — Raft write path | 4 | `append_and_sync` → `RaftManager::propose()` | ☑ |
 | 2 — Persistent Raft storage | 2 | `SledRaftStore` (disk-backed) | ☑ |
 | 3 — TCP Raft network | 3 | `TcpRaftNetwork` over tokio TCP | ☑ |
-| 4 — Production pgwire server | 5 | Full PostgreSQL wire protocol over tokio | ☐ |
-| 5 — Connection pool on production path | 5 | pgwire server uses `ConnectionPool` | ☐ |
+| 4 — Production pgwire server | 5 | Full PostgreSQL wire protocol over tokio | ☑ |
+| 5 — Connection pool on production path | 5 | pgwire server uses `ConnectionPool` | ☑ |
 | 6 — Sync replication default | 6 | `enable_raft` sets sync + quorum | ☑ |
 | 7 — VACUUM reclaims column space | 6 | Dead rows removed from `Vec<u64>` | ☑ |
-| 8 — Remove parser hacks | 7 | Formal AST for UNION ALL / MERGE / PIVOT | ☐ |
+| 8 — Remove parser hacks | 7 | Formal AST for UNION ALL / MERGE / PIVOT | ☑ |
 | 9 — Real doc comments | 8 | `#![allow(missing_docs)]` removed | ☐ |
 | 10 — Operational tooling | 9 | `turboGP admin` CLI | ☐ |
