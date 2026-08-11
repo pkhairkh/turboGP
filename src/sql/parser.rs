@@ -220,6 +220,26 @@ pub fn parse_set(tokens: Vec<Token>) -> Result<SetQuery, String> {
     }
 }
 
+/// Parse a single SQL expression from a token slice. Used by the DML
+/// parser to parse SET expressions and WHERE predicates without
+/// wrapping them in a synthetic SELECT.
+///
+/// The token slice should NOT include a trailing EOF — this function
+/// adds one internally. All tokens in the slice are consumed (an error
+/// is returned if trailing tokens remain after the expression).
+///
+/// # Errors
+///
+/// Returns `Err(String)` for malformed expressions or trailing tokens.
+pub fn parse_expression(tokens: Vec<Token>) -> Result<Expr, String> {
+    let mut p = Parser::new(tokens);
+    let e = p.parse_expr()?;
+    match p.peek() {
+        Token::Semicolon | Token::EOF => Ok(e),
+        other => Err(format!("unexpected trailing token in expression: {other:?}")),
+    }
+}
+
 /// The internal recursive-descent parser state.
 struct Parser {
     /// The token stream (with trailing EOF).
@@ -514,6 +534,14 @@ impl Parser {
         }
         // Wave 4: Unary minus / plus in SELECT list (e.g. SELECT -1 FROM t).
         if matches!(self.peek(), Token::Op(op) if op == "-" || op == "+") {
+            let expr = self.parse_expr()?;
+            let alias = self.parse_optional_alias()?;
+            return Ok(SelectItem::Expression { expr, alias });
+        }
+        // Wave 5: String / Float / Hex literals in SELECT list (used by
+        // DML expression parser when it wraps expressions in synthetic
+        // SELECT <expr> FROM __dummy__).
+        if matches!(self.peek(), Token::String(_) | Token::Float(_) | Token::Hex(_)) {
             let expr = self.parse_expr()?;
             let alias = self.parse_optional_alias()?;
             return Ok(SelectItem::Expression { expr, alias });

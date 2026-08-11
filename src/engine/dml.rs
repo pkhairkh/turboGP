@@ -231,18 +231,26 @@ impl QueryEngine {
             let idx = table
                 .column_idx(col_name)
                 .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
-            let trimmed = expr.trim();
-            let is_null = trimmed.eq_ignore_ascii_case("NULL");
+            // Wave 5: `expr` is now a parsed `ast::Expr`. Convert back to
+            // SQL string for the existing parse_value_cell helper. A proper
+            // refactor would update parse_value_cell to accept &Expr, but
+            // that's a larger change deferred to a later wave.
+            let expr_str = expr.to_string();
+            let trimmed = expr_str.trim();
+            let is_null = trimmed.eq_ignore_ascii_case("NULL") || matches!(expr, crate::sql::ast::Expr::Literal(crate::sql::ast::Value::Null));
             // For now, the expression must be a simple literal.
-            let cell = parse_value_cell(expr);
+            let cell = parse_value_cell(&expr_str);
             assigns.push((idx, cell, is_null));
         }
 
         // Determine which rows match the WHERE clause.
         let n = table.row_count;
         let mut updated = 0usize;
-        let match_mask: Vec<bool> = if let Some(where_str) = &upd.where_clause {
-            eval_simple_where(table, where_str)?
+        let match_mask: Vec<bool> = if let Some(where_expr) = &upd.where_clause {
+            // Wave 5: where_clause is now ast::Expr. Convert to SQL string
+            // for the existing eval_simple_where helper.
+            let where_str = where_expr.to_string();
+            eval_simple_where(table, &where_str)?
         } else {
             vec![true; n]
         };
@@ -348,8 +356,11 @@ impl QueryEngine {
             .ok_or_else(|| Error::NotFound(format!("table \"{}\"", del.table)))?;
 
         let n = table.row_count;
-        let delete_mask: Vec<bool> = if let Some(where_str) = &del.where_clause {
-            eval_simple_where(table, where_str)?
+        let delete_mask: Vec<bool> = if let Some(where_expr) = &del.where_clause {
+            // Wave 5: where_clause is now ast::Expr. Convert to SQL string
+            // for the existing eval_simple_where helper.
+            let where_str = where_expr.to_string();
+            eval_simple_where(table, &where_str)?
         } else {
             vec![true; n]
         };
