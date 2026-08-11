@@ -556,3 +556,237 @@ fn route_and_execute_via_execute(
 ) -> turbogp::Result<turbogp::engine::QueryResult> {
     engine.execute(sql)
 }
+
+// =========================================================================
+// Wave 7 Task 7.4 — Connection pool stress test.
+//
+// Spawns 50 concurrent tasks against a pool with max_size = 4. Each task
+// acquires a permit, sleeps 100ms while holding it, then releases. We
+// verify:
+//   1. No more than 4 tasks are active at any instant (max-observed ≤ 4).
+//   2. All 50 tasks complete.
+//   3. Pool metrics are consistent (total_acquired == 50, total_released == 50).
+//
+// The max-observed check uses an AtomicUsize that each task increments
+// after acquiring and decrements before releasing; the test periodically
+// polls the high-water mark. The check is best-effort but tight enough
+// that a buggy pool (e.g. max_size = 0 or no semaphore) would fail it.
+// =========================================================================
+
+/// Wave 7 Task 7.4 DoD — 50 concurrent acquires against a pool with
+/// max_size = 4 never exceed 4 active, all complete, and metrics are
+/// consistent.
+///
+/// We use a multi-thread runtime so that the 50 spawned tasks can actually
+/// run in parallel (otherwise the test would be a no-op — on a current-
+/// thread runtime, all tasks would serialise and never exceed 1 active).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_connection_pool_stress() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use turbogp::engine::QueryEngine;
+    use turbogp::server::{ConnectionPool, PoolConfig};
+
+    const MAX_SIZE: usize = 4;
+    const N_TASKS: usize = 50;
+    const HOLD_MS: u64 = 100;
+
+    // Build the pool wrapping an in-memory engine (the engine is unused
+    // — the stress test only exercises the pool's semaphore + metrics,
+    // not SQL execution).
+    let engine = Arc::new(std::sync::RwLock::new(QueryEngine::in_memory()));
+    let pool = Arc::new(ConnectionPool::new(
+        engine,
+        PoolConfig {
+            max_size: MAX_SIZE,
+            // Acquire timeout must be comfortably longer than the worst-
+            // case wait (N_TASKS / MAX_SIZE × HOLD_MS = 13 × 100ms = 1.3s,
+            // plus scheduler overhead). 30s gives a huge margin.
+            acquire_timeout_secs: 30,
+        },
+    ));
+
+    // Active-counter: each task increments after acquire, decrements
+    // before drop. The test polls `max_observed` to verify it never
+    // exceeds MAX_SIZE.
+    let active_now = Arc::new(AtomicUsize::new(0));
+    let max_observed = Arc::new(AtomicUsize::new(0));
+
+    // Spawn N_TASKS, each acquiring a permit, holding for HOLD_MS, then
+    // releasing. Returns Ok(()) on success, Err(msg) on acquire failure.
+    let mut handles = Vec::with_capacity(N_TASKS);
+    for task_id in 0..N_TASKS {
+        let pool = Arc::clone(&pool);
+        let active_now = Arc::clone(&active_now);
+        let max_observed = Arc::clone(&max_observed);
+        handles.push(tokio::spawn(async move {
+            let _permit = pool.acquire().await.map_err(|e| {
+                format!("task {task_id} acquire failed: {e}")
+            })?;
+
+            // We hold the permit — record our presence.
+            let cur = active_now.fetch_add(1, Ordering::SeqCst) + 1;
+            // Atomically update max_observed if cur > max_observed.
+            let mut prev_max = max_observed.load(Ordering::SeqCst);
+            while cur > prev_max {
+                match max_observed.compare_exchange_weak(
+                    prev_max,
+                    cur,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => prev_max = actual,
+                }
+            }
+
+            // Hold the permit for HOLD_MS — this is the "work" being
+            // done while the slot is occupied.
+            tokio::time::sleep(Duration::from_millis(HOLD_MS)).await;
+
+            // Release our presence BEFORE dropping the permit (so the
+            // next acquirer sees the decrement and can proceed).
+            active_now.fetch_sub(1, Ordering::SeqCst);
+            // _permit drops here, releasing the semaphore slot.
+            Ok::<(), String>(())
+        }));
+    }
+
+    // Poll max_observed periodically while tasks run, just for
+    // observability — the assertion is on the final value below.
+    let poll_start = Instant::now();
+    while poll_start.elapsed() < Duration::from_secs(30) {
+        let remaining = handles.iter().filter(|h| !h.is_finished()).count();
+        if remaining == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Join all tasks (with a generous timeout). Each must return Ok.
+    let mut errors: Vec<String> = Vec::new();
+    let mut joined = 0usize;
+    for (i, h) in handles.into_iter().enumerate() {
+        match tokio::time::timeout(Duration::from_secs(30), h).await {
+            Ok(Ok(Ok(()))) => joined += 1,
+            Ok(Ok(Err(e))) => errors.push(format!("task {i}: {e}")),
+            Ok(Err(join_err)) => errors.push(format!("task {i} join: {join_err}")),
+            Err(_) => errors.push(format!("task {i} timed out (30s)")),
+        }
+    }
+
+    // --- Verify (4): all 50 tasks eventually complete. ---
+    assert_eq!(
+        joined, N_TASKS,
+        "expected all {N_TASKS} tasks to complete, only {joined} did; errors: {errors:?}",
+    );
+    assert!(errors.is_empty(), "task errors: {errors:?}");
+
+    // --- Verify (3): no more than MAX_SIZE active at any time. ---
+    //
+    // max_observed tracks the high-water mark of `active_now`, which each
+    // task increments after acquire and decrements before drop. A correct
+    // pool (semaphore with MAX_SIZE permits) can never have more than
+    // MAX_SIZE permits outstanding, so max_observed ≤ MAX_SIZE.
+    //
+    // We assert ≤ MAX_SIZE (not == MAX_SIZE) because on a low-CPU machine
+    // the scheduler may not actually run 4 tasks simultaneously — but it
+    // must NEVER run 5.
+    let peak = max_observed.load(Ordering::SeqCst);
+    assert!(
+        peak <= MAX_SIZE,
+        "max observed active ({peak}) exceeded pool max_size ({MAX_SIZE}) — \
+         the pool allowed more than {MAX_SIZE} concurrent permits",
+    );
+    // Sanity: at least 1 task must have run (otherwise the test is bogus).
+    assert!(
+        peak >= 1,
+        "max observed active ({peak}) < 1 — no task ever held a permit? (test bug)",
+    );
+
+    // --- Verify (5): metrics consistency. ---
+    //
+    // After all 50 tasks complete and drop their permits:
+    //   - total_acquired == 50 (every task acquired exactly once).
+    //   - total_released == 50 (every permit was dropped).
+    //   - active == 0 (no permits outstanding).
+    //   - idle == MAX_SIZE (all slots free).
+    //
+    // Note: `waiting` is reported as 0 (see PoolMetrics docs — the
+    // semaphore doesn't expose a waiters count). We don't assert on it.
+    let m = pool.metrics();
+    assert_eq!(
+        m.total_acquired, N_TASKS as u64,
+        "total_acquired ({}) != N_TASKS ({N_TASKS})",
+        m.total_acquired,
+    );
+    assert_eq!(
+        m.total_released, N_TASKS as u64,
+        "total_released ({}) != N_TASKS ({N_TASKS})",
+        m.total_released,
+    );
+    assert_eq!(
+        m.active, 0,
+        "active ({}) should be 0 after all tasks complete",
+        m.active,
+    );
+    assert_eq!(
+        m.idle, MAX_SIZE,
+        "idle ({}) should be MAX_SIZE ({MAX_SIZE}) after all tasks complete",
+        m.idle,
+    );
+
+    eprintln!(
+        "test_connection_pool_stress: N_TASKS={N_TASKS}, MAX_SIZE={MAX_SIZE}, \
+         peak_active={peak}, total_acquired={}, total_released={}",
+        m.total_acquired, m.total_released,
+    );
+}
+
+/// Wave 7 Task 7.4 (supplemental) — verify that `pool.metrics()` reports
+/// the expected `active` count while permits are held, not just after
+/// release. This is a tighter check than the stress test's final-state
+/// assertion.
+#[tokio::test]
+async fn test_pool_metrics_active_during_hold() {
+    use std::sync::Arc;
+
+    use turbogp::engine::QueryEngine;
+    use turbogp::server::{ConnectionPool, PoolConfig};
+
+    let engine = Arc::new(std::sync::RwLock::new(QueryEngine::in_memory()));
+    let pool = Arc::new(ConnectionPool::new(
+        engine,
+        PoolConfig { max_size: 4, acquire_timeout_secs: 5 },
+    ));
+
+    // Acquire 3 permits and hold them while we check metrics.
+    let p1 = pool.acquire().await.expect("acquire 1");
+    let p2 = pool.acquire().await.expect("acquire 2");
+    let p3 = pool.acquire().await.expect("acquire 3");
+
+    let m = pool.metrics();
+    assert_eq!(m.active, 3, "3 permits held → active should be 3");
+    assert_eq!(m.idle, 1, "max_size=4, active=3 → idle should be 1");
+    assert_eq!(m.total_acquired, 3);
+    assert_eq!(m.total_released, 0);
+
+    // Release one, re-check.
+    drop(p1);
+    let m = pool.metrics();
+    assert_eq!(m.active, 2, "after dropping p1, active should be 2");
+    assert_eq!(m.idle, 2, "after dropping p1, idle should be 2");
+    assert_eq!(m.total_acquired, 3);
+    assert_eq!(m.total_released, 1);
+
+    // Release the rest.
+    drop(p2);
+    drop(p3);
+    let m = pool.metrics();
+    assert_eq!(m.active, 0);
+    assert_eq!(m.idle, 4);
+    assert_eq!(m.total_acquired, 3);
+    assert_eq!(m.total_released, 3);
+}
