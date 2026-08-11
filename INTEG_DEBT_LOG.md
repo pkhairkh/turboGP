@@ -102,3 +102,29 @@ parser.
 | debt-5.4 (on_become_leader) | RESOLVED | Agent B implemented |
 | debt-6.3 (WAL timestamps) | PARTIAL | WalRecord has no timestamp_us field; PITR uses proxy |
 | debt-6.x (list_tables bug) | RESOLVED | Agent B fixed list_tables to read from catalog directly |
+| debt-6.2/6.3/6.5 (openraft) | DEFERRED | Requires async runtime (tokio) refactor — see section below |
+
+---
+
+## Debt: openraft integration (Wave 6 Tasks 6.2, 6.3, 6.5)
+
+**Status:** DEFERRED — openraft requires a full async runtime (tokio)
+refactor that is out of scope for this hardening programme.
+
+**What was done instead:**
+- Task 6.1: Synchronous replication mode (flush-based) — implemented.
+- Task 6.4: LSN-based replica resume — implemented.
+- The existing minimal `RaftNode` (hand-rolled, single-node election)
+  remains. `enable_raft` creates a RaftNode and calls `on_become_leader`
+  which connects WalStreamers to followers.
+
+**What openraft would add:**
+- Real multi-node leader election with term-based voting.
+- Log replication with majority quorum.
+- Automatic failover (leader dies → new leader elected within seconds).
+- Network partition tolerance.
+
+**Recommended next step:**
+Migrate the engine to async (tokio), then replace the stub RaftNode with
+`openraft::Raft`. This is a significant refactor (the entire server layer
+needs to become async) and should be a separate workstream.
