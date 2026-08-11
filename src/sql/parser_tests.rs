@@ -6,6 +6,70 @@
         parse(tokenize(s)?)
     }
 
+    // ===== Orchestrator Return Criteria Verification =====
+    // These tests verify the specific SQL examples from the Orchestrator
+    // Return Criteria section of the Wave 8 spec.
+
+    #[test]
+    fn return_crit_in_subquery() {
+        assert!(parse_sql("SELECT * FROM t WHERE id IN (SELECT id FROM t2)").is_ok());
+    }
+
+    #[test]
+    fn return_crit_union() {
+        let tokens = tokenize("SELECT a FROM t1 UNION SELECT a FROM t2").unwrap();
+        assert!(parse_set(tokens).is_ok());
+    }
+
+    #[test]
+    fn return_crit_qualified_column() {
+        assert!(parse_sql("SELECT t.col FROM t").is_ok());
+    }
+
+    #[test]
+    fn return_crit_is_null() {
+        assert!(parse_sql("SELECT * FROM t WHERE x IS NULL").is_ok());
+    }
+
+    #[test]
+    fn return_crit_unary_minus() {
+        assert!(parse_sql("SELECT -1 FROM t").is_ok());
+    }
+
+    #[test]
+    fn return_crit_scalar_function() {
+        assert!(parse_sql("SELECT UPPER(name) FROM t").is_ok());
+    }
+
+    #[test]
+    fn return_crit_cte() {
+        let sql = "WITH t AS (SELECT * FROM x) SELECT * FROM t";
+        let result = crate::sql::cte::parse_with(sql);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_ok());
+    }
+
+    #[test]
+    fn return_crit_insert_select() {
+        let result = crate::sql::dml::parse_dml("INSERT INTO t SELECT * FROM t2");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn return_crit_check_constraint() {
+        let result = crate::sql::ddl::parse_ddl("CREATE TABLE t (x INT CHECK (x > 0))");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn return_crit_multi_column_index() {
+        let result = crate::sql::ddl::parse_ddl("CREATE INDEX idx ON t (a, b)");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
     #[test]
     fn parse_select_star_with_where() {
         let q = parse_sql("SELECT * FROM t WHERE x = 5").unwrap();
