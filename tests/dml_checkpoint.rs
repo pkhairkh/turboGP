@@ -194,7 +194,12 @@ fn checkpoint_preserves_float_type() {
             col_type: ColumnType::Float,
             not_null: false,
             primary_key: false,
+            unique: false,
+            check: None,
         }],
+        checks: Vec::new(),
+        unique_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     cat.register(t);
 
@@ -243,7 +248,12 @@ fn checkpoint_preserves_varchar_type() {
             col_type: ColumnType::Varchar(Some(50)),
             not_null: false,
             primary_key: false,
+            unique: false,
+            check: None,
         }],
+        checks: Vec::new(),
+        unique_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     cat.register(t);
 
@@ -344,14 +354,21 @@ fn checkpoint_roundtrip_floats_and_varchars() {
                 col_type: ColumnType::Varchar(None),
                 not_null: false,
                 primary_key: false,
+                unique: false,
+                check: None,
             },
             ColumnSchema {
                 name: "price".into(),
                 col_type: ColumnType::Float,
                 not_null: false,
                 primary_key: false,
+                unique: false,
+                check: None,
             },
         ],
+        checks: Vec::new(),
+        unique_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
     });
     cat.register(t);
 

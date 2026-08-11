@@ -11,6 +11,319 @@ impl QueryEngine {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Task 3.4 — FOREIGN KEY constraint enforcement.
+    //
+    // FK checks must run BEFORE the mutable column-extension / in-place
+    // update / delete loop so a violation leaves the table unchanged
+    // (atomicity). The child→parent existence check (INSERT/UPDATE) needs
+    // an immutable borrow of both the child table (to read its schema +
+    // column indices) and the parent table (to look up referenced rows);
+    // these cannot coexist with a mutable borrow of the child table.
+    // -----------------------------------------------------------------
+
+    /// Validate that FOREIGN KEY constraints on `table_name` are satisfied
+    /// by the proposed new rows (Task 3.4). Called from `execute_insert`
+    /// and `execute_update` BEFORE the mutation loop.
+    ///
+    /// For each FK on the table's schema:
+    /// 1. Resolve the FK column indices in the child table.
+    /// 2. If any FK column value is NULL, skip (NULL FKs are allowed —
+    ///    "no constraint", per SQL standard).
+    /// 3. Look up the referenced (parent) table via `self.catalog.get`.
+    /// 4. Check if the parent table has a row whose referenced columns
+    ///    match the child's FK values.
+    /// 5. If not, return `Err(Error::Other("23503: ..."))`.
+    ///
+    /// `new_rows` is a list of `(column_values, null_mask)` pairs — one
+    /// per row to be inserted/updated. The null mask is `true` for NULL
+    /// cells.
+    fn validate_foreign_keys(
+        &self,
+        table_name: &str,
+        new_rows: &[(Vec<u64>, Vec<bool>)],
+    ) -> Result<()> {
+        let child_table = match self.catalog.get(table_name) {
+            Some(t) => t,
+            None => return Ok(()), // table missing — caller will handle.
+        };
+        let Some(ref schema) = child_table.schema else {
+            return Ok(());
+        };
+        if schema.foreign_keys.is_empty() {
+            return Ok(());
+        }
+        for (row_idx, (vals, nulls)) in new_rows.iter().enumerate() {
+            for fk in &schema.foreign_keys {
+                // Resolve child column indices.
+                let child_idxs: Vec<Option<usize>> =
+                    fk.columns.iter().map(|name| child_table.column_idx(name)).collect();
+                // Skip if any child column value is NULL.
+                let any_null = child_idxs
+                    .iter()
+                    .any(|idx| idx.map(|ci| nulls[ci]).unwrap_or(true));
+                if any_null {
+                    continue;
+                }
+                // Collect child values.
+                let child_vals: Vec<u64> =
+                    child_idxs.iter().map(|idx| idx.map(|ci| vals[ci]).unwrap_or(0)).collect();
+                // Look up parent table.
+                let parent_table = match self.catalog.get(&fk.ref_table) {
+                    Some(t) => t,
+                    None => {
+                        return Err(Error::Other(format!(
+                            "23503: FOREIGN KEY references non-existent table \"{}\"",
+                            fk.ref_table
+                        )))
+                    }
+                };
+                // Resolve parent column indices.
+                let parent_idxs: Vec<Option<usize>> =
+                    fk.ref_columns.iter().map(|name| parent_table.column_idx(name)).collect();
+                // Scan parent rows for a match.
+                let mut found = false;
+                'parent_row: for r in 0..parent_table.row_count {
+                    for (i, &parent_ci) in parent_idxs.iter().enumerate() {
+                        let Some(parent_ci) = parent_ci else { continue 'parent_row };
+                        let existing =
+                            parent_table.columns[parent_ci].get(r).copied().unwrap_or(0);
+                        if existing != child_vals[i] {
+                            continue 'parent_row;
+                        }
+                    }
+                    found = true;
+                    break;
+                }
+                if !found {
+                    return Err(Error::Other(format!(
+                        "23503: FOREIGN KEY constraint violated: ({}) = ({}) references nonexistent row in table \"{}\" on row {}",
+                        fk.columns.join(", "),
+                        child_vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "),
+                        fk.ref_table,
+                        row_idx
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Task 3.4 — Enforce FK constraints when deleting rows from
+    /// `parent_table_name` (the DELETE-side of FK enforcement).
+    ///
+    /// Scans every table in the catalog for FKs that reference
+    /// `parent_table_name` (O(num_tables) — acceptable for now). For each
+    /// such FK, applies the configured `ON DELETE` action:
+    /// - **RESTRICT / NO ACTION** (default): if any child row references a
+    ///   deleted parent row, return `Err(Error::Other("23504: ..."))`.
+    /// - **CASCADE**: build a WHERE clause matching child rows that
+    ///   reference deleted parent rows, then recursively call
+    ///   `execute_dml(Delete)` on the child table. The recursive call
+    ///   handles the child's own FK checks (grandchild CASCADE, etc.).
+    /// - **SET NULL**: null the FK columns of child rows referencing
+    ///   deleted parent rows. (**SET DEFAULT** is treated as SET NULL —
+    ///   documented simplification.)
+    ///
+    /// `delete_mask` is a parallel-to-rows mask where `true` means the
+    /// parent row will be deleted.
+    fn enforce_fk_on_delete(
+        &mut self,
+        parent_table_name: &str,
+        delete_mask: &[bool],
+        txn_id: Option<u64>,
+    ) -> Result<()> {
+        // Snapshot all FK definitions that reference this parent table.
+        // We collect owned clones so the catalog can be mutably borrowed
+        // (for SET NULL) without holding an immutable borrow across the
+        // mutation.
+        let child_fks: Vec<(String, crate::sql::ddl::TableForeignKey)> = {
+            let mut fks = Vec::new();
+            let names: Vec<String> =
+                self.catalog.table_names().into_iter().map(String::from).collect();
+            for name in &names {
+                if name == parent_table_name {
+                    continue;
+                }
+                if let Some(t) = self.catalog.get(name) {
+                    if let Some(ref schema) = t.schema {
+                        for fk in &schema.foreign_keys {
+                            if fk.ref_table == parent_table_name {
+                                fks.push((name.clone(), fk.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            fks
+        };
+        if child_fks.is_empty() {
+            return Ok(());
+        }
+        for (child_table_name, fk) in child_fks {
+            // Collect the deleted parent rows' values in the FK's
+            // referenced columns. These are the values we need to match
+            // against child rows.
+            let deleted_parent_vals: Vec<Vec<u64>> = {
+                let parent_table = self
+                    .catalog
+                    .get(parent_table_name)
+                    .ok_or_else(|| Error::NotFound(format!("table \"{}\"", parent_table_name)))?;
+                let parent_idxs: Vec<Option<usize>> =
+                    fk.ref_columns.iter().map(|name| parent_table.column_idx(name)).collect();
+                let mut vals = Vec::new();
+                for (row_idx, &deleted) in delete_mask.iter().enumerate() {
+                    if !deleted {
+                        continue;
+                    }
+                    let row_vals: Vec<u64> = parent_idxs
+                        .iter()
+                        .map(|idx| {
+                            idx.and_then(|ci| parent_table.columns[ci].get(row_idx).copied())
+                                .unwrap_or(0)
+                        })
+                        .collect();
+                    vals.push(row_vals);
+                }
+                vals
+            };
+            let action = fk
+                .on_delete
+                .unwrap_or(crate::sql::ddl::ForeignKeyAction::NoAction);
+            match action {
+                crate::sql::ddl::ForeignKeyAction::Restrict
+                | crate::sql::ddl::ForeignKeyAction::NoAction => {
+                    // Check if any child row references a deleted parent row.
+                    let child_table = self
+                        .catalog
+                        .get(&child_table_name)
+                        .ok_or_else(|| Error::NotFound(format!("table \"{}\"", child_table_name)))?;
+                    let child_idxs: Vec<Option<usize>> =
+                        fk.columns.iter().map(|name| child_table.column_idx(name)).collect();
+                    for child_row_idx in 0..child_table.row_count {
+                        // Skip if any child FK column is NULL.
+                        let any_null = child_idxs.iter().any(|idx| {
+                            idx.and_then(|ci| {
+                                child_table
+                                    .null_bitmaps
+                                    .get(ci)
+                                    .and_then(|bm| bm.as_ref().map(|b| b.is_null(child_row_idx)))
+                            })
+                            .unwrap_or(false)
+                        });
+                        if any_null {
+                            continue;
+                        }
+                        let child_vals: Vec<u64> = child_idxs
+                            .iter()
+                            .map(|idx| {
+                                idx.and_then(|ci| child_table.columns[ci].get(child_row_idx).copied())
+                                    .unwrap_or(0)
+                            })
+                            .collect();
+                        for parent_vals in &deleted_parent_vals {
+                            if child_vals == *parent_vals {
+                                return Err(Error::Other(format!(
+                                    "23504: FOREIGN KEY constraint violated: cannot delete from table \"{}\" — row referenced by table \"{}\" ({})",
+                                    parent_table_name,
+                                    child_table_name,
+                                    fk.columns.join(", ")
+                                )));
+                            }
+                        }
+                    }
+                }
+                crate::sql::ddl::ForeignKeyAction::Cascade => {
+                    // Build a WHERE clause matching child rows that
+                    // reference deleted parent rows, then recursively
+                    // execute the delete on the child table. The
+                    // recursive call handles the child's own FK checks.
+                    let where_clause =
+                        build_cascade_where_expr(&fk.columns, &deleted_parent_vals);
+                    let child_del = crate::sql::Delete {
+                        table: child_table_name.clone(),
+                        where_clause,
+                        returning: None,
+                    };
+                    // Note: this recursive execute_dml call does NOT
+                    // append to the WAL (only execute_inner does). The
+                    // parent's WAL record (written by execute_inner
+                    // after execute_dml returns) will re-trigger the
+                    // CASCADE on replay, so committed CASCADE deletes
+                    // are durable. A crash DURING the CASCADE (after
+                    // the child delete but before the parent's WAL
+                    // record is written) loses both deletes — the
+                    // in-memory state is gone and the WAL has no
+                    // record to replay. This is a known limitation
+                    // (documented).
+                    self.execute_dml(crate::sql::DmlStatement::Delete(child_del), txn_id)?;
+                }
+                crate::sql::ddl::ForeignKeyAction::SetNull
+                | crate::sql::ddl::ForeignKeyAction::SetDefault => {
+                    // SET NULL: null the FK columns of child rows
+                    // referencing deleted parent rows.
+                    // SET DEFAULT: treated as SET NULL (simplification —
+                    // a proper implementation would set the column to its
+                    // DEFAULT value, but DEFAULT-value resolution at DML
+                    // time is not yet wired for all column types).
+                    let child_table = self
+                        .catalog
+                        .get_mut(&child_table_name)
+                        .ok_or_else(|| Error::NotFound(format!("table \"{}\"", child_table_name)))?;
+                    let child_idxs: Vec<Option<usize>> =
+                        fk.columns.iter().map(|name| child_table.column_idx(name)).collect();
+                    // Ensure null bitmaps exist for the FK columns.
+                    for idx in &child_idxs {
+                        if let Some(ci) = idx {
+                            while child_table.null_bitmaps.len() <= *ci {
+                                child_table.null_bitmaps.push(None);
+                            }
+                            if child_table.null_bitmaps[*ci].is_none() {
+                                let mut bm =
+                                    crate::types::null_bitmap::NullBitmap::new(child_table.row_count);
+                                for _ in 0..child_table.row_count {
+                                    bm.push_non_null();
+                                }
+                                child_table.null_bitmaps[*ci] = Some(bm);
+                            }
+                        }
+                    }
+                    for child_row_idx in 0..child_table.row_count {
+                        let child_vals: Vec<u64> = child_idxs
+                            .iter()
+                            .map(|idx| {
+                                idx.and_then(|ci| child_table.columns[ci].get(child_row_idx).copied())
+                                    .unwrap_or(0)
+                            })
+                            .collect();
+                        let mut matches = false;
+                        for parent_vals in &deleted_parent_vals {
+                            if child_vals == *parent_vals {
+                                matches = true;
+                                break;
+                            }
+                        }
+                        if matches {
+                            for idx in &child_idxs {
+                                if let Some(ci) = idx {
+                                    let col = std::sync::Arc::make_mut(&mut child_table.columns[*ci]);
+                                    col[child_row_idx] = 0;
+                                    if let Some(ref mut bm) = child_table.null_bitmaps[*ci] {
+                                        while bm.len() <= child_row_idx {
+                                            bm.push_non_null();
+                                        }
+                                        bm.set_null(child_row_idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Execute an INSERT statement.
     ///
     /// Wave 56c fix: when inserting a string literal into a VARCHAR / NVARCHAR
@@ -20,6 +333,70 @@ impl QueryEngine {
     /// so subsequent `SELECT col` could only return the hash, and JSON_VALUE
     /// / LIKE / range comparisons on inserted strings were broken.
     pub(crate) fn execute_insert(&mut self, ins: crate::sql::Insert, txn_id: Option<u64>) -> Result<QueryResult> {
+        // Task 3.4 — Validate FOREIGN KEY constraints (child → parent
+        // existence) BEFORE the mutable borrow of the child table extends
+        // into the column-extension loop. We need immutable borrows of both
+        // the child table (to read its schema + column indices) and the
+        // parent table (to look up referenced rows); these cannot coexist
+        // with a mutable borrow of the child table.
+        {
+            let fk_rows: Vec<(Vec<u64>, Vec<bool>)> = {
+                let child_table = match self.catalog.get(&ins.table) {
+                    Some(t) => t,
+                    None => {
+                        return Err(Error::NotFound(format!("table \"{}\"", ins.table)));
+                    }
+                };
+                let needs_fk_check = child_table
+                    .schema
+                    .as_ref()
+                    .map(|s| !s.foreign_keys.is_empty())
+                    .unwrap_or(false);
+                if !needs_fk_check {
+                    Vec::new()
+                } else {
+                    let col_indices: Vec<usize> = match &ins.columns {
+                        Some(cols) => {
+                            let mut idxs = Vec::with_capacity(cols.len());
+                            for col_name in cols {
+                                let idx = child_table
+                                    .column_idx(col_name)
+                                    .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
+                                idxs.push(idx);
+                            }
+                            idxs
+                        }
+                        None => (0..child_table.columns.len()).collect(),
+                    };
+                    if col_indices.len() != ins.values.first().map(|r| r.len()).unwrap_or(0) {
+                        return Err(Error::Other(format!(
+                            "column count ({}) doesn't match value count ({})",
+                            col_indices.len(),
+                            ins.values.first().map(|r| r.len()).unwrap_or(0)
+                        )));
+                    }
+                    let ncols = child_table.columns.len();
+                    ins.values
+                        .iter()
+                        .map(|row_vals| {
+                            let mut vals = vec![0u64; ncols];
+                            let mut nulls = vec![true; ncols];
+                            for (i, &col_idx) in col_indices.iter().enumerate() {
+                                let val_str = &row_vals[i];
+                                let is_null = val_str.trim().eq_ignore_ascii_case("null");
+                                vals[col_idx] = parse_value_cell(val_str);
+                                nulls[col_idx] = is_null;
+                            }
+                            (vals, nulls)
+                        })
+                        .collect()
+                }
+            };
+            if !fk_rows.is_empty() {
+                self.validate_foreign_keys(&ins.table, &fk_rows)?;
+            }
+        }
+
         let table = self
             .catalog
             .get_mut(&ins.table)
@@ -340,6 +717,90 @@ impl QueryEngine {
     /// `AVG(col)` correctly exclude the row. Previously the cell was set
     /// to 0 but the bitmap still considered it non-NULL.
     pub(crate) fn execute_update(&mut self, upd: crate::sql::Update, txn_id: Option<u64>) -> Result<QueryResult> {
+        // Task 3.4 — Validate FOREIGN KEY constraints at UPDATE time.
+        // Build the post-update row values for each matched row and check
+        // that FK columns still reference an existing parent row. Done
+        // BEFORE the mutable borrow extends into the in-place update loop
+        // (atomicity: a violation leaves the table unchanged).
+        {
+            let fk_rows: Vec<(Vec<u64>, Vec<bool>)> = {
+                let child_table = match self.catalog.get(&upd.table) {
+                    Some(t) => t,
+                    None => {
+                        return Err(Error::NotFound(format!("table \"{}\"", upd.table)));
+                    }
+                };
+                let needs_fk_check = child_table
+                    .schema
+                    .as_ref()
+                    .map(|s| !s.foreign_keys.is_empty())
+                    .unwrap_or(false);
+                if !needs_fk_check {
+                    Vec::new()
+                } else {
+                    // Parse assignments (mirror the mutable-phase parsing).
+                    let assigns: Vec<(usize, u64, bool)> = {
+                        let mut a = Vec::with_capacity(upd.assignments.len());
+                        for (col_name, expr) in &upd.assignments {
+                            let idx = child_table
+                                .column_idx(col_name)
+                                .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
+                            let expr_str = expr.to_string();
+                            let trimmed = expr_str.trim();
+                            let is_null = trimmed.eq_ignore_ascii_case("NULL")
+                                || matches!(
+                                    expr,
+                                    crate::sql::ast::Expr::Literal(crate::sql::ast::Value::Null)
+                                );
+                            let cell = parse_value_cell(&expr_str);
+                            a.push((idx, cell, is_null));
+                        }
+                        a
+                    };
+                    // Compute match_mask.
+                    let n = child_table.row_count;
+                    let match_mask: Vec<bool> = if let Some(where_expr) = &upd.where_clause {
+                        let where_str = where_expr.to_string();
+                        eval_simple_where(child_table, &where_str)?
+                    } else {
+                        vec![true; n]
+                    };
+                    // Build post-update rows for matched rows.
+                    let ncols = child_table.columns.len();
+                    let mut rows = Vec::new();
+                    for (row_idx, &matches) in match_mask.iter().enumerate() {
+                        if !matches {
+                            continue;
+                        }
+                        let mut vals: Vec<u64> = (0..ncols)
+                            .map(|ci| child_table.columns[ci].get(row_idx).copied().unwrap_or(0))
+                            .collect();
+                        let mut nulls: Vec<bool> = (0..ncols)
+                            .map(|ci| {
+                                if ci < child_table.null_bitmaps.len() {
+                                    if let Some(ref bm) = child_table.null_bitmaps[ci] {
+                                        return bm.is_null(row_idx);
+                                    }
+                                }
+                                false
+                            })
+                            .collect();
+                        for &(col_idx, val, is_null) in &assigns {
+                            if col_idx < vals.len() {
+                                vals[col_idx] = val;
+                                nulls[col_idx] = is_null;
+                            }
+                        }
+                        rows.push((vals, nulls));
+                    }
+                    rows
+                }
+            };
+            if !fk_rows.is_empty() {
+                self.validate_foreign_keys(&upd.table, &fk_rows)?;
+            }
+        }
+
         let table = self
             .catalog
             .get_mut(&upd.table)
@@ -649,27 +1110,42 @@ impl QueryEngine {
 
     /// Execute a DELETE statement.
     pub(crate) fn execute_delete(&mut self, del: crate::sql::Delete, txn_id: Option<u64>) -> Result<QueryResult> {
-        let table = self
-            .catalog
-            .get_mut(&del.table)
-            .ok_or_else(|| Error::NotFound(format!("table \"{}\"", del.table)))?;
-
-        let n = table.row_count;
-        let delete_mask: Vec<bool> = if let Some(where_expr) = &del.where_clause {
-            // Wave 5: where_clause is now ast::Expr. Convert to SQL string
-            // for the existing eval_simple_where helper.
-            let where_str = where_expr.to_string();
-            eval_simple_where(table, &where_str)?
-        } else {
-            vec![true; n]
+        // Task 3.4 — Enforce FK constraints on DELETE.
+        // Compute the delete_mask with an immutable borrow, then run the
+        // FK enforcement (RESTRICT/CASCADE/SET NULL) BEFORE the mutable
+        // borrow extends into the column-rebuild / MVCC-tombstone path.
+        // This keeps the parent table intact for the FK checks (we need
+        // to read the parent's referenced column values for the rows
+        // being deleted).
+        let delete_mask: Vec<bool> = {
+            let table = self
+                .catalog
+                .get(&del.table)
+                .ok_or_else(|| Error::NotFound(format!("table \"{}\"", del.table)))?;
+            let n = table.row_count;
+            if let Some(where_expr) = &del.where_clause {
+                let where_str = where_expr.to_string();
+                eval_simple_where(table, &where_str)?
+            } else {
+                vec![true; n]
+            }
         };
-
         let deleted = delete_mask.iter().filter(|&&b| b).count();
         if deleted == 0 {
             let mut result = QueryResult::empty();
             result.row_count = 0;
             return Ok(result);
         }
+        // Enforce FK constraints (RESTRICT → error; CASCADE → recurse;
+        // SET NULL → null FK columns).
+        self.enforce_fk_on_delete(&del.table, &delete_mask, txn_id)?;
+
+        let table = self
+            .catalog
+            .get_mut(&del.table)
+            .ok_or_else(|| Error::NotFound(format!("table \"{}\"", del.table)))?;
+
+        let n = table.row_count;
 
         // Task 2.3 (debt-4.2): in MVCC mode, tombstone the matched rows'
         // versions (xmax = txn_id) and leave the column data in place for
@@ -780,6 +1256,61 @@ impl QueryEngine {
         result.row_count = deleted;
         Ok(result)
     }
+}
+
+// -----------------------------------------------------------------
+// Task 3.4 — CASCADE WHERE-clause builder.
+//
+// Constructs an `Expr` matching child rows whose FK columns equal one
+// of the deleted parent rows' values. The resulting expression has the
+// shape:
+//   (col1 = v1a AND col2 = v2a) OR (col1 = v1b AND col2 = v2b) OR ...
+// which `eval_simple_where` can evaluate (it skips parens).
+// -----------------------------------------------------------------
+
+/// Build a WHERE-clause `Expr` for CASCADE deletes: matches any child
+/// row whose FK columns equal one of the `deleted_rows` value tuples.
+///
+/// Returns `None` if `deleted_rows` is empty (no rows to match → the
+/// caller should issue an unconditional delete or skip the recursive
+/// call).
+fn build_cascade_where_expr(
+    fk_cols: &[String],
+    deleted_rows: &[Vec<u64>],
+) -> Option<crate::sql::ast::Expr> {
+    use crate::sql::ast::{BinOp, Expr, Value};
+
+    if deleted_rows.is_empty() {
+        return None;
+    }
+    let mut per_row_exprs: Vec<Expr> = Vec::new();
+    for row in deleted_rows {
+        let col_eqs: Vec<Expr> = fk_cols
+            .iter()
+            .enumerate()
+            .map(|(i, col_name)| {
+                let val = row.get(i).copied().unwrap_or(0);
+                Expr::Binary {
+                    left: Box::new(Expr::Column(col_name.clone())),
+                    op: BinOp::Eq,
+                    right: Box::new(Expr::Literal(Value::Int(val as i64))),
+                }
+            })
+            .collect();
+        let row_expr = col_eqs.into_iter().reduce(|a, b| Expr::Binary {
+            left: Box::new(a),
+            op: BinOp::And,
+            right: Box::new(b),
+        });
+        if let Some(e) = row_expr {
+            per_row_exprs.push(e);
+        }
+    }
+    per_row_exprs.into_iter().reduce(|a, b| Expr::Binary {
+        left: Box::new(a),
+        op: BinOp::Or,
+        right: Box::new(b),
+    })
 }
 
 #[cfg(test)]
