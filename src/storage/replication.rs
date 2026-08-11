@@ -96,6 +96,38 @@ impl WalStreamer {
         }
         Ok(())
     }
+
+    /// Send only records whose LSN is `>= start_lsn` (Task 6.4).
+    ///
+    /// Used by a primary when a replica reconnects and requests replay
+    /// starting from `resume_lsn = last_applied_lsn + 1`. Only records
+    /// with `lsn >= start_lsn` are streamed, so already-applied records
+    /// are not re-sent.
+    ///
+    /// Returns the number of records actually sent (i.e. records in the
+    /// slice with `lsn >= start_lsn`).
+    ///
+    /// Records in the slice MUST be sorted by `lsn` ascending (the slice
+    /// is treated as already-ordered). Records with `lsn == 0` are
+    /// considered "unassigned" and are always sent (they predate the LSN
+    /// scheme — typically only legacy records).
+    pub fn stream_from_lsn(&mut self, records: &[WalRecord], start_lsn: u64) -> usize {
+        let mut sent = 0usize;
+        for record in records {
+            // Always send records with lsn == 0 (legacy / unassigned).
+            if record.lsn != 0 && record.lsn < start_lsn {
+                continue;
+            }
+            // Best-effort: log on error but keep going so a single bad
+            // record doesn't abort the whole replay.
+            if let Err(e) = self.stream_record(record) {
+                log::warn!("stream_from_lsn: stream_record failed for lsn={}: {e}", record.lsn);
+                continue;
+            }
+            sent += 1;
+        }
+        sent
+    }
 }
 
 impl Default for WalStreamer {
@@ -108,6 +140,16 @@ impl Default for WalStreamer {
 impl crate::storage::recovery::WalStreamSink for WalStreamer {
     fn stream(&mut self, record: &WalRecord) -> Result<usize, String> {
         self.stream_record(record)
+    }
+
+    /// Task 6.1: in `SyncMode::Synchronous`, `Wal::append_and_sync` calls
+    /// this after `stream()` to block until the record has left the
+    /// process. The simplified implementation calls `self.flush()`, which
+    /// flushes the underlying TCP stream (or no-ops if not connected).
+    /// Returns `Err` if the flush fails, which propagates as a commit
+    /// failure in synchronous mode.
+    fn sync_wait(&mut self) -> Result<(), String> {
+        self.flush()
     }
 }
 
@@ -162,6 +204,20 @@ impl crate::storage::recovery::WalStreamSink for MultiWalStreamSink {
         }
         Ok(total)
     }
+
+    /// Task 6.1: flush every child streamer so all followers receive the
+    /// record before `append_and_sync` returns. A failure on one follower
+    /// is logged but does not fail the call (best-effort, matching the
+    /// `stream()` semantics). A future task may make this configurable
+    /// (e.g. require-quorum ACK).
+    fn sync_wait(&mut self) -> Result<(), String> {
+        for streamer in &mut self.streamers {
+            if let Err(e) = streamer.flush() {
+                log::warn!("multi-sink: sync_wait flush failed: {e}");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A WAL receiver that listens on a TCP port and applies records.
@@ -177,6 +233,11 @@ pub struct WalReceiver {
     pub bytes_received: u64,
     /// Whether run_apply_loop continues after an apply error (Task 5.2).
     continue_on_error: bool,
+    /// Highest LSN applied so far (Task 6.4). 0 means no records applied.
+    /// Updated after every successful `apply` callback in `run_apply_loop`
+    /// (and after every record applied in `accept_and_apply`). On reconnect,
+    /// the replica asks the primary to resume from `last_applied_lsn + 1`.
+    last_applied_lsn: u64,
 }
 
 impl WalReceiver {
@@ -189,7 +250,22 @@ impl WalReceiver {
             records_received: 0,
             bytes_received: 0,
             continue_on_error: false,
+            last_applied_lsn: 0,
         })
+    }
+
+    /// Return the local address the receiver is bound to (Task 6.4 test
+    /// helper — also useful for logging the actual port when bound to
+    /// `127.0.0.1:0`).
+    ///
+    /// Returns `Err` if the receiver was not bound (already consumed by
+    /// `run_apply_loop`, or constructed without a listener).
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr, String> {
+        self.listener
+            .as_ref()
+            .ok_or("receiver not bound")?
+            .local_addr()
+            .map_err(|e| format!("local_addr: {}", e))
     }
 
     /// Accept one connection and receive WAL records until the connection closes.
@@ -223,6 +299,12 @@ impl WalReceiver {
                 if let Ok(record) = serde_json::from_str::<WalRecord>(&line) {
                     apply(&record);
                     self.records_received += 1;
+                    // Task 6.4: track the highest applied LSN so the
+                    // replica can resume from last_applied_lsn + 1 on
+                    // reconnect.
+                    if record.lsn > self.last_applied_lsn {
+                        self.last_applied_lsn = record.lsn;
+                    }
                 }
             }
         }
@@ -272,6 +354,12 @@ impl WalReceiver {
                     match apply(&record) {
                         Ok(()) => {
                             self.records_received += 1;
+                            // Task 6.4: track the highest applied LSN so
+                            // the replica can resume from
+                            // `last_applied_lsn + 1` on reconnect.
+                            if record.lsn > self.last_applied_lsn {
+                                self.last_applied_lsn = record.lsn;
+                            }
                         }
                         Err(e) => {
                             log::warn!("replication apply error: {e}");
@@ -293,6 +381,31 @@ impl WalReceiver {
     /// Default: false (stop on first error).
     pub fn set_continue_on_error(&mut self, continue_on_error: bool) {
         self.continue_on_error = continue_on_error;
+    }
+
+    /// Return the highest LSN applied so far (Task 6.4).
+    ///
+    /// 0 means no records have been applied yet. After `run_apply_loop`
+    /// processes records, this is the `lsn` of the most recently applied
+    /// record. Use `resume_from_lsn()` to get the LSN to request on
+    /// reconnect.
+    #[must_use]
+    pub fn last_applied_lsn(&self) -> u64 {
+        self.last_applied_lsn
+    }
+
+    /// Return the LSN to request from the primary on reconnect (Task 6.4).
+    ///
+    /// This is `last_applied_lsn + 1` — i.e. the next LSN the replica has
+    /// not yet applied. On reconnect, the primary calls
+    /// `WalStreamer::stream_from_lsn(records, resume_lsn)` to resend only
+    /// records the replica hasn't seen.
+    ///
+    /// If no records have been applied (`last_applied_lsn == 0`), returns
+    /// 1 (request from the beginning, since LSNs start at 1).
+    #[must_use]
+    pub fn resume_from_lsn(&self) -> u64 {
+        self.last_applied_lsn.saturating_add(1).max(1)
     }
 }
 

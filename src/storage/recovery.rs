@@ -34,6 +34,48 @@ pub trait WalStreamSink: Send {
     /// Stream a record to the replica. Returns the number of bytes sent,
     /// or an error.
     fn stream(&mut self, record: &WalRecord) -> Result<usize, String>;
+
+    /// Block until the replica has acknowledged (or the local OS socket
+    /// buffer has been flushed, depending on the implementation) — Task 6.1.
+    ///
+    /// Called by `Wal::append_and_sync()` only when `sync_mode ==
+    /// SyncMode::Synchronous`. In `Asynchronous` mode the default sink
+    /// behaviour (stream-and-forget) is used.
+    ///
+    /// The default implementation returns `Ok(())` so existing sinks
+    /// (including `MultiWalStreamSink` and any third-party impls) keep
+    /// working unchanged; "synchronous" then degrades to "async" for
+    /// those sinks. `WalStreamer` overrides this to call `flush()` so
+    /// the record leaves the process before the commit returns.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` if the sink could not be flushed / the
+    /// replica did not ACK within the implementation's timeout. The
+    /// `Wal::append_and_sync` call propagates this as an `io::Error`
+    /// (kind `Other`), causing the calling transaction to abort.
+    fn sync_wait(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Replication sync mode (Task 6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    /// Asynchronous (default): `append_and_sync` returns immediately after
+    /// local fsync. Stream errors are logged but don't fail the commit.
+    Asynchronous,
+    /// Synchronous: `append_and_sync` waits for the replica to ACK before
+    /// returning Ok. If the replica doesn't ACK within a timeout, the
+    /// commit fails (Error).
+    ///
+    /// In the simplified implementation (Task 6.1), "ACK" is approximated
+    /// by `WalStreamSink::sync_wait()`, which for `WalStreamer` calls
+    /// `flush()` — i.e. the data is pushed to the OS socket buffer. This
+    /// is stronger than async (data has left the process) but weaker than
+    /// a true application-level ACK (the replica may still crash before
+    /// applying). A future task may extend the wire protocol with an
+    /// explicit ACK message.
+    Synchronous,
 }
 
 /// A WAL record: one DML operation or a transaction boundary marker.
@@ -214,6 +256,10 @@ pub struct Wal {
     /// Optional replication sink (Task 5.1). When set, `append_and_sync()`
     /// calls `sink.stream(&record)` after fsync so the record is replicated.
     stream_sink: Option<Arc<Mutex<dyn WalStreamSink>>>,
+    /// Replication sync mode (Task 6.1). Default `Asynchronous`.
+    /// In `Synchronous` mode, `append_and_sync` calls `sink.sync_wait()`
+    /// after streaming and propagates a failure as an `io::Error`.
+    sync_mode: SyncMode,
 }
 
 impl Wal {
@@ -246,6 +292,7 @@ impl Wal {
             segment_limit,
             last_synced_lsn: 0,
             stream_sink: None,
+            sync_mode: SyncMode::Asynchronous,
         };
         // Scan existing records to find the max LSN.
         if let Ok(records) = wal.read_all() {
@@ -364,9 +411,39 @@ impl Wal {
         self.append(record)?;
         self.sync()?;
         // Task 5.1: stream the record to replicas if a sink is attached.
+        // Task 6.1: in `Synchronous` mode, additionally call `sync_wait()`
+        // and propagate any failure as an `io::Error` so the caller's
+        // transaction aborts (the commit is not durable on the replica).
         if let Some(ref sink) = self.stream_sink {
             if let Ok(mut sink) = sink.lock() {
-                let _ = sink.stream(record);
+                match sink.stream(record) {
+                    Ok(_) => {
+                        if self.sync_mode == SyncMode::Synchronous {
+                            // Wait for the sink to flush / ACK before
+                            // returning. A failure here fails the commit.
+                            if let Err(e) = sink.sync_wait() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("replication sync_wait failed: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Asynchronous mode: stream errors are logged but
+                        // don't fail the commit (replica going down must
+                        // not abort the primary's transactions).
+                        // Synchronous mode: stream errors fail the commit.
+                        if self.sync_mode == SyncMode::Synchronous {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("replication stream failed: {e}"),
+                            ));
+                        } else {
+                            log::warn!("WAL stream to replica failed (async): {e}");
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -381,6 +458,24 @@ impl Wal {
     /// Detach the replication sink (Task 5.1).
     pub fn clear_stream_sink(&mut self) {
         self.stream_sink = None;
+    }
+
+    /// Set the replication sync mode (Task 6.1).
+    ///
+    /// - `SyncMode::Asynchronous` (default): `append_and_sync` returns
+    ///   immediately after local fsync; stream errors are logged and
+    ///   swallowed.
+    /// - `SyncMode::Synchronous`: `append_and_sync` additionally calls
+    ///   `WalStreamSink::sync_wait()` after streaming, and propagates a
+    ///   failure as an `io::Error` so the calling transaction aborts.
+    pub fn set_sync_mode(&mut self, mode: SyncMode) {
+        self.sync_mode = mode;
+    }
+
+    /// Return the current replication sync mode (Task 6.1).
+    #[must_use]
+    pub fn sync_mode(&self) -> SyncMode {
+        self.sync_mode
     }
 
     /// Append a record WITHOUT fsyncing, returning the assigned LSN
