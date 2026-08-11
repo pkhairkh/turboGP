@@ -4,6 +4,12 @@
 //! shutdown on SIGTERM/SIGINT. This makes turboGP deployable as a
 //! standalone binary (no need to write your own tokio::main).
 //!
+//! Wave 2 (Agent C): the engine is wrapped in
+//! `Arc<RwLock<QueryEngine>>` so that SELECT queries can acquire a read
+//! lock (concurrent reads) while DML/DDL acquires a write lock (serialized
+//! writes). Use [`turbogp::engine::route_and_execute`] to automatically
+//! route based on the SQL verb (parser-based, not string match).
+//!
 //! Usage:
 //! ```sh
 //! turbogp --port 5432 --data-dir ./data --auth
