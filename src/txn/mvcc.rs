@@ -1,204 +1,258 @@
-//! # MVCC transaction manager (Wave 64).
+//! # MVCC transaction manager (Wave 4 redesign).
 //!
-//! Replaces the previous deep-clone snapshot isolation with real
-//! multi-version concurrency control. Each row carries a `(xmin, xmax)`
-//! transaction ID pair:
-//! - `xmin`: the transaction that created (INSERTed) this version of the row.
+//! Real multi-version concurrency control with per-row version chains.
+//! Each row carries a list of `RowVersion` entries, each tagged with
+//! `(xmin, xmax)` transaction IDs:
+//! - `xmin`: the transaction that created (INSERTed) this version.
 //! - `xmax`: the transaction that deleted (DELETEd/UPDATEd) this version.
-//!   0 means the row is still live (not deleted).
+//!   `None` means the version is still live.
 //!
-//! A transaction with ID `T` can see a row version if:
-//! - `xmin` is committed and `xmin <= T` (the row was created by a
-//!   committed transaction visible to us), AND
-//! - `xmax == 0` OR `xmax` is NOT committed OR `xmax > T` (the row was
-//!   not deleted by a transaction visible to us).
+//! A version is visible to transaction `T` (with snapshot_id `S`) if:
+//! - `xmin` was committed before `T` started (`xmin`'s commit_id <= `S`),
+//!   OR `xmin == T.id` (T sees its own writes), AND
+//! - `xmax` is `None`, OR `xmax` was NOT committed before `T` started
+//!   (`xmax`'s commit_id > `S` or `xmax` is InProgress/Aborted), OR
+//!   `xmax == T.id` (T deleted it, so it's invisible to T).
 //!
-//! UPDATE is implemented as DELETE + INSERT: the old version gets `xmax = T`,
-//! and a new version with `xmin = T` is inserted.
+//! UPDATE is implemented as DELETE + INSERT: the old version gets
+//! `xmax = T.id`, and a new version with `xmin = T.id` is appended.
 //!
-//! ## Commit state tracking
+//! ## O(1) BEGIN
 //!
-//! The `CommitState` map tracks which transactions are committed. A
-//! transaction ID is "visible" to transaction `T` if:
-//! - It's the same transaction (`T` itself), OR
-//! - It's in the committed set with a commit timestamp <= T's snapshot
-//!   timestamp.
+//! `begin()` assigns `snapshot_id = current_commit_id` — O(1), no
+//! catalog clone. This replaces the old HashSet-snapshot approach.
 //!
-//! ## Vacuum
+//! ## VACUUM
 //!
-//! Dead row versions (where `xmax` is committed and no active transaction
-//! can see them) are reclaimed by VACUUM (Wave 68).
+//! Dead versions (where `xmax` is committed and no active transaction
+//! can see them) are reclaimed by `vacuum()`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Global transaction ID counter (monotonic across all transactions).
-static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
+/// A transaction ID (monotonic).
+pub type TxnId = u64;
 
 /// The commit state of a transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnState {
     /// The transaction is still running (not committed or aborted).
     InProgress,
-    /// The transaction committed successfully.
-    Committed,
+    /// The transaction committed successfully. The enclosed value is the
+    /// `commit_id` assigned at commit time (monotonic across all commits).
+    Committed(TxnId),
     /// The transaction was rolled back (aborted).
     Aborted,
 }
 
-/// A row version header. Each row in a table carries this metadata.
-#[derive(Debug, Clone, Copy)]
+/// A row version. Each logical row has a `Vec<RowVersion>` (version chain).
+///
+/// Task 4.1: carries `values` (the actual column data) and a `deleted`
+/// flag so the version chain can represent both INSERT and DELETE without
+/// relying on an external table.
+#[derive(Debug, Clone)]
 pub struct RowVersion {
     /// The transaction ID that created this row version.
-    pub xmin: u64,
-    /// The transaction ID that deleted this row version (0 = not deleted).
-    pub xmax: u64,
+    pub xmin: TxnId,
+    /// The transaction ID that deleted this row version (`None` = still live).
+    pub xmax: Option<TxnId>,
+    /// The column values for this version.
+    pub values: Vec<u64>,
+    /// True if this version represents a logical delete (the row was
+    /// deleted by `xmin`). When `deleted` is true, `values` is empty.
+    pub deleted: bool,
 }
 
 impl RowVersion {
-    /// Create a new row version created by `txn_id`, not yet deleted.
-    pub fn new(txn_id: u64) -> Self {
-        Self { xmin: txn_id, xmax: 0 }
+    /// Create a new live row version created by `txn_id` with the given values.
+    pub fn new(txn_id: TxnId, values: Vec<u64>) -> Self {
+        Self { xmin: txn_id, xmax: None, values, deleted: false }
     }
 
-    /// Mark this row version as deleted by `txn_id`.
-    pub fn delete(&mut self, txn_id: u64) {
-        self.xmax = txn_id;
+    /// Create a new delete-marker version created by `txn_id`.
+    pub fn new_delete(txn_id: TxnId) -> Self {
+        Self { xmin: txn_id, xmax: None, values: Vec::new(), deleted: true }
     }
 
-    /// Check if this row version is visible to transaction `viewer`
-    /// given the commit state map.
-    pub fn is_visible(&self, viewer: u64, commit_state: &HashMap<u64, TxnState>) -> bool {
-        // The creating transaction must be committed (or be us).
-        let xmin_state = commit_state.get(&self.xmin).copied().unwrap_or(TxnState::InProgress);
-        let xmin_visible = self.xmin == viewer || xmin_state == TxnState::Committed;
-        if !xmin_visible {
-            return false;
-        }
-        // If the row is not deleted, it's visible.
-        if self.xmax == 0 {
-            return true;
-        }
-        // The row is deleted. Check if the deleting transaction is visible.
-        let xmax_state = commit_state.get(&self.xmax).copied().unwrap_or(TxnState::InProgress);
-        let xmax_visible = self.xmax == viewer || xmax_state == TxnState::Committed;
-        // If the deleting txn is NOT visible to us, we still see the row.
-        !xmax_visible
+    /// Mark this version as deleted by `txn_id` (sets `xmax`).
+    pub fn delete(&mut self, txn_id: TxnId) {
+        self.xmax = Some(txn_id);
     }
+
+    /// Check if this version is deleted (has an xmax).
+    pub fn is_deleted(&self) -> bool {
+        self.xmax.is_some()
+    }
+}
+
+/// An MVCC table: holds a version chain for each logical row.
+///
+/// Task 4.1: the version chain is `Vec<Vec<RowVersion>>` — one `Vec<RowVersion>`
+/// per row. New versions are appended; old versions are left for VACUUM.
+#[derive(Debug, Clone, Default)]
+pub struct MvccTable {
+    /// Table name (for debugging).
+    pub name: String,
+    /// Column names.
+    pub column_names: Vec<String>,
+    /// Version chains: one entry per logical row.
+    pub rows: Vec<Vec<RowVersion>>,
+}
+
+impl MvccTable {
+    /// Create a new empty MVCC table.
+    pub fn new(name: impl Into<String>, column_names: Vec<String>) -> Self {
+        Self { name: name.into(), column_names, rows: Vec::new() }
+    }
+
+    /// Insert a new row (append a fresh version chain with one version
+    /// created by `txn_id`).
+    pub fn insert(&mut self, txn_id: TxnId, values: Vec<u64>) -> usize {
+        let row_idx = self.rows.len();
+        self.rows.push(vec![RowVersion::new(txn_id, values)]);
+        row_idx
+    }
+
+    /// Delete a row: mark the latest visible version as deleted by `txn_id`.
+    /// Returns `true` if a version was marked, `false` if the row doesn't exist.
+    pub fn delete(&mut self, txn_id: TxnId, row_idx: usize) -> bool {
+        if let Some(chain) = self.rows.get_mut(row_idx) {
+            if let Some(version) = chain.last_mut() {
+                if version.xmax.is_none() {
+                    version.delete(txn_id);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Update a row: mark the latest version as deleted, then append a new
+    /// version with the new values. Returns `true` on success.
+    pub fn update(&mut self, txn_id: TxnId, row_idx: usize, new_values: Vec<u64>) -> bool {
+        if let Some(chain) = self.rows.get_mut(row_idx) {
+            if let Some(version) = chain.last_mut() {
+                if version.xmax.is_none() {
+                    version.delete(txn_id);
+                    chain.push(RowVersion::new(txn_id, new_values));
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get the version chain for a row.
+    pub fn row_versions(&self, row_idx: usize) -> &[RowVersion] {
+        self.rows.get(row_idx).map(|c| c.as_slice()).unwrap_or(&[])
+    }
+
+    /// Number of logical rows (version chains).
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+// =========================================================================
+// MvccTransaction and MvccTxnManager — Task 4.2
+// =========================================================================
+
+/// An active MVCC transaction.
+///
+/// Task 4.2: carries `snapshot_id` (the commit_id at BEGIN time) and `state`.
+#[derive(Debug, Clone)]
+pub struct MvccTransaction {
+    /// The transaction's unique ID.
+    pub id: TxnId,
+    /// The commit_id at BEGIN time. The transaction sees all data committed
+    /// by transactions with commit_id <= snapshot_id.
+    pub snapshot_id: TxnId,
+    /// The current state (InProgress, Committed, Aborted).
+    pub state: TxnState,
 }
 
 /// The MVCC transaction manager.
 ///
 /// Tracks:
-/// - The next transaction ID.
-/// - The commit state of every transaction (InProgress / Committed / Aborted).
-/// - The active transaction (if any) for the current connection.
+/// - `next_txn_id`: monotonic counter for assigning transaction IDs.
+/// - `commit_id`: monotonic counter incremented on each COMMIT.
+/// - `txn_states`: maps every txn_id to its current state + commit metadata.
+/// - `active`: the set of currently-active transaction IDs (for VACUUM).
+///
+/// Task 4.2: `begin()` is O(1) — just assigns `snapshot_id = commit_id`.
+/// Multiple concurrent transactions are supported.
 pub struct MvccTxnManager {
-    /// Commit state for every transaction ID we've seen.
-    commit_state: HashMap<u64, TxnState>,
-    /// The active transaction, if BEGIN has been called.
-    pub active: Option<MvccTransaction>,
-}
-
-/// An active MVCC transaction.
-pub struct MvccTransaction {
-    /// The transaction's unique ID.
-    pub id: u64,
-    /// The set of transaction IDs that were committed at BEGIN time
-    /// (the snapshot). A transaction T is visible to us if T is in this
-    /// set or T == our own ID.
-    snapshot: HashSet<u64>,
+    next_txn_id: TxnId,
+    commit_id: TxnId,
+    txn_states: HashMap<TxnId, TxnState>,
+    active: HashSet<TxnId>,
 }
 
 impl MvccTxnManager {
     /// Create a new MVCC transaction manager.
     pub fn new() -> Self {
-        Self { commit_state: HashMap::new(), active: None }
-    }
-
-    /// Begin a new transaction. Returns the transaction ID.
-    /// Returns an error if a transaction is already active (no nested
-    /// transactions — see Wave 69 for SAVEPOINT support).
-    pub fn begin(&mut self) -> Result<u64, String> {
-        if self.active.is_some() {
-            return Err(
-                "a transaction is already active (use SAVEPOINT for nested transactions)".into()
-            );
+        Self {
+            next_txn_id: 1,
+            commit_id: 0,
+            txn_states: HashMap::new(),
+            active: HashSet::new(),
         }
-        let id = NEXT_TXN_ID.fetch_add(1, Ordering::SeqCst);
-        // Take a snapshot of the currently-committed transactions.
-        let snapshot: HashSet<u64> = self
-            .commit_state
-            .iter()
-            .filter(|(_, &state)| state == TxnState::Committed)
-            .map(|(&id, _)| id)
-            .collect();
-        self.commit_state.insert(id, TxnState::InProgress);
-        self.active = Some(MvccTransaction { id, snapshot });
-        Ok(id)
     }
 
-    /// Commit the active transaction. Returns the transaction ID.
-    pub fn commit(&mut self) -> Result<u64, String> {
-        let txn = self.active.take().ok_or("no active transaction")?;
-        self.commit_state.insert(txn.id, TxnState::Committed);
-        Ok(txn.id)
+    /// Begin a new transaction. O(1): assigns `snapshot_id = commit_id`.
+    /// Returns the transaction handle.
+    pub fn begin(&mut self) -> MvccTransaction {
+        let id = self.next_txn_id;
+        self.next_txn_id += 1;
+        let snapshot_id = self.commit_id;
+        self.txn_states.insert(id, TxnState::InProgress);
+        self.active.insert(id);
+        MvccTransaction { id, snapshot_id, state: TxnState::InProgress }
     }
 
-    /// Rollback the active transaction. Returns the transaction ID.
-    pub fn rollback(&mut self) -> Result<u64, String> {
-        let txn = self.active.take().ok_or("no active transaction")?;
-        self.commit_state.insert(txn.id, TxnState::Aborted);
-        Ok(txn.id)
+    /// Commit a transaction. Increments `commit_id` and records the
+    /// transaction as `Committed(commit_id)`. Returns the commit_id.
+    pub fn commit(&mut self, txn_id: TxnId) -> TxnId {
+        self.commit_id += 1;
+        let cid = self.commit_id;
+        self.txn_states.insert(txn_id, TxnState::Committed(cid));
+        self.active.remove(&txn_id);
+        cid
     }
 
-    /// Check if a transaction ID is visible to the active transaction.
-    /// A transaction T is visible if:
-    /// - T == the active transaction's ID (we see our own writes), OR
-    /// - T is committed AND T was in our snapshot at BEGIN time.
-    pub fn is_visible(&self, txn_id: u64) -> bool {
-        if let Some(ref active) = self.active {
-            if active.id == txn_id {
-                return true;
+    /// Rollback (abort) a transaction.
+    pub fn rollback(&mut self, txn_id: TxnId) {
+        self.txn_states.insert(txn_id, TxnState::Aborted);
+        self.active.remove(&txn_id);
+    }
+
+    /// Get the state of a transaction.
+    pub fn txn_state(&self, txn_id: TxnId) -> TxnState {
+        self.txn_states.get(&txn_id).copied().unwrap_or(TxnState::Aborted)
+    }
+
+    /// The current commit_id (monotonic).
+    pub fn current_commit_id(&self) -> TxnId {
+        self.commit_id
+    }
+
+    /// The oldest active snapshot_id (for VACUUM). If no transactions are
+    /// active, returns the current commit_id.
+    pub fn oldest_active_snapshot(&self) -> TxnId {
+        let mut oldest = self.commit_id;
+        for &tid in &self.active {
+            if let Some(TxnState::InProgress) = self.txn_states.get(&tid) {
+                // Look up the snapshot_id — but we don't store it in txn_states.
+                // For VACUUM purposes, the oldest active snapshot is the
+                // minimum snapshot_id among active txns. Since snapshot_id =
+                // commit_id at begin time, and we don't store it, we use 0
+                // (conservative: never vacuum versions that might be visible).
+                oldest = oldest.min(0);
             }
         }
-        match self.commit_state.get(&txn_id) {
-            Some(TxnState::Committed) => {
-                if let Some(ref active) = self.active {
-                    active.snapshot.contains(&txn_id)
-                } else {
-                    // No active transaction — all committed transactions are visible.
-                    true
-                }
-            }
-            _ => false,
-        }
+        oldest
     }
 
-    /// Check if a row version is visible to the active transaction
-    /// (or to "autocommit" if no transaction is active).
-    pub fn is_row_visible(&self, version: &RowVersion) -> bool {
-        let viewer = self.active.as_ref().map(|t| t.id).unwrap_or(0);
-        version.is_visible(viewer, &self.commit_state)
-    }
-
-    /// Check if a transaction is active.
-    pub fn is_active(&self) -> bool {
-        self.active.is_some()
-    }
-
-    /// Get the active transaction ID (if any).
-    pub fn active_id(&self) -> Option<u64> {
-        self.active.as_ref().map(|t| t.id)
-    }
-
-    /// Clean up aborted transactions' state (called periodically).
-    /// Returns the number of states cleaned.
-    pub fn cleanup_aborted(&mut self) -> usize {
-        let before = self.commit_state.len();
-        self.commit_state.retain(|_, &mut state| state != TxnState::Aborted);
-        before - self.commit_state.len()
-    }
+    // Task 4.3 / 4.4 / 4.5 methods are added in subsequent commits.
 }
 
 impl Default for MvccTxnManager {
@@ -211,86 +265,93 @@ impl Default for MvccTxnManager {
 mod tests {
     use super::*;
 
+    /// Task 4.1 DoD: RowVersion carries xmin/xmax/values/deleted.
     #[test]
-    fn mvcc_basic_visibility() {
-        let mut mgr = MvccTxnManager::new();
-        // No active transaction — all committed transactions are visible.
-        // Initially nothing is committed, so nothing is visible.
-        assert!(!mgr.is_visible(1));
-        // Begin txn 1.
-        let id1 = mgr.begin().unwrap();
-        // Txn 1 sees its own writes.
-        assert!(mgr.is_visible(id1));
-        // Commit txn 1.
-        mgr.commit().unwrap();
-        // Now txn 1 is visible to autocommit (no active txn).
-        assert!(mgr.is_visible(id1));
+    fn row_version_basic() {
+        let v = RowVersion::new(1, vec![10, 20, 30]);
+        assert_eq!(v.xmin, 1);
+        assert!(v.xmax.is_none());
+        assert_eq!(v.values, vec![10, 20, 30]);
+        assert!(!v.deleted);
+        assert!(!v.is_deleted());
+
+        let mut v2 = v.clone();
+        v2.delete(2);
+        assert_eq!(v2.xmax, Some(2));
+        assert!(v2.is_deleted());
     }
 
+    /// Task 4.1 DoD: MvccTable version chain — insert/delete/update.
     #[test]
-    fn mvcc_snapshot_isolation() {
-        let mut mgr = MvccTxnManager::new();
-        // Txn 1 commits.
-        let id1 = mgr.begin().unwrap();
-        mgr.commit().unwrap();
-        // Txn 2 begins (sees txn 1 in its snapshot).
-        let id2 = mgr.begin().unwrap();
-        // Txn 2 sees txn 1 (it was committed before txn 2 began).
-        assert!(mgr.is_visible(id1));
-        // Txn 3 commits (but txn 2 doesn't see it — not in snapshot).
-        // We can't begin txn 3 while txn 2 is active in this simple manager,
-        // but we can simulate by directly inserting into commit_state.
-        mgr.commit_state.insert(100, TxnState::Committed);
-        // Txn 2 does NOT see txn 100 (not in its snapshot).
-        assert!(!mgr.is_visible(100), "snapshot isolation: txn 2 must not see txn 100");
-        // Commit txn 2.
-        mgr.commit().unwrap();
-        // Now autocommit sees both txn 1 and txn 100.
-        assert!(mgr.is_visible(id1));
-        assert!(mgr.is_visible(100));
+    fn mvcc_table_version_chain() {
+        let mut t = MvccTable::new("users", vec!["id".into(), "name".into()]);
+        let row0 = t.insert(1, vec![1, 100]);
+        let row1 = t.insert(1, vec![2, 200]);
+        assert_eq!(t.row_count(), 2);
+
+        // Each row has one version.
+        assert_eq!(t.row_versions(row0).len(), 1);
+        assert_eq!(t.row_versions(row0)[0].values, vec![1, 100]);
+
+        // Update row 0: marks old version deleted, appends new version.
+        t.update(2, row0, vec![1, 999]);
+        assert_eq!(t.row_versions(row0).len(), 2);
+        assert!(t.row_versions(row0)[0].is_deleted());
+        assert_eq!(t.row_versions(row0)[1].values, vec![1, 999]);
+
+        // Delete row 1.
+        t.delete(2, row1);
+        assert!(t.row_versions(row1)[0].is_deleted());
     }
 
+    /// Task 4.2 DoD: begin() is O(1) and assigns snapshot_id = commit_id.
     #[test]
-    fn mvcc_row_version_visibility() {
+    fn mvcc_begin_assigns_snapshot_id() {
         let mut mgr = MvccTxnManager::new();
-        // Txn 1 inserts a row.
-        let id1 = mgr.begin().unwrap();
-        let row = RowVersion::new(id1);
-        // Txn 1 sees its own inserted row.
-        assert!(mgr.is_row_visible(&row), "txn 1 must see its own insert");
-        // Commit txn 1.
-        mgr.commit().unwrap();
-        // Autocommit sees the row.
-        assert!(mgr.is_row_visible(&row));
-        // Txn 2 begins and deletes the row.
-        let id2 = mgr.begin().unwrap();
-        let mut deleted_row = row;
-        deleted_row.delete(id2);
-        // Txn 2 sees the row as deleted (not visible) because it deleted it.
-        assert!(!mgr.is_row_visible(&deleted_row), "txn 2 must not see the row it deleted");
-        // But if we check from autocommit's perspective (no active txn),
-        // the row is still visible because txn 2 hasn't committed.
-        mgr.active = None;
-        assert!(
-            mgr.is_row_visible(&deleted_row),
-            "autocommit must still see the row (txn 2 not committed)"
-        );
-        // Txn 2 commits.
-        mgr.commit_state.insert(id2, TxnState::Committed);
-        // Now autocommit sees the row as deleted.
-        assert!(
-            !mgr.is_row_visible(&deleted_row),
-            "after txn 2 commits, the deleted row must be invisible"
-        );
+        assert_eq!(mgr.current_commit_id(), 0);
+        let txn = mgr.begin();
+        assert_eq!(txn.id, 1);
+        assert_eq!(txn.snapshot_id, 0, "snapshot_id = commit_id at begin time");
+        assert_eq!(txn.state, TxnState::InProgress);
     }
 
+    /// Task 4.2 DoD: commit increments commit_id and records state.
+    #[test]
+    fn mvcc_commit_increments_commit_id() {
+        let mut mgr = MvccTxnManager::new();
+        let txn = mgr.begin();
+        let cid = mgr.commit(txn.id);
+        assert_eq!(cid, 1);
+        assert_eq!(mgr.current_commit_id(), 1);
+        assert_eq!(mgr.txn_state(txn.id), TxnState::Committed(1));
+    }
+
+    /// Task 4.2 DoD: multiple concurrent transactions are supported.
+    #[test]
+    fn mvcc_multiple_concurrent_transactions() {
+        let mut mgr = MvccTxnManager::new();
+        let t1 = mgr.begin();
+        let t2 = mgr.begin();
+        let t3 = mgr.begin();
+        assert!(t1.id < t2.id);
+        assert!(t2.id < t3.id);
+        // All three are InProgress simultaneously.
+        assert_eq!(mgr.txn_state(t1.id), TxnState::InProgress);
+        assert_eq!(mgr.txn_state(t2.id), TxnState::InProgress);
+        assert_eq!(mgr.txn_state(t3.id), TxnState::InProgress);
+        // Commit t2 — t1 and t3 are still active.
+        mgr.commit(t2.id);
+        assert_eq!(mgr.txn_state(t1.id), TxnState::InProgress);
+        assert_eq!(mgr.txn_state(t2.id), TxnState::Committed(1));
+        assert_eq!(mgr.txn_state(t3.id), TxnState::InProgress);
+    }
+
+    /// Task 4.2 DoD: rollback marks the transaction as Aborted.
     #[test]
     fn mvcc_rollback() {
         let mut mgr = MvccTxnManager::new();
-        let id = mgr.begin().unwrap();
-        mgr.rollback().unwrap();
-        // A rolled-back transaction's writes are not visible.
-        let row = RowVersion::new(id);
-        assert!(!mgr.is_row_visible(&row), "rolled-back txn's writes must be invisible");
+        let txn = mgr.begin();
+        mgr.rollback(txn.id);
+        assert_eq!(mgr.txn_state(txn.id), TxnState::Aborted);
     }
 }
