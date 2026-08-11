@@ -69,12 +69,24 @@ impl QueryEngine {
     /// data-loss window. Now it calls `flush_with_checkpoint()` which
     /// writes a `checkpoint.sql` file before truncating the WAL, so
     /// committed data survives a crash at any point.
+    ///
+    /// **Wave 4 (Agent C):** When MVCC mode is enabled, VACUUM also calls
+    /// `MvccTxnManager::cleanup_aborted()` to remove commit-state entries
+    /// for aborted transactions. Full row-version garbage collection
+    /// (removing dead row versions whose `xmax` is committed and not
+    /// visible to any active transaction) is pending Agent B's completion
+    /// of `MvccTxnManager::vacuum(&mut tables)` — see AGENT_C_API_REQUESTS.md.
     pub(crate) fn execute_vacuum(&mut self, start: &Instant) -> Result<QueryResult> {
         // 1. Flush dirty pages + write checkpoint file.
         self.flush_with_checkpoint()?;
         // 2. Now safe to truncate the WAL (committed state is in checkpoint).
         if let Some(ref mut wal) = self.wal {
             wal.truncate().map_err(|e| Error::Other(format!("WAL truncate: {e}")))?;
+        }
+        // 3. Wave 4 (Agent C): MVCC garbage collection.
+        if self.mvcc_enabled {
+            let cleaned = self.mvcc_txn_manager.cleanup_aborted();
+            log::debug!("VACUUM: cleaned {} aborted MVCC transactions", cleaned);
         }
         let mut result = QueryResult::empty();
         result.row_count = 0;
