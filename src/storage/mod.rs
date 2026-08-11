@@ -20,6 +20,10 @@ pub mod raft;
 // Compiled only when the `raft` feature is enabled.
 #[cfg(feature = "raft")]
 pub mod raft_store;
+// Production Wiring Wave 3: TCP transport for openraft RPCs.
+// Compiled only when the `raft` feature is enabled.
+#[cfg(feature = "raft")]
+pub mod raft_network;
 
 pub use buffer_pool::{BufferPool, PageId};
 pub use checkpoint::BinaryCheckpoint;
