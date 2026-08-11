@@ -163,3 +163,79 @@ fn test_enable_mvcc_fails_during_snapshot_txn() {
     engine.enable_mvcc().unwrap();
     assert!(engine.is_mvcc_enabled());
 }
+
+/// Task 2.4 — `execute_select` filters rows by MVCC visibility, eliminating
+/// dirty reads.
+///
+/// Scenario (mirrors the task description):
+/// 1. T1 begins, inserts a row, does NOT commit.
+/// 2. T2 begins (a *different* transaction, while T1 is still InProgress),
+///    `SELECT COUNT(*) FROM t` → must return 0 (T2 cannot see T1's
+///    uncommitted insert — no dirty read).
+/// 3. T1 commits (in the background, while T2 is still active).
+/// 4. T2 issues `SELECT COUNT(*) FROM t` again → must return 1 (T1's
+///    commit is now visible to T2).
+///
+/// Because `QueryEngine` is single-transaction-at-a-time via
+/// `execute("BEGIN")`, the test uses `begin_background_txn` /
+/// `commit_background_txn` (test-only helpers added in Task 2.4) to
+/// simulate a concurrent transaction's lifecycle while keeping T2 as the
+/// `current_active` reader.
+///
+/// This exercises the `filter_indices` → `is_row_visible_to_active` path:
+/// when an MVCC transaction is active, `execute_select` skips the planner
+/// pipeline / kernel dispatch / indexed-lookup fast paths and routes the
+/// scan through `filter_indices`, which retains only rows whose
+/// `row_versions[i]` is visible to the active transaction.
+#[test]
+fn test_execute_select_filters_uncommitted() {
+    let mut engine = QueryEngine::in_memory();
+    engine.enable_mvcc().expect("enable_mvcc");
+    engine.execute("CREATE TABLE t (id INT)").expect("CREATE TABLE");
+
+    // T1: BEGIN, INSERT (uncommitted).
+    engine.execute("BEGIN").expect("T1 BEGIN");
+    engine.execute("INSERT INTO t VALUES (1)").expect("T1 INSERT");
+    let t1_id = engine
+        .mvcc_txn_manager()
+        .active_id()
+        .expect("T1 should be active after BEGIN");
+
+    // T2: begin a background txn. T1 remains InProgress in the manager's
+    // `txn_states` map; `current_active` is now T2.
+    let _t2_id = engine.begin_background_txn();
+    assert!(
+        engine.mvcc_txn_manager().is_active(),
+        "T2 should be the current_active after begin_background_txn"
+    );
+
+    // T2 SELECT COUNT(*) → must be 0. T1's insert has `xmin = t1_id`,
+    // `txn_state(t1_id) = InProgress`, and `t1_id != active_id (T2)`, so
+    // `is_row_visible_to_active` returns false → the row is filtered out.
+    let r = engine.execute("SELECT COUNT(*) FROM t").expect("T2 SELECT (pre-commit)");
+    assert_eq!(
+        r.columns[0].values[0], 0,
+        "T2 must NOT see T1's uncommitted insert (dirty read eliminated)"
+    );
+
+    // T1 commits in the background. `txn_state(t1_id)` becomes
+    // `Committed(cid)`. `current_active` stays as T2 (the commit_background_txn
+    // helper only clears current_active if it matches t1_id).
+    engine.commit_background_txn(t1_id);
+
+    // T2 SELECT COUNT(*) → must be 1. T1's insert now has
+    // `txn_state(t1_id) = Committed`, so `is_row_visible_to_active` returns
+    // true (xmin is committed; xmax is None).
+    let r = engine.execute("SELECT COUNT(*) FROM t").expect("T2 SELECT (post-commit)");
+    assert_eq!(
+        r.columns[0].values[0], 1,
+        "T2 must see T1's row after T1 commits (no dirty read, commit visible)"
+    );
+
+    // Cleanup: commit T2.
+    engine.execute("COMMIT").expect("T2 COMMIT");
+    assert!(
+        !engine.mvcc_txn_manager().is_active(),
+        "no active txn after T2 COMMIT"
+    );
+}
