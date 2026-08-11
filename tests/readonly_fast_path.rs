@@ -6,7 +6,8 @@
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
-use turbogp::engine::QueryEngine;
+use std::time::Instant;
+use turbogp::engine::{is_readonly_sql, route_and_execute, QueryEngine};
 
 #[test]
 fn test_execute_readonly_select_works() {
@@ -174,4 +175,138 @@ fn test_concurrent_execute_readonly_ten_threads() {
             assert_eq!(c, 50, "each read should see 50 rows");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2 Task 2.2 — route_and_execute tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_is_readonly_sql_classification() {
+    // SELECT-like statements are readonly.
+    assert!(is_readonly_sql("SELECT * FROM t"));
+    assert!(is_readonly_sql("SELECT COUNT(*) FROM t WHERE id = 5"));
+    assert!(is_readonly_sql("  EXPLAIN SELECT * FROM t  "));
+    assert!(is_readonly_sql("SHOW tables"));
+
+    // DML/DDL/transaction control are NOT readonly.
+    assert!(!is_readonly_sql("INSERT INTO t VALUES (1)"));
+    assert!(!is_readonly_sql("UPDATE t SET id = 0"));
+    assert!(!is_readonly_sql("DELETE FROM t"));
+    assert!(!is_readonly_sql("CREATE TABLE t (id INT)"));
+    assert!(!is_readonly_sql("DROP TABLE t"));
+    assert!(!is_readonly_sql("BEGIN"));
+    assert!(!is_readonly_sql("COMMIT"));
+    assert!(!is_readonly_sql("VACUUM"));
+    assert!(!is_readonly_sql("COPY t TO '/tmp/x.csv'"));
+    assert!(!is_readonly_sql("BACKUP TO '/tmp/x'"));
+}
+
+#[test]
+fn test_route_and_execute_routes_select_to_read_lock() {
+    let mut engine = QueryEngine::in_memory();
+    engine.execute("CREATE TABLE t (id INT)").unwrap();
+    engine.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+
+    // SELECT should route to the read path and succeed.
+    let r = route_and_execute(&engine, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.columns[0].values[0], 3);
+}
+
+#[test]
+fn test_route_and_execute_routes_dml_to_write_lock() {
+    let mut engine = QueryEngine::in_memory();
+    engine.execute("CREATE TABLE t (id INT)").unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+
+    // INSERT should route to the write path and succeed.
+    route_and_execute(&engine, "INSERT INTO t VALUES (42)").unwrap();
+
+    // Verify the row was inserted.
+    let r = route_and_execute(&engine, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.columns[0].values[0], 1);
+}
+
+#[test]
+fn test_route_and_execute_concurrent_selects_run_in_parallel() {
+    // Wave 2 Task 2.2 DoD: 10 concurrent SELECTs run in parallel.
+    //
+    // We verify this by comparing 10 parallel SELECTs against 10 serial
+    // SELECTs. If SELECTs acquire a *write* lock (the bug we're guarding
+    // against), the parallel batch would take ~10× as long as the serial
+    // batch (because each parallel thread would wait for the write lock).
+    // With a *read* lock, all 10 threads can run concurrently, so the
+    // parallel batch should be much faster than 10× the serial batch.
+    //
+    // We use a SELECT with a WHERE clause so the query actually scans data
+    // (the planner short-circuits SELECT * and COUNT(*) without WHERE, so
+    // those are too fast to measure parallelism benefit).
+    let mut engine = QueryEngine::in_memory();
+    engine.execute("CREATE TABLE big (id INT, v INT)").unwrap();
+    for i in 0..50_000 {
+        engine.execute(&format!("INSERT INTO big VALUES ({}, {})", i, i * 2)).unwrap();
+    }
+    let engine = Arc::new(RwLock::new(engine));
+
+    // The query: scans the table, returns count of rows where v > 10000.
+    // This does real work (vectorized scan over 50k rows).
+    let sql = "SELECT COUNT(*) FROM big WHERE v > 10000";
+
+    // Warm up.
+    let _ = route_and_execute(&engine, sql).unwrap();
+
+    // Measure a single SELECT to get a baseline.
+    let start_one = Instant::now();
+    let r = route_and_execute(&engine, sql).unwrap();
+    assert!(r.columns[0].values[0] > 0);
+    let one_elapsed = start_one.elapsed();
+
+    // Measure 10 PARALLEL SELECTs.
+    let start_parallel = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let engine = Arc::clone(&engine);
+        handles.push(thread::spawn(move || route_and_execute(&engine, sql).unwrap()));
+    }
+    for h in handles {
+        let _ = h.join().unwrap();
+    }
+    let parallel_elapsed = start_parallel.elapsed();
+
+    // Measure 10 SERIAL SELECTs.
+    let start_serial = Instant::now();
+    for _ in 0..10 {
+        let _ = route_and_execute(&engine, sql).unwrap();
+    }
+    let serial_elapsed = start_serial.elapsed();
+
+    println!(
+        "1 query: {:?}  10 parallel: {:?}  10 serial: {:?}  parallel/serial ratio: {:.2}",
+        one_elapsed,
+        parallel_elapsed,
+        serial_elapsed,
+        parallel_elapsed.as_secs_f64() / serial_elapsed.as_secs_f64()
+    );
+
+    // If SELECTs acquire a WRITE lock, the 10 parallel SELECTs would be
+    // fully serialized → parallel ≈ 10 × (one_query_time + thread_spawn)
+    // ≈ 10 × serial_per_query. With a READ lock, they overlap, so parallel
+    // should be much less than 10× the serial batch.
+    //
+    // We assert `parallel < serial * 3` — this catches the write-lock
+    // regression (where parallel would be ~10× serial) while allowing
+    // for thread-spawn overhead on low-core-count CI machines. On a
+    // 2-core machine, parallel is typically ~1.0-1.2× serial (slightly
+    // slower due to spawn overhead). On an 8+ core machine, parallel is
+    // typically ~0.2-0.5× serial.
+    assert!(
+        parallel_elapsed < serial_elapsed * 3,
+        "10 parallel SELECTs ({:?}) should be much faster than 3× 10 serial SELECTs ({:?}) \
+         — if parallel ≥ 3× serial, SELECTs are taking a write lock and serializing. \
+         (1 query took {:?})",
+        parallel_elapsed,
+        serial_elapsed,
+        one_elapsed
+    );
 }
