@@ -17,6 +17,39 @@ use crate::kernel::{KernelTable, KernelParams, KernelResult, Operator};
 use crate::planner::lowerer::{KernelInvocation, PlanLowerer};
 use crate::planner::logical_plan::PlanNode;
 use crate::planner::CostModel;
+use std::cell::Cell;
+
+// ---------------------------------------------------------------------------
+// KernelTable::select reachability counter (Wave 1 Task 1.3 — Agent C).
+//
+// Thread-local counter incremented every time `Scheduler::dispatch_kernel`
+// calls `KernelTable::select`. Integration tests use this to prove the
+// kernel table is reachable from the production `execute()` path (not just
+// from `tests/kernel_pipeline_test.rs`).
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Per-thread counter: number of times `KernelTable::select` was called
+    /// by the Scheduler on this thread.
+    static KERNEL_TABLE_SELECT_INVOKED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Number of times `KernelTable::select` has been called by the Scheduler
+/// on the **current thread** since process start (or the last reset).
+///
+/// Integration tests call `reset_kernel_table_select_counter()` then run a
+/// query via `engine.execute()` and assert that this returns ≥ 1, proving
+/// the AVX-512 kernel table is reachable from the production path.
+#[must_use]
+pub fn kernel_table_select_count() -> u64 {
+    KERNEL_TABLE_SELECT_INVOKED.with(|c| c.get())
+}
+
+/// Reset the kernel-table select invocation counter to zero on the current
+/// thread. Test-only helper.
+pub fn reset_kernel_table_select_counter() {
+    KERNEL_TABLE_SELECT_INVOKED.with(|c| c.set(0));
+}
 
 /// The scheduler — executes kernel invocations and produces query results.
 pub struct Scheduler<'a> {
@@ -74,6 +107,11 @@ impl<'a> Scheduler<'a> {
         invocation: &KernelInvocation,
         _catalog: &Catalog,
     ) -> Result<Option<KernelResult>> {
+        // Wave 1 Task 1.3: increment the reachability counter before the
+        // select call so tests can prove KernelTable::select was reached
+        // from the production execute() path.
+        KERNEL_TABLE_SELECT_INVOKED.with(|c| c.set(c.get().saturating_add(1)));
+
         // Look up the kernel in the kernel table
         // The kernel table selects the best implementation based on CPU
         // and memory tier (AVX-512, AVX2, or scalar fallback)

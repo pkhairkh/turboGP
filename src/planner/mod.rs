@@ -90,7 +90,7 @@ pub use learned::{ColumnStats, LearnedCardinality};
 pub use logical_plan::{AggregateExpr, JoinType, PlanNode, SortOrder, WindowExpr, WindowFrame, FrameType, FrameBound};
 pub use lowerer::{KernelInvocation, PlanLowerer};
 pub use plan_builder::build_plan;
-pub use scheduler::{Scheduler, count_reached_kernels};
+pub use scheduler::{Scheduler, count_reached_kernels, kernel_table_select_count, reset_kernel_table_select_counter};
 
 use crate::error::{Error, Result};
 use crate::kernel::Operator;
