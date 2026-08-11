@@ -418,7 +418,7 @@ pub(crate) fn decode_snapshot(data: &[u8]) -> Vec<Vec<u8>> {
 
 /// An incoming RPC at a node's dispatcher: the request plus a oneshot
 /// channel to send the reply back to the caller's `RaftNetwork` impl.
-enum RpcMessage {
+pub(crate) enum RpcMessage {
     AppendEntries(
         AppendEntriesRequest<TypeConfig>,
         oneshot::Sender<Result<AppendEntriesResponse<u64>, RaftError<u64>>>,
