@@ -207,9 +207,16 @@ impl QueryEngine {
 
     /// Execute RESTORE FROM '<directory>' (Wave 6 Task 6.2 — Agent C).
     ///
-    /// Reads the manifest, creates each table, and loads data from the CSV
-    /// files. Optionally accepts `AS OF TIMESTAMP '<iso8601>'` for
-    /// point-in-time recovery (Task 6.3).
+    /// **Task 4.3:** RESTORE now prefers the binary checkpoint
+    /// (`checkpoint.bin`) for fast, no-reparse catalog restoration. If
+    /// the binary checkpoint is missing or corrupt, it falls back to the
+    /// SQL-text checkpoint (`checkpoint.sql`), then to the original
+    /// CSV-manifest format (`manifest.json` + `*.csv`).
+    ///
+    /// Optionally accepts `AS OF TIMESTAMP '<iso8601>'` for point-in-time
+    /// recovery (Task 6.3 / Task 4.3). When present, the WAL is replayed
+    /// up to the target timestamp using the real `timestamp_us` field on
+    /// each `WalRecord` (set by `Wal::append` to epoch microseconds).
     ///
     /// Implemented directly in the engine (not via
     /// `storage::replication::restore`) for consistency with `execute_backup`
@@ -223,12 +230,182 @@ impl QueryEngine {
             .ok_or_else(|| Error::Other(format!("invalid RESTORE syntax: {}", sql)))?;
         let backup_dir = std::path::Path::new(&dir_str);
 
-        // Read manifest.
+        // Task 4.3 — Binary-checkpoint-aware RESTORE.
+        //
+        // Load order:
+        //   1. `checkpoint.bin`  (fast path — direct catalog deserialization).
+        //   2. `checkpoint.sql`  (legacy SQL-text checkpoint; re-executes
+        //      CREATE TABLE / INSERT statements).
+        //   3. `manifest.json` + `*.csv` (the original Wave 6 BACKUP TO
+        //      format — kept for backwards compat with pre-checkpoint
+        //      backups).
+        //
+        // If AS OF TIMESTAMP is specified, the WAL (in `<backup_dir>/wal/`
+        // segmented form, or the legacy `<backup_dir>/wal.log` flat file)
+        // is replayed up to that timestamp using the real `timestamp_us`
+        // field set by `Wal::append` (Task 4.3 — debt-6.3). Records with
+        // `timestamp_us == 0` (pre-timestamp-format WAL files) fall back
+        // to record-index ordering so legacy PITR semantics still work.
+        let checkpoint_bin_path = backup_dir.join("checkpoint.bin");
+        let checkpoint_sql_path = backup_dir.join("checkpoint.sql");
         let manifest_path = backup_dir.join("manifest.json");
-        let manifest_str = std::fs::read_to_string(&manifest_path)
+
+        let mut total_rows: usize = 0;
+        let mut loaded_via_checkpoint = false;
+
+        // 1. Binary checkpoint (fast path).
+        if checkpoint_bin_path.exists() {
+            match crate::storage::checkpoint::BinaryCheckpoint::load(&checkpoint_bin_path) {
+                Ok(loaded) => {
+                    let names: Vec<String> =
+                        loaded.table_names().into_iter().map(String::from).collect();
+                    let mut registered = 0usize;
+                    for name in &names {
+                        if name == "__dummy__" {
+                            continue;
+                        }
+                        if let Some(table) = loaded.get(name) {
+                            total_rows += table.row_count;
+                            self.catalog.register(table.clone());
+                            registered += 1;
+                        }
+                    }
+                    loaded_via_checkpoint = true;
+                    log::debug!(
+                        "restore: loaded binary checkpoint from {} ({} tables, {} rows)",
+                        checkpoint_bin_path.display(),
+                        registered,
+                        total_rows
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "restore: binary checkpoint load failed ({}): {e}; falling back to SQL/CSV",
+                        checkpoint_bin_path.display()
+                    );
+                }
+            }
+        }
+
+        // 2. SQL checkpoint fallback (legacy data dir or corrupt binary).
+        if !loaded_via_checkpoint && checkpoint_sql_path.exists() {
+            // `Checkpoint::load` re-executes CREATE TABLE / INSERT lines
+            // via `engine.execute(...)`. Take the WAL out so those replay
+            // statements aren't themselves appended to the WAL (which
+            // would pollute PITR replay and break idempotency).
+            let saved_wal = self.wal.take();
+            match crate::storage::recovery::Checkpoint::load(self, &checkpoint_sql_path) {
+                Ok(_) => {
+                    for name in self.catalog.table_names() {
+                        if name == "__dummy__" {
+                            continue;
+                        }
+                        if let Some(t) = self.catalog.get(&name) {
+                            total_rows += t.row_count;
+                        }
+                    }
+                    loaded_via_checkpoint = true;
+                    log::debug!(
+                        "restore: loaded SQL checkpoint from {} ({} rows)",
+                        checkpoint_sql_path.display(),
+                        total_rows
+                    );
+                }
+                Err(e) => {
+                    log::warn!("restore: SQL checkpoint load failed: {e}; falling back to CSV");
+                }
+            }
+            self.wal = saved_wal;
+        }
+
+        // 3. CSV manifest path (legacy BACKUP TO format).
+        if !loaded_via_checkpoint {
+            if !manifest_path.exists() {
+                return Err(Error::Other(format!(
+                    "RESTORE: no checkpoint.bin, checkpoint.sql, or manifest.json in '{}'",
+                    backup_dir.display()
+                )));
+            }
+            total_rows = self.restore_from_manifest(backup_dir, &manifest_path)?;
+        }
+
+        // Wave 6 Task 6.3 / Task 4.3: if AS OF TIMESTAMP is specified,
+        // replay WAL records up to that timestamp for point-in-time
+        // recovery. Looks for the segmented WAL in `<backup_dir>/wal/`
+        // first (the canonical location written by `with_data_dir`), then
+        // falls back to the legacy flat `<backup_dir>/wal.log`.
+        if let Some(timestamp_us) = timestamp_opt {
+            let wal_dir = backup_dir.join("wal");
+            let wal_flat = backup_dir.join("wal.log");
+            let wal = if wal_dir.exists() {
+                crate::storage::recovery::Wal::open(&wal_dir)
+                    .map_err(|e| Error::Other(format!("WAL open for PITR ({}): {e}", wal_dir.display())))?
+            } else if wal_flat.exists() {
+                crate::storage::recovery::Wal::open(&wal_flat)
+                    .map_err(|e| Error::Other(format!("WAL open for PITR ({}): {e}", wal_flat.display())))?
+            } else {
+                // No WAL — nothing to replay. The checkpoint state is
+                // the final state at the target timestamp.
+                return Self::finish_restore(start, total_rows);
+            };
+            let records = wal.read_all()
+                .map_err(|e| Error::Other(format!("WAL read for PITR: {e}")))?;
+            // Task 4.3: use the real `timestamp_us` field on WalRecord
+            // (set by Wal::append to epoch microseconds). For legacy WAL
+            // files written before the timestamp field existed (all
+            // records have `timestamp_us == 0`), fall back to record-index
+            // ordering so the original PITR semantics still work.
+            let ts_records: Vec<_> = records
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let ts = if r.timestamp_us > 0 { r.timestamp_us } else { i as u64 };
+                    crate::storage::replication::TimestampedWalRecord {
+                        record: r,
+                        timestamp_us: ts,
+                    }
+                })
+                .collect();
+            crate::storage::replication::replay_wal_to_timestamp(
+                self,
+                &ts_records,
+                timestamp_us,
+            ).map_err(Error::Other)?;
+        }
+
+        Self::finish_restore(start, total_rows)
+    }
+
+    /// Build the final `QueryResult` for a RESTORE operation.
+    fn finish_restore(start: &Instant, total_rows: usize) -> Result<QueryResult> {
+        let mut result = QueryResult::empty();
+        result.row_count = total_rows;
+        result.columns = vec![ResultColumn {
+            name: "rows_restored".into(),
+            values: vec![total_rows as u64],
+            string_values: None,
+            type_oid: 20,
+            null_mask: None,
+        }];
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+
+    /// Restore from a CSV-manifest backup (the original Wave 6 BACKUP TO
+    /// format). Reads `manifest.json`, creates each table if it doesn't
+    /// exist, and `COPY FROM`s the CSV file. Returns the total row count.
+    ///
+    /// This is the legacy path used when neither `checkpoint.bin` nor
+    /// `checkpoint.sql` exists in the backup directory.
+    fn restore_from_manifest(
+        &mut self,
+        backup_dir: &std::path::Path,
+        manifest_path: &std::path::Path,
+    ) -> Result<usize> {
+        let manifest_str = std::fs::read_to_string(manifest_path)
             .map_err(|e| Error::Other(format!("read manifest: {e}")))?;
-        let manifest: serde_json::Value =
-            serde_json::from_str(&manifest_str).map_err(|e| Error::Other(format!("parse manifest: {e}")))?;
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_str)
+            .map_err(|e| Error::Other(format!("parse manifest: {e}")))?;
 
         let mut total_rows: usize = 0;
         if let Some(tables) = manifest.get("tables").and_then(|t| t.as_array()) {
@@ -256,7 +433,6 @@ impl QueryEngine {
                 let csv_path = backup_dir.join(format!("{}.csv", table_name));
                 if csv_path.exists() {
                     // COPY requires allowed_copy_dirs to include the backup dir.
-                    // Add it temporarily.
                     let abs_path = csv_path.canonicalize()
                         .unwrap_or_else(|_| csv_path.clone());
                     let abs_dir = abs_path.parent().unwrap_or(backup_dir).to_path_buf();
@@ -273,46 +449,7 @@ impl QueryEngine {
                 }
             }
         }
-
-        // Wave 6 Task 6.3: if AS OF TIMESTAMP is specified, replay WAL records
-        // up to that timestamp for point-in-time recovery.
-        if let Some(timestamp_us) = timestamp_opt {
-            let wal_path = backup_dir.join("wal.log");
-            if wal_path.exists() {
-                let wal = crate::storage::recovery::Wal::open(&wal_path)
-                    .map_err(|e| Error::Other(format!("WAL open for PITR: {e}")))?;
-                let records = wal.read_all()
-                    .map_err(|e| Error::Other(format!("WAL read for PITR: {e}")))?;
-                // Assign monotonic timestamps based on record order.
-                // (Agent B should add real timestamps to WalRecord — see
-                // AGENT_C_API_REQUESTS.md.)
-                let ts_records: Vec<_> = records
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, r)| crate::storage::replication::TimestampedWalRecord {
-                        record: r,
-                        timestamp_us: i as u64,
-                    })
-                    .collect();
-                crate::storage::replication::replay_wal_to_timestamp(
-                    self,
-                    &ts_records,
-                    timestamp_us,
-                ).map_err(Error::Other)?;
-            }
-        }
-
-        let mut result = QueryResult::empty();
-        result.row_count = total_rows;
-        result.columns = vec![ResultColumn {
-            name: "rows_restored".into(),
-            values: vec![total_rows as u64],
-            string_values: None,
-            type_oid: 20,
-            null_mask: None,
-        }];
-        result.elapsed_us = start.elapsed().as_micros() as u64;
-        Ok(result)
+        Ok(total_rows)
     }
 }
 
