@@ -122,6 +122,8 @@ pub struct WalReceiver {
     pub records_received: u64,
     /// Bytes received so far.
     pub bytes_received: u64,
+    /// Whether run_apply_loop continues after an apply error (Task 5.2).
+    continue_on_error: bool,
 }
 
 impl WalReceiver {
@@ -133,6 +135,7 @@ impl WalReceiver {
             listener: Some(listener),
             records_received: 0,
             bytes_received: 0,
+            continue_on_error: false,
         })
     }
 
@@ -173,6 +176,70 @@ impl WalReceiver {
 
         let _ = addr;
         Ok(self.records_received)
+    }
+
+    /// Run the apply loop: accept a connection, receive records, and apply
+    /// each via the `apply` callback (Task 5.2).
+    ///
+    /// Unlike `accept_and_apply`, the `apply` callback returns `Result<()>`:
+    /// - `Ok(())` — the record was applied successfully.
+    /// - `Err(e)` — the apply failed. The error is logged, and the loop
+    ///   continues (configurable behaviour — see `set_continue_on_error`).
+    ///   If `continue_on_error` is false (the default), the loop returns
+    ///   the error immediately.
+    ///
+    /// The loop runs until the connection closes or an unrecoverable error
+    /// occurs (read failure, or apply failure when `continue_on_error` is
+    /// false).
+    pub fn run_apply_loop<F>(&mut self, mut apply: F) -> Result<u64, String>
+    where
+        F: FnMut(&WalRecord) -> Result<(), String>,
+    {
+        let listener = self.listener.as_ref()
+            .ok_or("receiver not bound")?;
+        let (mut stream, _addr) = listener.accept()
+            .map_err(|e| format!("accept: {}", e))?;
+        let mut buffer = String::new();
+        let mut chunk = [0u8; 4096];
+        let continue_on_error = self.continue_on_error;
+
+        loop {
+            let n = stream.read(&mut chunk)
+                .map_err(|e| format!("read: {}", e))?;
+            if n == 0 {
+                break; // connection closed
+            }
+            self.bytes_received += n as u64;
+            buffer.push_str(&String::from_utf8_lossy(&chunk[..n]));
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].to_string();
+                buffer = buffer[pos + 1..].to_string();
+                if let Ok(record) = serde_json::from_str::<WalRecord>(&line) {
+                    match apply(&record) {
+                        Ok(()) => {
+                            self.records_received += 1;
+                        }
+                        Err(e) => {
+                            log::warn!("replication apply error: {e}");
+                            if !continue_on_error {
+                                return Err(format!("apply error: {e}"));
+                            }
+                            // Continue — count the record as received but not applied.
+                            self.records_received += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(self.records_received)
+    }
+
+    /// Set whether the apply loop continues after an apply error (Task 5.2).
+    /// Default: false (stop on first error).
+    pub fn set_continue_on_error(&mut self, continue_on_error: bool) {
+        self.continue_on_error = continue_on_error;
     }
 }
 
@@ -672,5 +739,49 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_micros(10));
         let t2 = now_us();
         assert!(t2 > t1, "timestamp must increase: {} > {}", t2, t1);
+    }
+
+    /// Task 5.2 DoD: stream 100 records from a WalStreamer to a WalReceiver
+    /// via run_apply_loop, verify all 100 are received and applied.
+    #[test]
+    fn wal_receiver_run_apply_loop() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // Bind a receiver on a random port.
+        let receiver = WalReceiver::bind("127.0.0.1:0").unwrap();
+        let bound_addr = {
+            let listener = receiver.listener.as_ref().unwrap();
+            listener.local_addr().unwrap().to_string()
+        };
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+
+        // Spawn the receiver thread.
+        let handle = thread::spawn(move || {
+            let mut receiver = receiver;
+            receiver.run_apply_loop(|record| {
+                received_clone.lock().unwrap().push(record.sql.clone());
+                Ok(())
+            }).unwrap()
+        });
+
+        // Connect a streamer and send 100 records.
+        let mut streamer = WalStreamer::new();
+        // Wait a moment for the receiver to be ready.
+        thread::sleep(std::time::Duration::from_millis(50));
+        streamer.connect(&bound_addr).unwrap();
+        for i in 0..100 {
+            streamer.stream_record(&WalRecord::autocommit(format!("INSERT INTO t VALUES ({})", i))).unwrap();
+        }
+        streamer.flush().unwrap();
+        drop(streamer); // close the connection
+
+        let count = handle.join().unwrap();
+        assert_eq!(count, 100, "receiver must get 100 records");
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 100);
+        assert_eq!(received[0], "INSERT INTO t VALUES (0)");
+        assert_eq!(received[99], "INSERT INTO t VALUES (99)");
     }
 }
