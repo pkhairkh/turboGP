@@ -1084,6 +1084,14 @@ impl QueryEngine {
                 self.flush_with_checkpoint()?;
                 return Ok(QueryResult::empty());
             }
+            crate::engine::dispatch::StatementKind::Backup => {
+                // BACKUP TO '<dir>' (Wave 6 Task 6.1 — Agent C).
+                return self.execute_backup(trimmed, &start);
+            }
+            crate::engine::dispatch::StatementKind::Restore => {
+                // RESTORE FROM '<dir>' [AS OF TIMESTAMP '<ts>'] (Wave 6 Tasks 6.2, 6.3).
+                return self.execute_restore(trimmed, &start);
+            }
             crate::engine::dispatch::StatementKind::Begin => {
                 // Wave 4 (Agent C): route to MVCC or snapshot-isolation
                 // manager based on mvcc_enabled.
