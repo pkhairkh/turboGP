@@ -314,10 +314,10 @@ fn smoke_procedures_and_session() {
 
 #[test]
 fn smoke_durability_wal() {
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
     use turbogp::storage::recovery::{Wal, WalRecord};
 
-    let tmp = NamedTempFile::new().unwrap();
+    let tmp = TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     wal.append(&WalRecord {
         lsn: 0,

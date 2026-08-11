@@ -68,7 +68,7 @@ fn buffer_pool_page_allocation() {
 fn wal_records_physical_changes() {
     use turbogp::storage::recovery::{PhysicalChange, Wal, WalRecord};
     let tmp = TempDir::new().unwrap();
-    let wal_path = tmp.path().join("test_wal.log");
+    let wal_path = tmp.path().join("wal_dir");
 
     // Write a physical change record.
     {
