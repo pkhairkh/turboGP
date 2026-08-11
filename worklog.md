@@ -1323,3 +1323,17 @@ Stage Summary:
 - **`worklog.md` initialized** (this section).
 
 DoD satisfied: sandbox accessible; Rust, Python, Docker installed; turboGP cloned and on `feat/benchmarking`; worklog initialized.
+
+### Task 1.2 — Install and verify ClickHouse
+- Pulled `clickhouse/clickhouse-server:latest`.
+- Running container `clickhouse` with `--network host` (port 9000 native TCP, 8123 HTTP).
+- Data volume: `/srv/clickhouse/data` (persisted).
+- Default user `default`, no password (sandbox-internal; host-only network).
+- `SELECT 1` returns 1.
+- Version: `WORKLOG
+echo "  - Version: \`$CLICKHOUSE_VERSION\`" >> /root/turboGP/worklog.md
+cat >> /root/turboGP/worklog.md << 'WORKLOG'
+`.
+- Connection string used by benchmarks: `clickhouse-client --host 127.0.0.1 --port 9000 --user default --password ''`.
+
+DoD satisfied: ClickHouse runs via Docker; clickhouse-client connects; SELECT 1 returns 1; version documented.
