@@ -158,11 +158,18 @@ pub struct QueryEngine {
 
 /// A handle to an active WAL streamer (Wave 5 Task 5.3 — Agent C).
 ///
-/// Wraps `WalStreamer` in a `Mutex` so the engine can share it across
-/// threads (the engine itself is behind an `Arc<RwLock<QueryEngine>>`).
+/// Wraps `WalStreamer` in an `Arc<Mutex<...>>` so the engine can share
+/// the *same* streamer instance with the `Wal` (which holds it as an
+/// `Arc<Mutex<dyn WalStreamSink>>` via `set_stream_sink`). Both
+/// `enable_replication` and `enable_replication_local_only` clone the
+/// same `Arc` into both `self.wal_streamer` and the Wal's sink, so that
+/// `wal_records_streamed()` reads the counter the Wal actually writes
+/// to (fix for the pre-existing wiring bug where `wal_records_streamed()`
+/// always returned 0 because it queried a separate, never-written
+/// streamer).
 pub struct WalStreamerHandle {
-    /// The underlying WalStreamer.
-    pub streamer: std::sync::Mutex<crate::storage::replication::WalStreamer>,
+    /// The underlying WalStreamer, shared with the Wal's stream sink.
+    pub streamer: std::sync::Arc<std::sync::Mutex<crate::storage::replication::WalStreamer>>,
 }
 
 
@@ -965,16 +972,25 @@ impl QueryEngine {
         streamer
             .connect(peer_addr)
             .map_err(Error::Other)?;
-        let handle = std::sync::Arc::new(std::sync::Mutex::new(streamer));
+        // Build ONE shared Arc<Mutex<WalStreamer>> and store the SAME
+        // Arc in both `self.wal_streamer` (queried by `wal_records_streamed()`)
+        // and the Wal's stream sink (written to by `append_and_sync`).
+        // Pre-existing bug: these used to be two different `WalStreamer`
+        // instances, so `wal_records_streamed()` always returned 0.
+        let handle: std::sync::Arc<std::sync::Mutex<crate::storage::replication::WalStreamer>> =
+            std::sync::Arc::new(std::sync::Mutex::new(streamer));
         self.wal_streamer = Some(WalStreamerHandle {
-            streamer: std::sync::Mutex::new(
-                crate::storage::replication::WalStreamer::new(),
-            ),
+            streamer: handle.clone(),
         });
-        // Task 4.2 (debt-5.3): attach the streamer to the Wal via set_stream_sink
-        // so Wal::append_and_sync auto-streams after fsync.
+        // Task 4.2 (debt-5.3): attach the same streamer to the Wal via
+        // set_stream_sink so Wal::append_and_sync auto-streams after fsync.
+        // The `Arc<Mutex<WalStreamer>>` coerces to
+        // `Arc<Mutex<dyn WalStreamSink>>` via unsizing.
         if let Some(ref mut wal) = self.wal {
-            wal.set_stream_sink(handle);
+            let sink: std::sync::Arc<
+                std::sync::Mutex<dyn crate::storage::recovery::WalStreamSink>,
+            > = handle.clone();
+            wal.set_stream_sink(sink);
         }
         log::info!("Replication enabled: streaming WAL to {}", peer_addr);
         Ok(())
@@ -987,16 +1003,27 @@ impl QueryEngine {
     /// send them anywhere. Useful for testing the replication wiring
     /// without a live replica.
     pub fn enable_replication_local_only(&mut self) {
-        let streamer = crate::storage::replication::WalStreamer::new();
-        let handle = std::sync::Arc::new(std::sync::Mutex::new(streamer));
-        self.wal_streamer = Some(WalStreamerHandle {
-            streamer: std::sync::Mutex::new(
+        // Build ONE shared Arc<Mutex<WalStreamer>> and store the SAME Arc
+        // in both `self.wal_streamer` (queried by `wal_records_streamed()`)
+        // and the Wal's stream sink (written to by `append_and_sync`).
+        // Pre-existing bug: these used to be two different `WalStreamer`
+        // instances, so `wal_records_streamed()` always returned 0 even
+        // after records were streamed.
+        let handle: std::sync::Arc<std::sync::Mutex<crate::storage::replication::WalStreamer>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
                 crate::storage::replication::WalStreamer::new(),
-            ),
+            ));
+        self.wal_streamer = Some(WalStreamerHandle {
+            streamer: handle.clone(),
         });
-        // Attach to Wal for auto-streaming.
+        // Attach the same streamer to the Wal for auto-streaming. The
+        // `Arc<Mutex<WalStreamer>>` coerces to
+        // `Arc<Mutex<dyn WalStreamSink>>` via unsizing.
         if let Some(ref mut wal) = self.wal {
-            wal.set_stream_sink(handle);
+            let sink: std::sync::Arc<
+                std::sync::Mutex<dyn crate::storage::recovery::WalStreamSink>,
+            > = handle.clone();
+            wal.set_stream_sink(sink);
         }
     }
 
