@@ -137,6 +137,12 @@ pub const KEYWORDS: &[&str] = &[
     "CONFLICT",
     "NOTHING",
     "DO",
+    // DDL constraint keywords (Wave 6) — UNIQUE, CHECK, CASCADE, ACTION
+    // used in CREATE TABLE constraints and ON DELETE/UPDATE actions.
+    "UNIQUE",
+    "CHECK",
+    "CASCADE",
+    "ACTION",
     // CTE keywords (Wave 6)
     "WITH",
     "UNION",
