@@ -9,10 +9,12 @@
 pub mod async_server;
 pub mod auth;
 pub mod pgwire;
+pub mod pool;
 pub mod session;
 
 pub use auth::{PasswordManager, TlsConfig};
 pub use pgwire::PgConn;
+pub use pool::{ConnectionPool, PoolConfig, PoolMetrics, PoolPermit};
 pub use session::Session;
 
 use crate::engine::QueryEngine;
