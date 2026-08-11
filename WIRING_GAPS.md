@@ -161,7 +161,7 @@ Branch: `feat/prod-wiring`.
   `cluster-status`, `vacuum`, and `checkpoint` subcommands. Operators
   can run all five against a `--data-dir` without a SQL connection.
 - **Resolved by:** Wave 9 (Tasks 9.1–9.3).
-- **Resolved:** ☐
+- **Resolved:** ☑ (commits 37266cd, 2298844, 3eb8ad0)
 
 ---
 
@@ -178,4 +178,4 @@ Branch: `feat/prod-wiring`.
 | 7 — VACUUM reclaims column space | 6 | Dead rows removed from `Vec<u64>` | ☑ |
 | 8 — Remove parser hacks | 7 | Formal AST for UNION ALL / MERGE / PIVOT | ☑ |
 | 9 — Real doc comments | 8 | `#![allow(missing_docs)]` removed | ☑ |
-| 10 — Operational tooling | 9 | `turboGP admin` CLI | ☐ |
+| 10 — Operational tooling | 9 | `turboGP admin` CLI | ☑ |

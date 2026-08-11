@@ -1979,3 +1979,118 @@ Stage Summary:
 - missing_docs suppression removed.
 - Zero compiler warnings on both build configurations.
 - Wave 8 complete.
+
+---
+Task ID: 9.1 + 9.2 + 9.3
+Agent: prod-wiring-orchestrator (delegated subagent for Wave 9)
+Task: Operational tooling — `turboGP admin` CLI.
+
+Work Log:
+
+- Task 9.1 (commit 37266cd): admin CLI skeleton + backup/restore.
+  - NEW `src/admin/mod.rs` (323 LOC): `AdminCli` clap-derive struct,
+    `AdminCommand` enum (Backup, Restore — extended in 9.2 to also
+    include ClusterStatus, Vacuum, Checkpoint). `run()` parses args
+    via `AdminCli::parse()`; `dispatch(cli)` switches on the
+    subcommand and prints a status line or error to stderr/stdout.
+    `backup(data_dir, output)` recursively copies the data dir via
+    `std::fs::copy`; refuses to back up into a subdirectory of the
+    data dir (recursion guard). `restore(data_dir, input)` requires
+    the destination to be empty or non-existent, then copies the
+    backup in. Both return `Result<(), String>`. 2 lib tests:
+    `admin_backup_creates_copy_of_data_dir`,
+    `admin_restore_copies_files_into_empty_dir`.
+  - NEW `src/bin/turbogp-admin.rs` (27 LOC): thin `fn main()` shim
+    that calls `turbogp::admin::run()` and exits with the return code.
+  - MODIFIED `src/lib.rs`: registered `pub mod admin;` and added
+    `admin` to the module list in the crate doc comment.
+  - Files touched: 3 (within the per-task budget).
+  - Cargo auto-discovers the binary in `src/bin/` — no `[[bin]]`
+    entry in Cargo.toml needed (matches the existing `turbogp`
+    server binary, which is also auto-discovered).
+
+- Task 9.2 (commit 2298844): cluster-status, vacuum, checkpoint.
+  - MODIFIED `src/admin/mod.rs` (+437 LOC): added 3 new variants to
+    `AdminCommand` (ClusterStatus, Vacuum, Checkpoint), each holding
+    a `data_dir: PathBuf`. Wired 3 new arms into `dispatch()`.
+  - `cluster_status(data_dir)` — opens `SledRaftStore` at the data
+    dir, reads Raft state via the `RaftStorage` trait (`read_vote`,
+    `read_committed`, `get_log_state`, `last_applied_state`,
+    `get_current_snapshot`) plus the sync pub fns `last_applied()`
+    and `applied_records()`. Returns a multi-line summary: Vote,
+    Last committed, Last log id, Last purged log, Last applied,
+    Membership, Snapshot, Applied records. Two flavors:
+    `cluster_status_async` (the actual implementation) and a sync
+    `cluster_status` that wraps it in a fresh `tokio::runtime::Runtime`
+    for the binary's main path. Gated on `feature = "raft"` — the
+    sync stub without raft returns a "requires --features raft" error
+    so the binary still parses --help cleanly.
+  - `vacuum(data_dir)` — opens `QueryEngine::with_data_dir`,
+    enumerates `catalog.table_names()` (skipping the `__`-prefixed
+    internals), captures before row counts, executes `VACUUM`,
+    captures after row counts, returns a summary string with
+    per-table `before -> after` lines.
+  - `checkpoint(data_dir)` — opens `QueryEngine::with_data_dir`,
+    executes `CHECKPOINT`, verifies `checkpoint.bin` + `checkpoint.sql`
+    exist on disk, returns a summary.
+  - 3 new lib tests: `admin_cluster_status_prints_raft_state`
+    (gated on `feature = "raft"`, `#[tokio::test]` — seeds
+    SledRaftStore with vote/committed/log entry/applied SM,
+    verifies the report mentions Vote `T7-N3:committed`, Last
+    committed, Last log id, Last applied, Applied records: 1 entries),
+    `admin_vacuum_runs_vacuum_on_all_tables`,
+    `admin_checkpoint_flushes_wal`.
+  - Files touched: 1 (well within budget).
+
+- Task 9.3 (commit 3eb8ad0): end-to-end integration test.
+  - MODIFIED `src/admin/mod.rs` (+117 LOC): added
+    `admin_end_to_end_backup_restore_round_trip` lib test. Phase 1
+    opens `QueryEngine::with_data_dir`, creates a table, inserts 50
+    rows (v = id * 2), CHECKPOINTs so the catalog is in
+    `checkpoint.bin` and the WAL is truncated. Phase 2 calls
+    `admin::backup()` to recursively copy the data dir. Phase 3
+    calls `admin::restore()` into a fresh (non-existent) data dir.
+    Phase 4 reopens the engine at the restored data dir and verifies
+    `SELECT count(*) = 50`, the specific row `id=42 -> v=84`, and
+    the reverse lookup `v=30 -> id=15`. Phase 5 composes the tooling:
+    backup the restored dir, restore into a second fresh dir, verify
+    the row count still round-trips. Calls the admin functions
+    directly (no subprocess) per the task spec's preferred
+    alternative — faster than spawning the binary and avoids
+    build-order complexity.
+  - Files touched: 1.
+
+Tests: 904 lib tests pass without features (was 899 in Wave 8 + 5
+new admin tests). 919 lib tests pass with `--features raft` (was
+913 + 1 raft cluster-status test + 5 admin tests that run in both
+builds). Build: `cargo check --jobs 1` green with zero warnings.
+`cargo check --jobs 1 --features raft` green with zero warnings.
+
+Deviations from the plan:
+- The task spec's "Files you may touch" list included `Cargo.toml`
+  for the binary registration, but Cargo auto-discovers binaries in
+  `src/bin/` (no `[[bin]]` entry needed — matches the existing
+  `turbogp` server binary which is also auto-discovered). Task 9.1
+  therefore touched only 3 files (`src/admin/mod.rs`,
+  `src/bin/turbogp-admin.rs`, `src/lib.rs`), staying within the
+  3-files-per-task budget.
+- The task spec suggested "execute `VACUUM <table_name>` for each
+  table in the catalog" if the engine doesn't have a `vacuum_all()`
+  method. The engine DOES support `engine.execute("VACUUM")` (which
+  internally iterates every table via `catalog.table_names()`), so
+  we use that single SQL statement instead of per-table VACUUM
+  calls. The summary still reports per-table before/after counts.
+- `cluster_status` is gated on `feature = "raft"` because
+  `SledRaftStore` requires the openraft + sled dependencies. When
+  compiled without `--features raft`, the function returns an
+  error string ("cluster-status requires turboGP to be compiled
+  with --features raft") so the binary still parses `--help` and
+  prints a clear message when invoked.
+- The `cluster_status` test is `#[cfg(feature = "raft")]` and uses
+  `#[tokio::test]` to call `cluster_status_async` directly (avoids
+  nested-runtime panics). The sync `cluster_status` wrapper creates
+  its own `Runtime::new()` for the binary's main path.
+
+Stage Summary:
+- Gap 10 (Operational tooling) — RESOLVED.
+- Wave 9 complete. All 10 production-wiring gaps closed.
