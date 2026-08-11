@@ -181,12 +181,12 @@ fn collect_keys(
 ) -> Result<(), Error> {
     match on {
         crate::sql::parser::Expr::Binary { left: l, op, right: r } => {
-            if op.eq_ignore_ascii_case("AND") {
+            if *op == crate::sql::parser::BinOp::And {
                 collect_keys(l, left, right, keys)?;
                 collect_keys(r, left, right, keys)?;
                 return Ok(());
             }
-            if op == "=" {
+            if *op == crate::sql::parser::BinOp::Eq {
                 // Try: left expr in left table, right expr in right table
                 if let (Some(lk), Some(rk)) = (resolve_col(l, left), resolve_col(r, right)) {
                     keys.push(JoinKey { left: lk, right: rk });
