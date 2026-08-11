@@ -416,3 +416,132 @@ Stage Summary:
   snapshot isolation is verified end-to-end via the integration test.
   863 lib tests + 15 mvcc_integration tests pass (0 failures). Ready
   for Wave 4.
+
+---
+Task ID: 4.1 + 4.2 + 4.3
+Agent: ha-concurrency-agent (Wave 4)
+Task: Add tokio async runtime, async server skeleton, async pgwire
+handler (simplified/deferred), and async session management.
+
+Work Log:
+
+Commit 1 — `feat(4): server: add tokio async runtime, async server
+skeleton, async session handler` (d69bb6b):
+
+Task 4.1 — tokio + async server skeleton:
+- `tokio` is ALREADY a direct (non-optional) dependency in `Cargo.toml`
+  (lines 203-205, `[dependencies.tokio]` with features
+  `rt-multi-thread`, `net`, `io-util`, `sync`, `macros`, `time`,
+  `signal`). It was added during an earlier wave (Wave 2 server mode)
+  and is also present as a `[dev-dependencies]` entry (line 92, with
+  `features = ["full"]`) — Cargo merges features, so the dev/test
+  build has the full tokio feature set while the production build has
+  the curated subset. No `Cargo.toml` change was needed (the task spec
+  explicitly said "add tokio dependency if not already present — it
+  may be there as an optional dep"). The `openraft` dep remains
+  optional (`raft` feature) — Wave 5 will enable it.
+- New file `src/server/async_server.rs` (182 lines):
+  - `pub async fn serve(addr: &str, engine: Arc<RwLock<QueryEngine>>)
+    -> Result<(), String>`: binds a `tokio::net::TcpListener` and
+    loops on `accept()`, spawning a tokio task per connection. Bind
+    and accept errors propagate as `Err(String)`; per-connection
+    errors are logged (via `log::warn!`) and do NOT break the accept
+    loop.
+  - `async fn handle_connection(stream, engine) -> Result<(), String>`:
+    splits the `TcpStream` into read/write halves, writes a banner
+    (`turboGP async server. Type SQL commands.\n`), then loops on
+    `BufReader::read_line`, dispatching each SQL line through
+    `crate::engine::route_and_execute(&engine, sql)` and writing back
+    `OK (<n> rows)\n` or `ERROR: <msg>\n`. EOF on read breaks the
+    loop (client closed).
+- `src/server/mod.rs`: added `pub mod async_server;` (alphabetical,
+  before `auth`). The existing sync pgwire server (`Server::bind`,
+  `PgConn`) is untouched and remains the production protocol path.
+
+Task 4.2 — async pgwire protocol handler (deferred):
+- The async server uses a **simple line-based text protocol**, NOT
+  the full PostgreSQL pgwire v3 protocol. The existing sync pgwire
+  server (`src/server/pgwire.rs`, `PgConn::handle`) remains the
+  production pgwire implementation. A full async port of pgwire is a
+  large effort (startup handshake, extended-query P/B/D/E/S/C/X/H,
+  SCRAM-SHA-256 auth, RowDescription/DataRow wire encoding, etc.) and
+  is deferred to a later wave. The skeleton's module-doc comment
+  documents this deferral explicitly. The async skeleton exists so
+  that Wave 5's `openraft` integration (which requires tokio) has an
+  async entry point, and so that the async session/locking model can
+  be exercised in isolation.
+
+Task 4.3 — async session management:
+- `handle_connection` IS the session handler. Each accepted
+  connection is its own tokio task; the connection's lifetime IS the
+  session lifetime. There is no explicit `Session` struct in the
+  async path — sessions are isolated by the shared
+  `Arc<RwLock<QueryEngine>>`: `route_and_execute` acquires the read
+  lock for SELECT/EXPLAIN/SHOW (concurrent readers run in parallel)
+  and the write lock for DML/DDL/transaction-control (writers
+  serialised). This matches the Wave 2 concurrent-stress verification
+  (10 concurrent SELECTs share the read lock; documented in
+  `route_and_execute`'s rustdoc). A future wave may add per-session
+  state (prepared statements, transaction state, etc.) via a
+  `Session` map keyed by connection id; left out of scope here.
+- New test `server::async_server::tests::test_async_server_accepts_connection`:
+  creates an in-memory `QueryEngine`, `CREATE TABLE t (id INT)`, binds
+  an ephemeral port (bind→local_addr→drop→rebind pattern), spawns
+  `serve` in a tokio task, sleeps 100 ms for the server to bind,
+  connects a client, sends `SELECT COUNT(*) FROM t\n`, reads up to
+  1024 bytes, and asserts the response contains `OK` or `turboGP`
+  (the banner — the single `read` may return only the banner if the
+  query response hasn't arrived yet, both are acceptable proof the
+  server is alive). Aborts the server task at the end. Uses
+  `unwrap()` freely (test code).
+
+Files touched (1 commit, d69bb6b): 2 files, +183 / -0.
+- `src/server/async_server.rs` (NEW, 182 lines).
+- `src/server/mod.rs` (+1 line: `pub mod async_server;`).
+
+Constraints honoured:
+- No `unwrap()`/`expect()` in new production code: `serve` and
+  `handle_connection` map all I/O and engine errors to `String` via
+  `.map_err(|e| ...)?`. The test uses `unwrap()` freely (per spec).
+- Max 3 files per commit: touched 2 of the 3 allowed
+  (`Cargo.toml` was not modified — tokio was already a direct dep).
+- Context budget: 182 LOC in the new file, well under 1,500.
+- `cargo check --jobs 1 --lib`: 0 errors, 462 warnings (all
+  pre-existing, unchanged from Wave 3 baseline).
+- `cargo test --jobs 1 --lib`: 864 passed, 0 failed (was 863 baseline
+  + 1 new async_server test).
+
+Notes / follow-ups:
+- `Cargo.toml` line 88-92 has a `[dev-dependencies] tokio = { version
+  = "1", features = ["full"] }` entry whose comment ("tokio is needed
+  by integration tests for the async server") is now stale — the
+  direct `[dependencies.tokio]` (lines 203-205) is what actually
+  provides tokio to the lib. The dev-dep entry is now redundant
+  (Cargo merges features, so it's harmless) but the comment is
+  misleading. Left untouched to keep this commit's diff minimal; a
+  future cleanup could remove the redundant dev-dep entry.
+- Full async pgwire is deferred (Task 4.2). The skeleton's line-based
+  protocol is NOT wire-compatible with the sync pgwire server —
+  psql/Postgres clients cannot connect to the async server. The async
+  server is a building block for Wave 5's openraft integration, not a
+  replacement for the sync pgwire server.
+- The async server has no connection limit, no auth, no TLS, and no
+  query timeout — the sync `Server` (in `src/server/mod.rs`) has all
+  of these (`max_connections` semaphore, SCRAM-SHA-256, `TlsConfig`,
+  `statement_timeout_ms`). Porting these to the async path is a
+  future hardening wave once full async pgwire lands.
+- The `serve` function loops forever on `accept()` and only returns
+  on a bind or accept error. There is no graceful shutdown signal
+  handling yet (the sync `Server` similarly loops forever; `join()`
+  waits on the spawned task). A future wave could add
+  `tokio::signal::ctrl_c` handling.
+- The test's bind→drop→rebind pattern relies on tokio's `TcpListener`
+  setting `SO_REUSEADDR` (which it does on Unix). On Windows this
+  could race, but the test runs on Linux in CI.
+
+Stage Summary:
+- Task 4.1 + 4.2 + 4.3 complete. The async server skeleton exists,
+  tokio is integrated (was already a direct dep), and the async
+  session handler dispatches SQL through `route_and_execute`. Full
+  async pgwire is deferred (documented). 864 lib tests pass (0
+  failures). Ready for Wave 5 (openraft).
