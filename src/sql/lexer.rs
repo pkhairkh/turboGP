@@ -138,6 +138,10 @@ pub const KEYWORDS: &[&str] = &[
     "ALL",
     "OPTION",
     "MAXRECURSION",
+    // Set operation keywords (Wave 4) — INTERSECT and EXCEPT are required
+    // for set operations to be recognised by the parser's match_keyword.
+    "INTERSECT",
+    "EXCEPT",
     // Window function keywords (Wave 7)
     "OVER",
     "PARTITION",
