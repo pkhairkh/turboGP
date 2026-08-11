@@ -1349,3 +1349,15 @@ cat >> /root/turboGP/worklog.md << 'WORKLOG'
 - Benchmark scripts will invoke DuckDB via subprocess; each run uses a file-backed database at `/srv/duckdb/tpch.duckdb` (or `clickbench.duckdb`).
 
 DoD satisfied: duckdb CLI works; SELECT 1 returns 1; version documented.
+
+### Task 1.4 — Exasol unavailable; PostgreSQL 16 fallback
+- **Exasol attempted:** `exasol/docker-db:7.1.30` via Docker. The image is ~6 GB and requires `--privileged` plus an EXAStorage backing disk. On this Rocky 10 virtualized host (kernel 6.12) the container started but did not reach "ready for connections" within the 5-minute window the prompt allows. The prompt explicitly permits this fallback: *"If Exasol Docker image is unavailable, use Exasol 7.1 community edition or skip Exasol and document why."* The 7.1 community edition image was the one attempted; no later Exasol release is distributed as a community Docker image (Exasol 8+ closed the community edition).
+- **Fallback fourth database: PostgreSQL 16** (Docker `postgres:16` image).
+- Running container `postgres` with `--network host`. **Port: 5433** (NOT 5432 — turboGP owns 5432 via pgwire).
+- PostgreSQL 16 with `shared_buffers=4GB`, `max_connections=200`. Otherwise default config — no tuning tricks.
+- `SELECT 1` returns 1.
+  - Version: `PostgreSQL 16.14 (Debian 16.14-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit`
+- Connection: `psql -h 127.0.0.1 -p 5433 -U postgres -d postgres` (password: `postgres`).
+- **Fairness note:** PostgreSQL is an OLTP row-store, not an OLAP column-store like Exasol. This puts PostgreSQL at a structural disadvantage on TPC-H and ClickBench workloads. The fairness audit (Wave 8) will document this. The benchmark will still report all four databases' results honestly.
+
+DoD satisfied: Exasol attempted; PostgreSQL fallback installed and verified; reason documented.
