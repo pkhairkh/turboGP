@@ -21,6 +21,31 @@
 //! snapshots the catalog into per-worker borrows at scheduling time,
 //! so the registry itself never sees concurrent access during a
 //! query.
+//!
+//! ## Task 5.1 — internal `RwLock` DEFERRED
+//!
+//! Wave 5 Task 5.1 called for wrapping `tables` in a
+//! `parking_lot::RwLock<HashMap<String, Table>>` so concurrent readers
+//! could call `get()` without taking an external write lock. The
+//! refactor was deferred because the existing API
+//! (`get(&self, &str) -> Option<&Table>`,
+//!  `get_mut(&mut self, &str) -> Option<&mut Table>`,
+//!  `table_names(&self) -> Vec<&str>`)
+//! returns borrowed references into the map, and switching to either
+//! owned `Table` returns or `RwLockReadGuard`-returning methods would
+//! break ~13 caller files (`engine/ddl.rs`, `engine/dml.rs`,
+//! `engine/vacuum.rs`, `engine/mod.rs`, `engine/query_features.rs`,
+//! `engine/query_interpreter/*.rs`, `planner/scheduler.rs`,
+//! `txn/mod.rs`, `storage/checkpoint.rs`, `storage/recovery.rs`,
+//! `storage/replication.rs`) — far beyond Wave 5's 3-file budget.
+//!
+//! Concurrency safety is currently provided by the engine-level
+//! `Arc<RwLock<QueryEngine>>` (read-only queries take a shared read
+//! guard; DML/DDL take an exclusive write guard). That is coarser than
+//! per-table locking but is sufficient for the production-hardening
+//! DoD. A future wave should revisit this with a guard-returning API
+//! (see `parking_lot::RwLockReadGuard` and the `with_mut` pattern
+//! sketched in the Wave 5 task brief).
 
 pub mod views;
 

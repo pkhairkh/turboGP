@@ -212,3 +212,110 @@ documented debt items and verifying the full end-to-end pipeline.
 - `scripts/check_file_size.sh` passes
 - `scripts/check_no_panics.sh` passes
 - `scripts/check_dead_code.sh` passes
+
+---
+
+## Production Hardening (Waves 1-7)
+
+The Production Hardening Programme is a follow-on effort to the v3
+remediation and three-branch integration. It addresses the 7
+production-readiness gaps identified in `PROD_GAPS.md` (originally
+documented against commit `9ec9b4a`). The programme ran as 7 waves on
+the `feat/prod-hardening` branch.
+
+### Gaps Fixed
+
+| # | Property | Status | Wave | Resolution |
+|---|----------|--------|------|------------|
+| 1 | Isolation | RESOLVED | 2 | `execute_select` filters rows by MVCC visibility (xmin/xmax version chains). |
+| 2 | Atomicity | RESOLVED | 3 | MVCC ROLLBACK sets `xmax` on every version inserted by the aborted txn; visibility filter excludes them. |
+| 3 | Consistency | RESOLVED | 3 | UNIQUE (23505), FOREIGN KEY (23503), and CHECK (23514) constraints enforced at INSERT/UPDATE/DELETE time. |
+| 4 | Persistence | RESOLVED | 4 | Binary checkpoint format (`checkpoint.bin`) via `bincode`; atomic swap; ~20x faster than SQL-text. |
+| 5 | Concurrency | PARTIALLY RESOLVED | 5 | MORS parallel scan + `route_and_execute` (read-lock sharing); Catalog `RwLock` deferred. |
+| 6 | Replication | PARTIALLY RESOLVED | 6 | `SyncMode::Synchronous` + LSN-resume replay; `openraft` migration deferred behind `raft` feature. |
+| 7 | Durability | RESOLVED | 4 | Binary checkpoint + real WAL timestamps + LSN-based idempotent replay. |
+
+### Test Counts
+
+| Metric | Before (commit `9ec9b4a`) | After (Wave 7) |
+|--------|---------------------------|----------------|
+| Lib tests (`cargo test --lib`) | 817 | **850** (+33) |
+| ACID fuzz (`tests/acid_fuzz.rs`) | 0 | 1 (1000 randomised txns) |
+| Crash recovery stress (`tests/crash_recovery_stress.rs`) | 0 | 1 (5 crash + reload cycles) |
+| MVCC integration (`tests/mvcc_integration.rs`) | 0 | 8 |
+| WAL durability replication | 0 | 5 |
+| Backup/restore PITR | 0 | 6 |
+| Concurrency (readers + writer) | 0 | 12 |
+| Readonly fast path | 0 | 12 |
+| DML checkpoint | existing | 15 |
+
+All 850 lib tests pass with no regressions. The new integration tests
+(`tests/acid_fuzz.rs`, `tests/crash_recovery_stress.rs`) run in
+under 20 seconds combined.
+
+### Performance Benchmarks (Task 7.3)
+
+A new benchmark suite at `benches/prod_hardening.rs` measures four
+production-relevant workloads. Run with:
+
+```sh
+cargo test --bench prod_hardening -- --nocapture
+```
+
+Baseline numbers (debug build, 4-core x86_64 runner):
+
+| Benchmark | Workload | Baseline | Notes |
+|-----------|----------|----------|-------|
+| INSERT throughput | 10,000 autocommit INSERTs | **20,938 rows/sec** (0.478s) | Per-row parse + plan + execute |
+| SELECT scan throughput | `SELECT COUNT(*)` on 10k rows | **192M rows/sec** (<1us) | Planner fast path (returns `row_count` directly) |
+| Checkpoint time | `CHECKPOINT` on 10k-row table | **29 ms** | Binary + SQL formats, atomic swap |
+| MVCC visibility overhead | `SELECT COUNT(*)` on 10k rows | **4.10 ms (MVCC) vs 47 us (non-MVCC), 86x ratio** | Per-row visibility check vs planner fast path |
+
+The MVCC overhead ratio (86x) looks alarming but is misleading: the
+non-MVCC `COUNT(*)` path is O(1) (planner returns `row_count`
+directly), while the MVCC path is O(rows). The meaningful number is
+the absolute delta: ~4 ms for 10k rows, or ~400 ns per row of
+visibility-check overhead.
+
+### Final ACID / HA Status
+
+| Property | Status | Evidence |
+|----------|--------|----------|
+| **A**tomicity | VERIFIED | `tests/acid.rs::test_acid_atomicity_partial_failure_rollback`, `tests/acid_fuzz.rs` (228 rollbacks, no leaked rows) |
+| **C**onsistency | VERIFIED | `tests/acid_fuzz.rs` triggers all three SQLSTATE codes (23505, 23503, 23514); post-run verifies PK uniqueness, `balance >= 0`, FK validity |
+| **I**solation | VERIFIED | `tests/mvcc_integration.rs` (8 tests): T1 uncommitted INSERT not visible to T2; T1 DELETE not visible to T2 until COMMIT |
+| **D**urability | VERIFIED | `tests/crash_recovery_stress.rs`: 5 crash + reload cycles, 500 rows committed = 500 rows recovered (no data loss, no duplicates, monotonic count) |
+| **H**igh Availability | PARTIAL | Sync replication + LSN-resume wired; `openraft` deferred (single-leader with manual failover only) |
+
+### Deferred Items
+
+1. **Catalog `RwLock` (Gap 5)** — re-evaluate when adding multi-
+   threaded DDL or background vacuum. The engine-level
+   `RwLock<QueryEngine>` is sufficient for the current single-node
+   deployment model. See `INTEG_DEBT_LOG.md` (debt 2.3).
+2. **`openraft` migration (Gap 6)** — the `openraft` dependency is
+   declared in `Cargo.toml` (optional, behind the `raft` feature
+   flag) but not yet the default `RaftNode` implementation. The
+   hand-rolled `RaftNode` remains the default. A full `openraft`
+   migration requires an async engine API, which is out of scope.
+   Enable for production with `cargo build --features raft`.
+3. **MVCC ROLLBACK row physical removal** — rolled-back INSERTs
+   remain in `Table.columns` (filtered out by SELECT visibility but
+   not physically removed). `row_count` (underlying) is typically >
+   `SELECT COUNT(*)` after rolled-back transactions. A future vacuum
+   task could compact these. Pre-existing limitation, documented in
+   `tests/mvcc_integration.rs`.
+4. **Parser negative-literal bug** — `INSERT INTO t VALUES (1, -5)`
+   tokenizes `-5` as `Op("-") Int(5)`, causing a column-count
+   mismatch. Workaround: use UPDATE for negative literals. Pre-
+   existing limitation.
+
+### Commit History (Production Hardening)
+
+```
+506e32b test(7): hardening: add ACID fuzz test + crash recovery stress test
+4cf4ac4 docs(6.1,6.4): append worklog entry for sync mode + LSN resume
+3bdfb0c fix(6): replication: fix enable_replication wiring + document openraft deferral
+d1a3cc8 docs(6): append worklog entry for replication wiring fix + openraft deferral
+... (Waves 1-5 commits in the worklog)
+```

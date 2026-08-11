@@ -13,17 +13,45 @@ pub struct ColumnSchema {
     pub col_type: ColumnType,
     pub not_null: bool,
     pub primary_key: bool,
+    /// True if UNIQUE was specified at the column level (Task 3.2).
+    /// Enforced at INSERT and UPDATE time by `execute_insert` /
+    /// `execute_update` in `engine/dml.rs`.
+    pub unique: bool,
+    /// Optional CHECK constraint expression at the column level
+    /// (Task 3.5). Evaluated against the row's u64 cells by
+    /// `eval_check_expr` in `engine/helpers.rs`.
+    pub check: Option<crate::sql::ast::Expr>,
 }
 
 /// Schema for a table: column schemas in order.
 #[derive(Debug, Clone, Default)]
 pub struct TableSchema {
     pub columns: Vec<ColumnSchema>,
+    /// Table-level CHECK constraints (Task 3.5). Each is an expression
+    /// that must evaluate to TRUE (or UNKNOWN) for every row.
+    /// Populated by `from_create_table`; `from_ddl` leaves this empty
+    /// (it doesn't have access to the `CreateTable` struct).
+    pub checks: Vec<crate::sql::ast::Expr>,
+    /// Table-level (multi-column) UNIQUE constraints (Task 3.2). Each
+    /// entry is a list of column names whose combination must be unique
+    /// across rows. Populated by `from_create_table`; `from_ddl` leaves
+    /// this empty.
+    pub unique_constraints: Vec<Vec<String>>,
+    /// Foreign key constraints (Task 3.4). Populated by `from_create_table`
+    /// from both table-level `FOREIGN KEY (...) REFERENCES ...` clauses
+    /// and column-level `col TYPE REFERENCES other(col)` shorthand.
+    /// Enforced at INSERT/UPDATE/DELETE time by `engine/dml.rs`.
+    pub foreign_keys: Vec<crate::sql::ddl::TableForeignKey>,
 }
 
 impl TableSchema {
     pub fn new() -> Self {
-        Self { columns: Vec::new() }
+        Self {
+            columns: Vec::new(),
+            checks: Vec::new(),
+            unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
     }
 
     pub fn from_ddl(cols: &[crate::sql::ddl::ColumnDef]) -> Self {
@@ -35,8 +63,55 @@ impl TableSchema {
                     col_type: c.col_type.clone(),
                     not_null: c.not_null,
                     primary_key: c.primary_key,
+                    unique: c.unique,
+                    check: c.check.clone(),
                 })
                 .collect(),
+            // `from_ddl` only sees the column list; table-level
+            // constraints (CHECK / multi-column UNIQUE / FOREIGN KEY)
+            // are not available here. Callers that need them should use
+            // `from_create_table`.
+            //
+            // Column-level `REFERENCES` (which IS available here) is
+            // converted into `TableForeignKey` entries so that ALTER
+            // TABLE ADD COLUMN with REFERENCES also gets FK enforcement.
+            checks: Vec::new(),
+            unique_constraints: Vec::new(),
+            foreign_keys: column_fks_from_ddl(cols),
+        }
+    }
+
+    /// Build a `TableSchema` from a full `CreateTable` AST node,
+    /// preserving table-level CHECK and multi-column UNIQUE constraints
+    /// (Task 3.2 + 3.5).
+    ///
+    /// This is the preferred constructor when the full DDL is available.
+    /// `from_ddl` is kept for backward compatibility (it only populates
+    /// column-level constraints).
+    pub fn from_create_table(ct: &crate::sql::ddl::CreateTable) -> Self {
+        Self {
+            columns: ct
+                .columns
+                .iter()
+                .map(|c| ColumnSchema {
+                    name: c.name.clone(),
+                    col_type: c.col_type.clone(),
+                    not_null: c.not_null,
+                    primary_key: c.primary_key,
+                    unique: c.unique,
+                    check: c.check.clone(),
+                })
+                .collect(),
+            checks: ct.checks.clone(),
+            unique_constraints: ct.unique_constraints.clone(),
+            // Combine table-level FOREIGN KEY clauses with column-level
+            // `col TYPE REFERENCES other(col)` shorthand. Both produce
+            // `TableForeignKey` entries consumed by `engine/dml.rs`.
+            foreign_keys: {
+                let mut fks = ct.foreign_keys.clone();
+                fks.extend(column_fks_from_ddl(&ct.columns));
+                fks
+            },
         }
     }
 
@@ -125,6 +200,32 @@ impl TableSchema {
     }
 }
 
+/// Collect column-level `REFERENCES` clauses from a slice of `ColumnDef`s
+/// and convert each into a `TableForeignKey` entry (Task 3.4).
+///
+/// A column declared as `parent_id INT REFERENCES parent(id) ON DELETE CASCADE`
+/// produces a `TableForeignKey { columns: ["parent_id"], ref_table: "parent",
+/// ref_columns: ["id"], on_delete: Some(Cascade), on_update: None }`.
+///
+/// Table-level `FOREIGN KEY (...) REFERENCES ...` clauses are NOT handled
+/// here — they are added by `from_create_table` directly from
+/// `CreateTable.foreign_keys`.
+fn column_fks_from_ddl(cols: &[crate::sql::ddl::ColumnDef]) -> Vec<crate::sql::ddl::TableForeignKey> {
+    let mut fks = Vec::new();
+    for c in cols {
+        if let Some((ref_table, ref_col)) = &c.references {
+            fks.push(crate::sql::ddl::TableForeignKey {
+                columns: vec![c.name.clone()],
+                ref_table: ref_table.clone(),
+                ref_columns: vec![ref_col.clone()],
+                on_delete: c.on_delete,
+                on_update: c.on_update,
+            });
+        }
+    }
+    fks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,14 +278,21 @@ mod tests {
                     col_type: ColumnType::Int,
                     not_null: false,
                     primary_key: false,
+                    unique: false,
+                    check: None,
                 },
                 ColumnSchema {
                     name: "name".into(),
                     col_type: ColumnType::Varchar(Some(50)),
                     not_null: false,
                     primary_key: false,
+                    unique: false,
+                    check: None,
                 },
             ],
+            checks: Vec::new(),
+            unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         assert!(!schema.is_string(0));
         assert!(schema.is_string(1));
@@ -199,14 +307,21 @@ mod tests {
                     col_type: ColumnType::Int,
                     not_null: false,
                     primary_key: false,
+                    unique: false,
+                    check: None,
                 },
                 ColumnSchema {
                     name: "price".into(),
                     col_type: ColumnType::Float,
                     not_null: false,
                     primary_key: false,
+                    unique: false,
+                    check: None,
                 },
             ],
+            checks: Vec::new(),
+            unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         assert!(!schema.is_float(0));
         assert!(schema.is_float(1));
@@ -220,7 +335,12 @@ mod tests {
                 col_type: ColumnType::Float,
                 not_null: false,
                 primary_key: false,
+                unique: false,
+                check: None,
             }],
+            checks: Vec::new(),
+            unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         let val = 19.99f64.to_bits();
         assert_eq!(schema.format_cell(0, val), "19.99");
@@ -234,7 +354,12 @@ mod tests {
                 col_type: ColumnType::Int,
                 not_null: false,
                 primary_key: false,
+                unique: false,
+                check: None,
             }],
+            checks: Vec::new(),
+            unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         assert_eq!(schema.format_cell(0, 42), "42");
     }
@@ -247,7 +372,12 @@ mod tests {
                 col_type: ColumnType::Boolean,
                 not_null: false,
                 primary_key: false,
+                unique: false,
+                check: None,
             }],
+            checks: Vec::new(),
+            unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         assert_eq!(schema.format_cell(0, 1), "true");
         assert_eq!(schema.format_cell(0, 0), "false");
@@ -262,32 +392,45 @@ mod tests {
                     col_type: ColumnType::Int,
                     not_null: false,
                     primary_key: false,
+                    unique: false,
+                    check: None,
                 },
                 ColumnSchema {
                     name: "b".into(),
                     col_type: ColumnType::BigInt,
                     not_null: false,
                     primary_key: false,
+                    unique: false,
+                    check: None,
                 },
                 ColumnSchema {
                     name: "c".into(),
                     col_type: ColumnType::Float,
                     not_null: false,
                     primary_key: false,
+                    unique: false,
+                    check: None,
                 },
                 ColumnSchema {
                     name: "d".into(),
                     col_type: ColumnType::Varchar(Some(50)),
                     not_null: false,
                     primary_key: false,
+                    unique: false,
+                    check: None,
                 },
                 ColumnSchema {
                     name: "e".into(),
                     col_type: ColumnType::Boolean,
                     not_null: false,
                     primary_key: false,
+                    unique: false,
+                    check: None,
                 },
             ],
+            checks: Vec::new(),
+            unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         assert_eq!(schema.pg_type_oid(0), 23); // int4
         assert_eq!(schema.pg_type_oid(1), 20); // int8
