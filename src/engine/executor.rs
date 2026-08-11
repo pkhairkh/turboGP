@@ -1547,10 +1547,13 @@ fn filter_indices(
 /// empty chain are treated as visible (backward compatibility with
 /// non-MVCC tables / pre-MVCC rows).
 ///
-/// Task 3.2 (debt-4.3): this is the chokepoint where the snapshot_id-aware
-/// visibility check (`is_visible_with_snapshot`) is applied. Until 3.2
-/// lands, this uses the coarse `is_row_visible_to_active` (read-committed)
-/// check.
+/// Task 3.2: the visibility check is now snapshot-aware — it uses
+/// [`MvccTxnManager::is_visible_with_snapshot`] with the active txn's
+/// `snapshot_id` (or `current_commit_id` in autocommit mode) and the
+/// active txn's `id` (or `0` in autocommit). This is the snapshot-
+/// isolation read rule: a transaction sees at most one version of each
+/// row, namely the newest version whose `xmin` committed at or before
+/// the txn's snapshot (or was created by the txn itself).
 fn row_visible_to_active(
     table: &Table,
     mgr: &crate::txn::MvccTxnManager,
@@ -1563,7 +1566,15 @@ fn row_visible_to_active(
     if chain.is_empty() {
         return true; // Empty chain — backward compat.
     }
-    chain.iter().rev().any(|v| mgr.is_row_visible_to_active(v))
+    // Task 3.2: snapshot-isolation visibility check. In autocommit
+    // (no active txn), the reader is txn 0 with `snapshot_id =
+    // current_commit_id` (sees all committed data).
+    let active_txn_id = mgr.active_id().unwrap_or(0);
+    let snapshot_id = mgr.active_snapshot_id().unwrap_or_else(|| mgr.current_commit_id());
+    chain
+        .iter()
+        .rev()
+        .any(|v| mgr.is_visible_with_snapshot(v, snapshot_id, active_txn_id))
 }
 
 /// Task 5.3 — parallel MORS scan path for `filter_indices`.

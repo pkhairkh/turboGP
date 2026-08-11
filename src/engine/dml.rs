@@ -1586,4 +1586,107 @@ mod tests {
         assert_eq!(r.scalar_u64(), Some(1), "row should still have x=5");
         Ok(())
     }
+
+    // -----------------------------------------------------------------
+    // Task 3.3 — UPDATE new version visible to updating txn
+    // -----------------------------------------------------------------
+
+    /// Task 3.3 DoD: `BEGIN; INSERT (1,10); UPDATE SET v=99 WHERE id=1;
+    /// SELECT v FROM t WHERE id=1` returns `99` (not `10`).
+    ///
+    /// Verifies the snapshot-isolation read rule: the updating txn sees
+    /// its own new version (xmin == active_txn_id, xmax None) and does
+    /// NOT see the old version (xmax == active_txn_id → invisible).
+    #[test]
+    fn test_update_visible_to_updating_txn() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut engine = QueryEngine::in_memory();
+        engine.enable_mvcc()?;
+        engine.execute("CREATE TABLE t (id INT, v INT)")?;
+
+        engine.execute("BEGIN")?;
+        engine.execute("INSERT INTO t VALUES (1, 10)")?;
+        engine.execute("UPDATE t SET v = 99 WHERE id = 1")?;
+
+        // The SELECT inside the same txn must see the updated value 99.
+        let r = engine.execute("SELECT v FROM t WHERE id = 1")?;
+        let v = r
+            .column("v")
+            .and_then(|c| c.first().copied())
+            .ok_or_else(|| "expected non-empty SELECT v result".to_string())?;
+        assert_eq!(v, 99, "updating txn must see its own new version (99), not the old value (10)");
+
+        engine.execute("COMMIT")?;
+
+        // After COMMIT, an autocommit SELECT also sees 99 (the new
+        // version is now committed).
+        let r = engine.execute("SELECT v FROM t WHERE id = 1")?;
+        let v = r
+            .column("v")
+            .and_then(|c| c.first().copied())
+            .ok_or_else(|| "expected non-empty SELECT v result after COMMIT".to_string())?;
+        assert_eq!(v, 99, "post-commit autocommit SELECT must see 99");
+        Ok(())
+    }
+
+    /// Task 3.3 DoD: `INSERT; UPDATE; UPDATE` produces a 3-version chain
+    /// for the row, and the LATEST version (carrying the second UPDATE's
+    /// value) is visible to the updating txn.
+    ///
+    /// Note: the INSERT path stores an empty `values` vec (the version
+    /// metadata records `xmin`/`xmax` only; the actual column data lives
+    /// in `table.columns`). Only UPDATE versions carry non-empty `values`
+    /// (read from the mutated columns at UPDATE time).
+    #[test]
+    fn test_version_chain_roundtrip() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut engine = QueryEngine::in_memory();
+        engine.enable_mvcc()?;
+        engine.execute("CREATE TABLE t (id INT, v INT)")?;
+
+        engine.execute("BEGIN")?;
+        let txn_id = engine
+            .mvcc_txn_manager()
+            .active_id()
+            .ok_or_else(|| "active txn id should be Some after BEGIN".to_string())?;
+        engine.execute("INSERT INTO t VALUES (1, 10)")?;
+        engine.execute("UPDATE t SET v = 20 WHERE id = 1")?;
+        engine.execute("UPDATE t SET v = 30 WHERE id = 1")?;
+
+        // The chain at row 0 should have 3 versions: original INSERT,
+        // first UPDATE, second UPDATE.
+        let table = engine
+            .catalog()
+            .get("t")
+            .ok_or_else(|| "table t should exist".to_string())?;
+        let chain = &table.row_versions[0];
+        assert_eq!(chain.len(), 3, "expected 3 versions in the chain; got {}", chain.len());
+
+        // chain[0] = original INSERT (xmin=txn_id, xmax=txn_id — tombstoned by 1st UPDATE).
+        // INSERT versions carry empty `values` (column data is in `table.columns`).
+        assert_eq!(chain[0].xmin, txn_id);
+        assert_eq!(chain[0].xmax, Some(txn_id), "original version tombstoned by 1st UPDATE");
+        assert!(chain[0].values.is_empty(), "INSERT version carries empty values");
+
+        // chain[1] = 1st UPDATE (xmin=txn_id, xmax=txn_id — tombstoned by 2nd UPDATE).
+        assert_eq!(chain[1].xmin, txn_id);
+        assert_eq!(chain[1].xmax, Some(txn_id), "1st UPDATE version tombstoned by 2nd UPDATE");
+        assert!(chain[1].values.contains(&20), "1st UPDATE version carries v=20");
+
+        // chain[2] = 2nd UPDATE (xmin=txn_id, xmax=None — LIVE).
+        assert_eq!(chain[2].xmin, txn_id);
+        assert_eq!(chain[2].xmax, None, "latest version (2nd UPDATE) is live");
+        assert!(chain[2].values.contains(&30), "latest version carries v=30");
+
+        // The updating txn's SELECT must see the latest version (v=30).
+        // (The value is read from `table.columns[1][0]`, which UPDATE
+        // mutated in place to 30.)
+        let r = engine.execute("SELECT v FROM t WHERE id = 1")?;
+        let v = r
+            .column("v")
+            .and_then(|c| c.first().copied())
+            .ok_or_else(|| "expected non-empty SELECT v result".to_string())?;
+        assert_eq!(v, 30, "updating txn must see the latest version (v=30)");
+
+        engine.execute("COMMIT")?;
+        Ok(())
+    }
 }
