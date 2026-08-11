@@ -1648,3 +1648,158 @@ pub(crate) fn literal_to_cell(val: &crate::sql::parser::Value) -> Option<u64> {
         Value::Null => None,
     }
 }
+
+// ---------------------------------------------------------------------------
+// DML helper impls for `QueryEngine` (moved from `src/engine/mod.rs` in
+// Task 8.2-fix to satisfy the 2000-LOC file-size limit).
+//
+// These three methods (`materialize_views_in_sql`, `execute_merge_stmt`,
+// `execute_with_json_value`) used to live in mod.rs as private impl
+// blocks. They are declared `pub(crate)` here so mod.rs (and the rest
+// of the crate) can still call them via `self.<method>`.
+//
+// Note: `QueryEngine::execute_inner` was bumped from `fn` to
+// `pub(crate) fn` in mod.rs to support the cross-module call.
+// ---------------------------------------------------------------------------
+
+impl QueryEngine {
+    /// Expand any views referenced in `sql` into real catalog tables by
+    /// running the view's `select_sql` and registering the result under
+    /// the view's name. Returns the SQL unchanged (the view tables are
+    /// already in the catalog by the time the caller runs the SQL).
+    pub(crate) fn materialize_views_in_sql(&mut self, sql: &str) -> String {
+        let lower = sql.to_lowercase();
+        // Collect view names that appear in the SQL before mutating self.
+        let view_names: Vec<String> = self
+            .views
+            .names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .filter(|view_name| {
+                let pattern = format!("from {}", view_name.to_lowercase());
+                lower.contains(&pattern)
+            })
+            .collect();
+        // Now materialize each view. We collect (name, select_sql) pairs
+        // first to release the immutable borrow on self.views before we
+        // call self.execute_inner (which needs &mut self).
+        let view_specs: Vec<(String, String)> = view_names
+            .into_iter()
+            .filter_map(|name| self.views.get(&name).map(|v| (name, v.select_sql.clone())))
+            .collect();
+        for (view_name, select_sql) in view_specs {
+            if let Ok(result) = self.execute_inner(&select_sql, &Instant::now(), None) {
+                let table = result_to_table(&view_name, &result);
+                self.catalog.register(table);
+            }
+        }
+        sql.to_string()
+    }
+
+    /// Execute a MERGE statement against a catalog table (Wave 53 wiring
+    /// for exec/merge.rs). The target table is loaded into a QueryResult,
+    /// `execute_merge` is applied, and the result is written back to the
+    /// catalog.
+    pub(crate) fn execute_merge_stmt(
+        &mut self,
+        merge: crate::exec::merge::Merge,
+        start: &Instant,
+    ) -> Result<QueryResult> {
+        let target_name = merge.target.clone();
+        // Load the target table into a QueryResult.
+        let table = self
+            .catalog
+            .get(&target_name)
+            .ok_or_else(|| Error::NotFound(format!("MERGE target table \"{target_name}\"")))?
+            .clone();
+        let mut qr = table_to_query_result(&table);
+
+        let merge_result = crate::exec::merge::execute_merge(&mut qr, &merge);
+
+        // Write the mutated QueryResult back into the catalog table.
+        let new_table = query_result_to_table(&target_name, &qr);
+        self.catalog.register(new_table);
+
+        let mut result = QueryResult::empty();
+        result.row_count = merge_result.inserted + merge_result.updated + merge_result.deleted;
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+}
+
+impl QueryEngine {
+    /// Rewrite a SQL string containing `JSON_VALUE(col, 'path')` /
+    /// `JSON_QUERY(col, 'path')` calls so that the bare column name is
+    /// selected, then post-process the result to apply the JSON
+    /// extraction to the string values of that column. Used by
+    /// `execute_inner` when the SQL contains a JSON_VALUE/JSON_QUERY call.
+    pub(crate) fn execute_with_json_value(
+        &mut self,
+        sql: &str,
+        start: &Instant,
+        txn_id: Option<u64>,
+    ) -> Result<QueryResult> {
+        let calls = extract_json_value_calls(sql);
+        if calls.is_empty() {
+            // Shouldn't happen — contains_json_value_call returned true — but
+            // fall through to the normal path just in case.
+            return self.execute_inner(sql, start, txn_id);
+        }
+        // Rewrite the SQL: replace each call with the bare column name.
+        let mut rewritten = String::with_capacity(sql.len());
+        let mut last_end = 0;
+        for c in &calls {
+            rewritten.push_str(&sql[last_end..c.start]);
+            rewritten.push_str(&c.col_name);
+            last_end = c.end;
+        }
+        rewritten.push_str(&sql[last_end..]);
+        // Execute the rewritten SQL. The rewritten SQL has no JSON_VALUE(...)
+        // calls, so this won't re-enter execute_with_json_value.
+        let mut result = self.execute_inner(&rewritten, start, txn_id)?;
+        // Post-process: for each call, find the result column at the call's
+        // SELECT position and apply json_value() / json_query() to its string
+        // values.
+        for c in &calls {
+            let col_idx = c.select_position;
+            if col_idx >= result.columns.len() {
+                continue;
+            }
+            // Get the string values from the column. If string_values is
+            // None, we can't extract JSON — skip this call.
+            let strings = result.columns[col_idx].string_values.clone().unwrap_or_default();
+            if strings.is_empty() {
+                continue;
+            }
+            let extracted: Vec<String> = strings
+                .iter()
+                .map(|s| {
+                    if c.is_query {
+                        crate::exec::json::json_query(s, &c.path).unwrap_or_default()
+                    } else {
+                        crate::exec::json::json_value(s, &c.path).unwrap_or_default()
+                    }
+                })
+                .collect();
+            // Replace the column with a new one carrying the extracted strings.
+            use xxhash_rust::xxh3;
+            let values: Vec<u64> = extracted.iter().map(|s| xxh3::xxh3_64(s.as_bytes())).collect();
+            let final_name = c.alias.clone().unwrap_or_else(|| {
+                if c.is_query {
+                    "json_query".into()
+                } else {
+                    "json_value".into()
+                }
+            });
+            result.columns[col_idx] = ResultColumn {
+                name: final_name,
+                values,
+                string_values: Some(extracted),
+                type_oid: 25, // text OID
+                null_mask: None,
+            };
+        }
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+}
