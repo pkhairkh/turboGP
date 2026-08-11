@@ -62,6 +62,10 @@ pub struct WalRecord {
 
 /// A physical page-level change recorded in the WAL.
 /// Used for page-level crash recovery (Wave 63).
+///
+/// Task 3.1: expanded with `RowUpdate` and `PageSplit` variants. Each
+/// variant carries enough information to redo (and, for updates/deletes,
+/// optionally undo) the change during physical replay.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum PhysicalChange {
@@ -69,10 +73,30 @@ pub enum PhysicalChange {
     PageAlloc { table_id: u64, page_num: u32 },
     /// A cell in a page was updated.
     CellUpdate { table_id: u64, page_num: u32, cell_index: usize, old_value: u64, new_value: u64 },
-    /// A row was inserted (appended to a page).
-    RowInsert { table_id: u64, page_num: u32, row_offset: usize, values: Vec<u64> },
-    /// A row was deleted.
-    RowDelete { table_id: u64, page_num: u32, row_offset: usize },
+    /// A row was inserted (appended to a page at the given slot).
+    RowInsert { table_id: u64, page_num: u32, slot: usize, values: Vec<u64> },
+    /// A row was updated in place (Task 3.1). Carries old and new values
+    /// so the change can be redone (apply new_values) or undone (restore
+    /// old_values) during recovery.
+    RowUpdate {
+        table_id: u64,
+        page_num: u32,
+        slot: usize,
+        old_values: Vec<u64>,
+        new_values: Vec<u64>,
+    },
+    /// A row was deleted (logically, by marking the slot empty).
+    RowDelete { table_id: u64, page_num: u32, slot: usize },
+    /// A page was split: rows from `old_page` were redistributed onto a
+    /// newly-allocated `new_page` (Task 3.1). The split point indicates
+    /// how many rows remain on `old_page` after the split; the rest moved
+    /// to `new_page` starting at slot 0.
+    PageSplit {
+        table_id: u64,
+        old_page: u32,
+        new_page: u32,
+        split_point: usize,
+    },
 }
 
 impl WalRecord {
@@ -1486,5 +1510,31 @@ mod tests {
         // Records are durable.
         let records = wal.read_all().unwrap();
         assert_eq!(records.len(), 1);
+    }
+
+    /// Task 3.1 DoD: PhysicalChange variants serialize and round-trip.
+    #[test]
+    fn physical_change_roundtrips() {
+        let changes = vec![
+            PhysicalChange::PageAlloc { table_id: 1, page_num: 0 },
+            PhysicalChange::CellUpdate {
+                table_id: 1, page_num: 0, cell_index: 5, old_value: 10, new_value: 20,
+            },
+            PhysicalChange::RowInsert { table_id: 2, page_num: 1, slot: 3, values: vec![100, 200] },
+            PhysicalChange::RowUpdate {
+                table_id: 2, page_num: 1, slot: 3,
+                old_values: vec![100, 200], new_values: vec![300, 400],
+            },
+            PhysicalChange::RowDelete { table_id: 2, page_num: 1, slot: 3 },
+            PhysicalChange::PageSplit { table_id: 3, old_page: 0, new_page: 1, split_point: 256 },
+        ];
+        for change in &changes {
+            let json = serde_json::to_string(change).unwrap();
+            let back: PhysicalChange = serde_json::from_str(&json).unwrap();
+            // Re-serialize and compare — enums with the same variant + fields
+            // must produce identical JSON.
+            let json2 = serde_json::to_string(&back).unwrap();
+            assert_eq!(json, json2, "PhysicalChange round-trip mismatch");
+        }
     }
 }

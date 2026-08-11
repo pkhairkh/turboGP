@@ -397,7 +397,7 @@ impl QueryEngine {
                 }
                 bp.unpin_page(page_id, true);
             }
-            PhysicalChange::RowInsert { table_id, page_num, row_offset, values } => {
+            PhysicalChange::RowInsert { table_id, page_num, slot, values } => {
                 let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
                 let bp = self.buffer_pool.as_mut().unwrap();
                 let idx =
@@ -405,17 +405,48 @@ impl QueryEngine {
                 {
                     let page = bp.get_page_mut(idx);
                     for (i, &val) in values.iter().enumerate() {
-                        let cell_idx = *row_offset + i;
+                        let cell_idx = *slot + i;
                         if cell_idx < crate::storage::page::PAGE_CELLS {
                             page.set_cell(cell_idx, val);
                         }
                     }
+                    page.header.row_count = page.header.row_count.max((*slot + values.len()) as u64);
+                    page.update_checksum();
+                }
+                bp.unpin_page(page_id, true);
+            }
+            PhysicalChange::RowUpdate { table_id, page_num, slot, new_values, .. } => {
+                // Task 3.1: redo-only — apply new_values at the slot.
+                let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
+                let bp = self.buffer_pool.as_mut().unwrap();
+                let idx =
+                    bp.fetch_page(page_id).map_err(|e| Error::Other(format!("page fetch: {e}")))?;
+                {
+                    let page = bp.get_page_mut(idx);
+                    for (i, &val) in new_values.iter().enumerate() {
+                        let cell_idx = *slot + i;
+                        if cell_idx < crate::storage::page::PAGE_CELLS {
+                            page.set_cell(cell_idx, val);
+                        }
+                    }
+                    page.update_checksum();
                 }
                 bp.unpin_page(page_id, true);
             }
             PhysicalChange::RowDelete { .. } => {
                 // Row deletion is handled by the catalog (row_count decrement).
                 // Physical deletion (compaction) happens during VACUUM.
+            }
+            PhysicalChange::PageSplit { table_id, old_page, new_page, .. } => {
+                // Task 3.1: ensure both pages are fetched (allocated) in the
+                // buffer pool. The actual row redistribution is handled by
+                // the executor when it performs the split; this redo path
+                // just makes sure both pages exist.
+                let old_page_id = crate::storage::buffer_pool::PageId::new(*table_id, *old_page);
+                let new_page_id = crate::storage::buffer_pool::PageId::new(*table_id, *new_page);
+                let bp = self.buffer_pool.as_mut().unwrap();
+                let _ = bp.fetch_page(old_page_id);
+                let _ = bp.fetch_page(new_page_id);
             }
         }
         Ok(())
