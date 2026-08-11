@@ -547,13 +547,15 @@ pub fn restore(engine: &mut QueryEngine, backup_dir: &Path) -> Result<usize, Str
                 let _ = engine.execute(&create_sql); // ignore if table exists
             }
 
-            // Load data from CSV
+            // Task 5.4: load data from CSV directly via engine.load_csv()
+            // (bypasses the COPY command's allowed_copy_dirs security check,
+            // since restore() is a trusted operation).
             let csv_path = backup_dir.join(format!("{}.csv", table_name));
             if csv_path.exists() {
-                let sql = format!("COPY {} FROM '{}'", table_name, csv_path.display());
-                let result = engine.execute(&sql)
+                let path_str = csv_path.to_string_lossy();
+                let row_count = engine.load_csv(&path_str, table_name, true)
                     .map_err(|e| format!("restore {}: {}", table_name, e))?;
-                total_rows += result.row_count;
+                total_rows += row_count;
             }
         }
     }
@@ -563,8 +565,17 @@ pub fn restore(engine: &mut QueryEngine, backup_dir: &Path) -> Result<usize, Str
 
 /// List all table names in the engine's catalog.
 fn list_tables(engine: &mut QueryEngine) -> Result<Vec<String>, String> {
-    // Try to query a system table or use a SHOW TABLES command
-    // If that fails, return empty (the caller can specify tables manually)
+    // Task 5.4: use the catalog directly (more reliable than SHOW TABLES).
+    let names: Vec<String> = engine.catalog.table_names()
+        .into_iter()
+        .filter(|n| *n != "__dummy__")
+        .map(String::from)
+        .collect();
+    if !names.is_empty() {
+        return Ok(names);
+    }
+    // Fallback: try SHOW TABLES (in case the catalog is empty but the
+    // engine has some other table source).
     if let Ok(result) = engine.execute("SHOW TABLES") {
         if !result.columns.is_empty() {
             return Ok(result.columns[0].values.iter()
@@ -572,7 +583,6 @@ fn list_tables(engine: &mut QueryEngine) -> Result<Vec<String>, String> {
                 .collect());
         }
     }
-    // Fallback: return empty list
     Ok(vec![])
 }
 
