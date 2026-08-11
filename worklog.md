@@ -1835,3 +1835,180 @@ Stage Summary:
     (which already uses `parking_lot`). Out of scope here.
 - Ready for downstream Wave 5+ tasks (e.g. per-table Catalog RwLock to
   un-defer Task 5.1; criterion benchmark for parallel vs. serial scan).
+
+---
+Task ID: 6.1 + 6.4
+Agent: general-purpose
+Task: Synchronous replication mode + replica replay with LSN consistency check.
+
+Work Log:
+- Read `worklog.md` (Waves 1-5 done), `src/storage/recovery.rs`,
+  `src/storage/replication.rs`, `tests/wal_durability_replication.rs`,
+  and `src/engine/mod.rs` (to understand `WalStreamerHandle` and the
+  `enable_replication_local_only` wiring).
+- Confirmed baseline: 850 lib tests pass on `feat/prod-hardening`.
+
+Task 6.1 — Synchronous replication mode (in `src/storage/recovery.rs`,
+~70 LOC):
+- Added `pub enum SyncMode { Asynchronous, Synchronous }` with full
+  doc comments explaining the simplified flush-based semantics
+  (no true replica ACK in this revision; a future task may extend the
+  wire protocol with an explicit ACK message).
+- Added `sync_wait(&mut self) -> Result<(), String>` to the
+  `WalStreamSink` trait with a default `Ok(())` impl, so existing
+  sinks (incl. any third-party impls) keep working unchanged.
+- Added `sync_mode: SyncMode` field to `Wal` (default
+  `Asynchronous`, initialized in `open_with_segment_limit`).
+- Added `Wal::set_sync_mode(mode)` and `Wal::sync_mode() -> SyncMode`
+  (the latter `#[must_use]`).
+- Modified `Wal::append_and_sync`:
+  - In `Synchronous` mode, after a successful `stream()`, calls
+    `sink.sync_wait()`. A failure is propagated as
+    `io::Error::new(io::ErrorKind::Other, ...)` so the calling
+    transaction aborts (the commit is not durable on the replica).
+  - In `Synchronous` mode, a `stream()` failure (replica down) is
+    also propagated as an `io::Error` (vs. async where it's logged
+    and swallowed).
+  - In `Asynchronous` mode (default), behaviour is unchanged from
+    Wave 5: stream errors are `log::warn!`-ed and the commit succeeds.
+- In `src/storage/replication.rs`, overrode `sync_wait` on both
+  `WalStreamer` (calls `self.flush()` — pushes data to the OS socket
+  buffer) and `MultiWalStreamSink` (flushes every child streamer,
+  best-effort — a single follower failure is logged but doesn't fail
+  the call, matching the `stream()` semantics).
+
+Task 6.4 — Replica replay with LSN consistency (in
+`src/storage/replication.rs`, ~80 LOC):
+- Added `last_applied_lsn: u64` field to `WalReceiver` (default 0).
+- Added `pub fn last_applied_lsn(&self) -> u64` (`#[must_use]`)
+  accessor.
+- Added `pub fn resume_from_lsn(&self) -> u64` (`#[must_use]`)
+  returning `last_applied_lsn.saturating_add(1).max(1)` — the next
+  LSN to request on reconnect. Edge case: returns 1 if no records
+  have been applied (LSNs start at 1).
+- Modified `WalReceiver::run_apply_loop` and `accept_and_apply`:
+  after applying a record, set
+  `self.last_applied_lsn = max(self.last_applied_lsn, record.lsn)`.
+  Records applied out-of-order (theoretically possible with
+  reordering across reconnects) cannot regress the counter.
+- Added `pub fn local_addr(&self) -> Result<SocketAddr, String>` to
+  `WalReceiver` — small principled API addition so callers (and
+  tests) can discover the actual bound port when bound to
+  `127.0.0.1:0`. Also useful for logging in production.
+- Added `pub fn stream_from_lsn(&mut self, records: &[WalRecord],
+  start_lsn: u64) -> usize` to `WalStreamer` — sends only records
+  with `lsn >= start_lsn`. Records with `lsn == 0` (legacy /
+  unassigned) are always sent (preserves backward compatibility with
+  pre-LSN WAL records). Returns the count of records actually sent.
+  Stream errors are logged (`log::warn!`) but don't abort the
+  replay — a single bad record shouldn't fail the whole catch-up.
+
+Tests (in `tests/wal_durability_replication.rs`, ~310 LOC, 6 new
+tests):
+- `test_sync_mode_waits_for_flush` (Task 6.1 DoD): creates a `Wal`
+  with a typed `Arc<Mutex<WalStreamer>>` (so we can read
+  `records_sent` post-append via the typed Arc; the same Arc is
+  attached to the Wal as `Arc<Mutex<dyn WalStreamSink>>` via
+  unsized coercion). Sets `Synchronous` mode, calls
+  `append_and_sync`, asserts `Ok(())` and `records_sent == 1`.
+- `test_sync_mode_propagates_sync_wait_error`: uses a custom
+  `FailingSink` whose `sync_wait` always returns `Err`. Asserts
+  `append_and_sync` returns `Err` with a message mentioning
+  `sync_wait` / `ACK`.
+- `test_async_mode_swallows_stream_error`: uses a custom sink
+  whose `stream` always returns `Err`. Asserts `append_and_sync`
+  in default `Asynchronous` mode returns `Ok(())` (error logged
+  and swallowed — Wave 5 behaviour formalized).
+- `test_replica_resume_from_lsn` (Task 6.4 DoD): constructs 10
+  records (lsn 1..=10), computes `resume_lsn = 5 + 1 = 6` (the
+  value `WalReceiver::resume_from_lsn()` would return after
+  applying record 5), calls `stream_from_lsn(&records, 6)` on a
+  fresh `WalStreamer`. Asserts `sent == 5` and
+  `records_sent == 5`.
+- `test_stream_from_lsn_edge_cases`: `start_lsn == 1` sends all
+  10; `start_lsn == 11` sends 0; `start_lsn == 10` sends 1
+  (boundary). Plus a legacy `lsn == 0` record mixed in is always
+  sent (1 + 6 = 7 with `start_lsn = 5`).
+- `test_replica_last_applied_lsn_after_apply_loop`: full TCP
+  round-trip — binds a `WalReceiver` on `127.0.0.1:0`, discovers
+  the port via `local_addr()`, spawns the receiver thread running
+  `run_apply_loop` (collecting applied LSNs into a shared
+  `Arc<Mutex<Vec<u64>>>`), connects a `WalStreamer`, streams 5
+  records with LSNs 1..=5, flushes, drops the streamer (closes
+  the connection). After the receiver thread joins, asserts:
+  (a) `applied == [1, 2, 3, 4, 5]` (in order);
+  (b) `last_applied_lsn() == 5`;
+  (c) `resume_from_lsn() == 6`;
+  (d) a fresh `WalStreamer::stream_from_lsn(all_10_records, 6)`
+      sends exactly 5 catch-up records (lsn 6-10).
+  Verified stable across 3 consecutive runs (~0.05s each).
+
+Constraints honoured:
+- Max 3 files touched: exactly 3 (`src/storage/recovery.rs` +97,
+  `src/storage/replication.rs` +113, `tests/wal_durability_replication.rs`
+  +303 — total 512 LOC, well under the 1,500 LOC budget).
+- No `unwrap()`/`expect()` in new production code (verified via
+  `git diff | grep unwrap` — 0 matches in the two `src/` files).
+  Tests use `.expect("descriptive message")` / `.unwrap()` as
+  appropriate for test-only code.
+- `cargo check --jobs 1` → 466 pre-existing warnings, 0 errors,
+  no new warnings introduced by this task.
+- `cargo test --jobs 1 --lib` → **850 passed, 0 failed** (matches
+  the Task 5.5 baseline; no regressions).
+- `cargo test --jobs 1 --test wal_durability_replication` →
+  **10 passed, 2 failed**:
+  - The 6 new tests added by this task all pass.
+  - The 2 pre-existing tests
+    (`test_enable_replication_local_only`,
+    `test_wal_streamer_records_after_commit`) were already failing
+    on the baseline (verified via `git stash` + retest on the
+    pre-task HEAD `00856c7`). Root cause: a pre-existing bug in
+    `QueryEngine::enable_replication_local_only` (in
+    `src/engine/mod.rs`, NOT touched by this task) — it stores a
+    NEW `WalStreamer` in `self.wal_streamer` instead of the one
+    attached to the `Wal`, so `wal_records_streamed()` always
+    returns 0. Out of scope for Task 6.1/6.4 (would require
+    touching a 4th file: `src/engine/mod.rs`). Documented here
+    for a future engine-side task.
+- Committed on `feat/prod-hardening` as `9c79d40` with the
+  task-specified commit-message template. NOT pushed to origin.
+
+Stage Summary:
+- DoD met for both tasks:
+  - **Task 6.1 (sync mode):** `SyncMode` enum exists with
+    `Asynchronous` (default) and `Synchronous` variants.
+    `Wal::set_sync_mode` + `Wal::sync_mode` accessor added.
+    `WalStreamSink::sync_wait` trait method added (default `Ok(())`,
+    overridden in `WalStreamer` to call `flush()` and in
+    `MultiWalStreamSink` to flush all children). `append_and_sync`
+    in `Synchronous` mode calls `sync_wait` and propagates failure
+    as `io::Error`. Test `test_sync_mode_waits_for_flush` proves
+    the path works end-to-end with a local-only sink.
+  - **Task 6.4 (LSN resume):** `WalReceiver::last_applied_lsn` +
+    `resume_from_lsn` accessors added; `run_apply_loop` and
+    `accept_and_apply` both update `last_applied_lsn` after each
+    successful apply. `WalStreamer::stream_from_lsn` filters by
+    `lsn >= start_lsn` and returns the count sent. Test
+    `test_replica_resume_from_lsn` proves 5 catch-up records are
+    sent (not 10) when resuming from LSN 6. Integration test
+    `test_replica_last_applied_lsn_after_apply_loop` verifies the
+    full TCP round-trip + LSN bookkeeping.
+- Known limitations (out of scope for this task):
+  - `sync_wait` is a simplified "flush to OS socket buffer"
+    implementation, NOT a true replica ACK. A future task may
+    extend the wire protocol with an explicit ACK message
+    (`<ACK lsn=N>\n` reply from replica → primary blocks on read
+    with timeout). The trait shape (`sync_wait -> Result<(), String>`)
+    is forward-compatible with this.
+  - `MultiWalStreamSink::sync_wait` is best-effort (a single
+    follower flush failure is logged but doesn't fail the call).
+    A future task may make this configurable (require-quorum ACK
+    vs. require-all ACK vs. require-any ACK).
+  - Pre-existing `enable_replication_local_only` bug (engine
+    stores a separate `WalStreamer` from the one attached to the
+    `Wal`) makes `wal_records_streamed()` return 0 — affects 2
+    pre-existing tests. NOT introduced by this task; tracked for
+    a future engine-side task.
+- Ready for downstream Wave 6+ tasks (e.g. real replica ACK
+  protocol, Raft quorum-based sync replication, automated
+  failover).
