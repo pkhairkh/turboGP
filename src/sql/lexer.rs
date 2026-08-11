@@ -131,6 +131,12 @@ pub const KEYWORDS: &[&str] = &[
     "SET",
     "INTO",
     "OUTPUT",
+    // DML extension keywords (Wave 5) — RETURNING, CONFLICT, NOTHING,
+    // DO used by INSERT/UPDATE/DELETE ... RETURNING and ON CONFLICT.
+    "RETURNING",
+    "CONFLICT",
+    "NOTHING",
+    "DO",
     // CTE keywords (Wave 6)
     "WITH",
     "UNION",
