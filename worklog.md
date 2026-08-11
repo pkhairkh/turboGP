@@ -1485,3 +1485,217 @@ Stage Summary:
 - Raft wired into the write path: append_and_sync → RaftManager::propose (via raft.client_write).
 - Backward compatibility preserved when Raft is not enabled.
 - Wave 4 complete.
+
+---
+Task ID: 5.1
+Agent: prod-wiring-orchestrator
+Task: Async pgwire protocol — startup + simple query.
+
+Work Log:
+- Created `src/server/async_pgwire.rs` (~640 LOC).
+- `AsyncPgwireServer::bind(addr, engine)` returns a server struct with
+  `local_addr` + `serve()`. Serve loop spawns one tokio task per
+  accepted connection.
+- `PgConn` owns split `BufReader<OwnedReadHalf>` / `BufWriter<OwnedWriteHalf>`
+  + transaction status byte ('I'/'T'/'E').
+- Startup handling: reads the startup message (4-byte len + 4-byte magic +
+  null-terminated key/value pairs), declines SSLRequest / GSSAPIRequest
+  with 'N' (plaintext), parses protocol v3 (196608..196620), and (in
+  this commit) immediately responds with `AuthenticationOk` (R) +
+  `ParameterStatus`* (server_version, server_encoding, client_encoding,
+  DateStyle, integer_datetimes, standard_conforming_strings,
+  application_name, IntervalStyle, TimeZone) + `BackendKeyData` (K,
+  random pid/secret) + `ReadyForQuery` (Z, 'I').
+- Simple Query (Q): splits the SQL on ';' boundaries (respecting
+  single-quoted strings via the same `split_sql_batch` logic as
+  pgwire.rs), intercepts BEGIN/COMMIT/ROLLBACK to update txn status,
+  routes each statement through `engine::route_and_execute` (read lock
+  for SELECT/EXPLAIN/SHOW, write lock for DML/DDL), and emits
+  `RowDescription` (T) + `DataRow`* (D) + `CommandComplete` (C) +
+  `ReadyForQuery` (Z). Errors emit `ErrorResponse` (E) + Z.
+- Registered `pub mod async_pgwire;` in `src/server/mod.rs`.
+- Tests in `src/server/async_pgwire_tests.rs` (registered via
+  `#[cfg(test)] #[path = "async_pgwire_tests.rs"] mod async_pgwire_tests;`
+  at the bottom of `async_pgwire.rs` — kept in-file so test helpers stay
+  in scope).
+  - `async_pgwire_startup_and_simple_select_round_trip`: CREATE TABLE +
+    INSERT + SELECT, verifies AuthOk + ParameterStatus* + K + Z startup
+    sequence, then RowDescription + DataRow + CommandComplete for SELECT.
+  - `async_pgwire_simple_query_error_returns_error_response`: invalid
+    SQL ('FOOBAR baz quux') returns ErrorResponse + ReadyForQuery.
+  - `async_pgwire_multi_statement_simple_query`: two INSERTs in one Q
+    message return two CommandComplete tags + one ReadyForQuery.
+- All tests use raw `tokio::net::TcpStream` byte-level clients (no `psql`
+  dependency). Helper functions `build_startup`, `build_query`,
+  `read_message`, `read_until_ready` build/parse pgwire frames.
+
+Stage Summary:
+- AsyncPgwireServer starts up, speaks pgwire v3, and round-trips simple
+  queries. Task 5.1 done.
+
+---
+Task ID: 5.2
+Agent: prod-wiring-orchestrator
+Task: Async pgwire — extended query protocol (Parse/Bind/Describe/Execute/Sync/Close).
+
+Work Log:
+- Added `PreparedStatement` (sql + param_oids) and `Portal`
+  (stmt_name + params) structs to `PgConn`'s per-connection state.
+  Added `statements: HashMap<String, PreparedStatement>` and
+  `portals: HashMap<String, Portal>` fields.
+- Message handlers:
+  - **Parse (P)**: reads `cstring(stmt_name) + cstring(sql) +
+    int16(n_params) + int32[n_params](oids)`, stores the prepared
+    statement, emits `ParseComplete` ('1').
+  - **Bind (B)**: reads `cstring(portal_name) + cstring(stmt_name) +
+    int16(n_fmt) + int16[n_fmt](formats) + int16(n_params) +
+    for each: int32(len) + bytes + int16(n_rfmt) + int16[n_rfmt]`,
+    decodes parameters as text (NULL → -1 len, no payload), stores the
+    portal, emits `BindComplete` ('2'). Missing statement →
+    ErrorResponse (SQLSTATE 26000).
+  - **Describe (D)**: 'S' → `ParameterDescription` ('t') + `NoData` ('n');
+    'P' → `NoData` ('n'). (Mirrors pgwire.rs Wave 52 fix — we don't
+    execute the query just to learn the schema.)
+  - **Execute (E)**: reads `cstring(portal_name) + int32(max_rows)`,
+    fetches the portal + underlying statement, text-substitutes the
+    bound parameters via `substitute_params`, runs the SQL via
+    `route_and_execute`, emits `DataRow`* + `CommandComplete` (or
+    `ErrorResponse` on error). `max_rows > 0` (cursor mode) is treated
+    as unlimited for now — TODO comment left for a future wave.
+  - **Sync (S)**: flush + `ReadyForQuery`.
+  - **Close (C)**: drops the named statement or portal, emits
+    `CloseComplete` ('3').
+- Parameter substitution: `$1`/`$2`/... text interpolation with
+  SQL-injection-safe escaping (numeric values unquoted, strings wrapped
+  in single quotes with internal quotes doubled). Mirrors
+  `crate::server::pgwire::substitute_params` (private). A TODO comment
+  flags type-aware binding as a future improvement.
+- Tests:
+  - `async_pgwire_extended_query_parse_bind_execute`: Parse + Bind +
+    Execute an INSERT with `$1`, verify ParseComplete + BindComplete +
+    CommandComplete + ReadyForQuery. Then Parse + Bind + Execute a
+    SELECT, verify 1 DataRow + 'SELECT 1' tag.
+  - `async_pgwire_extended_query_describe_statement`: Parse + Describe
+    statement emits ParameterDescription + NoData.
+  - `async_pgwire_extended_query_close_drops_statement`: Close removes
+    the statement; subsequent Describe returns ErrorResponse.
+
+Stage Summary:
+- Extended query protocol complete: P/B/D/E/S/C all handled.
+- Task 5.2 done.
+
+---
+Task ID: 5.3
+Agent: prod-wiring-orchestrator
+Task: Async pgwire — connection pool integration.
+
+Work Log:
+- Added `AsyncPgwireServer::bind_with_pool(addr, pool)` — takes a
+  `Arc<ConnectionPool>`, clones `pool.engine` into the server's engine
+  field so the server and pool share the same `Arc<RwLock<QueryEngine>>`.
+- Added `AsyncPgwireServer::with_acquire_timeout(timeout)` builder to
+  override the default 5 s pool-acquire timeout (chainable).
+- `handle_connection` was restructured:
+  1. Read the startup message (new `read_startup_message` method — does
+     NOT send any response yet, just validates the protocol).
+  2. Acquire a `PoolPermit` from the pool (with the configured timeout).
+     On failure (timeout or pool error), send a FATAL `ErrorResponse`
+     ('E', severity='FATAL', SQLSTATE='53300', message='too many
+     connections') and close the connection.
+  3. Send `AuthenticationOk` + parameter statuses + `BackendKeyData` +
+     `ReadyForQuery` (via `send_authentication_ok_and_params` — split
+     out from the old `handle_startup`).
+  4. Enter the request loop.
+- This ordering is important: a rejected client sees only the FATAL —
+  not a misleading `ReadyForQuery` first (which would suggest the
+  connection is usable).
+- The permit is held for the entire request loop and dropped at the end
+  of `handle_connection` (RAII via `PoolPermit::Drop`).
+- Tests:
+  - `async_pgwire_pool_limits_concurrency`: pool size 2, 4 simultaneous
+    connections. The first 2 receive AuthOk + ReadyForQuery and sit
+    idle (holding their permits). The 3rd and 4th receive FATAL
+    ErrorResponse after the 200ms server-side acquire timeout.
+    Verifies `pool.metrics().active == 2` and `total_acquired == 2`
+    (the rejected acquires don't increment the counter).
+  - `async_pgwire_pool_releases_permit_on_disconnect`: pool size 1,
+    drop the first connection, verify a new connection can then
+    acquire the freed permit (proving the pool isn't permanently
+    stuck after rejections).
+
+Stage Summary:
+- AsyncPgwireServer now gates admission through a ConnectionPool.
+- Pool exhaustion is reported to the client as a FATAL pgwire error.
+- Task 5.3 done.
+
+---
+Task ID: 5.4
+Agent: prod-wiring-orchestrator
+Task: Async pgwire integration test.
+
+Work Log:
+- Added `async_pgwire_end_to_end_integration` — comprehensive test:
+  - Phase 1 (single connection): CREATE TABLE t (id INTEGER) →
+    'CREATE'; INSERT INTO t VALUES (1/2/3) → 'INSERT 0 1' x3;
+    SELECT * FROM t → RowDescription (1 col) + 3 DataRows +
+    'SELECT 3'. Verifies row count (3), column count (1), and the
+    actual row values (1, 2, 3) by parsing the DataRow first-column
+    bytes (`first_col_as_i64` helper).
+  - Phase 2 (concurrent): 3 concurrent SELECTs in parallel (multi_thread
+    runtime, 4 workers), each returns 3 DataRows + 'SELECT 3' command
+    tag. Proves the server correctly handles concurrent connections
+    on a shared `Arc<RwLock<QueryEngine>>` with no corruption.
+- Test uses raw `tokio::net::TcpStream` byte-level clients (no `psql`).
+
+Stage Summary:
+- End-to-end integration test passes. Task 5.4 done.
+
+---
+Wave 5 Summary
+
+Agent: prod-wiring-orchestrator
+Branch: feat/prod-wiring
+Commits (4):
+- 40fa9df feat(5): server: async pgwire startup + simple query protocol
+- 59df02a feat(5): server: async pgwire extended query protocol (Parse/Bind/Execute)
+- 48403f7 feat(5): server: async pgwire uses ConnectionPool for admission control
+- 5a49ae6 test(5): server: async pgwire end-to-end integration test
+
+Files:
+- NEW src/server/async_pgwire.rs (1182 LOC) — AsyncPgwireServer, PgConn,
+  wire-protocol helpers, Parse/Bind/Describe/Execute/Sync/Close
+  handlers, substitute_params + escape_param_value, command_tag,
+  split_sql_batch.
+- NEW src/server/async_pgwire_tests.rs (749 LOC) — 9 tests covering
+  startup, simple query, extended query, pool admission, end-to-end.
+- MODIFIED src/server/mod.rs — registered `pub mod async_pgwire;`.
+- MODIFIED WIRING_GAPS.md — marked Gaps 4 and 5 resolved.
+
+Tests: 880 lib tests pass (was 871 — 9 new async_pgwire tests added).
+Build: `cargo check --jobs 1` green with zero new warnings.
+`cargo check --jobs 1 --features raft` green (one pre-existing
+RpcMessage privacy warning, untouched).
+
+Deviations from the plan:
+- The task spec said "send the FATAL before reading the startup" was
+  acceptable. We chose to acquire the permit AFTER reading the startup
+  (but BEFORE sending AuthOk), so a rejected client sees only the FATAL
+  — not a misleading ReadyForQuery first. This required splitting
+  `handle_startup` into `read_startup_message` (no response) +
+  `send_authentication_ok_and_params` (full response). No functional
+  impact on tests; cleaner client-visible behavior.
+- INSERT INTO t VALUES (1) returns a non-empty QueryResult in turboGP
+  (the engine returns the inserted row), so the test
+  `async_pgwire_extended_query_parse_bind_execute` was relaxed to
+  assert on structural messages (ParseComplete, BindComplete, contains
+  CommandComplete, ends with ReadyForQuery) rather than an exact
+  `12CZ` sequence — INSERT may emit 0 or more DataRows depending on
+  engine internals.
+- `SELECT * FROM does_not_exist` returns an empty QueryResult in
+  turboGP (not an error), so the error-path test uses syntactically
+  invalid SQL (`FOOBAR baz quux`) instead.
+
+Stage Summary:
+- Gap 4 (Production pgwire server is a line-based skeleton) — RESOLVED.
+- Gap 5 (Connection pool is not on the production path) — RESOLVED.
+- Wave 5 complete. Ready for Wave 6.

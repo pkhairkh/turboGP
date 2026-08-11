@@ -69,7 +69,7 @@ Branch: `feat/prod-wiring`.
   Describe, Execute, Sync), and proper error/notice propagation. It is the
   default server for production deployments.
 - **Resolved by:** Wave 5 (Tasks 5.1–5.4).
-- **Resolved:** ☐
+- **Resolved:** ☑ (commits 40fa9df, 59df02a, 48403f7, 5a49ae6)
 
 ---
 
@@ -84,7 +84,7 @@ Branch: `feat/prod-wiring`.
   rejected with a `too_many_connections` error). The pool size is the upper
   bound on concurrent queries.
 - **Resolved by:** Wave 5 (Task 5.3).
-- **Resolved:** ☐
+- **Resolved:** ☑ (commit 48403f7)
 
 ---
 
