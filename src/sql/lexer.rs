@@ -303,6 +303,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 let s = read_string_literal(&mut chars)?;
                 tokens.push(Token::String(s));
             }
+            // Double-quoted identifier. The contents are taken literally
+            // (case preserved, spaces allowed) and never matched against
+            // the keyword table — `"order"` is an identifier, not ORDER.
+            // A doubled `""` inside the quotes is an escaped literal `"`.
+            '"' => {
+                chars.next();
+                let s = read_quoted_identifier(&mut chars)?;
+                tokens.push(Token::Ident(s));
+            }
             // Number or hex literal.
             '0'..='9' => {
                 let (tok, _consumed) = read_number(&mut chars)?;
@@ -423,6 +432,37 @@ fn skip_block_comment(
         }
     }
     Err("unterminated block comment".to_string())
+}
+
+/// Read a double-quoted identifier body, starting *after* the opening `"`.
+///
+/// Doubled `""` inside the quotes is an escaped literal `"` (matching
+/// PostgreSQL's behavior). Consumes the closing `"`. Returns `Err` if the
+/// identifier is unterminated. Unlike plain identifiers, the contents are
+/// not uppercased or matched against the keyword table.
+fn read_quoted_identifier(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, String> {
+    let mut s = String::new();
+    let mut closed = false;
+    while let Some(&c) = chars.peek() {
+        chars.next();
+        if c == '"' {
+            if chars.peek() == Some(&'"') {
+                chars.next();
+                s.push('"');
+            } else {
+                closed = true;
+                break;
+            }
+        } else {
+            s.push(c);
+        }
+    }
+    if !closed {
+        return Err("unterminated quoted identifier".to_string());
+    }
+    Ok(s)
 }
 
 /// Read a single-quoted string literal starting *after* the opening quote.
@@ -838,6 +878,53 @@ mod tests {
                 Token::EOF,
             ],
         );
+    }
+
+    #[test]
+    fn tokenize_quoted_identifier() {
+        // Spaces and case are preserved inside double quotes.
+        let toks = tokenize("SELECT \"my column\" FROM t").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Keyword("SELECT".into()),
+                Token::Ident("my column".into()),
+                Token::Keyword("FROM".into()),
+                Token::Ident("t".into()),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_quoted_identifier_preserves_case() {
+        let toks = tokenize("\"MyCol\"").unwrap();
+        assert_tokens_eq(&toks, &[Token::Ident("MyCol".into()), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_quoted_identifier_not_keyword() {
+        // `"order"` is an identifier, not the keyword ORDER.
+        let toks = tokenize("\"order\"").unwrap();
+        assert_tokens_eq(&toks, &[Token::Ident("order".into()), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_quoted_identifier_escaped_quote() {
+        // `""` inside the quotes is an escaped literal `"`.
+        let toks = tokenize("\"a\"\"b\"").unwrap();
+        assert_tokens_eq(&toks, &[Token::Ident("a\"b".into()), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_quoted_identifier_empty() {
+        let toks = tokenize("\"\"").unwrap();
+        assert_tokens_eq(&toks, &[Token::Ident("".into()), Token::EOF]);
+    }
+
+    #[test]
+    fn tokenize_unterminated_quoted_identifier_errors() {
+        assert!(tokenize("\"never closed").is_err());
     }
 
     #[test]
