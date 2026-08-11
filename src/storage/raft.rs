@@ -70,6 +70,7 @@ use openraft::{
     StorageError, StorageIOError, StoredMembership, TokioRuntime, Vote,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
+use crate::storage::raft_store::SledRaftStore;
 use tokio::task::{AbortHandle, JoinHandle};
 
 // =========================================================================
@@ -625,8 +626,12 @@ pub struct RaftManager {
     dispatcher_abort: AbortHandle,
     /// The factory the cluster shares (so `Drop` can unregister).
     factory: ChannelNetworkFactory,
-    /// The store (kept for test inspection).
-    store: MemStore,
+    /// The in-memory store (kept for test inspection). `None` when this
+    /// manager is backed by a [`SledRaftStore`] instead.
+    store: Option<MemStore>,
+    /// The disk-backed store, when this manager is persistent. `None`
+    /// when this manager uses the in-memory `MemStore`.
+    sled_store: Option<SledRaftStore>,
 }
 
 impl RaftManager {
@@ -659,6 +664,10 @@ impl RaftManager {
     /// initialized with itself as the only member and becomes leader
     /// immediately (trivially correct — one node is always a quorum of
     /// one).
+    ///
+    /// Uses the in-memory [`MemStore`]. For a persistent single-node
+    /// cluster that survives process restart, use
+    /// [`RaftManager::new_single_node_persistent`].
     pub async fn new_single_node(node_id: u64) -> Result<Self, String> {
         let config = Self::default_config()?;
         let factory = ChannelNetworkFactory::new();
@@ -687,7 +696,66 @@ impl RaftManager {
             node_id,
             dispatcher_abort,
             factory,
-            store,
+            store: Some(store),
+            sled_store: None,
+        })
+    }
+
+    /// Create a single-node Raft cluster backed by a disk-backed
+    /// [`SledRaftStore`] rooted at `data_dir`. The Raft log, vote, and
+    /// applied state machine persist across process restarts.
+    ///
+    /// The node is initialized with itself as the only member and becomes
+    /// leader immediately (trivially correct — one node is always a
+    /// quorum of one). If the data directory already contains initialized
+    /// state from a previous run, the existing state is loaded and no
+    /// re-initialization is performed.
+    pub async fn new_single_node_persistent<P: AsRef<std::path::Path>>(
+        node_id: u64,
+        data_dir: P,
+    ) -> Result<Self, String> {
+        let config = Self::default_config()?;
+        let factory = ChannelNetworkFactory::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        factory.register(node_id, tx).await;
+
+        let store = SledRaftStore::open(data_dir).map_err(|e| format!("SledRaftStore::open failed: {}", e))?;
+        let (log_store, state_machine) = Adaptor::new(store.clone());
+        let raft = Raft::new(node_id, config, factory.clone(), log_store, state_machine)
+            .await
+            .map_err(|e| format!("Raft::new failed: {}", e))?;
+
+        let (_join, dispatcher_abort) = Self::spawn_dispatcher(raft.clone(), rx);
+
+        // If the store has no log entries, this is a fresh node — initialize
+        // it with self as the only member. If it already has entries, the
+        // node was previously initialized and we should NOT re-initialize
+        // (openraft would reject a second `initialize` call with
+        // `NotAllowToInitialize`).
+        let is_fresh = {
+            let log_tree = store
+                .db_ref()
+                .open_tree("raft_log")
+                .map_err(|e| format!("open raft_log tree failed: {}", e))?;
+            log_tree.is_empty()
+        };
+        if is_fresh {
+            let members: BTreeMap<u64, BasicNode> =
+                [(node_id, BasicNode::new(format!("node-{}", node_id)))]
+                    .into_iter()
+                    .collect();
+            raft.initialize(members)
+                .await
+                .map_err(|e| format!("Raft::initialize failed: {}", e))?;
+        }
+
+        Ok(RaftManager {
+            raft,
+            node_id,
+            dispatcher_abort,
+            factory,
+            store: None,
+            sled_store: Some(store),
         })
     }
 
@@ -696,6 +764,9 @@ impl RaftManager {
     /// [`RaftManager::initialize_cluster`] on exactly one node after all
     /// members are created. All members must share the same
     /// `factory` (passed in so the cluster shares one registry).
+    ///
+    /// Uses the in-memory [`MemStore`]. For a persistent multi-node
+    /// cluster member, use [`RaftManager::new_persistent`].
     pub async fn new(
         node_id: u64,
         _peers: Vec<u64>,
@@ -718,7 +789,41 @@ impl RaftManager {
             node_id,
             dispatcher_abort,
             factory,
-            store,
+            store: Some(store),
+            sled_store: None,
+        })
+    }
+
+    /// Create a member of a multi-node cluster backed by a disk-backed
+    /// [`SledRaftStore`] rooted at `data_dir`. The caller must call
+    /// [`RaftManager::initialize_cluster`] on exactly one node after all
+    /// members are created (only when starting a fresh cluster; restarts
+    /// load existing state and skip initialization).
+    pub async fn new_persistent<P: AsRef<std::path::Path>>(
+        node_id: u64,
+        _peers: Vec<u64>,
+        factory: ChannelNetworkFactory,
+        data_dir: P,
+    ) -> Result<Self, String> {
+        let config = Self::default_config()?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        factory.register(node_id, tx).await;
+
+        let store = SledRaftStore::open(data_dir).map_err(|e| format!("SledRaftStore::open failed: {}", e))?;
+        let (log_store, state_machine) = Adaptor::new(store.clone());
+        let raft = Raft::new(node_id, config, factory.clone(), log_store, state_machine)
+            .await
+            .map_err(|e| format!("Raft::new failed: {}", e))?;
+
+        let (_join, dispatcher_abort) = Self::spawn_dispatcher(raft.clone(), rx);
+
+        Ok(RaftManager {
+            raft,
+            node_id,
+            dispatcher_abort,
+            factory,
+            store: None,
+            sled_store: Some(store),
         })
     }
 
@@ -802,8 +907,18 @@ impl RaftManager {
     }
 
     /// Borrow the in-memory store (for test inspection of applied records).
-    pub fn store(&self) -> &MemStore {
-        &self.store
+    /// Returns `None` if this manager is backed by a [`SledRaftStore`]
+    /// (use [`RaftManager::sled_store`] instead).
+    pub fn store(&self) -> Option<&MemStore> {
+        self.store.as_ref()
+    }
+
+    /// Borrow the disk-backed store (for test inspection of applied records
+    /// and direct persistence operations). Returns `None` if this manager
+    /// is backed by an in-memory [`MemStore`] (use [`RaftManager::store`]
+    /// instead).
+    pub fn sled_store(&self) -> Option<&SledRaftStore> {
+        self.sled_store.as_ref()
     }
 
     /// Gracefully shut down this node's Raft core and dispatcher. After
@@ -931,7 +1046,7 @@ mod tests {
             // Wait for both entries to apply.
             mgr.wait_applied_at_least(2, 2000).await.expect("applied >= 2");
 
-            let applied = mgr.store().applied_records().await;
+            let applied = mgr.store().expect("memstore").applied_records().await;
             assert_eq!(applied.len(), 2, "applied_records: {:?}", applied);
             assert_eq!(applied[0], b"INSERT INTO t VALUES (1)");
             assert_eq!(applied[1], b"INSERT INTO t VALUES (2)");
@@ -995,7 +1110,7 @@ mod tests {
 
             let mut found = 0;
             for n in &nodes {
-                let applied = n.store().applied_records().await;
+                let applied = n.store().expect("memstore").applied_records().await;
                 if applied.iter().any(|r| r == b"INSERT INTO t VALUES (42)") {
                     found += 1;
                 }
@@ -1075,7 +1190,7 @@ mod tests {
 
             let mut found = 0;
             for n in &nodes {
-                let applied = n.store().applied_records().await;
+                let applied = n.store().expect("memstore").applied_records().await;
                 if applied.iter().any(|r| r == b"INSERT INTO t VALUES (99)") {
                     found += 1;
                 }
@@ -1098,5 +1213,78 @@ mod tests {
         let encoded = encode_snapshot(&records);
         let decoded = decode_snapshot(&encoded);
         assert_eq!(decoded, records);
+    }
+
+    /// Task 2.3 DoD: create persistent RaftManager, propose 5 records,
+    /// drop, recreate with the same data dir, verify the 5 records are
+    /// present in the reopened store.
+    #[test]
+    fn raft_manager_persistent_survives_restart() {
+        use tempfile::tempdir;
+        let rt = rt();
+        rt.block_on(async {
+            let dir = tempdir().expect("tempdir");
+            let dir_path = dir.path().to_path_buf();
+
+            // Phase 1: create persistent manager, propose 5 records.
+            {
+                let mgr = RaftManager::new_single_node_persistent(1, &dir_path)
+                    .await
+                    .expect("new_single_node_persistent");
+                mgr.wait_until_leader(3000).await.expect("leader");
+
+                for i in 1..=5u8 {
+                    let payload = vec![b'r', b'-', i];
+                    mgr.propose(&payload).await.expect("propose");
+                }
+                // Wait for all 5 entries to apply.
+                mgr.wait_applied_at_least(5, 3000).await.expect("applied >= 5");
+
+                let applied = mgr
+                    .sled_store()
+                    .expect("sled_store")
+                    .applied_records()
+                    .expect("applied_records");
+                assert_eq!(applied.len(), 5, "expected 5 applied records");
+                // Explicitly shutdown the Raft core so it releases its
+                // references to the sled store. Without this, the
+                // dispatcher task and the openraft state machine keep
+                // `Arc<Db>` clones alive and sled's file lock is not
+                // released — the reopen would fail with `WouldBlock`.
+                let _ = mgr.shutdown().await;
+                // Give the runtime a moment to drop the dispatcher task
+                // and the openraft `Arc`s. 200 ms is empirically enough.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                drop(mgr);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+
+            // Phase 2: re-open with the SAME data dir. The previously-applied
+            // records MUST be present.
+            {
+                let mgr = RaftManager::new_single_node_persistent(1, &dir_path)
+                    .await
+                    .expect("reopen new_single_node_persistent");
+                // Give the new leader a moment to settle.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                let applied = mgr
+                    .sled_store()
+                    .expect("sled_store")
+                    .applied_records()
+                    .expect("applied_records after reopen");
+                assert_eq!(
+                    applied.len(),
+                    5,
+                    "expected 5 applied records after restart, got {}",
+                    applied.len()
+                );
+                // Verify payload content.
+                for (i, rec) in applied.iter().enumerate() {
+                    let expected_i = (i + 1) as u8;
+                    assert_eq!(rec, &[b'r', b'-', expected_i], "record {} mismatch", i);
+                }
+            }
+        });
     }
 }

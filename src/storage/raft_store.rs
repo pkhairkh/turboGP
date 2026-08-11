@@ -120,6 +120,14 @@ impl SledRaftStore {
         &self.data_dir
     }
 
+    /// Borrow the underlying sled database. Used by callers that need
+    /// to inspect or manipulate sled trees directly (e.g. checking
+    /// whether the `raft_log` tree is empty before initializing a
+    /// cluster).
+    pub fn db_ref(&self) -> &Db {
+        &self.db
+    }
+
     /// Convenience accessor for the `raft_log` tree.
     fn log_tree(&self) -> Result<Tree, StorageError<u64>> {
         self.db.open_tree("raft_log").map_err(sled_io_err)
