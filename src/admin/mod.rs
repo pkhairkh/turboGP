@@ -726,4 +726,121 @@ mod tests {
             );
         }
     }
+
+    /// End-to-end admin CLI round-trip: write data via `QueryEngine`,
+    /// `backup` the data dir, `restore` into a fresh dir, then reopen
+    /// via `QueryEngine::with_data_dir` and verify every row survived.
+    ///
+    /// This is the Task 9.3 DoD test. It calls the admin functions
+    /// directly (no subprocess) — faster than spawning the binary and
+    /// avoids build-order complexity.
+    #[test]
+    fn admin_end_to_end_backup_restore_round_trip() {
+        let src_dir = TempDir::new().expect("tempdir src");
+        let data_dir = src_dir.path();
+        let backup_root = TempDir::new().expect("tempdir backup");
+        let backup_dir = backup_root.path().join("snapshot");
+        let restore_root = TempDir::new().expect("tempdir restore");
+        let restored_data_dir = restore_root.path().join("data");
+
+        // Phase 1: start a turboGP instance, insert 50 rows, CHECKPOINT
+        // so the catalog is on disk (checkpoint.bin) and the WAL is
+        // truncated.
+        {
+            let mut engine = crate::engine::QueryEngine::with_data_dir(data_dir)
+                .expect("with_data_dir");
+            engine.execute("CREATE TABLE t (id INT, v INT)").expect("CREATE TABLE");
+            for i in 0..50u64 {
+                let sql = format!("INSERT INTO t VALUES ({}, {})", i, i * 2);
+                engine.execute(&sql).expect("INSERT");
+            }
+            // Verify the data is queryable before backup.
+            let r = engine.execute("SELECT count(*) FROM t").expect("count before backup");
+            assert_eq!(r.scalar_u64(), Some(50), "50 rows must be visible before backup");
+
+            // CHECKPOINT so the catalog is durably on disk and the WAL
+            // is truncated. Without this, the data lives only in the
+            // WAL (which would also round-trip, but CHECKPOINT is the
+            // more interesting case to verify the binary snapshot
+            // survives the file-level copy).
+            engine.execute("CHECKPOINT").expect("CHECKPOINT");
+        } // engine dropped — files closed
+
+        // Phase 2: admin backup — recursively copy data_dir to backup_dir.
+        backup(data_dir, &backup_dir).expect("backup ok");
+
+        // Sanity check: the backup should contain checkpoint.bin (the
+        // binary catalog snapshot) and the wal/ directory.
+        assert!(
+            backup_dir.join("checkpoint.bin").exists(),
+            "backup must contain checkpoint.bin"
+        );
+        assert!(
+            backup_dir.join("wal").is_dir(),
+            "backup must contain the wal/ directory"
+        );
+
+        // Phase 3: admin restore — copy backup_dir into a fresh data dir.
+        // restored_data_dir does not exist yet; restore() creates it.
+        restore(&restored_data_dir, &backup_dir).expect("restore ok");
+
+        // Verify the restored data dir contains the same key files.
+        assert!(
+            restored_data_dir.join("checkpoint.bin").exists(),
+            "restored data dir must contain checkpoint.bin"
+        );
+
+        // Phase 4: reopen the engine at the restored data dir and
+        // verify every row survived.
+        {
+            let mut engine = crate::engine::QueryEngine::with_data_dir(&restored_data_dir)
+                .expect("reopen restored engine");
+            let r = engine.execute("SELECT count(*) FROM t").expect("count after restore");
+            assert_eq!(
+                r.scalar_u64(),
+                Some(50),
+                "row count must round-trip through backup -> restore"
+            );
+            // Spot-check a specific row: v = id * 2.
+            let r = engine
+                .execute("SELECT v FROM t WHERE id = 42")
+                .expect("select v where id=42");
+            assert_eq!(
+                r.scalar_u64(),
+                Some(84),
+                "row id=42 must have v=84 after restore"
+            );
+            // Spot-check another row.
+            let r = engine
+                .execute("SELECT id FROM t WHERE v = 30")
+                .expect("select id where v=30");
+            assert_eq!(
+                r.scalar_u64(),
+                Some(15),
+                "row with v=30 must have id=15 after restore"
+            );
+        }
+
+        // Phase 5: the admin tooling must compose — running backup
+        // again from the restored dir, then restoring into a second
+        // fresh dir, must round-trip the same data.
+        let backup2_root = TempDir::new().expect("tempdir backup2");
+        let backup2_dir = backup2_root.path().join("snapshot2");
+        let restore2_root = TempDir::new().expect("tempdir restore2");
+        let restored2_data_dir = restore2_root.path().join("data");
+        backup(&restored_data_dir, &backup2_dir).expect("backup2 ok");
+        restore(&restored2_data_dir, &backup2_dir).expect("restore2 ok");
+        {
+            let mut engine = crate::engine::QueryEngine::with_data_dir(&restored2_data_dir)
+                .expect("reopen second restored engine");
+            let r = engine
+                .execute("SELECT count(*) FROM t")
+                .expect("count after second restore");
+            assert_eq!(
+                r.scalar_u64(),
+                Some(50),
+                "row count must round-trip through two backup -> restore cycles"
+            );
+        }
+    }
 }
