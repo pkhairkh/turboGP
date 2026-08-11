@@ -138,6 +138,21 @@ pub struct QueryEngine {
     /// MVCC mode is opt-in via [`QueryEngine::enable_mvcc`] so existing
     /// callers that depend on snapshot-isolation semantics are unaffected.
     mvcc_enabled: bool,
+    /// Optional WAL streamer for replication (Wave 5 Task 5.3 — Agent C).
+    ///
+    /// When set, every successful WAL append+fsync also streams the record
+    /// to a replica via `WalStreamer::stream_record`. The streamer is
+    /// attached via [`QueryEngine::enable_replication`].
+    wal_streamer: Option<WalStreamerHandle>,
+}
+
+/// A handle to an active WAL streamer (Wave 5 Task 5.3 — Agent C).
+///
+/// Wraps `WalStreamer` in a `Mutex` so the engine can share it across
+/// threads (the engine itself is behind an `Arc<RwLock<QueryEngine>>`).
+pub struct WalStreamerHandle {
+    /// The underlying WalStreamer.
+    pub streamer: std::sync::Mutex<crate::storage::replication::WalStreamer>,
 }
 
 
@@ -438,6 +453,7 @@ impl QueryEngine {
             allowed_copy_dirs: Vec::new(),
             mvcc_txn_manager: crate::txn::MvccTxnManager::new(),
             mvcc_enabled: false,
+            wal_streamer: None,
         }
     }
 
@@ -702,43 +718,154 @@ impl QueryEngine {
         Ok(())
     }
 
+    /// Enable replication by attaching a `WalStreamer` (Wave 5 Task 5.3 — Agent C).
+    ///
+    /// Creates a `WalStreamer`, connects it to the replica at `peer_addr`,
+    /// and attaches it to the engine. After every successful WAL append+fsync,
+    /// the record is streamed to the replica via `WalStreamer::stream_record`.
+    ///
+    /// **Note:** This wraps the `WalStreamer` in a `Mutex` and stores it in
+    /// `self.wal_streamer`. The streaming happens inline in `wal_append_txn`
+    /// / `wal_append_record` after fsync succeeds. Stream errors are logged
+    /// as warnings (non-fatal) so a replica going down doesn't abort the
+    /// primary's transactions.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Other`] if the streamer fails to connect to `peer_addr`.
+    pub fn enable_replication(&mut self, peer_addr: &str) -> Result<()> {
+        let mut streamer = crate::storage::replication::WalStreamer::new();
+        streamer
+            .connect(peer_addr)
+            .map_err(Error::Other)?;
+        self.wal_streamer = Some(WalStreamerHandle {
+            streamer: std::sync::Mutex::new(streamer),
+        });
+        log::info!("Replication enabled: streaming WAL to {}", peer_addr);
+        Ok(())
+    }
+
+    /// Enable replication without connecting to a replica (Wave 5 Task 5.3).
+    ///
+    /// Attaches a `WalStreamer` that is NOT connected to any peer. The
+    /// streamer counts records (via `records_sent`) but doesn't actually
+    /// send them anywhere. Useful for testing the replication wiring
+    /// without a live replica.
+    pub fn enable_replication_local_only(&mut self) {
+        let streamer = crate::storage::replication::WalStreamer::new();
+        self.wal_streamer = Some(WalStreamerHandle {
+            streamer: std::sync::Mutex::new(streamer),
+        });
+    }
+
+    /// Returns the number of WAL records streamed to the replica (Wave 5 Task 5.3).
+    ///
+    /// Returns 0 if replication is not enabled.
+    #[must_use]
+    pub fn wal_records_streamed(&self) -> u64 {
+        if let Some(ref handle) = self.wal_streamer {
+            if let Ok(streamer) = handle.streamer.lock() {
+                return streamer.records_sent;
+            }
+        }
+        0
+    }
+
+    /// Enable Raft-based leader election (Wave 5 Task 5.4 — Agent C, STUB).
+    ///
+    /// **STUB:** `RaftNode::on_become_leader()` is not yet implemented by
+    /// Agent B. This method creates a `RaftNode` and stores it, but does
+    /// NOT start leader election or wire `Wal::set_streamer()` on becoming
+    /// leader. Documented as debt in `AGENT_C_API_REQUESTS.md`.
+    ///
+    /// When Agent B completes the Raft API, this method should:
+    /// 1. Create a `RaftNode` with the given `node_id` and `peers`.
+    /// 2. Start leader election.
+    /// 3. On becoming leader, call `self.enable_replication(peer_addr)`
+    ///    for each peer.
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok(())` (stub). Will return an error if
+    /// Raft initialization fails once implemented.
+    pub fn enable_raft(&mut self, _node_id: u64, _peers: Vec<(u64, String)>) -> Result<()> {
+        log::warn!(
+            "enable_raft: RaftNode integration is a STUB (Agent B hasn't completed \
+             RaftNode::on_become_leader). See AGENT_C_API_REQUESTS.md."
+        );
+        // TODO(Agent B): create RaftNode, start election, wire set_streamer
+        // on becoming leader.
+        Ok(())
+    }
+
     /// Append a DML/DDL record to the WAL (if enabled).
     ///
     /// Wave 51 fix: `txn_id` is `Some(id)` for statements inside an
     /// explicit transaction, or `None` for autocommit. The record carries
     /// the txn_id so replay can group statements by transaction.
     ///
-    /// Wave 3 (A5): WAL errors are now propagated — if the WAL append or
-    /// sync fails, the error is logged and the engine continues (the
-    /// transaction will be visible in-memory but may not survive a crash).
-    /// A future wave will make this abort the transaction.
-    fn wal_append_txn(&mut self, sql: &str, txn_id: Option<u64>) {
+    /// **Wave 5 Task 5.1 (Agent C):** WAL errors are now **raised**, not
+    /// logged-and-swallowed. If `wal.append()` or `wal.sync()` fails, the
+    /// error is propagated to the caller (`execute()`), which aborts the
+    /// transaction and returns the error to the user. Previously, a WAL
+    /// sync failure was silently logged and the transaction appeared to
+    /// succeed — risking data loss on crash.
+    ///
+    /// Returns `Ok(())` if the WAL is not enabled (no-op).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Other`] wrapping the underlying I/O error if `wal.append()`
+    ///   or `wal.sync()` fails.
+    fn wal_append_txn(&mut self, sql: &str, txn_id: Option<u64>) -> Result<()> {
         if let Some(ref mut wal) = self.wal {
             let record = match txn_id {
                 Some(id) => crate::storage::recovery::WalRecord::txn_dml(id, sql),
                 None => crate::storage::recovery::WalRecord::autocommit(sql),
             };
-            if let Err(e) = wal.append(&record) {
-                log::error!("WAL append failed (A5): {e}");
-            }
-            if let Err(e) = wal.sync() {
-                log::error!("WAL sync failed (A5): {e}");
+            wal.append(&record)
+                .map_err(|e| Error::Other(format!("WAL append failed: {e}")))?;
+            wal.sync()
+                .map_err(|e| Error::Other(format!("WAL sync failed: {e}")))?;
+            // Wave 5 Task 5.3 (Agent C): if a WalStreamer is attached, stream
+            // the record to the replica after fsync.
+            if let Some(ref streamer_handle) = self.wal_streamer {
+                if let Ok(mut streamer) = streamer_handle.streamer.lock() {
+                    if let Err(e) = streamer.stream_record(&record) {
+                        log::warn!("WAL stream to replica failed (non-fatal): {e}");
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     /// Append a pre-constructed WAL record (BEGIN / COMMIT / ROLLBACK
     /// markers, or any other special record). Used by `execute()` to
     /// write transaction boundary markers (Wave 51 fix).
-    fn wal_append_record(&mut self, record: crate::storage::recovery::WalRecord) {
+    ///
+    /// **Wave 5 Task 5.1 (Agent C):** WAL errors are raised, not swallowed.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Other`] wrapping the underlying I/O error if `wal.append()`
+    ///   or `wal.sync()` fails.
+    fn wal_append_record(&mut self, record: crate::storage::recovery::WalRecord) -> Result<()> {
         if let Some(ref mut wal) = self.wal {
-            if let Err(e) = wal.append(&record) {
-                log::error!("WAL append failed (A5): {e}");
-            }
-            if let Err(e) = wal.sync() {
-                log::error!("WAL sync failed (A5): {e}");
+            wal.append(&record)
+                .map_err(|e| Error::Other(format!("WAL append failed: {e}")))?;
+            wal.sync()
+                .map_err(|e| Error::Other(format!("WAL sync failed: {e}")))?;
+            // Wave 5 Task 5.3 (Agent C): stream to replica after fsync.
+            if let Some(ref streamer_handle) = self.wal_streamer {
+                if let Ok(mut streamer) = streamer_handle.streamer.lock() {
+                    if let Err(e) = streamer.stream_record(&record) {
+                        log::warn!("WAL stream to replica failed (non-fatal): {e}");
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     /// Construct an engine with a custom cost model (e.g., one with a
@@ -962,10 +1089,10 @@ impl QueryEngine {
                 // manager based on mvcc_enabled.
                 if self.mvcc_enabled {
                     let id = self.mvcc_txn_manager.begin().map_err(Error::Other)?;
-                    self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
+                    self.wal_append_record(crate::storage::recovery::WalRecord::begin(id))?;
                 } else {
                     let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
-                    self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
+                    self.wal_append_record(crate::storage::recovery::WalRecord::begin(id))?;
                 }
                 return Ok(QueryResult::empty());
             }
@@ -982,7 +1109,7 @@ impl QueryEngine {
                     txn_id
                 };
                 self.savepoints.clear(); // Wave 69: clear savepoints on commit.
-                self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id));
+                self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id))?;
                 return Ok(QueryResult::empty());
             }
             crate::engine::dispatch::StatementKind::Rollback => {
@@ -996,7 +1123,7 @@ impl QueryEngine {
                     txn_id
                 };
                 self.savepoints.clear(); // Wave 69: clear savepoints on rollback.
-                self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id));
+                self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id))?;
                 return Ok(QueryResult::empty());
             }
             _ => {
@@ -1257,7 +1384,7 @@ impl QueryEngine {
                 }
             }
             // Wave 51 fix: append AFTER successful execute.
-            self.wal_append_txn(sql, txn_id);
+            self.wal_append_txn(sql, txn_id)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }
@@ -1267,7 +1394,7 @@ impl QueryEngine {
             let mut result = self.execute_dml(dml)?;
             // Wave 51 fix: append AFTER successful execute. If execute_dml
             // returns Err, we never reach this line, so the WAL stays clean.
-            self.wal_append_txn(sql, txn_id);
+            self.wal_append_txn(sql, txn_id)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }

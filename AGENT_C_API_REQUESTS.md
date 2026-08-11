@@ -181,6 +181,8 @@ verifies a basic PIVOT query executes.
 | 4 | 4.2 Row-version creation | DEBT | Agent B: populate `Table.row_versions` in INSERT/UPDATE/DELETE; add `Table::append_row_version`, `Table::mark_deleted`; update `execute_select` to filter by visibility |
 | 4 | 4.1 begin_with_isolation | DEBT | Agent B: add `MvccTxnManager::begin_with_isolation(level)` |
 | 4 | 4.3 vacuum dead row versions | DEBT | Agent B: add `MvccTxnManager::vacuum(&mut tables)` that removes dead row versions |
+| 5 | 5.2 `Wal::append_and_sync` | DEBT | Agent B: add atomic append+fsync method |
+| 5 | 5.4 `RaftNode::on_become_leader` | DEBT | Agent B: add leader-election callback API |
 
 All hacks are tagged with comments referencing this file in the relevant
 source files.
@@ -267,24 +269,76 @@ spawns 2 threads, each does BEGIN/INSERT/COMMIT. Both succeed.
 
 ### Wave 5 — WAL durability and replication
 
-**Status:** Not yet started.
+**Status:** Tasks 5.1, 5.3 COMPLETE. Tasks 5.2, 5.4 are DOCUMENTED AS DEBT.
 
-`Wal` already has `append()` + `sync()` as separate calls. Agent C needs:
-- `Wal::append_and_sync(record: &WalRecord) -> std::io::Result<()>` — atomic
-  append + fsync, so we don't have a window where the append succeeded but
-  sync failed.
-- `Wal::set_streamer(streamer: WalStreamer)` — registers a streamer that's
-  called after every successful append+sync, for replication.
-- `RaftNode::on_become_leader(callback)` — hook so the engine can wire
-  `Wal::set_streamer()` when this node wins leader election.
+#### Task 5.1 — Complete (WAL errors raised)
 
-**Until Agent B completes these:** Agent C will:
-- Make `wal_append_txn` return `Result<()>` (raise errors instead of
-  logging them) — this is doable now.
-- Keep the separate `wal.append()` + `wal.sync()` calls (documented as
-  known debt).
-- Stub `enable_replication()` and `enable_raft()` (documented as known
-  debt).
+`wal_append_txn` and `wal_append_record` now return `Result<()>` (was `()`).
+If `wal.append()` or `wal.sync()` fails, the error is propagated to
+`execute()`, which aborts the transaction and returns the error to the user.
+Previously, WAL sync failures were silently logged — risking data loss on
+crash.
+
+All callers in `execute()` and `execute_inner()` use `?` to propagate errors.
+
+#### Task 5.2 — `Wal::append_and_sync` (DEBT)
+
+The DoD specifies using `Wal::append_and_sync(record)` — an atomic
+append + fsync. The current `Wal` API (owned by Agent B) only has separate
+`append()` + `sync()` calls. Agent C uses the separate calls (with errors
+raised, from Task 5.1).
+
+**Why kept:** `Wal::append_and_sync()` doesn't exist in `src/storage/recovery.rs`.
+Agent B should add it so we don't have a window where the append succeeded
+but sync failed (the `?` propagation in Task 5.1 catches this, but a single
+atomic call would be cleaner).
+
+#### Task 5.3 — Complete (WalStreamer wired)
+
+`QueryEngine::enable_replication(peer_addr: &str)` creates a `WalStreamer`,
+connects it to the replica, and attaches it to the engine. After every
+successful WAL append+fsync, the record is streamed to the replica via
+`WalStreamer::stream_record`.
+
+The streamer is wrapped in a `Mutex` (`WalStreamerHandle`) so it can be
+shared across threads. Stream errors are logged as warnings (non-fatal) so
+a replica going down doesn't abort the primary's transactions.
+
+`enable_replication_local_only()` attaches a streamer that counts records
+but doesn't connect — useful for testing.
+
+`wal_records_streamed()` returns the count of records streamed (for tests).
+
+**Why this approach:** The DoD specifies `Wal::set_streamer(streamer)`. The
+current `Wal` API doesn't have `set_streamer`. Agent C stores the streamer
+in `QueryEngine.wal_streamer` instead of in the `Wal` object. The effect
+is the same: every WAL append triggers a stream call.
+
+**API request for Agent B:** Add `Wal::set_streamer(streamer: WalStreamer)`
+and have `Wal::append_and_sync()` automatically call `streamer.stream_record()`
+after fsync. This would let the streamer live inside `Wal` (cleaner
+encapsulation) instead of in `QueryEngine`.
+
+#### Task 5.4 — `RaftNode` leader election (DEBT/STUB)
+
+`QueryEngine::enable_raft(node_id, peers)` is a **stub** — it logs a warning
+and returns `Ok(())`. It does NOT start leader election or wire
+`Wal::set_streamer()` on becoming leader.
+
+**Why stubbed:** `RaftNode::on_become_leader(callback)` is not yet
+implemented by Agent B. The `RaftNode` struct exists in
+`src/storage/replication.rs` but has no callback API for leader election.
+
+**Required API from Agent B:**
+- `RaftNode::on_become_leader<F: Fn(&mut Self)>(&mut self, callback: F)`
+  — registers a callback fired when this node wins leader election.
+- The engine would use this to call `enable_replication(peer_addr)` for
+  each peer on becoming leader.
+
+Until Agent B completes this, `enable_raft` is a no-op stub. Documented in
+the method's doc comment.
+
+---
 
 ### Wave 6 — Backup/restore/PITR
 
