@@ -176,6 +176,9 @@ pub struct Wal {
     next_lsn: u64,
     /// Rotate to a new segment when the current one reaches this many bytes.
     segment_limit: u64,
+    /// The highest LSN that has been fsynced to disk (Task 2.4 group commit).
+    /// `sync_to_lsn(lsn)` only fsyncs if `lsn > last_synced_lsn`.
+    last_synced_lsn: u64,
 }
 
 impl Wal {
@@ -206,6 +209,7 @@ impl Wal {
             file: Some(file),
             next_lsn: 1,
             segment_limit,
+            last_synced_lsn: 0,
         };
         // Scan existing records to find the max LSN.
         if let Ok(records) = wal.read_all() {
@@ -288,10 +292,12 @@ impl Wal {
     }
 
     /// Fsync the WAL file to durably persist all appended records.
+    /// Updates `last_synced_lsn` to the current LSN (Task 2.4).
     pub fn sync(&mut self) -> std::io::Result<()> {
         if let Some(ref mut file) = self.file {
             file.sync_all()?;
         }
+        self.last_synced_lsn = self.current_lsn();
         Ok(())
     }
 
@@ -316,6 +322,55 @@ impl Wal {
         self.append(record)?;
         self.sync()?;
         Ok(())
+    }
+
+    /// Append a record WITHOUT fsyncing, returning the assigned LSN
+    /// (Task 2.4 — group commit framework).
+    ///
+    /// The record is written to the OS page cache but NOT fsynced. The
+    /// caller must later call `sync_to_lsn(lsn)` or `flush_group(&[lsn])`
+    /// to make the record durable. This enables group commit: multiple
+    /// transactions can append without fsync, then a single fsync covers
+    /// all of them.
+    ///
+    /// # Returns
+    /// The LSN assigned to this record. The caller can pass this LSN to
+    /// `sync_to_lsn()` or `flush_group()` to wait for durability.
+    pub fn append_async(&mut self, record: &WalRecord) -> std::io::Result<u64> {
+        self.append(record)?;
+        Ok(self.current_lsn())
+    }
+
+    /// Fsync the WAL only if the given LSN hasn't been fsynced yet
+    /// (Task 2.4 — group commit framework).
+    ///
+    /// If `lsn <= last_synced_lsn`, this is a no-op (the record is
+    /// already durable). Otherwise, fsync the WAL and update
+    /// `last_synced_lsn` to `lsn`.
+    ///
+    /// This enables group commit: N transactions each append a record
+    /// (getting LSNs L, L+1, ..., L+N-1), then each calls
+    /// `sync_to_lsn(their_lsn)`. Only the first call fsyncs; the rest
+    /// are no-ops because `last_synced_lsn` was bumped past their LSN.
+    pub fn sync_to_lsn(&mut self, lsn: u64) -> std::io::Result<()> {
+        if lsn > self.last_synced_lsn {
+            if let Some(ref mut file) = self.file {
+                file.sync_all()?;
+            }
+            self.last_synced_lsn = lsn;
+        }
+        Ok(())
+    }
+
+    /// Fsync once for a batch of LSNs (Task 2.4 — group commit framework).
+    ///
+    /// Finds the maximum LSN in `lsns` and calls `sync_to_lsn(max)`.
+    /// This is the group-commit primitive: N concurrent transactions
+    /// collect their LSNs, call `flush_group(&lsns)`, and a single
+    /// fsync makes all N records durable.
+    pub fn flush_group(&mut self, lsns: &[u64]) -> std::io::Result<()> {
+        let max_lsn = lsns.iter().copied().max().unwrap_or(0);
+        self.sync_to_lsn(max_lsn)
     }
 
     /// Read all records from the WAL (for replay on startup).
@@ -1385,5 +1440,51 @@ mod tests {
         assert_eq!(wal.segment_count().unwrap(), 1, "only segment 0 after truncate");
         assert_eq!(wal.read_all().unwrap().len(), 0, "WAL empty after truncate");
         assert_eq!(wal.current_lsn(), lsn_before, "next_lsn preserved");
+    }
+
+    /// Task 2.4 DoD: append_async returns the assigned LSN without fsyncing.
+    #[test]
+    fn wal_append_async_returns_lsn() {
+        let tmp = TempDir::new().unwrap();
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        let lsn1 = wal.append_async(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
+        let lsn2 = wal.append_async(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
+        let lsn3 = wal.append_async(&WalRecord::autocommit("INSERT INTO t VALUES (3)")).unwrap();
+        assert_eq!(lsn1, 1);
+        assert_eq!(lsn2, 2);
+        assert_eq!(lsn3, 3);
+        assert_eq!(wal.current_lsn(), 3);
+    }
+
+    /// Task 2.4 DoD: flush_group fsyncs once for a batch of LSNs.
+    #[test]
+    fn wal_flush_group_syncs_batch() {
+        let tmp = TempDir::new().unwrap();
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        // Append 3 records without fsync.
+        let lsn1 = wal.append_async(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
+        let lsn2 = wal.append_async(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
+        let lsn3 = wal.append_async(&WalRecord::autocommit("INSERT INTO t VALUES (3)")).unwrap();
+        // Group-commit: a single fsync covers all three.
+        wal.flush_group(&[lsn1, lsn2, lsn3]).unwrap();
+        // All records are durable and readable.
+        let records = wal.read_all().unwrap();
+        assert_eq!(records.len(), 3);
+    }
+
+    /// Task 2.4 DoD: sync_to_lsn is a no-op for already-synced LSNs.
+    #[test]
+    fn wal_sync_to_lsn_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        let lsn1 = wal.append_async(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
+        wal.sync_to_lsn(lsn1).unwrap();
+        // Syncing again at the same LSN is a no-op.
+        wal.sync_to_lsn(lsn1).unwrap();
+        // Syncing at a lower LSN is also a no-op.
+        wal.sync_to_lsn(0).unwrap();
+        // Records are durable.
+        let records = wal.read_all().unwrap();
+        assert_eq!(records.len(), 1);
     }
 }

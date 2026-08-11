@@ -63,3 +63,37 @@ formalises the API:
 - `Wal::advance_lsn_to(lsn: u64)` — bumps `next_lsn` past `lsn`.
 - `Wal::open()` scans existing records to recover `next_lsn`.
 - `Wal::truncate()` preserves `next_lsn` (monotonic across checkpoints).
+
+### WAL segmentation — Task 2.3
+
+**Changed** `Wal::open()` to take a **directory** (not a file path). The WAL
+now manages segment files `wal-<N>.log` inside the directory. Segments
+rotate at 64 MB (`DEFAULT_SEGMENT_LIMIT`).
+
+**Engine wiring**: `with_data_dir()` now creates a `wal/` subdirectory inside
+`data_dir` and passes it to `Wal::open()`. Previously it passed
+`data_dir.join("wal.log")` (a single file).
+
+**New API**:
+- `Wal::open(dir)` — opens a segmented WAL in the directory.
+- `Wal::open_with_segment_limit(dir, limit)` — for tests.
+- `Wal::segment_count() -> io::Result<usize>` — number of segment files.
+- `Wal::current_segment() -> u64` — current segment number.
+- `Wal::read_all()` reads across ALL segments in order.
+- `Wal::truncate()` deletes all segments and starts fresh at 0.
+
+### Group commit framework — Task 2.4
+
+**New API** in `src/storage/recovery.rs`:
+- `Wal::append_async(&mut self, record) -> io::Result<u64>` — appends without
+  fsync, returns the assigned LSN.
+- `Wal::sync_to_lsn(&mut self, lsn: u64) -> io::Result<()>` — fsyncs only if
+  `lsn > last_synced_lsn` (no-op otherwise).
+- `Wal::flush_group(&mut self, lsns: &[u64]) -> io::Result<()>` — fsyncs once
+  for a batch of LSNs (finds the max, calls `sync_to_lsn(max)`).
+
+**Engine usage** (optional, Agent C can wire later): instead of calling
+`append_and_sync()` per transaction, the engine can:
+1. `let lsn = wal.append_async(&record)?;`
+2. Collect LSNs from concurrent transactions.
+3. `wal.flush_group(&lsns)?;` — one fsync for all.
