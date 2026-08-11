@@ -6,6 +6,7 @@
 //! ErrorResponse for unsupported msgs, and SCRAM-SHA-256 authentication
 //! (Wave 65) when `ServerConfig::auth_required` is true.
 
+pub mod async_server;
 pub mod auth;
 pub mod pgwire;
 pub mod session;
