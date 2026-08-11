@@ -387,6 +387,41 @@ pub struct ReplayStats {
 pub struct Checkpoint;
 
 impl Checkpoint {
+    /// Save a checkpoint AND truncate the WAL atomically (Task 1.1).
+    ///
+    /// This is the canonical "checkpoint" operation: after it returns,
+    /// the checkpoint file at `path` contains the full catalog state,
+    /// and the WAL at `wal` is empty (zero length). On restart, the
+    /// engine loads the checkpoint first, then replays an empty WAL —
+    /// no duplicate rows.
+    ///
+    /// # Arguments
+    /// * `catalog` - The catalog to checkpoint.
+    /// * `path` - The checkpoint file path (e.g. `<data_dir>/checkpoint.sql`).
+    /// * `wal` - The WAL to truncate after the checkpoint is written.
+    ///
+    /// # Errors
+    /// Returns an error if either the checkpoint write or the WAL
+    /// truncation fails. If the checkpoint write fails, the WAL is NOT
+    /// truncated (so no data is lost). If the truncation fails after a
+    /// successful checkpoint write, the checkpoint is still valid — the
+    /// next restart will load the checkpoint and replay the (non-empty)
+    /// WAL, which may produce duplicate rows; Task 1.3's idempotent
+    /// replay defends against this case.
+    pub fn save_and_truncate(
+        catalog: &crate::catalog::Catalog,
+        path: &Path,
+        wal: &mut Wal,
+    ) -> std::io::Result<usize> {
+        let n = Self::save(catalog, path)?;
+        wal.truncate()?;
+        log::debug!(
+            "checkpoint: wrote {n} tables to {} and truncated WAL",
+            path.display()
+        );
+        Ok(n)
+    }
+
     /// Save a checkpoint of the current catalog state to a SQL file.
     /// The file contains:
     /// 1. CREATE TABLE statements for every table (with correct column
@@ -524,6 +559,14 @@ impl Checkpoint {
     /// the catalog to the state at checkpoint time, after which WAL replay
     /// applies any records written after the checkpoint.
     ///
+    /// **Task 1.1 fix:** The WAL is temporarily taken out of the engine
+    /// during checkpoint load so that the checkpoint statements are NOT
+    /// re-written to the WAL. Without this, loading a 10-row checkpoint
+    /// would append 10 INSERT records to the WAL, and the subsequent WAL
+    /// replay would re-execute them — producing 20 rows on restart (the
+    /// data-corruption bug). By loading the checkpoint in "no-WAL" mode,
+    /// we ensure the WAL stays empty after a checkpoint+restart cycle.
+    ///
     /// Returns the number of SQL statements executed.
     pub fn load<P: AsRef<Path>>(
         engine: &mut crate::engine::QueryEngine,
@@ -536,6 +579,12 @@ impl Checkpoint {
         }
         let content = std::fs::read_to_string(path)?;
         let mut count = 0;
+        // Take the WAL out of the engine so that the checkpoint statements
+        // (CREATE TABLE / INSERT) are NOT appended to the WAL during load.
+        // This is the critical fix for the duplicate-row data-corruption
+        // bug: without it, each checkpoint load re-populates the WAL, and
+        // the subsequent replay duplicates every row.
+        let saved_wal = engine.wal.take();
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with("--") {
@@ -549,6 +598,8 @@ impl Checkpoint {
                 }
             }
         }
+        // Restore the WAL so subsequent DML writes are durable.
+        engine.wal = saved_wal;
         log::info!("checkpoint: loaded {count} statements from {}", path.display());
         Ok(count)
     }
@@ -772,5 +823,39 @@ mod tests {
         assert!(content.contains("INSERT INTO users VALUES (1)"));
         assert!(content.contains("INSERT INTO users VALUES (2)"));
         assert!(content.contains("INSERT INTO users VALUES (3)"));
+    }
+
+    /// Task 1.1 DoD: save_and_truncate writes the checkpoint AND empties the WAL.
+    #[test]
+    fn checkpoint_save_and_truncate_empties_wal() {
+        let wal_tmp = NamedTempFile::new().unwrap();
+        let ckpt_tmp = NamedTempFile::new().unwrap();
+        let mut wal = Wal::open(wal_tmp.path()).unwrap();
+        // Append a few records to the WAL.
+        wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
+        wal.append(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
+        wal.sync().unwrap();
+        assert_eq!(wal.read_all().unwrap().len(), 2);
+
+        // Build a minimal catalog.
+        use crate::datasource::parquet::{LoadedColumn, LoadedTable};
+        use crate::datasource::Table as DS;
+        let mut cat = crate::catalog::Catalog::new();
+        cat.register(DS::from_loaded(LoadedTable {
+            name: "t".into(),
+            columns: vec![LoadedColumn {
+                name: "id".into(),
+                cells: vec![1, 2],
+                row_count: 2,
+                string_search: None,
+                null_bitmap: None,
+            }],
+            row_count: 2,
+        }));
+
+        let n = Checkpoint::save_and_truncate(&cat, ckpt_tmp.path(), &mut wal).unwrap();
+        assert_eq!(n, 1, "one table checkpointed");
+        assert_eq!(wal.read_all().unwrap().len(), 0, "WAL must be empty after checkpoint");
+        assert!(ckpt_tmp.path().exists(), "checkpoint file must exist");
     }
 }

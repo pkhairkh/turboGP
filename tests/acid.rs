@@ -173,13 +173,9 @@ fn test_acid_durability_commit_survives_checkpoint() {
     let mut engine = QueryEngine::with_data_dir(data_dir).unwrap();
     let result = engine.execute("SELECT COUNT(*) FROM persistent").unwrap();
     let count = result.columns[0].values[0];
-    // NOTE: WAL replay may duplicate rows if the checkpoint doesn't truncate
-    // the WAL. We verify that AT LEAST 10 rows survive (data is durable),
-    // and document the duplication as a known issue.
-    assert!(count >= 10, "Durability: at least 10 committed rows should survive restart (got {})", count);
-    if count > 10 {
-        eprintln!("WARNING: WAL replay duplicated rows ({} instead of 10) — known checkpoint/WAL truncation issue", count);
-    }
+    // Task 1.1 fix: checkpoint now truncates the WAL, so restart must
+    // produce exactly 10 rows (no duplicates from WAL replay).
+    assert_eq!(count, 10, "Durability: exactly 10 committed rows should survive restart (got {})", count);
 }
 
 #[test]
