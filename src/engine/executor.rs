@@ -1522,19 +1522,48 @@ fn filter_indices(
         filter_indices_old(where_clause, table)
     };
     if let Some(mgr) = mvcc {
-        // Retain only rows whose row_versions[i] is visible to the active
-        // txn. Rows without a row_versions entry (e.g. tables created
+        // Retain only rows whose row_versions[i] chain contains a visible
+        // version. Rows without a row_versions entry (e.g. tables created
         // before MVCC was enabled, or rows added by non-MVCC DDL) are kept
         // — backward compatibility.
-        indices.retain(|&i| {
-            if i < table.row_versions.len() {
-                mgr.is_row_visible_to_active(&table.row_versions[i])
-            } else {
-                true
-            }
-        });
+        //
+        // Task 3.1: `row_versions[i]` is now a `Vec<RowVersion>` (chain).
+        // We iterate the chain in reverse and accept the row if ANY version
+        // is visible (the latest visible version wins — the iterator
+        // short-circuits on the first visible version, which is the
+        // snapshot-isolation read rule).
+        indices.retain(|&i| row_visible_to_active(table, mgr, i));
     }
     indices
+}
+
+/// Check if row `i` is visible to the active transaction under MVCC.
+///
+/// Task 3.1: iterates the version chain at `row_versions[i]` in reverse
+/// and returns `true` if ANY version is visible to the active transaction
+/// (the latest visible version wins — short-circuits on first hit).
+///
+/// Rows without a `row_versions` entry (chain vec too short) or with an
+/// empty chain are treated as visible (backward compatibility with
+/// non-MVCC tables / pre-MVCC rows).
+///
+/// Task 3.2 (debt-4.3): this is the chokepoint where the snapshot_id-aware
+/// visibility check (`is_visible_with_snapshot`) is applied. Until 3.2
+/// lands, this uses the coarse `is_row_visible_to_active` (read-committed)
+/// check.
+fn row_visible_to_active(
+    table: &Table,
+    mgr: &crate::txn::MvccTxnManager,
+    i: usize,
+) -> bool {
+    if i >= table.row_versions.len() {
+        return true; // No chain — backward compat.
+    }
+    let chain = &table.row_versions[i];
+    if chain.is_empty() {
+        return true; // Empty chain — backward compat.
+    }
+    chain.iter().rev().any(|v| mgr.is_row_visible_to_active(v))
 }
 
 /// Task 5.3 — parallel MORS scan path for `filter_indices`.
@@ -1605,15 +1634,7 @@ fn filter_indices_parallel(
     let worker = |morsel: &[usize]| -> Vec<usize> {
         let mut out = Vec::with_capacity(morsel.len());
         for &i in morsel {
-            // MVCC visibility: rows without a row_versions entry (e.g.
-            // tables created before MVCC was enabled, or rows added by
-            // non-MVCC DDL) are kept — backward compatibility.
-            let visible = if i < table.row_versions.len() {
-                mgr.is_row_visible_to_active(&table.row_versions[i])
-            } else {
-                true
-            };
-            if !visible {
+            if !row_visible_to_active(table, mgr, i) {
                 continue;
             }
 

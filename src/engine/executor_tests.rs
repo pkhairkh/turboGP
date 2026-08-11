@@ -69,14 +69,15 @@ fn make_two_col_table(n: usize) -> DataSourceTable {
 fn test_execute_select_parallel_large_table() {
     let n = 5_000;
     let mut table = make_int_table(n);
-    // All rows committed-live: xmin=1 (committed), xmax=None.
+    // All rows committed-live: xmin=1 (committed), xmax=None. Each row
+    // gets a single-element chain (Task 3.1 layout: Vec<Vec<RowVersion>>).
     table.row_versions = (0..n)
-        .map(|i| RowVersion {
+        .map(|i| vec![RowVersion {
             xmin: 1,
             xmax: None,
             values: vec![i as u64],
             deleted: false,
-        })
+        }])
         .collect();
 
     // Manager: txn 1 committed (so xmin=1 is visible), txn 2 active reader.
@@ -113,23 +114,24 @@ fn test_execute_select_parallel_large_table() {
 fn test_filter_indices_parallel_excludes_invisible() {
     let n = 5_000;
     let mut table = make_int_table(n);
-    // Mark every 10th row as deleted by txn 2 (committed).
+    // Mark every 10th row as deleted by txn 2 (committed). Each row
+    // gets a single-element chain (Task 3.1 layout).
     table.row_versions = (0..n)
         .map(|i| {
             if i % 10 == 0 {
-                RowVersion {
+                vec![RowVersion {
                     xmin: 1,           // committed by txn 1
                     xmax: Some(2),     // deleted by txn 2
                     values: vec![i as u64],
                     deleted: false,
-                }
+                }]
             } else {
-                RowVersion {
+                vec![RowVersion {
                     xmin: 1,
                     xmax: None,
                     values: vec![i as u64],
                     deleted: false,
-                }
+                }]
             }
         })
         .collect();
@@ -168,14 +170,15 @@ fn test_filter_indices_parallel_excludes_invisible() {
 fn test_filter_indices_parallel_where_and_mvcc() {
     let n = 5_000;
     let mut table = make_two_col_table(n);
-    // All rows committed-live.
+    // All rows committed-live. Each row gets a single-element chain
+    // (Task 3.1 layout).
     table.row_versions = (0..n)
-        .map(|i| RowVersion {
+        .map(|i| vec![RowVersion {
             xmin: 1,
             xmax: None,
             values: vec![i as u64, (i % 7) as u64],
             deleted: false,
-        })
+        }])
         .collect();
 
     let mut mgr = MvccTxnManager::new();
@@ -209,14 +212,15 @@ fn test_filter_indices_parallel_where_and_mvcc() {
 fn test_filter_indices_parallel_matches_serial() {
     let n = 5_000;
     let mut table = make_two_col_table(n);
-    // Half the rows deleted by committed txn 2.
+    // Half the rows deleted by committed txn 2. Each row gets a
+    // single-element chain (Task 3.1 layout).
     table.row_versions = (0..n)
-        .map(|i| RowVersion {
+        .map(|i| vec![RowVersion {
             xmin: 1,
             xmax: if i % 2 == 0 { Some(2) } else { None },
             values: vec![i as u64, (i % 7) as u64],
             deleted: false,
-        })
+        }])
         .collect();
 
     let mut mgr = MvccTxnManager::new();
@@ -253,12 +257,12 @@ fn test_filter_indices_small_table_uses_serial_path() {
     let n = 1_000; // exactly the threshold (NOT > 1000).
     let mut table = make_int_table(n);
     table.row_versions = (0..n)
-        .map(|i| RowVersion {
+        .map(|i| vec![RowVersion {
             xmin: 1,
             xmax: None,
             values: vec![i as u64],
             deleted: false,
-        })
+        }])
         .collect();
 
     let mut mgr = MvccTxnManager::new();
