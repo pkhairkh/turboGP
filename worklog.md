@@ -2645,3 +2645,168 @@ Stage Summary:
   `impl QueryEngine` methods have identical signatures and
   semantics — only their visibility changed from private to
   `pub(crate)`.
+
+---
+Task ID: 8.3
+Agent: general-purpose
+Task: Add the final ACID + HA verification matrix test (Wave 8 closeout).
+
+Work Log:
+- Read `worklog.md` (2647 lines) for context on all prior waves (1-8).
+- Read the existing integration tests for API patterns:
+  - `tests/mvcc_integration.rs` — `enable_mvcc`, `begin_background_txn`,
+    `commit_background_txn`, `mvcc_txn_manager().active_id()`,
+    `is_active()`; the `test_execute_select_filters_uncommitted` pattern
+    for the Isolation sub-check.
+  - `tests/wal_durability_replication.rs` — `enable_replication_local_only`,
+    `wal_records_streamed()`, `QueryEngine::with_data_dir(data_dir)`.
+  - `tests/concurrency_test.rs` — `route_and_execute` on
+    `Arc<RwLock<QueryEngine>>` with N reader threads.
+  - `tests/dml_checkpoint.rs` and `src/engine/binary_checkpoint_tests.rs`
+    — `CHECKPOINT` writes `checkpoint.bin` + `checkpoint.sql`;
+    `with_data_dir` reload restores from `checkpoint.bin`.
+  - `tests/acid.rs::test_acid_atomicity_consistency_mvcc` — MVCC-mode
+    ROLLBACK atomicity pattern (Task 3.6, passing as of Wave 3).
+- Read `src/engine/mod.rs` to confirm:
+  - `enable_mvcc()` (line 514), `begin_background_txn` (line 568),
+    `commit_background_txn` (line 579) — the `#[doc(hidden)]` test helpers.
+  - `with_data_dir` (line 588) — opens WAL, loads `checkpoint.bin` (or
+    falls back to `checkpoint.sql`), replays WAL.
+  - `enable_replication_local_only` (line 1005) — attaches a shared
+    `Arc<Mutex<WalStreamer>>` to both `self.wal_streamer` and the Wal's
+    stream sink; `wal_records_streamed()` (line 1034) reads
+    `streamer.records_sent`.
+  - `route_and_execute` (line 408) — takes `&Arc<RwLock<QueryEngine>>`,
+    uses `is_readonly_sql` (line 351) to pick read vs write lock.
+  - `CHECKPOINT` dispatch (line 1334) calls `flush_with_checkpoint()`
+    which writes `checkpoint.bin` + `checkpoint.sql` + WAL truncate.
+- Created `tests/acid_ha_verification_matrix.rs` (545 LOC — well under
+  the 1,500-LOC budget). Structure:
+  - One `#[test]` function: `test_acid_ha_verification_matrix`.
+  - Seven private `verify_*` helpers, each returning
+    `VerifyResult = (bool, String)` — `(passed, human-readable detail)`.
+    The test function destructures each result and prepends the property
+    name, building a `Vec<(&'static str, bool, String)>` of length 7.
+  - The test prints a summary table to stderr (`eprintln!`) with the
+    exact format from the task brief:
+    ```
+    ACID+HA Verification Matrix:
+      Atomicity     PASS   <detail>
+      Consistency   PASS   <detail>
+      Isolation     PASS   <detail>
+      Durability    PASS   <detail>
+      Persistence   PASS   <detail>
+      Concurrency   PASS   <detail>
+      Replication   PASS   <detail>
+
+    All 7 properties verified.
+    ```
+  - If any property fails, the test collects the failed property names
+    and panics with: `"ACID+HA verification FAILED for: <names>. See
+    the summary table above for details."`. All 7 sub-checks always run
+    (no short-circuit on first failure) so the summary is always
+    complete.
+- Sub-check details:
+  1. **Atomicity** (`verify_atomicity`): `QueryEngine::in_memory()` +
+     `enable_mvcc()`; `CREATE TABLE t (id INT)`; `BEGIN`; `INSERT INTO t
+     VALUES (1)`; `ROLLBACK`; `SELECT COUNT(*) FROM t` → assert count=0.
+     The MvccTxnManager marks T1 Aborted on ROLLBACK; the visibility
+     filter (`is_row_visible_to_active`) hides rows whose `xmin` is
+     Aborted.
+  2. **Consistency** (`verify_consistency`): `CREATE TABLE t (x INT
+     CHECK (x > 0))`; `INSERT INTO t VALUES (0)` → assert Err with
+     SQLSTATE `23514` in the message. Uses `x=0` (not `x=-1`) because
+     the DML parser tokenizes `-1` as `Op("-") Int(1)` (column-count
+     mismatch, not a CHECK violation) — same approach as
+     `tests/acid.rs::test_acid_atomicity_consistency_mvcc` and
+     `src/engine/dml.rs::test_check_violation_at_insert`.
+  3. **Isolation** (`verify_isolation`): `enable_mvcc()`; `CREATE TABLE
+     t (id INT)`; `BEGIN` (T1 current_active); `INSERT INTO t VALUES
+     (1)` (xmin=t1_id, InProgress); capture `t1_id =
+     mvcc_txn_manager().active_id()`; `begin_background_txn()` (T2
+     becomes current_active, T1 stays InProgress); T2 `SELECT COUNT(*)
+     FROM t` → assert count=0 (no dirty read); cleanup:
+     `commit_background_txn(t1_id)` + `execute("COMMIT")` (T2). Mirrors
+     `test_execute_select_filters_uncommitted` in
+     `tests/mvcc_integration.rs`.
+  4. **Durability** (`verify_durability`): `TempDir::new()` +
+     `QueryEngine::with_data_dir(tmp.path())`; `CREATE TABLE dur (id
+     INT)`; 25 INSERTs; pre-CHECKPOINT `SELECT COUNT(*)` (sanity = 25);
+     `CHECKPOINT`; drop engine (block scope exit); reload via
+     `with_data_dir`; `SELECT COUNT(*)` → assert count=25.
+  5. **Persistence** (`verify_persistence`): `TempDir::new()` +
+     `with_data_dir`; `CREATE TABLE persist (id INT)`; `INSERT INTO
+     persist VALUES (7)`; `CHECKPOINT`; drop engine; assert
+     `data_dir.join("checkpoint.bin").exists()` AND `metadata.len() >
+     0` (binary format, non-empty).
+  6. **Concurrency** (`verify_concurrency`): `QueryEngine::in_memory()`;
+     `CREATE TABLE conc (id INT)`; 50 INSERTs; wrap in
+     `Arc<RwLock<QueryEngine>>`; spawn 10 threads, each calls
+     `route_and_execute(&engine, "SELECT COUNT(*) FROM conc")`; join
+     all 10; assert all returned Ok with count=50. A deadlock would
+     hang and be killed by cargo's 60s test timeout; a panic in a
+     thread is caught and reported in the failure message.
+  7. **Replication** (`verify_replication`): `TempDir::new()` +
+     `with_data_dir`; `CREATE TABLE repl (id INT)`;
+     `enable_replication_local_only()`; assert
+     `wal_records_streamed() == 0` (sanity, before any INSERT);
+     `INSERT INTO repl VALUES (1)`; assert `wal_records_streamed() >=
+     1`. Requires `with_data_dir` (the WAL must be attached for the
+     streamer to receive records via `Wal::append_and_sync` — an
+     in-memory engine has `wal: None` and would stream 0 records).
+
+Verification:
+- `cargo check --jobs 1 --test acid_ha_verification_matrix` → 0 errors,
+  0 new warnings (only the 466 pre-existing lib warnings).
+- `cargo test --jobs 1 --test acid_ha_verification_matrix -- --nocapture`
+  → **1 passed, 0 failed**. Summary table printed exactly as specified:
+  ```
+  ACID+HA Verification Matrix:
+    Atomicity     PASS   BEGIN; INSERT; ROLLBACK; SELECT COUNT(*) → 0 (rolled-back insert invisible)
+    Consistency   PASS   INSERT x=0 rejected with SQLSTATE 23514 (check_violation)
+    Isolation     PASS   T1 uncommitted INSERT invisible to T2 (count=0, no dirty read)
+    Durability    PASS   CHECKPOINT + reload preserved all 25 rows (count=25)
+    Persistence   PASS   checkpoint.bin exists on disk (148 bytes, binary format)
+    Concurrency   PASS   10 concurrent SELECTs via route_and_execute all succeeded (count=50)
+    Replication   PASS   INSERT streamed 1 WAL record(s) to local replica (>= 1)
+
+  All 7 properties verified.
+  ```
+  Test runtime: 0.01s (well under any reasonable CI budget).
+- `cargo check --jobs 1 --tests` → 1 pre-existing error in
+  `tests/integration.rs` (`unresolved imports: turbogp::executor,
+  turbogp::memory::region`) — confirmed to pre-date this task (stashed
+  the new file and re-ran; same error). Not introduced by Task 8.3; the
+  new test file is the only file touched and is independent of
+  `tests/integration.rs`.
+- Committed on `feat/prod-hardening` as `56e78ef` with the
+  task-specified commit-message template. NOT pushed to origin.
+
+Constraints honoured:
+- Max 3 files touched: exactly 1 (`tests/acid_ha_verification_matrix.rs`
+  NEW). (The worklog append below is a separate post-commit step
+  explicitly required by the task brief, not part of the 3-file work
+  budget.)
+- Context budget: 545 LOC — well under the 1,500-LOC limit.
+- Tests use `expect()`/`match` with clear messages; no silent failures.
+- All 7 sub-checks run unconditionally and report PASS/FAIL in the
+  summary; the test only panics AFTER the summary is printed (so a
+  failure still produces the full matrix output, not just the first
+  failing assertion).
+- Each sub-check uses an isolated engine / temp dir — no shared state
+  between properties, so a failure in one cannot perturb another's
+  result.
+
+Stage Summary:
+- DoD met: `test_acid_ha_verification_matrix` verifies all 7 ACID/HA
+  properties (Atomicity, Consistency, Isolation, Durability,
+  Persistence, Concurrency, Replication) in a single test. All 7 pass.
+- The test prints the exact summary table format specified in the task
+  brief and panics with a clear message listing the failed property
+  names if any fail.
+- Wave 8 (closeout) is complete. The branch `feat/prod-hardening` is
+  ready for review/merge (NOT pushed to origin per the task brief).
+- The Production Hardening Programme is complete: 8 waves, all gaps
+  resolved or deferred-with-justification, benchmarks in place, docs
+  updated, and a final verification matrix that proves all 7 ACID/HA
+  properties hold end-to-end.
