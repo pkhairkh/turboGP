@@ -667,6 +667,55 @@ pub struct ReplayStats {
     pub error_messages: Vec<String>,
 }
 
+/// Replay WAL physical-change records directly against the engine's buffer
+/// pool, WITHOUT re-executing SQL (Task 3.2 — redo-only recovery).
+///
+/// This is the fast path: records that carry a `PhysicalChange` are applied
+/// directly to the buffer pool. Records WITHOUT a physical change (pure SQL
+/// records) are skipped here — the caller should fall back to `replay_wal`
+/// for those.
+///
+/// Returns statistics about how many physical changes were applied.
+pub fn replay_wal_physical(
+    engine: &mut crate::engine::QueryEngine,
+    wal: &Wal,
+) -> std::io::Result<ReplayStats> {
+    let records = wal.read_all()?;
+    let mut stats = ReplayStats::default();
+
+    // Group by transaction to skip uncommitted/rolled-back ones.
+    let mut committed_txns: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for record in &records {
+        if record.is_commit && record.txn_id != 0 {
+            committed_txns.insert(record.txn_id);
+        }
+    }
+
+    for record in &records {
+        // Skip rollback records.
+        if record.is_rollback {
+            continue;
+        }
+        // Skip uncommitted explicit transactions.
+        if record.txn_id != 0 && !committed_txns.contains(&record.txn_id) {
+            stats.skipped += 1;
+            continue;
+        }
+        // Only apply records that carry a physical change.
+        if let Some(ref change) = record.physical_change {
+            match engine.apply_physical_change_public(change) {
+                Ok(()) => stats.replayed += 1,
+                Err(e) => {
+                    stats.errors += 1;
+                    stats.error_messages.push(format!("physical replay error: {e}"));
+                }
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
 /// A checkpoint: flushes the catalog's DDL + data to a SQL file that
 /// can be re-executed on restart to restore the state without replaying
 /// the full WAL.
@@ -1536,5 +1585,29 @@ mod tests {
             let json2 = serde_json::to_string(&back).unwrap();
             assert_eq!(json, json2, "PhysicalChange round-trip mismatch");
         }
+    }
+
+    /// Task 3.2 DoD: replay_wal_physical applies PhysicalChange records
+    /// without re-executing SQL.
+    #[test]
+    fn replay_wal_physical_applies_changes() {
+        let tmp = TempDir::new().unwrap();
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        // Append physical change records only (no SQL).
+        wal.append(&WalRecord::physical(0, PhysicalChange::PageAlloc { table_id: 1, page_num: 0 })).unwrap();
+        wal.append(&WalRecord::physical(0, PhysicalChange::RowInsert {
+            table_id: 1, page_num: 0, slot: 0, values: vec![42],
+        })).unwrap();
+        wal.sync().unwrap();
+
+        // Replay physically into a fresh engine with a buffer pool.
+        let data_dir = TempDir::new().unwrap();
+        let mut engine = crate::engine::QueryEngine::with_data_dir(data_dir.path()).unwrap();
+        // Detach the engine's own WAL so replay doesn't re-write to it.
+        let saved_wal = engine.wal.take();
+        let stats = replay_wal_physical(&mut engine, &wal).unwrap();
+        engine.wal = saved_wal;
+        assert_eq!(stats.replayed, 2, "two physical changes applied");
+        assert_eq!(stats.errors, 0);
     }
 }
