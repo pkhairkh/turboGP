@@ -87,6 +87,41 @@ impl QueryEngine {
         if self.mvcc_enabled {
             let cleaned = self.mvcc_txn_manager.cleanup_aborted();
             log::debug!("VACUUM: cleaned {} aborted MVCC transactions", cleaned);
+
+            // Task 3.4: compact dead row versions from every table's
+            // version chains. `vacuum_table` removes versions whose
+            // xmin aborted OR whose xmax committed at or before the
+            // oldest active snapshot (no active txn can see them). The
+            // column data itself is NOT compacted here — only the
+            // `row_versions` chains shrink. Column compaction (reclaiming
+            // space from tombstoned rows) is a separate future step.
+            //
+            // We iterate over a snapshot of table names (collected under
+            // a read lock) and then mutate each table under a scoped
+            // write lock via `with_mut`. This avoids holding the
+            // catalog's write lock across all tables simultaneously and
+            // sidesteps the `&self` / `&mut self.mvcc_txn_manager` borrow
+            // conflict (the `with_mut` closure captures `table` only;
+            // the manager borrow is released before the next iteration).
+            let table_names = self.catalog.table_names();
+            let mut total_removed = 0usize;
+            for name in &table_names {
+                // Skip internal tables (e.g. __dummy__).
+                if name.starts_with("__") {
+                    continue;
+                }
+                let removed = self.catalog.with_mut(name, |table| {
+                    self.mvcc_txn_manager.vacuum_table(table)
+                });
+                if let Some(n) = removed {
+                    total_removed += n;
+                }
+            }
+            log::debug!(
+                "VACUUM: removed {} dead row versions across {} tables",
+                total_removed,
+                table_names.len()
+            );
         }
         let mut result = QueryResult::empty();
         result.row_count = 0;

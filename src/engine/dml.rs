@@ -1015,6 +1015,45 @@ impl QueryEngine {
             }
         }
 
+        // Task 3.5 — Serializable write-write conflict detection.
+        //
+        // When MVCC is enabled AND the active transaction's isolation level
+        // is `Serializable`, verify that no concurrent committed transaction
+        // has modified any matched row (first-committer-wins). This runs
+        // BEFORE the in-place column updates so a conflict leaves the table
+        // unchanged (atomicity). RepeatableRead skips this check — per the
+        // SQL standard, RR permits lost updates (the conflict would surface
+        // as a stale read, not an abort).
+        //
+        // The check looks at the latest version VISIBLE TO the active txn
+        // and errors if its `xmax` was set by a transaction that committed
+        // AFTER the active txn's snapshot. See
+        // [`MvccTxnManager::check_write_conflict_for_table`] for the full
+        // rule.
+        if self.mvcc_enabled
+            && self.mvcc_txn_manager.active_isolation_level()
+                == Some(crate::txn::IsolationLevel::Serializable)
+        {
+            let active_txn_id = txn_id.unwrap_or(0);
+            let active_snapshot_id = self
+                .mvcc_txn_manager
+                .active_snapshot_id()
+                .unwrap_or_else(|| self.mvcc_txn_manager.current_commit_id());
+            for (row_idx, &matches) in match_mask.iter().enumerate() {
+                if !matches {
+                    continue;
+                }
+                self.mvcc_txn_manager
+                    .check_write_conflict_for_table(
+                        table,
+                        active_txn_id,
+                        active_snapshot_id,
+                        row_idx,
+                    )
+                    .map_err(|e| Error::Other(e.message))?;
+            }
+        }
+
         for (row_idx, &matches) in match_mask.iter().enumerate() {
             if !matches {
                 continue;
@@ -1205,6 +1244,63 @@ impl QueryEngine {
         // so FOR SYSTEM_TIME queries see the row's end-time, but its
         // column rebuild is skipped to preserve the row-version alignment.
         if self.mvcc_enabled {
+            // Task 3.5 — Serializable write-write conflict detection.
+            //
+            // Before tombstoning any matched row, verify no concurrent
+            // committed transaction has modified it (first-committer-wins).
+            // Gated on Serializable isolation; RepeatableRead skips this.
+            // The check runs BEFORE the tombstoning loop so a conflict
+            // leaves all matched rows untouched (atomicity). On conflict,
+            // we return the error immediately — the temporal sidecar sync
+            // and column rebuild below are skipped.
+            if self.mvcc_txn_manager.active_isolation_level()
+                == Some(crate::txn::IsolationLevel::Serializable)
+            {
+                let active_txn_id = txn_id.unwrap_or(0);
+                let active_snapshot_id = self
+                    .mvcc_txn_manager
+                    .active_snapshot_id()
+                    .unwrap_or_else(|| self.mvcc_txn_manager.current_commit_id());
+                // Read the table under a scoped read lock to run the
+                // conflict checks. The tombstoning loop below takes its
+                // own write lock; splitting the two avoids holding the
+                // write lock during the (read-only) conflict scan.
+                //
+                // `catalog.with` returns `Option<R>` (None if the table
+                // is missing). Our closure returns `Option<ConflictError>`
+                // (None = no conflict, Some = conflict). We flatten the
+                // outer Option: a missing table is an error we surface
+                // as NotFound; otherwise we inspect the inner Option.
+                let conflict_result: Option<Option<crate::txn::ConflictError>> =
+                    self.catalog.with(&del.table, |table| {
+                        for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
+                            if !delete_flag {
+                                continue;
+                            }
+                            if let Err(e) = self.mvcc_txn_manager
+                                .check_write_conflict_for_table(
+                                    table,
+                                    active_txn_id,
+                                    active_snapshot_id,
+                                    row_idx,
+                                )
+                            {
+                                return Some(e);
+                            }
+                        }
+                        None
+                    });
+                let conflict_err: Option<crate::txn::ConflictError> = match conflict_result {
+                    Some(inner) => inner,
+                    None => {
+                        return Err(Error::NotFound(format!("table \"{}\"", del.table)));
+                    }
+                };
+                if let Some(e) = conflict_err {
+                    return Err(Error::Other(e.message));
+                }
+            }
+
             // Tombstone the deleted rows under a scoped write lock.
             self.catalog
                 .with_mut(&del.table, |table| {
@@ -1309,6 +1405,26 @@ impl QueryEngine {
         let mut result = QueryResult::empty();
         result.row_count = deleted;
         Ok(result)
+    }
+
+    /// Test-only: begin a background MVCC transaction with a specific
+    /// isolation level (Task 3.5).
+    ///
+    /// Like [`begin_background_txn`](Self::begin_background_txn) but allows
+    /// specifying the isolation level. Used by the Serializable conflict
+    /// detection integration test to start T1/T2 as `Serializable` (the
+    /// engine's `BEGIN` SQL always uses the default `RepeatableRead`).
+    ///
+    /// Returns the new transaction's ID. The previously-active transaction
+    /// (if any) remains in the manager's `txn_states` map as `InProgress`;
+    /// `current_active` is overwritten to the new txn.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn begin_background_txn_with_isolation(
+        &mut self,
+        level: crate::txn::IsolationLevel,
+    ) -> u64 {
+        self.mvcc_txn_manager.begin_with_isolation(level).id
     }
 }
 
