@@ -104,6 +104,13 @@ impl Default for WalStreamer {
     }
 }
 
+/// Task 5.1: implement WalStreamSink so WalStreamer can be attached to a Wal.
+impl crate::storage::recovery::WalStreamSink for WalStreamer {
+    fn stream(&mut self, record: &WalRecord) -> Result<usize, String> {
+        self.stream_record(record)
+    }
+}
+
 /// A WAL receiver that listens on a TCP port and applies records.
 ///
 /// The replica creates a `WalReceiver` bound to a TCP port, then calls
