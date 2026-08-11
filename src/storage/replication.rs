@@ -111,6 +111,59 @@ impl crate::storage::recovery::WalStreamSink for WalStreamer {
     }
 }
 
+/// A sink that fans out records to multiple `WalStreamer`s (Task 5.3).
+///
+/// Used by `RaftNode::on_become_leader` to stream WAL records to all
+/// followers via a single sink attached to the `Wal`.
+pub struct MultiWalStreamSink {
+    streamers: Vec<WalStreamer>,
+}
+
+impl MultiWalStreamSink {
+    /// Create an empty multi-sink.
+    pub fn new() -> Self {
+        Self { streamers: Vec::new() }
+    }
+
+    /// Add a streamer to the fan-out set.
+    pub fn add(&mut self, streamer: WalStreamer) {
+        self.streamers.push(streamer);
+    }
+
+    /// Number of streamers in the set.
+    pub fn len(&self) -> usize {
+        self.streamers.len()
+    }
+
+    /// Whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.streamers.is_empty()
+    }
+}
+
+impl Default for MultiWalStreamSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::storage::recovery::WalStreamSink for MultiWalStreamSink {
+    fn stream(&mut self, record: &WalRecord) -> Result<usize, String> {
+        let mut total = 0;
+        // Stream to all followers. A failure on one follower doesn't stop
+        // streaming to the others (best-effort replication).
+        for streamer in &mut self.streamers {
+            match streamer.stream_record(record) {
+                Ok(n) => total += n,
+                Err(e) => {
+                    log::warn!("multi-sink: stream to follower failed: {e}");
+                }
+            }
+        }
+        Ok(total)
+    }
+}
+
 /// A WAL receiver that listens on a TCP port and applies records.
 ///
 /// The replica creates a `WalReceiver` bound to a TCP port, then calls
@@ -327,6 +380,51 @@ impl RaftNode {
         for peer_id in self.peers.keys() {
             self.next_index.insert(*peer_id, log_len);
         }
+    }
+
+    /// Called when this node becomes the leader (Task 5.3).
+    ///
+    /// Connects a `WalStreamer` to each follower address in `peer_addrs`,
+    /// wraps them in a `MultiWalStreamSink`, and attaches the sink to the
+    /// `Wal` so subsequent `append_and_sync()` calls stream records to all
+    /// followers.
+    ///
+    /// Returns the number of followers successfully connected.
+    pub fn on_become_leader(
+        &mut self,
+        wal: &mut crate::storage::recovery::Wal,
+        peer_addrs: &[&str],
+    ) -> usize {
+        self.become_leader();
+        let mut multi_sink = MultiWalStreamSink::new();
+        let mut connected = 0;
+        for addr in peer_addrs {
+            let mut streamer = WalStreamer::new();
+            match streamer.connect(addr) {
+                Ok(()) => {
+                    log::info!("leader: connected WalStreamer to follower at {}", addr);
+                    multi_sink.add(streamer);
+                    connected += 1;
+                }
+                Err(e) => {
+                    log::warn!("leader: failed to connect to follower at {}: {}", addr, e);
+                }
+            }
+        }
+        if connected > 0 {
+            wal.set_stream_sink(std::sync::Arc::new(std::sync::Mutex::new(multi_sink)));
+        }
+        connected
+    }
+
+    /// Called when this node steps down from leader (Task 5.3).
+    ///
+    /// Detaches the stream sink from the `Wal` so records are no longer
+    /// streamed to followers.
+    pub fn on_demote(&mut self, wal: &mut crate::storage::recovery::Wal) {
+        self.state = RaftState::Follower;
+        wal.clear_stream_sink();
+        log::info!("demoted: disconnected WalStreamers from followers");
     }
 
     /// Append a log entry (leader only).
@@ -783,5 +881,69 @@ mod tests {
         assert_eq!(received.len(), 100);
         assert_eq!(received[0], "INSERT INTO t VALUES (0)");
         assert_eq!(received[99], "INSERT INTO t VALUES (99)");
+    }
+
+    /// Task 5.3 DoD: 3-node Raft cluster, leader election, verify leader
+    /// streams WAL to 2 followers.
+    #[test]
+    fn raft_leader_streams_to_followers() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use crate::storage::recovery::Wal;
+
+        // Bind 2 receivers (followers) on random ports.
+        let r1 = WalReceiver::bind("127.0.0.1:0").unwrap();
+        let r2 = WalReceiver::bind("127.0.0.1:0").unwrap();
+        let addr1 = r1.listener.as_ref().unwrap().local_addr().unwrap().to_string();
+        let addr2 = r2.listener.as_ref().unwrap().local_addr().unwrap().to_string();
+
+        let received1 = Arc::new(Mutex::new(Vec::new()));
+        let received2 = Arc::new(Mutex::new(Vec::new()));
+        let rc1 = received1.clone();
+        let rc2 = received2.clone();
+
+        let h1 = thread::spawn(move || {
+            let mut r1 = r1;
+            r1.run_apply_loop(|record| { rc1.lock().unwrap().push(record.sql.clone()); Ok(()) }).unwrap()
+        });
+        let h2 = thread::spawn(move || {
+            let mut r2 = r2;
+            r2.run_apply_loop(|record| { rc2.lock().unwrap().push(record.sql.clone()); Ok(()) }).unwrap()
+        });
+
+        // Wait for receivers to be ready.
+        thread::sleep(std::time::Duration::from_millis(50));
+
+        // Create a leader node and a Wal.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        let mut node = RaftNode::new(1);
+        node.add_peer(2, &addr1);
+        node.add_peer(3, &addr2);
+
+        // Become leader — connects WalStreamers to both followers.
+        let connected = node.on_become_leader(&mut wal, &[&addr1, &addr2]);
+        assert_eq!(connected, 2, "must connect to 2 followers");
+        assert_eq!(node.state, RaftState::Leader);
+
+        // Append records — they should stream to both followers.
+        wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
+        wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
+
+        // Give the receivers time to process.
+        thread::sleep(std::time::Duration::from_millis(100));
+        drop(wal); // close streamers → receivers see EOF
+
+        let c1 = h1.join().unwrap();
+        let c2 = h2.join().unwrap();
+        assert!(c1 >= 2, "follower 1 must receive >= 2 records (got {})", c1);
+        assert!(c2 >= 2, "follower 2 must receive >= 2 records (got {})", c2);
+
+        let r1 = received1.lock().unwrap();
+        let r2 = received2.lock().unwrap();
+        assert!(r1.contains(&"INSERT INTO t VALUES (1)".to_string()));
+        assert!(r1.contains(&"INSERT INTO t VALUES (2)".to_string()));
+        assert!(r2.contains(&"INSERT INTO t VALUES (1)".to_string()));
+        assert!(r2.contains(&"INSERT INTO t VALUES (2)".to_string()));
     }
 }
