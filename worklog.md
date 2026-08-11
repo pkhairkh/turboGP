@@ -1012,3 +1012,279 @@ Stage Summary:
   → quorum 2/3 → kill 1 (still 2/3, Ok) → kill 2 (only 1, Err). 870
   lib tests pass with `--features raft` (864 without); 13 integration
   tests pass (was 12). Ready for Wave 7.
+
+---
+Task ID: 7.1 + 7.2 + 7.3 + 7.4
+Agent: ha-concurrency-agent (Wave 7)
+Task: Connection pool with configurable size, async server integration,
+metrics, and stress test.
+
+Work Log:
+
+Commit 1 — `feat(7): server: connection pool with configurable size,
+metrics, stress test` (2385bd2):
+
+Task 7.1 — ConnectionPool implementation (`src/server/pool.rs`, NEW, 372
+lines including tests):
+- `PoolConfig { max_size: usize, acquire_timeout_secs: u64 }` with
+  `Default = { max_size: 10, acquire_timeout_secs: 30 }`.
+- `PoolMetrics { active, idle, waiting, total_acquired, total_released }`
+  — `Debug + Clone + Default`. Updated under a `parking_lot::Mutex` on
+  every `acquire` and `Drop`. `waiting` is reported as 0 (simplified —
+  `tokio::sync::Semaphore` does not expose a waiters count; a future
+  implementation could track it with an `AtomicUsize` incremented
+  before `acquire_owned` and decremented after).
+- `ConnectionPool`:
+  - `pub engine: Arc<RwLock<QueryEngine>>` — exposed as a public field
+    so `async_server::serve` can pull it out and pass it to
+    `handle_connection` after acquiring a permit (the pool itself does
+    NOT execute SQL — it only gates concurrency).
+  - `semaphore: Arc<tokio::sync::Semaphore>` — created with
+    `config.max_size` permits.
+  - `metrics: Arc<Mutex<PoolMetrics>>` — shared counters.
+  - `new(engine, config) -> Self`.
+  - `acquire(&self) -> Result<PoolPermit, String>` — wraps
+    `Semaphore::acquire_owned` under `tokio::time::timeout`. On
+    timeout: `Err("acquire timeout")`. On semaphore close:
+    `Err("semaphore: <err>")`. Updates `active`/`idle`/`total_acquired`
+    before returning.
+  - `metrics(&self) -> PoolMetrics` — snapshot under the metrics lock.
+  - `max_size(&self) -> usize` — accessor.
+- `PoolPermit`:
+  - `permit: Option<tokio::sync::OwnedSemaphorePermit>` — **owned**
+    variant (NOT `SemaphorePermit<'static>` as the task spec draft
+    suggested). The task spec explicitly flagged the `'static` lifetime
+    as "tricky" and suggested `OwnedSemaphorePermit` as the fix; we
+    took that suggestion. `OwnedSemaphorePermit` is `'static`, so it
+    can be moved freely across `.await` points and stored in spawned
+    tasks without lifetime gymnastics.
+  - `metrics: Arc<Mutex<PoolMetrics>>` — held so `Drop` can decrement.
+  - `into_raw(self) -> Option<OwnedSemaphorePermit>` — extract the raw
+    permit without triggering the metrics update (provided for
+    completeness; currently unused in production code, marked
+    `#[allow(dead_code)]`).
+  - `Drop`: takes the permit (dropping it adds one back to the
+    semaphore, unblocking a waiting `acquire`), then under the metrics
+    lock decrements `active`, increments `idle`, increments
+    `total_released`. The `idle + active == max_size` invariant is
+    maintained by simply incrementing `idle` by 1 (since `active` was
+    just decremented by 1) — `max_size` is not stored on the permit.
+- 5 unit tests in `pool::tests`:
+  - `pool_initial_metrics`: fresh pool reports all-zero counters.
+  - `acquire_and_release_updates_metrics`: acquire+drop round-trip
+    updates active/idle/total_acquired/total_released correctly.
+  - `acquire_blocks_when_pool_full`: 2 permits held on a max_size=2
+    pool; a third acquire (with 200ms outer timeout) blocks/times out
+    rather than succeeding immediately.
+  - `release_unblocks_waiting_acquire`: max_size=1; spawn a second
+    acquire that blocks, drop the first permit, the second acquires.
+  - `pool_exposes_engine_arc`: `Arc::ptr_eq(&pool.engine, &original)`
+    — confirms the engine Arc is passed through unchanged.
+
+Task 7.2 — Integrate pool with async server (`src/server/async_server.rs`):
+- `serve` signature changed from
+  `serve(addr: &str, engine: Arc<RwLock<QueryEngine>>) -> Result<(), String>`
+  to
+  `serve(addr: &str, pool: Arc<ConnectionPool>) -> Result<(), String>`.
+- Per-connection flow:
+  1. `accept()` the TCP stream.
+  2. `pool.clone()` (cheap Arc clone).
+  3. `tokio::spawn` a task that:
+     a. `pool.acquire().await` — waits up to `acquire_timeout_secs`.
+     b. On `Ok(_permit)`: call `handle_connection(stream, pool.engine.clone())`.
+        The permit is held for the entire connection lifetime and
+        released when the spawned task exits (whether
+        `handle_connection` returns Ok/Err or panics).
+     c. On `Err(e)`: write `ERROR: pool exhausted: {e}\n` to the client
+        and close. Logged at WARN via `log::warn!`.
+- `handle_connection` is unchanged (still takes
+  `Arc<RwLock<QueryEngine>>`); it receives `pool.engine.clone()` from
+  `serve`.
+- The existing `test_async_server_accepts_connection` test (Wave 4)
+  was updated to build a `ConnectionPool` and pass `Arc<ConnectionPool>`
+  to `serve` (the test previously passed a raw `Arc<RwLock<QueryEngine>>`).
+- New test `test_async_server_rejects_when_pool_full` (Task 7.2 DoD):
+  builds a pool with max_size=1, connects a first client (which reads
+  the banner but never sends SQL, so the handler blocks on `read_line`
+  holding the single permit), then connects a second client. The
+  second client should receive `ERROR: pool exhausted: acquire timeout`
+  within ~5s (the pool's acquire timeout). The test uses an 8s outer
+  timeout to allow for the pool's 5s acquire timeout plus I/O latency.
+  Multi-thread runtime (4 workers) so the first client's blocking
+  `read_line` doesn't block the server's accept loop.
+
+Task 7.3 — Pool metrics via SQL:
+- The `pool.metrics()` method is the primary API for accessing metrics.
+  It returns a `PoolMetrics` snapshot (5 fields: active, idle, waiting,
+  total_acquired, total_released).
+- **SQL interface deferred.** Wiring `SHOW POOL_STATUS` into the
+  engine's SQL dispatch would require touching `src/engine/vacuum.rs`
+  (`execute_show`) and `src/engine/mod.rs` — neither of which is in
+  this task's allowed-file list (max 3 files: pool.rs, mod.rs,
+  async_server.rs, plus optionally concurrency_test.rs in a separate
+  commit). The deferral is documented in `pool.rs`'s module docs:
+  > A future wave can: 1. Add the pool handle to `QueryEngine` (e.g.
+  > as an `Option<Arc<ConnectionPool>>` field), then 2. Extend
+  > `execute_show` to handle `SHOW POOL_STATUS` by reading the field
+  > and returning a one-row `QueryResult` with the metrics as columns.
+- The metrics are fully observable via `pool.metrics()` from Rust
+  code (and from the tests). The async server logs the pool max_size
+  on bind (`log::info!("async server listening on {addr} (pool
+  max_size = {})", pool.max_size())`).
+
+Module wiring (`src/server/mod.rs`):
+- Added `pub mod pool;` (alphabetical, between `pgwire` and `session`).
+- Re-exported `ConnectionPool`, `PoolConfig`, `PoolMetrics`, `PoolPermit`
+  at the crate root (`pub use pool::{...}`).
+
+Commit 2 — `feat(7.4): tests: connection pool stress test (50 tasks,
+max_size 4)` (d9f9f9a):
+
+Task 7.4 — Stress test (`tests/concurrency_test.rs`, +234 lines, 4th
+file → separate commit per task spec):
+
+- `test_connection_pool_stress` (Task 7.4 DoD):
+  - Pool: `max_size = 4`, `acquire_timeout_secs = 30`.
+  - 50 concurrent tokio tasks (`tokio::spawn`), each:
+    1. `pool.acquire().await` — returns a `PoolPermit` (or `Err` on
+       timeout, which would fail the task).
+    2. Atomically increment `active_now` and update `max_observed`
+       (compare-exchange loop) — tracks the high-water mark of
+       concurrent active permits.
+    3. `tokio::time::sleep(100ms)` — simulates "work" while holding
+       the slot.
+    4. Atomically decrement `active_now`.
+    5. Drop the permit (releases the semaphore slot).
+  - Multi-thread runtime (8 workers) so tasks actually run in
+    parallel — on a current-thread runtime they'd serialise and
+    `max_observed` would never exceed 1, making the test a no-op.
+  - Assertions:
+    1. All 50 tasks complete (joined with 30s outer timeout per task;
+       no timeouts, no join errors, no task-internal errors).
+    2. `max_observed ≤ MAX_SIZE` (4) — the pool never allowed more
+       than 4 concurrent permits. (Asserts `≤ 4`, not `== 4`, because
+       on a low-CPU machine the scheduler may not actually run 4 tasks
+       simultaneously — but it must NEVER run 5. Sanity-check
+       `peak ≥ 1` so a no-op test would fail.)
+    3. Metrics consistency: `total_acquired == 50`,
+       `total_released == 50`, `active == 0`, `idle == 4`.
+  - Observed output (3 consecutive runs):
+    `peak_active=4, total_acquired=50, total_released=50` — the pool
+    saturates to 4 concurrent and processes all 50 in ~1.3s (13
+    batches × 100ms = 1.3s, matching the expected
+    `ceil(50/4) × 100ms`).
+- `test_pool_metrics_active_during_hold` (supplemental):
+  - Acquire 3 permits on a max_size=4 pool, assert `active=3, idle=1,
+    total_acquired=3, total_released=0`. Drop one, assert `active=2,
+    idle=2, total_released=1`. Drop the rest, assert `active=0, idle=4,
+    total_released=3`. Tighter than the stress test's final-state
+    check — verifies the metrics are correct AT EACH STEP, not just
+    after all permits are released.
+
+Files touched (2 commits):
+- Commit 1 (3 files): src/server/pool.rs (NEW, 372 lines),
+  src/server/mod.rs (+2), src/server/async_server.rs
+  (+158/-24). +508 / -24.
+- Commit 2 (1 file): tests/concurrency_test.rs (+234). +234 / -0.
+
+Constraints honoured:
+- No `unwrap()`/`expect()` in new production code:
+  - `pool.rs`: `acquire` maps all errors to `String` via `?` and
+    `.map_err(|e| format!(...))`. `Drop` uses `saturating_sub` and
+    `saturating_add` (no panics on underflow). `into_raw` is
+    infallible.
+  - `async_server::serve`: `pool.acquire().await` is `match`ed (no
+    `?`); the `Err` arm writes the error to the client and closes.
+    The `Ok` arm calls `handle_connection`, whose errors are logged
+    via `log::warn!` (not propagated — the accept loop continues).
+  - Tests use `unwrap()`/`expect()` freely (per spec).
+- Max 3 files per commit:
+  - Commit 1: pool.rs, mod.rs, async_server.rs (3 of 4).
+  - Commit 2: concurrency_test.rs (1 of 4 — separate commit per
+    spec for the 4th file).
+- Context budget:
+  - Commit 1: 372 LOC (pool.rs) + ~158 LOC of async_server changes
+    + 2 LOC of mod.rs = ~532 LOC of new/changed production code,
+    well under 1,500.
+  - Commit 2: 234 LOC of test code (not production), well under
+    1,500.
+- `cargo check --jobs 1 --lib`: 0 errors, 462 warnings (all
+  pre-existing, unchanged from Wave 6 baseline).
+- `cargo check --jobs 1 --test concurrency_test`: 0 errors.
+- `cargo test --jobs 1 --lib`: 870 passed, 0 failed (was 864
+  baseline + 5 new pool tests + 1 new async_server test = 870).
+- `cargo test --jobs 1 --test concurrency_test`: 6 passed, 0 failed
+  (was 4 baseline + 2 new pool tests = 6). Stress test runs in
+  ~1.3s, stable across 3 consecutive runs.
+
+Notes / follow-ups:
+- `OwnedSemaphorePermit` vs `SemaphorePermit<'static>`: the task
+  spec's draft code used `SemaphorePermit<'static>` and flagged it as
+  "tricky". The idiomatic fix is `OwnedSemaphorePermit` (returned by
+  `Semaphore::acquire_owned` on an `Arc<Semaphore>`). It's `'static`
+  and can be moved freely across `.await` points — exactly what we
+  need for a permit that outlives the `acquire` call and is held for
+  the entire connection lifetime. The `pool.rs` module docs document
+  this choice explicitly.
+- `waiting` metric is hardcoded to 0. `tokio::sync::Semaphore` does
+  not expose a waiters count (its `available_permits()` returns the
+  remaining permit count, not the number of blocked `acquire`
+  callers). A future implementation could track `waiting` with an
+  `AtomicUsize` incremented before `acquire_owned` and decremented
+  after — but that has a race (the increment happens before the
+  caller is actually blocked, and the decrement happens after the
+  permit is granted, so `waiting` could over-count). The current
+  `0` placeholder is documented in `PoolMetrics`'s rustdoc. For
+  production observability, `available_permits()` (= `max_size -
+  active`) is the more useful signal.
+- SQL interface for `SHOW POOL_STATUS` is deferred (see Task 7.3
+  notes above). The metrics are fully accessible via
+  `pool.metrics()` from Rust; a future wave can wire the SQL path
+  by adding `Option<Arc<ConnectionPool>>` to `QueryEngine` and
+  extending `execute_show`.
+- The async server now has a connection limit (via the pool), but
+  still no auth, no TLS, no query timeout. The sync `Server` (in
+  `src/server/mod.rs`) has all of these (SCRAM-SHA-256, `TlsConfig`,
+  `statement_timeout_ms`). Porting these to the async path remains a
+  future hardening wave.
+- The `test_async_server_rejects_when_pool_full` test relies on the
+  first client holding its permit by blocking on `read_line` (the
+  client connects and reads the banner but never sends SQL). This
+  works because `handle_connection` acquires the permit BEFORE the
+  read loop, so the permit is held for the entire connection
+  lifetime — including the idle period waiting for the client to
+  send SQL. This is the intended behaviour: a connected-but-idle
+  client occupies a pool slot. A future enhancement could release
+  the permit between SQL statements (returning it to the pool when
+  the client is idle), trading concurrency for complexity. The
+  current "one permit per connection" model matches the sync
+  `Server`'s `max_connections` semaphore semantics.
+- The stress test's `max_observed` tracking uses
+  `compare_exchange_weak` in a loop (the standard CAS pattern). The
+  test asserts `peak ≤ MAX_SIZE` (not `== MAX_SIZE`) because on a
+  low-CPU machine the scheduler may not actually run 4 tasks
+  simultaneously. In practice (8-worker runtime), the test
+  consistently reports `peak_active=4` — the pool saturates.
+- The pool's `engine` field is `pub` (rather than `pub(crate)`) so
+  that `async_server::serve` (which is in the same crate but a
+  different module) can access it as `pool.engine.clone()`. An
+  alternative would be a `pub fn engine(&self) -> &Arc<...>`
+  accessor; the `pub` field is simpler and the field is documented
+  as "exposed so async_server::serve can pull it out". No external
+  crate depends on this field (turboGP is a lib + binary, not a
+  published crate), so the `pub` visibility is benign.
+
+Stage Summary:
+- Task 7.1 + 7.2 + 7.3 + 7.4 complete. The async server now has a
+  configurable connection pool: `ConnectionPool` wraps a
+  `tokio::sync::Semaphore` with `max_size` permits, `acquire` waits
+  up to `acquire_timeout_secs`, `PoolPermit` is RAII (releases on
+  drop), and `PoolMetrics` tracks active/idle/waiting/total counters.
+  `async_server::serve` accepts `Arc<ConnectionPool>` and rejects
+  excess connections with `ERROR: pool exhausted: ...`. The stress
+  test (50 tasks, max_size 4) confirms no more than 4 concurrent
+  permits are ever outstanding and all 50 tasks complete with
+  consistent metrics. The SQL `SHOW POOL_STATUS` interface is
+  deferred (documented) — metrics are accessible via `pool.metrics()`
+  from Rust. 870 lib tests + 6 concurrency integration tests pass
+  (0 failures). Ready for Wave 8.
