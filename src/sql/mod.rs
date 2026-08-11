@@ -47,12 +47,11 @@ pub use ddl::{
 pub use dml::{parse_dml, Delete, DmlStatement, Insert, Update};
 pub use extensions::{parse_extensions, parse_extensions_and_strip, QueryExtensions};
 pub use lexer::{tokenize, Token, KEYWORDS};
-pub use parser::{parse, Expr, SelectItem, SelectQuery, Value};
-
-// Re-export the unified AST types. Wave 4 migrates all consumers to these;
-// until then they are staged here so the unified types are reachable from
-// the crate root and visible in docs.
-pub use ast::{BinOp as UnifiedBinOp, Expr as UnifiedExpr, Value as UnifiedValue};
+pub use parser::{parse, SelectItem, SelectQuery};
+// Unified AST types — re-exported from `ast` so consumers can write
+// `turbogp::sql::Expr` directly. The `parser::Expr` re-export still works
+// for legacy call sites (`use crate::sql::parser::Expr`).
+pub use ast::{BinOp, Expr, UnaryOp, Value};
 
 /// Parse a SQL string into a `(SelectQuery, QueryExtensions)` pair.
 ///

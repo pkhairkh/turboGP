@@ -46,7 +46,7 @@ pub fn build_plan(query: &SelectQuery) -> Result<PlanNode> {
         plan = PlanNode::Sort {
             input: Box::new(plan),
             order_by: query.order_by.iter()
-                .map(|(col, asc)| (col.clone(),
+                .map(|(col, asc, _nulls)| (col.clone(),
                     if *asc { SortOrder::Asc } else { SortOrder::Desc }))
                 .collect(),
         };
@@ -188,71 +188,27 @@ fn parse_select_expr(s: &str) -> (Expr, String) {
 }
 
 /// Convert a parser::Expr to an ast::Expr.
+///
+/// Since Wave 2 of the SQL Frontend Remediation, `parser::Expr` IS
+/// `ast::Expr` (re-exported). This function is now a trivial clone.
 fn convert_expr(expr: &crate::sql::parser::Expr) -> Expr {
-    use crate::sql::parser::Expr as ParserExpr;
-    match expr {
-        ParserExpr::Column(name) => Expr::Column(name.clone()),
-        ParserExpr::Literal(val) => Expr::Literal(convert_value(val)),
-        ParserExpr::Binary { left, op, right } => Expr::Binary {
-            left: Box::new(convert_expr(left)),
-            op: convert_op(op),
-            right: Box::new(convert_expr(right)),
-        },
-        ParserExpr::Case { when_clauses, else_clause } => Expr::Case {
-            when_clauses: when_clauses.iter()
-                .map(|(cond, val)| (convert_expr(cond), convert_expr(val)))
-                .collect(),
-            else_clause: else_clause.as_ref().map(|e| Box::new(convert_expr(e))),
-        },
-        ParserExpr::Function { name, arg } => Expr::Function {
-            name: name.clone(),
-            args: if arg == "*" {
-                vec![Expr::Wildcard]
-            } else {
-                vec![Expr::Column(arg.clone())]
-            },
-            distinct: false,
-        },
-        ParserExpr::Extract { field, expr } => Expr::Extract {
-            field: field.clone(),
-            expr: Box::new(convert_expr(expr)),
-        },
-        ParserExpr::Cast { expr, target_type } => Expr::Cast {
-            expr: Box::new(convert_expr(expr)),
-            target_type: target_type.clone(),
-        },
-    }
+    expr.clone()
 }
 
 /// Convert a parser::Value to an ast::Value.
+///
+/// Since Wave 2, `parser::Value` IS `ast::Value` (re-exported). This
+/// function is now a trivial clone.
 fn convert_value(val: &crate::sql::parser::Value) -> Value {
-    use crate::sql::parser::Value as ParserValue;
-    match val {
-        ParserValue::Int(i) => Value::Int(*i),
-        ParserValue::Float(f) => Value::Float(*f),
-        ParserValue::String(s) => Value::Str(s.clone()),
-        ParserValue::Hex(bytes) => Value::Int(bytes.iter().enumerate()
-            .fold(0i64, |acc, (i, &b)| acc | ((b as i64) << (8 * i)))),
-    }
+    val.clone()
 }
 
 /// Convert a string operator to a typed BinOp.
+///
+/// Kept for backward compatibility with internal call sites that still
+/// pass operators as strings. New code should use [`BinOp::from_str`].
 fn convert_op(op: &str) -> BinOp {
-    match op {
-        "=" => BinOp::Eq,
-        "!=" | "<>" => BinOp::NotEq,
-        "<" => BinOp::Lt,
-        ">" => BinOp::Gt,
-        "<=" => BinOp::LtEq,
-        ">=" => BinOp::GtEq,
-        "+" => BinOp::Add,
-        "-" => BinOp::Sub,
-        "*" => BinOp::Mul,
-        "/" => BinOp::Div,
-        "AND" => BinOp::And,
-        "OR" => BinOp::Or,
-        _ => BinOp::Eq,
-    }
+    BinOp::from_str(op).unwrap_or(BinOp::Eq)
 }
 
 /// Convert a join type string to JoinType.

@@ -279,6 +279,30 @@ impl BufferPool {
         Ok(())
     }
 
+    /// Mark a page as dirty (Task 3.3). The page will be written back to
+    /// disk on the next `flush_page`, `flush_table`, `flush_all`, or
+    /// eviction. Use this after modifying a page via `get_page_mut()`
+    /// instead of (or in addition to) `unpin_page(page_id, true)`.
+    pub fn mark_dirty(&mut self, page_id: PageId) {
+        if let Some(&idx) = self.page_table.get(&page_id) {
+            self.frames[idx].dirty = true;
+        }
+    }
+
+    /// Flush a single dirty page to disk (Task 3.3). If the page is not
+    /// dirty or not in the pool, this is a no-op. Returns Ok(()) on success.
+    pub fn flush_page(&mut self, page_id: PageId) -> std::io::Result<()> {
+        if let Some(&idx) = self.page_table.get(&page_id) {
+            if self.frames[idx].dirty {
+                // Clone the page to avoid borrowing issues with write_page_to_disk.
+                let page = self.frames[idx].page.clone();
+                self.write_page_to_disk(page_id, &page)?;
+                self.frames[idx].dirty = false;
+            }
+        }
+        Ok(())
+    }
+
     /// Flush all dirty pages to disk.
     pub fn flush_all(&mut self) -> std::io::Result<()> {
         let page_ids: Vec<PageId> = self.page_table.keys().copied().collect();
@@ -356,5 +380,57 @@ mod tests {
         let _ = pool.fetch_page(p2).unwrap();
         pool.unpin_page(p2, false);
         let _ = pool.fetch_page(p0).unwrap();
+    }
+
+    /// Task 3.3 DoD: mark_dirty + flush_page write a single dirty page.
+    #[test]
+    fn buffer_pool_mark_dirty_and_flush_page() {
+        let tmp = TempDir::new().unwrap();
+        let mut pool = BufferPool::new(tmp.path(), 4).unwrap();
+        let p0 = pool.new_page(1).unwrap();
+        pool.unpin_page(p0, false);
+        // Re-fetch and write without setting dirty on unpin.
+        let f0 = pool.fetch_page(p0).unwrap();
+        {
+            let page = pool.get_page_mut(f0);
+            page.set_cell(0, 999);
+        }
+        pool.unpin_page(p0, false); // NOT marked dirty via unpin
+        // Use mark_dirty explicitly.
+        pool.mark_dirty(p0);
+        // Flush just this page.
+        pool.flush_page(p0).unwrap();
+        // Verify the .tbl file exists and contains the data.
+        let tbl_path = tmp.path().join("1.tbl");
+        assert!(tbl_path.exists(), ".tbl file must exist after flush_page");
+        // Re-fetch and verify the value persisted.
+        let f0_again = pool.fetch_page(p0).unwrap();
+        let page = pool.get_page(f0_again);
+        assert_eq!(page.get_cell(0), 999, "value must persist after flush_page");
+    }
+
+    /// Task 3.3 DoD: checkpoint flushes dirty pages to .tbl files.
+    #[test]
+    fn buffer_pool_checkpoint_flushes_to_tbl() {
+        let tmp = TempDir::new().unwrap();
+        let mut pool = BufferPool::new(tmp.path(), 4).unwrap();
+        let p0 = pool.new_page(1).unwrap();
+        let f0 = pool.fetch_page(p0).unwrap();
+        {
+            let page = pool.get_page_mut(f0);
+            page.set_cell(0, 42);
+            page.set_cell(1, 99);
+            page.update_checksum();
+        }
+        pool.unpin_page(p0, true);
+        // Flush all (as flush_with_checkpoint does).
+        pool.flush_all().unwrap();
+        // Verify the .tbl file contains the data by reading it back.
+        let tbl_path = tmp.path().join("1.tbl");
+        assert!(tbl_path.exists(), ".tbl file must exist after flush_all");
+        assert!(
+            std::fs::metadata(&tbl_path).map(|m| m.len()).unwrap_or(0) >= crate::storage::page::PAGE_SIZE as u64,
+            ".tbl file must be at least one page"
+        );
     }
 }

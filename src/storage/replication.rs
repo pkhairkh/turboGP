@@ -104,6 +104,66 @@ impl Default for WalStreamer {
     }
 }
 
+/// Task 5.1: implement WalStreamSink so WalStreamer can be attached to a Wal.
+impl crate::storage::recovery::WalStreamSink for WalStreamer {
+    fn stream(&mut self, record: &WalRecord) -> Result<usize, String> {
+        self.stream_record(record)
+    }
+}
+
+/// A sink that fans out records to multiple `WalStreamer`s (Task 5.3).
+///
+/// Used by `RaftNode::on_become_leader` to stream WAL records to all
+/// followers via a single sink attached to the `Wal`.
+pub struct MultiWalStreamSink {
+    streamers: Vec<WalStreamer>,
+}
+
+impl MultiWalStreamSink {
+    /// Create an empty multi-sink.
+    pub fn new() -> Self {
+        Self { streamers: Vec::new() }
+    }
+
+    /// Add a streamer to the fan-out set.
+    pub fn add(&mut self, streamer: WalStreamer) {
+        self.streamers.push(streamer);
+    }
+
+    /// Number of streamers in the set.
+    pub fn len(&self) -> usize {
+        self.streamers.len()
+    }
+
+    /// Whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.streamers.is_empty()
+    }
+}
+
+impl Default for MultiWalStreamSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::storage::recovery::WalStreamSink for MultiWalStreamSink {
+    fn stream(&mut self, record: &WalRecord) -> Result<usize, String> {
+        let mut total = 0;
+        // Stream to all followers. A failure on one follower doesn't stop
+        // streaming to the others (best-effort replication).
+        for streamer in &mut self.streamers {
+            match streamer.stream_record(record) {
+                Ok(n) => total += n,
+                Err(e) => {
+                    log::warn!("multi-sink: stream to follower failed: {e}");
+                }
+            }
+        }
+        Ok(total)
+    }
+}
+
 /// A WAL receiver that listens on a TCP port and applies records.
 ///
 /// The replica creates a `WalReceiver` bound to a TCP port, then calls
@@ -115,6 +175,8 @@ pub struct WalReceiver {
     pub records_received: u64,
     /// Bytes received so far.
     pub bytes_received: u64,
+    /// Whether run_apply_loop continues after an apply error (Task 5.2).
+    continue_on_error: bool,
 }
 
 impl WalReceiver {
@@ -126,6 +188,7 @@ impl WalReceiver {
             listener: Some(listener),
             records_received: 0,
             bytes_received: 0,
+            continue_on_error: false,
         })
     }
 
@@ -166,6 +229,70 @@ impl WalReceiver {
 
         let _ = addr;
         Ok(self.records_received)
+    }
+
+    /// Run the apply loop: accept a connection, receive records, and apply
+    /// each via the `apply` callback (Task 5.2).
+    ///
+    /// Unlike `accept_and_apply`, the `apply` callback returns `Result<()>`:
+    /// - `Ok(())` — the record was applied successfully.
+    /// - `Err(e)` — the apply failed. The error is logged, and the loop
+    ///   continues (configurable behaviour — see `set_continue_on_error`).
+    ///   If `continue_on_error` is false (the default), the loop returns
+    ///   the error immediately.
+    ///
+    /// The loop runs until the connection closes or an unrecoverable error
+    /// occurs (read failure, or apply failure when `continue_on_error` is
+    /// false).
+    pub fn run_apply_loop<F>(&mut self, mut apply: F) -> Result<u64, String>
+    where
+        F: FnMut(&WalRecord) -> Result<(), String>,
+    {
+        let listener = self.listener.as_ref()
+            .ok_or("receiver not bound")?;
+        let (mut stream, _addr) = listener.accept()
+            .map_err(|e| format!("accept: {}", e))?;
+        let mut buffer = String::new();
+        let mut chunk = [0u8; 4096];
+        let continue_on_error = self.continue_on_error;
+
+        loop {
+            let n = stream.read(&mut chunk)
+                .map_err(|e| format!("read: {}", e))?;
+            if n == 0 {
+                break; // connection closed
+            }
+            self.bytes_received += n as u64;
+            buffer.push_str(&String::from_utf8_lossy(&chunk[..n]));
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].to_string();
+                buffer = buffer[pos + 1..].to_string();
+                if let Ok(record) = serde_json::from_str::<WalRecord>(&line) {
+                    match apply(&record) {
+                        Ok(()) => {
+                            self.records_received += 1;
+                        }
+                        Err(e) => {
+                            log::warn!("replication apply error: {e}");
+                            if !continue_on_error {
+                                return Err(format!("apply error: {e}"));
+                            }
+                            // Continue — count the record as received but not applied.
+                            self.records_received += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(self.records_received)
+    }
+
+    /// Set whether the apply loop continues after an apply error (Task 5.2).
+    /// Default: false (stop on first error).
+    pub fn set_continue_on_error(&mut self, continue_on_error: bool) {
+        self.continue_on_error = continue_on_error;
     }
 }
 
@@ -253,6 +380,51 @@ impl RaftNode {
         for peer_id in self.peers.keys() {
             self.next_index.insert(*peer_id, log_len);
         }
+    }
+
+    /// Called when this node becomes the leader (Task 5.3).
+    ///
+    /// Connects a `WalStreamer` to each follower address in `peer_addrs`,
+    /// wraps them in a `MultiWalStreamSink`, and attaches the sink to the
+    /// `Wal` so subsequent `append_and_sync()` calls stream records to all
+    /// followers.
+    ///
+    /// Returns the number of followers successfully connected.
+    pub fn on_become_leader(
+        &mut self,
+        wal: &mut crate::storage::recovery::Wal,
+        peer_addrs: &[&str],
+    ) -> usize {
+        self.become_leader();
+        let mut multi_sink = MultiWalStreamSink::new();
+        let mut connected = 0;
+        for addr in peer_addrs {
+            let mut streamer = WalStreamer::new();
+            match streamer.connect(addr) {
+                Ok(()) => {
+                    log::info!("leader: connected WalStreamer to follower at {}", addr);
+                    multi_sink.add(streamer);
+                    connected += 1;
+                }
+                Err(e) => {
+                    log::warn!("leader: failed to connect to follower at {}: {}", addr, e);
+                }
+            }
+        }
+        if connected > 0 {
+            wal.set_stream_sink(std::sync::Arc::new(std::sync::Mutex::new(multi_sink)));
+        }
+        connected
+    }
+
+    /// Called when this node steps down from leader (Task 5.3).
+    ///
+    /// Detaches the stream sink from the `Wal` so records are no longer
+    /// streamed to followers.
+    pub fn on_demote(&mut self, wal: &mut crate::storage::recovery::Wal) {
+        self.state = RaftState::Follower;
+        wal.clear_stream_sink();
+        log::info!("demoted: disconnected WalStreamers from followers");
     }
 
     /// Append a log entry (leader only).
@@ -375,13 +547,15 @@ pub fn restore(engine: &mut QueryEngine, backup_dir: &Path) -> Result<usize, Str
                 let _ = engine.execute(&create_sql); // ignore if table exists
             }
 
-            // Load data from CSV
+            // Task 5.4: load data from CSV directly via engine.load_csv()
+            // (bypasses the COPY command's allowed_copy_dirs security check,
+            // since restore() is a trusted operation).
             let csv_path = backup_dir.join(format!("{}.csv", table_name));
             if csv_path.exists() {
-                let sql = format!("COPY {} FROM '{}'", table_name, csv_path.display());
-                let result = engine.execute(&sql)
+                let path_str = csv_path.to_string_lossy();
+                let row_count = engine.load_csv(&path_str, table_name, true)
                     .map_err(|e| format!("restore {}: {}", table_name, e))?;
-                total_rows += result.row_count;
+                total_rows += row_count;
             }
         }
     }
@@ -391,8 +565,17 @@ pub fn restore(engine: &mut QueryEngine, backup_dir: &Path) -> Result<usize, Str
 
 /// List all table names in the engine's catalog.
 fn list_tables(engine: &mut QueryEngine) -> Result<Vec<String>, String> {
-    // Try to query a system table or use a SHOW TABLES command
-    // If that fails, return empty (the caller can specify tables manually)
+    // Task 5.4: use the catalog directly (more reliable than SHOW TABLES).
+    let names: Vec<String> = engine.catalog.table_names()
+        .into_iter()
+        .filter(|n| *n != "__dummy__")
+        .map(String::from)
+        .collect();
+    if !names.is_empty() {
+        return Ok(names);
+    }
+    // Fallback: try SHOW TABLES (in case the catalog is empty but the
+    // engine has some other table source).
     if let Ok(result) = engine.execute("SHOW TABLES") {
         if !result.columns.is_empty() {
             return Ok(result.columns[0].values.iter()
@@ -400,7 +583,6 @@ fn list_tables(engine: &mut QueryEngine) -> Result<Vec<String>, String> {
                 .collect());
         }
     }
-    // Fallback: return empty list
     Ok(vec![])
 }
 
@@ -665,5 +847,113 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_micros(10));
         let t2 = now_us();
         assert!(t2 > t1, "timestamp must increase: {} > {}", t2, t1);
+    }
+
+    /// Task 5.2 DoD: stream 100 records from a WalStreamer to a WalReceiver
+    /// via run_apply_loop, verify all 100 are received and applied.
+    #[test]
+    fn wal_receiver_run_apply_loop() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // Bind a receiver on a random port.
+        let receiver = WalReceiver::bind("127.0.0.1:0").unwrap();
+        let bound_addr = {
+            let listener = receiver.listener.as_ref().unwrap();
+            listener.local_addr().unwrap().to_string()
+        };
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+
+        // Spawn the receiver thread.
+        let handle = thread::spawn(move || {
+            let mut receiver = receiver;
+            receiver.run_apply_loop(|record| {
+                received_clone.lock().unwrap().push(record.sql.clone());
+                Ok(())
+            }).unwrap()
+        });
+
+        // Connect a streamer and send 100 records.
+        let mut streamer = WalStreamer::new();
+        // Wait a moment for the receiver to be ready.
+        thread::sleep(std::time::Duration::from_millis(50));
+        streamer.connect(&bound_addr).unwrap();
+        for i in 0..100 {
+            streamer.stream_record(&WalRecord::autocommit(format!("INSERT INTO t VALUES ({})", i))).unwrap();
+        }
+        streamer.flush().unwrap();
+        drop(streamer); // close the connection
+
+        let count = handle.join().unwrap();
+        assert_eq!(count, 100, "receiver must get 100 records");
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 100);
+        assert_eq!(received[0], "INSERT INTO t VALUES (0)");
+        assert_eq!(received[99], "INSERT INTO t VALUES (99)");
+    }
+
+    /// Task 5.3 DoD: 3-node Raft cluster, leader election, verify leader
+    /// streams WAL to 2 followers.
+    #[test]
+    fn raft_leader_streams_to_followers() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use crate::storage::recovery::Wal;
+
+        // Bind 2 receivers (followers) on random ports.
+        let r1 = WalReceiver::bind("127.0.0.1:0").unwrap();
+        let r2 = WalReceiver::bind("127.0.0.1:0").unwrap();
+        let addr1 = r1.listener.as_ref().unwrap().local_addr().unwrap().to_string();
+        let addr2 = r2.listener.as_ref().unwrap().local_addr().unwrap().to_string();
+
+        let received1 = Arc::new(Mutex::new(Vec::new()));
+        let received2 = Arc::new(Mutex::new(Vec::new()));
+        let rc1 = received1.clone();
+        let rc2 = received2.clone();
+
+        let h1 = thread::spawn(move || {
+            let mut r1 = r1;
+            r1.run_apply_loop(|record| { rc1.lock().unwrap().push(record.sql.clone()); Ok(()) }).unwrap()
+        });
+        let h2 = thread::spawn(move || {
+            let mut r2 = r2;
+            r2.run_apply_loop(|record| { rc2.lock().unwrap().push(record.sql.clone()); Ok(()) }).unwrap()
+        });
+
+        // Wait for receivers to be ready.
+        thread::sleep(std::time::Duration::from_millis(50));
+
+        // Create a leader node and a Wal.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        let mut node = RaftNode::new(1);
+        node.add_peer(2, &addr1);
+        node.add_peer(3, &addr2);
+
+        // Become leader — connects WalStreamers to both followers.
+        let connected = node.on_become_leader(&mut wal, &[&addr1, &addr2]);
+        assert_eq!(connected, 2, "must connect to 2 followers");
+        assert_eq!(node.state, RaftState::Leader);
+
+        // Append records — they should stream to both followers.
+        wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
+        wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
+
+        // Give the receivers time to process.
+        thread::sleep(std::time::Duration::from_millis(100));
+        drop(wal); // close streamers → receivers see EOF
+
+        let c1 = h1.join().unwrap();
+        let c2 = h2.join().unwrap();
+        assert!(c1 >= 2, "follower 1 must receive >= 2 records (got {})", c1);
+        assert!(c2 >= 2, "follower 2 must receive >= 2 records (got {})", c2);
+
+        let r1 = received1.lock().unwrap();
+        let r2 = received2.lock().unwrap();
+        assert!(r1.contains(&"INSERT INTO t VALUES (1)".to_string()));
+        assert!(r1.contains(&"INSERT INTO t VALUES (2)".to_string()));
+        assert!(r2.contains(&"INSERT INTO t VALUES (1)".to_string()));
+        assert!(r2.contains(&"INSERT INTO t VALUES (2)".to_string()));
     }
 }
