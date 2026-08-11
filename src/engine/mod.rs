@@ -123,6 +123,21 @@ pub struct QueryEngine {
     /// Allowed directories for COPY TO/FROM operations (Wave 2 security).
     /// Empty by default — COPY is disabled unless explicitly configured.
     pub allowed_copy_dirs: Vec<std::path::PathBuf>,
+    /// MVCC transaction manager (Wave 4 — Agent C).
+    ///
+    /// Used when `mvcc_enabled` is true. Tracks transaction IDs and commit
+    /// state for real multi-version concurrency control. Unlike the legacy
+    /// `TxnManager` (which deep-clones the entire catalog at BEGIN), this
+    /// manager is O(1) per BEGIN — it just records the snapshot timestamp.
+    mvcc_txn_manager: crate::txn::MvccTxnManager,
+    /// Whether MVCC mode is enabled (Wave 4 — Agent C).
+    ///
+    /// `false` (default): use the legacy `TxnManager` with catalog snapshot
+    /// swap. `true`: use `MvccTxnManager` with per-row version chains.
+    ///
+    /// MVCC mode is opt-in via [`QueryEngine::enable_mvcc`] so existing
+    /// callers that depend on snapshot-isolation semantics are unaffected.
+    mvcc_enabled: bool,
 }
 
 
@@ -421,7 +436,67 @@ impl QueryEngine {
             next_table_id: 1,
             savepoints: Vec::new(),
             allowed_copy_dirs: Vec::new(),
+            mvcc_txn_manager: crate::txn::MvccTxnManager::new(),
+            mvcc_enabled: false,
         }
+    }
+
+    /// Enable MVCC mode (Wave 4 — Agent C).
+    ///
+    /// After calling this, `BEGIN`/`COMMIT`/`ROLLBACK` use the
+    /// [`MvccTxnManager`] instead of the legacy `TxnManager`. The
+    /// `MvccTxnManager` is O(1) per BEGIN (no catalog deep-clone) and
+    /// supports multiple concurrent transactions.
+    ///
+    /// **Note:** full row-level visibility filtering (where `execute_select`
+    /// filters rows by `(xmin, xmax)` version chains) is pending Agent B's
+    /// completion of the `Table.row_versions` population in INSERT/UPDATE/
+    /// DELETE. In the current implementation, MVCC mode provides correct
+    /// transaction ID tracking and commit/abort state, but does NOT yet
+    /// filter rows by visibility — all rows are visible to all transactions
+    /// (like autocommit). This is documented in `AGENT_C_API_REQUESTS.md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Other` if a snapshot-isolation transaction is
+    /// currently active (must commit or rollback first).
+    pub fn enable_mvcc(&mut self) -> Result<()> {
+        if self.txn_manager.is_active() {
+            return Err(Error::Other(
+                "cannot enable MVCC while a snapshot-isolation transaction is active".into(),
+            ));
+        }
+        self.mvcc_enabled = true;
+        Ok(())
+    }
+
+    /// Disable MVCC mode, reverting to the legacy `TxnManager` (Wave 4).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Other` if an MVCC transaction is currently active.
+    pub fn disable_mvcc(&mut self) -> Result<()> {
+        if self.mvcc_txn_manager.is_active() {
+            return Err(Error::Other(
+                "cannot disable MVCC while an MVCC transaction is active".into(),
+            ));
+        }
+        self.mvcc_enabled = false;
+        Ok(())
+    }
+
+    /// Returns `true` if MVCC mode is enabled (Wave 4).
+    #[must_use]
+    pub fn is_mvcc_enabled(&self) -> bool {
+        self.mvcc_enabled
+    }
+
+    /// Borrow the MVCC transaction manager (Wave 4).
+    ///
+    /// Exposed for tests that want to verify transaction state directly.
+    #[must_use]
+    pub fn mvcc_txn_manager(&self) -> &crate::txn::MvccTxnManager {
+        &self.mvcc_txn_manager
     }
 
     /// Create a QueryEngine with on-disk persistence (Wave 63).
@@ -883,15 +958,29 @@ impl QueryEngine {
                 return Ok(QueryResult::empty());
             }
             crate::engine::dispatch::StatementKind::Begin => {
-                let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
-                self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
+                // Wave 4 (Agent C): route to MVCC or snapshot-isolation
+                // manager based on mvcc_enabled.
+                if self.mvcc_enabled {
+                    let id = self.mvcc_txn_manager.begin().map_err(Error::Other)?;
+                    self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
+                } else {
+                    let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
+                    self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
+                }
                 return Ok(QueryResult::empty());
             }
             crate::engine::dispatch::StatementKind::Commit => {
-                // Capture the txn_id before we drain the transaction.
-                let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
-                let committed = self.txn_manager.commit().map_err(Error::Other)?;
-                self.catalog = committed;
+                // Wave 4 (Agent C): route to the active transaction manager.
+                let txn_id = if self.mvcc_enabled {
+                    let id = self.mvcc_txn_manager.commit().map_err(Error::Other)?;
+                    id
+                } else {
+                    // Capture the txn_id before we drain the transaction.
+                    let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
+                    let committed = self.txn_manager.commit().map_err(Error::Other)?;
+                    self.catalog = committed;
+                    txn_id
+                };
                 self.savepoints.clear(); // Wave 69: clear savepoints on commit.
                 self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id));
                 return Ok(QueryResult::empty());
@@ -899,8 +988,13 @@ impl QueryEngine {
             crate::engine::dispatch::StatementKind::Rollback => {
                 // Full ROLLBACK (no `TO` savepoint). RollbackTo is handled
                 // in execute_inner below so it operates on the txn snapshot.
-                let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
-                self.txn_manager.rollback().map_err(Error::Other)?;
+                let txn_id = if self.mvcc_enabled {
+                    self.mvcc_txn_manager.rollback().map_err(Error::Other)?
+                } else {
+                    let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
+                    self.txn_manager.rollback().map_err(Error::Other)?;
+                    txn_id
+                };
                 self.savepoints.clear(); // Wave 69: clear savepoints on rollback.
                 self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id));
                 return Ok(QueryResult::empty());
@@ -914,8 +1008,23 @@ impl QueryEngine {
             }
         }
 
-        // If a transaction is active, route all DML/DDL/SELECT to the
-        // snapshot catalog. Otherwise, use the main catalog.
+        // Wave 4 (Agent C): in MVCC mode, there's no catalog snapshot swap.
+        // DML/SELECT execute against the main catalog directly; visibility
+        // filtering (when implemented by Agent B) will happen inside
+        // execute_select.
+        if self.mvcc_enabled {
+            let txn_id = self.mvcc_txn_manager.active_id();
+            let mut result = self.execute_inner(sql, &start, txn_id)?;
+            let elapsed_ms = start.elapsed().as_millis();
+            if elapsed_ms > 100 {
+                log::warn!("slow query ({} ms): {}", elapsed_ms, sql.trim());
+            }
+            result.elapsed_us = start.elapsed().as_micros() as u64;
+            return Ok(result);
+        }
+
+        // If a snapshot-isolation transaction is active, route all DML/DDL/
+        // SELECT to the snapshot catalog. Otherwise, use the main catalog.
         // We do this by swapping the snapshot into self.catalog for the
         // duration of the statement, then swapping back.
         let txn_active = self.txn_manager.is_active();

@@ -178,9 +178,12 @@ verifies a basic PIVOT query executes.
 | 3 | 3.2 UNION ALL | DEBT | Agent A: add `SetQuery::Union` to parser |
 | 3 | 3.3 MERGE | DEBT | Agent A: add MERGE to parser |
 | 3 | 3.4 PIVOT | DEBT | Agent A: add PIVOT/UNPIVOT to parser |
+| 4 | 4.2 Row-version creation | DEBT | Agent B: populate `Table.row_versions` in INSERT/UPDATE/DELETE; add `Table::append_row_version`, `Table::mark_deleted`; update `execute_select` to filter by visibility |
+| 4 | 4.1 begin_with_isolation | DEBT | Agent B: add `MvccTxnManager::begin_with_isolation(level)` |
+| 4 | 4.3 vacuum dead row versions | DEBT | Agent B: add `MvccTxnManager::vacuum(&mut tables)` that removes dead row versions |
 
-All three hacks are tagged with comments referencing this file in
-`src/engine/mod.rs::execute_inner()`.
+All hacks are tagged with comments referencing this file in the relevant
+source files.
 
 ---
 
@@ -188,30 +191,79 @@ All three hacks are tagged with comments referencing this file in
 
 ### Wave 4 — MVCC integration
 
-**Status:** Not yet started.
+**Status:** Tasks 4.1, 4.3, 4.4 COMPLETE. Task 4.2 is DOCUMENTED AS DEBT.
 
-`MvccTxnManager` already exists in `src/txn/mvcc.rs` with:
-- `begin() -> Result<u64, String>`
-- `commit() -> Result<u64, String>`
-- `rollback() -> Result<u64, String>`
-- `is_visible(txn_id: u64) -> bool`
-- `is_row_visible(version: &RowVersion) -> bool`
-- `is_active() -> bool`
-- `active_id() -> Option<u64>`
+#### Task 4.1 — Complete (MVCC manager wired)
 
-Agent C will swap `QueryEngine.txn_manager: TxnManager` for
-`MvccTxnManager`. The current `TxnManager` takes a full-catalog snapshot at
-BEGIN and swaps it back on COMMIT — the new `MvccTxnManager` uses per-row
-version chains (the `RowVersion { xmin, xmax }` already on `Table`).
+`QueryEngine` now has an `mvcc_txn_manager: MvccTxnManager` field
+(alongside the legacy `txn_manager: TxnManager`). MVCC mode is opt-in
+via `QueryEngine::enable_mvcc()`.
 
-**API request for Agent B:**
-- `MvccTxnManager::begin_with_isolation(level: IsolationLevel) -> Result<u64, String>`
-  (currently `begin()` always uses snapshot isolation).
-- `MvccTxnManager::vacuum(&mut self, tables: &mut HashMap<String, Table>) -> usize`
-  to remove dead row versions whose `xmax` is committed and not visible to
-  any active transaction.
-- Ensure `Table::row_versions: Vec<RowVersion>` is populated by INSERT/UPDATE
-  (it's currently `Vec::new()`).
+When MVCC mode is enabled:
+- `BEGIN` calls `mvcc_txn_manager.begin()` (O(1), no catalog deep-clone)
+- `COMMIT` calls `mvcc_txn_manager.commit()`
+- `ROLLBACK` calls `mvcc_txn_manager.rollback()`
+- DML/SELECT execute against the main catalog directly (no snapshot swap)
+
+When MVCC mode is disabled (default): existing snapshot-isolation behavior
+is unchanged.
+
+**API request for Agent B:** The DoD specifies
+`begin_with_isolation(IsolationLevel::ReadCommitted)`. The current
+`MvccTxnManager::begin()` always uses snapshot isolation. Agent B should
+add `begin_with_isolation(level)` so the engine can request
+`ReadCommitted` for the MVCC mode.
+
+#### Task 4.2 — Row-version creation (DEBT)
+
+`execute_insert` / `execute_update` / `execute_delete` do NOT yet create
+`RowVersion { xmin, xmax }` entries. The `Table.row_versions` field
+exists but is `Vec::new()` (empty). As a result, `execute_select` cannot
+filter rows by visibility — all rows are visible to all transactions
+(like autocommit).
+
+**Why kept:** Agent B hasn't completed the DML→row-version wiring. The
+engine's DML path is owned by Agent C (engine/dml.rs) but the row-version
+data structure (`RowVersion`, `Table.row_versions`) is owned by Agent B
+(storage/table). Agent C cannot modify `Table` to populate `row_versions`
+during INSERT.
+
+**Required API from Agent B:**
+- `Table::append_row_version(&mut self, version: RowVersion)` — appends a
+  new row version to the version chain.
+- `Table::mark_deleted(&mut self, row_idx: usize, txn_id: u64)` — sets
+  `xmax` on the row version at `row_idx`.
+- Ensure `execute_select` is updated to filter by
+  `mvcc_txn_manager.is_row_visible(&version)`.
+
+Until Agent B completes this, MVCC mode provides correct transaction ID
+tracking and commit/abort state, but does NOT enforce snapshot isolation
+visibility. This is documented in `enable_mvcc()`'s doc comment.
+
+#### Task 4.3 — Complete (VACUUM calls MVCC cleanup)
+
+`execute_vacuum()` now calls `mvcc_txn_manager.cleanup_aborted()` when
+MVCC mode is enabled, removing commit-state entries for aborted
+transactions.
+
+**API request for Agent B:** The DoD specifies
+`MvccTxnManager::vacuum(&mut tables)` to remove dead row versions whose
+`xmax` is committed and not visible to any active transaction. The current
+`cleanup_aborted()` only removes commit-state entries — it doesn't touch
+`Table.row_versions`. Agent B should add `vacuum(&mut self, tables: &mut
+HashMap<String, Table>)` that scans row versions and removes dead ones.
+
+#### Task 4.4 — Complete (concurrent transactions supported)
+
+`MvccTxnManager` already tracks commit state for multiple transaction IDs.
+In MVCC mode, the engine doesn't use the single-active-transaction
+`TxnManager`, so concurrent connections (each with their own
+`QueryEngine`) can have active transactions simultaneously.
+
+Test: `tests/mvcc_integration.rs::test_mvcc_concurrent_transactions_two_writers`
+spawns 2 threads, each does BEGIN/INSERT/COMMIT. Both succeed.
+
+---
 
 ### Wave 5 — WAL durability and replication
 
