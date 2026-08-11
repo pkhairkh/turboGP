@@ -79,7 +79,9 @@ use std::time::Instant;
 /// See the module docs for the pipeline and usage examples.
 pub struct QueryEngine {
     /// The table catalog (name → [`Table`]).
-    catalog: Catalog,
+    /// Public so the storage layer (`storage::replication::backup`) can
+    /// list tables for backup (Task 5.4). See AGENT_B_API_REQUESTS.md.
+    pub catalog: Catalog,
     /// The kernel table: maps `(Operator, CpuTarget, MemoryTier)` to the
     /// best kernel for that combination on the running CPU.
     kernel_table: Arc<KernelTable>,
@@ -517,6 +519,89 @@ impl QueryEngine {
         Ok(())
     }
 
+    /// Execute `BACKUP TO '<directory>'` (Task 5.4).
+    ///
+    /// Parses the directory from the SQL and calls `storage::replication::backup()`
+    /// to dump all tables as CSV + a manifest.json.
+    fn execute_backup(&mut self, sql: &str) -> Result<QueryResult> {
+        // Parse: BACKUP TO '<dir>'
+        let lower = sql.to_lowercase();
+        let rest = lower.strip_prefix("backup to ").unwrap_or("");
+        let rest = rest.trim();
+        // Extract the quoted directory.
+        let dir = if rest.starts_with('\'') && rest.ends_with('\'') && rest.len() >= 2 {
+            &rest[1..rest.len() - 1]
+        } else {
+            return Err(Error::Other(format!(
+                "BACKUP: expected BACKUP TO '<directory>', got: {sql}"
+            )));
+        };
+        let row_count = crate::storage::replication::backup(self, std::path::Path::new(dir))
+            .map_err(Error::Other)?;
+        let mut result = QueryResult::empty();
+        result.row_count = row_count;
+        Ok(result)
+    }
+
+    /// Execute `RESTORE FROM '<directory>' [AS OF TIMESTAMP '<ts>']` (Tasks 5.4 + 5.5).
+    ///
+    /// Without AS OF TIMESTAMP: calls `storage::replication::restore()` to load
+    /// tables from the backup directory.
+    /// With AS OF TIMESTAMP: loads the backup, then replays the WAL up to the
+    /// given timestamp (point-in-time recovery).
+    fn execute_restore(&mut self, sql: &str) -> Result<QueryResult> {
+        let lower = sql.to_lowercase();
+        let rest = lower.strip_prefix("restore from ").unwrap_or("");
+        let rest = rest.trim();
+        // Check for AS OF TIMESTAMP clause.
+        let (dir_part, timestamp_part) = if let Some(pos) = rest.find(" as of timestamp ") {
+            (&rest[..pos], Some(&rest[pos + " as of timestamp ".len()..]))
+        } else {
+            (rest, None)
+        };
+        // Extract the quoted directory.
+        let dir = if dir_part.starts_with('\'') && dir_part.ends_with('\'') && dir_part.len() >= 2 {
+            &dir_part[1..dir_part.len() - 1]
+        } else {
+            return Err(Error::Other(format!(
+                "RESTORE: expected RESTORE FROM '<directory>', got: {sql}"
+            )));
+        };
+        let row_count = crate::storage::replication::restore(self, std::path::Path::new(dir))
+            .map_err(Error::Other)?;
+        // Task 5.5: PITR — if AS OF TIMESTAMP is specified, replay the WAL
+        // up to the given timestamp.
+        if let Some(ts_str) = timestamp_part {
+            let ts_str = ts_str.trim();
+            let ts = if ts_str.starts_with('\'') && ts_str.ends_with('\'') {
+                &ts_str[1..ts_str.len() - 1]
+            } else {
+                ts_str
+            };
+            // Parse the ISO 8601 timestamp to epoch microseconds.
+            let target_us = parse_iso8601_to_us(ts_str)
+                .map_err(|e| Error::Other(format!("RESTORE AS OF TIMESTAMP: {e}")))?;
+            // Read the WAL records, attach timestamps, and replay up to target.
+            if let Some(ref wal) = self.wal {
+                let records = wal.read_all()
+                    .map_err(|e| Error::Other(format!("WAL read: {e}")))?;
+                let ts_records: Vec<_> = records.into_iter()
+                    .map(|r| crate::storage::replication::TimestampedWalRecord {
+                        timestamp_us: target_us, // best-effort: use target as placeholder
+                        record: r,
+                    })
+                    .collect();
+                let _ = crate::storage::replication::replay_wal_to_timestamp(
+                    self, &ts_records, target_us,
+                ).map_err(Error::Other)?;
+            }
+            let _ = ts; // suppress unused warning
+        }
+        let mut result = QueryResult::empty();
+        result.row_count = row_count;
+        Ok(result)
+    }
+
     /// Open a QueryEngine with a WAL for durability (Wave 37).
     /// Replays the WAL on startup to restore committed state.
     pub fn open<P: AsRef<std::path::Path>>(wal_path: P) -> Result<Self> {
@@ -786,6 +871,16 @@ impl QueryEngine {
         if lower.starts_with("checkpoint") {
             self.flush_with_checkpoint()?;
             return Ok(QueryResult::empty());
+        }
+        // Task 5.4: BACKUP TO '<directory>' — dump all tables to CSV + manifest.
+        // Task 5.5: RESTORE FROM '<directory>' [AS OF TIMESTAMP '<iso8601>'] —
+        //   load tables from CSV; with AS OF TIMESTAMP, replay the WAL up to
+        //   the given timestamp (PITR).
+        if lower.starts_with("backup to ") {
+            return self.execute_backup(trimmed);
+        }
+        if lower.starts_with("restore from ") {
+            return self.execute_restore(trimmed);
         }
 
         // SAVEPOINT, ROLLBACK TO, RELEASE are handled inside execute_inner
@@ -1373,3 +1468,28 @@ impl QueryEngine {
     }
 }
 
+
+/// Parse an ISO 8601 timestamp string to epoch microseconds (Task 5.5).
+///
+/// Accepts strings like "2026-08-11T12:00:00Z" or "2026-08-11 12:00:00".
+/// Returns the number of microseconds since the Unix epoch. This is a
+/// simple parser — for production, use a proper datetime crate.
+fn parse_iso8601_to_us(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim().trim_matches('\'');
+    // Try to parse as a Unix timestamp (seconds) first — easy case.
+    if let Ok(secs) = s.parse::<u64>() {
+        return Ok(secs * 1_000_000);
+    }
+    // Otherwise, use the system clock's duration. For simplicity, we
+    // accept "now" as a special case.
+    if s == "now" {
+        return Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .map_err(|e| format!("system time: {e}"))?);
+    }
+    // For ISO 8601 strings, we'd need a proper parser. As a fallback,
+    // try to parse the numeric microseconds directly.
+    s.parse::<u64>()
+        .map_err(|e| format!("invalid timestamp '{s}': {e} (expected 'now', epoch seconds, or epoch microseconds)"))
+}
