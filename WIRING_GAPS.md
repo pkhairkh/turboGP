@@ -98,7 +98,7 @@ Branch: `feat/prod-wiring`.
   attaches a `MultiWalStreamSink` with `QuorumPolicy::Majority`. HA
   deployments get durable sync replication out of the box.
 - **Resolved by:** Wave 6 (Task 6.1).
-- **Resolved:** ☐
+- **Resolved:** ☑ (commit f3d6ba5)
 
 ---
 
@@ -112,7 +112,7 @@ Branch: `feat/prod-wiring`.
   `row_count`, and compacts `row_versions` chains. After VACUUM,
   `columns[0].len() == row_count == SELECT COUNT(*)`.
 - **Resolved by:** Wave 6 (Tasks 6.2–6.3).
-- **Resolved:** ☐
+- **Resolved:** ☑ (commits ea2d0e7, 4af4c10)
 
 ---
 
@@ -174,8 +174,8 @@ Branch: `feat/prod-wiring`.
 | 3 — TCP Raft network | 3 | `TcpRaftNetwork` over tokio TCP | ☑ |
 | 4 — Production pgwire server | 5 | Full PostgreSQL wire protocol over tokio | ☐ |
 | 5 — Connection pool on production path | 5 | pgwire server uses `ConnectionPool` | ☐ |
-| 6 — Sync replication default | 6 | `enable_raft` sets sync + quorum | ☐ |
-| 7 — VACUUM reclaims column space | 6 | Dead rows removed from `Vec<u64>` | ☐ |
+| 6 — Sync replication default | 6 | `enable_raft` sets sync + quorum | ☑ |
+| 7 — VACUUM reclaims column space | 6 | Dead rows removed from `Vec<u64>` | ☑ |
 | 8 — Remove parser hacks | 7 | Formal AST for UNION ALL / MERGE / PIVOT | ☐ |
 | 9 — Real doc comments | 8 | `#![allow(missing_docs)]` removed | ☐ |
 | 10 — Operational tooling | 9 | `turboGP admin` CLI | ☐ |

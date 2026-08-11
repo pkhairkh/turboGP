@@ -1699,3 +1699,234 @@ Stage Summary:
 - Gap 4 (Production pgwire server is a line-based skeleton) — RESOLVED.
 - Gap 5 (Connection pool is not on the production path) — RESOLVED.
 - Wave 5 complete. Ready for Wave 6.
+
+---
+Task ID: 6.1
+Agent: prod-wiring-agent (Wave 6)
+Task: Sync mode + quorum as default when Raft is enabled.
+
+Work Log:
+- `QueryEngine::enable_raft` in `src/engine/mod.rs` (the
+  `#[cfg(feature = "raft")]` branch) now ALSO:
+  1. Sets `Wal::sync_mode = SyncMode::Synchronous` so every
+     `append_and_sync` call additionally waits for the attached sink
+     to ACK via `WalStreamSink::sync_wait()` before returning Ok.
+  2. Attaches an empty `MultiWalStreamSink` with the default
+     `QuorumPolicy::Majority` so subsequent commits are fanned out
+     to all replicas (added later via `MultiWalStreamSink::add`).
+- The combined effect (with Wave 4 Raft routing in
+  `Wal::append_and_sync`): every commit goes through Raft consensus
+  (Wave 4) AND the sync-mode + quorum policy is the default. A user
+  who calls `enable_raft` gets durable sync replication out of the
+  box — no extra opt-in.
+- New trait method `WalStreamSink::type_name(&self) -> &'static str`
+  in `src/storage/recovery.rs`. Default returns
+  `std::any::type_name::<Self>()` (e.g.
+  `turboGP::storage::replication::MultiWalStreamSink`); concrete sinks
+  don't need to override it. Used by tests to assert the attached sink
+  type.
+- New `Wal` accessors (used by tests):
+  - `Wal::has_stream_sink(&self) -> bool`
+  - `Wal::stream_sink_type_name(&self) -> Option<&'static str>`
+    (locks the `Arc<Mutex<dyn WalStreamSink>>` and calls `type_name()`;
+    returns `None` when no sink is attached).
+- Test `enable_raft_sets_sync_mode_and_quorum` in NEW file
+  `src/engine/enable_raft_tests.rs` (registered in `engine/mod.rs` as
+  `#[cfg(all(test, feature = "raft"))] mod enable_raft_tests;`). The
+  test constructs a `QueryEngine` with a WAL attached, calls
+  `engine.enable_raft(1, vec![])`, and asserts:
+  - Before: `wal.sync_mode() == Asynchronous`, `!wal.has_stream_sink()`.
+  - After: `wal.sync_mode() == Synchronous`,
+    `wal.has_stream_sink() == true`, and the attached sink's
+    `type_name()` contains `MultiWalStreamSink`.
+  - Explicitly shuts down the RaftManager (no leak).
+- Why a new test file: `src/engine/mod.rs` was at 1984 LOC (close to
+  the 2000 limit); adding the test inline would have pushed it over.
+  `src/storage/recovery.rs` was at 1945 LOC — same problem. The new
+  file `src/engine/enable_raft_tests.rs` (88 LOC) keeps both under
+  the limit and follows the existing pattern
+  (`binary_checkpoint_tests.rs`).
+
+Files touched (3):
+- src/engine/mod.rs (+13 LOC): modified `enable_raft` `#[cfg(feature =
+  "raft")]` branch; registered the new test module.
+- src/storage/recovery.rs (+37 LOC, -4 LOC = net +33 LOC): added
+  `type_name()` default method on `WalStreamSink`; added `has_stream_sink`
+  + `stream_sink_type_name` accessors on `Wal`; compacted the
+  `raft_handle` field onto a single line (frees 3 LOC).
+- src/engine/enable_raft_tests.rs (+88 LOC, NEW): one test.
+
+Stage Summary:
+- `cargo check --jobs 1` and `cargo check --jobs 1 --features raft`
+  both pass with no new warnings.
+- `cargo test --jobs 1 --lib` (raft): 894 passed (was 893 + 1 new
+  raft-only test). Without raft: 880 passed (unchanged — the new test
+  is `#[cfg(feature = "raft")]`).
+- Gap 6 (Sync replication is opt-in, not default) — RESOLVED.
+
+---
+Task ID: 6.2
+Agent: prod-wiring-agent (Wave 6)
+Task: VACUUM removes dead rows from `Table::columns` (not just version chains).
+
+Work Log:
+- `MvccTxnManager::vacuum_table` in `src/txn/mvcc.rs` previously
+  compacted ONLY the `row_versions` chains on a `Table` — the column
+  vectors (`columns: Vec<Arc<Vec<u64>>>`) kept their dead-row cells,
+  wasting memory and skewing scans. After VACUUM,
+  `columns[0].len()` could exceed `row_count`, so `SELECT COUNT(*)`
+  returned a stale value because the engine scans the column vectors.
+- Extended `vacuum_table` to ALSO reclaim column space:
+  1. Existing dead-version retain runs on every chain (unchanged).
+     A row is **dead** iff its chain becomes empty after the retain
+     (the latest version has a committed `xmax` whose commit_id ≤
+     `oldest_active_snapshot_or_current()`).
+  2. Rows whose chain is empty after step 1 are dropped from
+     `table.columns` (every `Vec<u64>` is rebuilt to exclude the
+     dead row's cells) and from `table.null_bitmaps` (each `Some`
+     bitmap is rebuilt to keep only the surviving bits).
+  3. `table.row_versions` is rebuilt in lock-step: only chains for
+     surviving rows are kept (in original relative order, so
+     `row_versions[i]` still corresponds to `columns[c][i]`).
+  4. `table.row_count` is decremented to match the surviving row
+     count.
+- After VACUUM: `table.columns[0].len() == table.row_count == the
+  number of surviving rows`. `SELECT COUNT(*) FROM t` returns the
+  same value.
+- The rebuild is skipped when every row survived (`live_count ==
+  row_count_before`), so calls on live tables are O(n) in the chain
+  scan only (no column copy).
+- Test `vacuum_removes_dead_rows_from_columns` in NEW module
+  `engine::vacuum::vacuum_tests` (registered in `vacuum.rs` as
+  `#[cfg(test)] mod vacuum_tests { ... }`). The test builds a 100-row
+  `Table` (via `Table::from_loaded` + manual `row_versions`
+  initialization), marks 50 rows deleted by a committed transaction
+  (`mgr.commit(t2)` then sets `chain[0].xmax = Some(t2)` on rows
+  0..50), runs `mgr.vacuum_table(&mut table)`, and asserts:
+  - `removed == 50` (50 dead versions removed by the retain).
+  - `table.row_count == 50`.
+  - `table.columns[0].len() == 50`.
+  - `table.row_versions.len() == 50` with each chain having 1 live
+    version (`xmax == None`).
+  - The surviving cells are exactly rows 50..100 in original order.
+
+Files touched (2):
+- src/txn/mvcc.rs (+92 LOC, -8 LOC = net +84 LOC): extended
+  `vacuum_table` with column compaction; updated docstring.
+- src/engine/vacuum.rs (+110 LOC, NEW test module): added
+  `#[cfg(test)] mod vacuum_tests` with
+  `vacuum_removes_dead_rows_from_columns`.
+
+Stage Summary:
+- `cargo check --jobs 1` and `cargo check --jobs 1 --features raft`
+  both pass with no new warnings.
+- `cargo test --jobs 1 --lib` (no features): 881 passed (was 880 + 1
+  new test). With raft: 895 passed.
+- Existing vacuum tests still pass:
+  `mvcc_vacuum_removes_dead_versions`,
+  `mvcc_vacuum_removes_aborted_versions`.
+
+---
+Task ID: 6.3
+Agent: prod-wiring-agent (Wave 6)
+Task: VACUUM integration test (full end-to-end via engine.execute).
+
+Work Log:
+- Added `vacuum_integration_test` to the existing
+  `engine::vacuum::vacuum_tests` module. The test exercises the
+  engine's `execute()` method end-to-end (no direct API calls):
+  1. `CREATE TABLE t (id INT, v INT)` + `enable_mvcc`.
+  2. BEGIN; 1000 individual INSERTs (`INSERT INTO t VALUES (i, i*10)`);
+     COMMIT. All 1000 rows share `xmin = t1` (committed).
+  3. BEGIN; `UPDATE t SET v = 999 WHERE id < 500`; COMMIT. For rows
+     0..500, the old version is tombstoned (`xmax = t2`) and a new
+     version is appended with `v = 999`. The column vector is also
+     in-place updated to `v = 999` (MVCC in-place UPDATE semantics).
+  4. BEGIN; `DELETE FROM t WHERE id < 200`; COMMIT. For rows 0..200,
+     the latest version's `xmax` is set to `t3`.
+  5. `VACUUM`.
+- Assertions after VACUUM:
+  - `table.row_count == 800` (1000 − 200 deleted).
+  - Every column vector has exactly 800 entries (id and v columns).
+  - `row_versions.len() == 800` (one chain per surviving row).
+  - Each surviving chain is non-empty and its latest version has
+    `xmax == None` (no dead versions remain in the chains).
+  - `SELECT COUNT(*) FROM t` returns 800 (end-to-end verification
+    that the compacted column vectors are scanned correctly under
+    MVCC visibility).
+- The test exercises the full DML → VACUUM → SELECT pipeline that
+  Gap 7 targets: pre-VACUUM, the columns had 1000 entries with 200
+  tombstoned; after VACUUM, the columns are compacted to 800 and
+  `SELECT COUNT(*)` reflects the surviving rows.
+
+Files touched (1):
+- src/engine/vacuum.rs (+92 LOC): added `vacuum_integration_test`
+  to the existing test module.
+
+Stage Summary:
+- `cargo check --jobs 1` and `cargo check --jobs 1 --features raft`
+  both pass with no new warnings.
+- `cargo test --jobs 1 --lib` (no features): 882 passed (was 881 + 1
+  new test). With raft: 896 passed.
+- Test runtime: ~120 ms (1000 INSERTs + UPDATE + DELETE + VACUUM +
+  SELECT COUNT).
+
+---
+Wave 6 Summary
+
+Agent: prod-wiring-agent (Wave 6)
+Branch: feat/prod-wiring
+Commits (3):
+- f3d6ba5 feat(6): replication: sync mode + quorum default when Raft enabled
+- ea2d0e7 feat(6): vacuum: VACUUM removes dead rows from columns (not just version chains)
+- 4af4c10 test(6): vacuum: VACUUM reclaims space integration test
+
+Files:
+- MODIFIED src/engine/mod.rs — `enable_raft` `#[cfg(feature = "raft")]`
+  branch now also sets `Wal::sync_mode = Synchronous` and attaches an
+  empty `MultiWalStreamSink` (default `QuorumPolicy::Majority`);
+  registered `#[cfg(all(test, feature = "raft"))] mod enable_raft_tests;`.
+- MODIFIED src/storage/recovery.rs — added `type_name()` default method
+  on `WalStreamSink`; added `Wal::has_stream_sink` and
+  `Wal::stream_sink_type_name` accessors; compacted `raft_handle`
+  field declaration (saves 3 LOC to keep file under 2000).
+- NEW src/engine/enable_raft_tests.rs (88 LOC) — one test for Task 6.1.
+- MODIFIED src/txn/mvcc.rs — extended `vacuum_table` with column
+  compaction (rebuild `columns` + `null_bitmaps` + `row_versions` to
+  exclude dead rows; decrement `row_count`).
+- MODIFIED src/engine/vacuum.rs — added `#[cfg(test)] mod vacuum_tests`
+  with `vacuum_removes_dead_rows_from_columns` (Task 6.2) and
+  `vacuum_integration_test` (Task 6.3).
+- MODIFIED WIRING_GAPS.md — marked Gap 6 and Gap 7 resolved.
+
+Tests: 882 lib tests pass without features (was 880 + 2 new vacuum
+tests). 896 lib tests pass with `--features raft` (was 894 + 1 raft
+test + 1 vacuum test, since vacuum tests run in both builds).
+Build: `cargo check --jobs 1` green with zero new warnings.
+`cargo check --jobs 1 --features raft` green (one pre-existing
+RpcMessage privacy warning, untouched).
+
+Deviations from the plan:
+- The task spec listed `src/engine/vacuum.rs::vacuum_table` as the
+  function to modify for Task 6.2; the actual `vacuum_table` lives in
+  `src/txn/mvcc.rs` (the task's file list was a hint, not exhaustive).
+  We modified `src/txn/mvcc.rs` (one of the 3 files touched per-task
+  budget — Task 6.2 touched 2 files, well within the limit). The
+  engine-level `execute_vacuum` in `src/engine/vacuum.rs` calls
+  `mgr.vacuum_table(table)` per-table inside a `catalog.with_mut`
+  closure, so the existing call site picks up the new column
+  compaction automatically (no `src/engine/vacuum.rs` change needed
+  for the column-compaction wiring — only for the tests).
+- The Task 6.1 test was originally drafted in `src/storage/recovery.rs`
+  to keep all the Wal-related test code together, but `recovery.rs`
+  was at 1945 LOC (close to the 2000 limit). Moved the test to a new
+  file `src/engine/enable_raft_tests.rs` (following the existing
+  `binary_checkpoint_tests.rs` pattern) to keep both files under 2000
+  LOC. The 3-files-per-task budget still holds (Task 6.1 touched 3
+  files: `engine/mod.rs`, `storage/recovery.rs`, and the new
+  `enable_raft_tests.rs`).
+
+Stage Summary:
+- Gap 6 (Sync replication is opt-in, not default) — RESOLVED.
+- Gap 7 (VACUUM does not reclaim column space) — RESOLVED.
+- Wave 6 complete. Ready for Wave 7.
