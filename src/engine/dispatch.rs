@@ -313,7 +313,7 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
 
             // Apply ORDER BY if present (Wave 45).
             if !query.order_by.is_empty() {
-                let (order_col, ascending) = &query.order_by[0];
+                let (order_col, ascending, _) = &query.order_by[0];
                 // Try to find the ORDER BY column — could be the same column or a different one.
                 let order_col_idx = if order_col == &name {
                     col_idx
@@ -405,7 +405,7 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
             // `a` values rather than the first 10 rows in scan order.
             let mut indices: Vec<usize> = (0..table.row_count).filter(|&i| mask[i]).collect();
             if !query.order_by.is_empty() {
-                let (order_col, ascending) = &query.order_by[0];
+                let (order_col, ascending, _) = &query.order_by[0];
                 let order_col_idx = resolve_col_name(order_col, table).unwrap_or(0);
                 let has_string_sidecar = order_col_idx < table.string_columns.len()
                     && table.string_columns[order_col_idx].is_some();
@@ -1057,7 +1057,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
 
         // Apply ORDER BY
         if !query.order_by.is_empty() {
-            let (col_name, ascending) = &query.order_by[0];
+            let (col_name, ascending, _) = &query.order_by[0];
             let col_idx = result
                 .columns
                 .iter()
@@ -1199,7 +1199,7 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
     let mut result = QueryResult { columns: result_cols, row_count, elapsed_us: 0 };
 
     if !query.order_by.is_empty() {
-        let (col_name, ascending) = &query.order_by[0];
+        let (col_name, ascending, _) = &query.order_by[0];
         let col_idx = result
             .columns
             .iter()
@@ -1288,7 +1288,7 @@ fn execute_string_group_by(
 
     // Apply ORDER BY (typically `c DESC` — count descending).
     if !query.order_by.is_empty() {
-        let (col_name, ascending) = &query.order_by[0];
+        let (col_name, ascending, _) = &query.order_by[0];
         // Determine whether the ORDER BY column refers to the aggregate
         // (by alias or by function name) or to the GROUP BY column.
         let agg_name = query.select.iter().find_map(|s| match s {

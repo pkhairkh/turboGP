@@ -143,6 +143,15 @@ pub const KEYWORDS: &[&str] = &[
     "CHECK",
     "CASCADE",
     "ACTION",
+    // ORDER BY / LIMIT extension keywords (Wave 8) — NULLS FIRST/LAST,
+    // OFFSET n ROWS, FETCH FIRST n ROWS ONLY.
+    "NULLS",
+    "FIRST",
+    "LAST",
+    "NEXT",
+    "FETCH",
+    "OFFSET",
+    "ONLY",
     // CTE keywords (Wave 6)
     "WITH",
     "UNION",

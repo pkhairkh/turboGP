@@ -46,7 +46,7 @@ pub fn build_plan(query: &SelectQuery) -> Result<PlanNode> {
         plan = PlanNode::Sort {
             input: Box::new(plan),
             order_by: query.order_by.iter()
-                .map(|(col, asc)| (col.clone(),
+                .map(|(col, asc, _nulls)| (col.clone(),
                     if *asc { SortOrder::Asc } else { SortOrder::Desc }))
                 .collect(),
         };
