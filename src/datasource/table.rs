@@ -142,23 +142,19 @@ impl Table {
 
     /// Append a new [`RowVersion`] to the table's MVCC version chain.
     ///
-    /// The version is appended to `self.row_versions`. The table
-    /// invariant requires `row_versions.len() <= row_count` (one entry
-    /// per logical row), so if that bound has already been reached this
-    /// call is a no-op and a warning is logged.
+    /// The version is appended to `self.row_versions`. This is used by:
+    /// - **INSERT**: once per newly created row (the version's `xmin`
+    ///   records the creating txn; `xmax` is `None`).
+    /// - **UPDATE**: once per matched row, after [`Table::mark_deleted`]
+    ///   has tombstoned the old version (the new version's `xmin` records
+    ///   the updating txn and carries the post-update column values).
     ///
-    /// Typical use: a loader or INSERT path calls this once per newly
-    /// created row, filling the next slot.
+    /// The flat `row_versions` vec is allowed to grow beyond `row_count`
+    /// when UPDATE creates additional versions for existing rows; VACUUM
+    /// is responsible for compacting dead versions (where `xmax` is set
+    /// and no active transaction can see them). The first `row_count`
+    /// entries remain aligned with the logical rows in `columns`.
     pub fn append_row_version(&mut self, version: crate::txn::mvcc::RowVersion) {
-        if self.row_versions.len() >= self.row_count {
-            log::warn!(
-                "Table::append_row_version ignored on table {:?}: row_versions.len()={} >= row_count={}",
-                self.name,
-                self.row_versions.len(),
-                self.row_count
-            );
-            return;
-        }
         self.row_versions.push(version);
     }
 
@@ -356,9 +352,13 @@ mod tests {
         table.append_row_version(RowVersion::new(3, vec![500, 600]));
         assert_eq!(table.row_versions.len(), 3);
 
-        // The table is now full — appending a 4th version is a no-op.
+        // Task 2.2: `append_row_version` no longer enforces a `len <= row_count`
+        // bound, because UPDATE needs to push a new version for an existing
+        // row (growing the chain beyond `row_count`). VACUUM compacts. So a
+        // 4th append now succeeds.
         table.append_row_version(RowVersion::new(4, vec![700, 800]));
-        assert_eq!(table.row_versions.len(), 3);
+        assert_eq!(table.row_versions.len(), 4);
+        assert_eq!(table.row_versions[3].xmin, 4);
     }
 
     /// `mark_deleted` sets `xmax` on the version at `row_idx` and

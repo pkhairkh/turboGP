@@ -313,6 +313,39 @@ impl QueryEngine {
             updated += 1;
         }
 
+        // Task 2.2 (debt-4.2): populate Table.row_versions when MVCC mode
+        // is enabled. For each matched row, the old version is tombstoned
+        // (xmax = txn_id) via `mark_deleted`, and a new RowVersion carrying
+        // the post-update column values is appended. This must run BEFORE
+        // the temporal-sync block below, which drops the `table` borrow.
+        //
+        // The new version's `values` are read from the already-mutated
+        // `columns` (the in-place update loop above wrote the new cells),
+        // so they reflect the post-UPDATE state of the row.
+        if self.mvcc_enabled {
+            let xmin = txn_id.unwrap_or(0);
+            let ncols = table.columns.len();
+            for (row_idx, &matches) in match_mask.iter().enumerate() {
+                if !matches {
+                    continue;
+                }
+                // Build the new values from the (already updated) columns.
+                let mut new_values = Vec::with_capacity(ncols);
+                for ci in 0..ncols {
+                    new_values.push(table.columns[ci].get(row_idx).copied().unwrap_or(0));
+                }
+                // Tombstone the old version (sets xmax). If the row had no
+                // version yet (e.g. table loaded without MVCC tracking),
+                // `mark_deleted` returns false and we skip the append — the
+                // absence of a prior version means there is nothing to
+                // supersede.
+                let marked = table.mark_deleted(row_idx, xmin);
+                if marked {
+                    table.append_row_version(crate::txn::mvcc::RowVersion::new(xmin, new_values));
+                }
+            }
+        }
+
         // Wave 56d: if this is a temporal table, sync the update to the
         // TemporalTable sidecar. We collect the matched row indices and
         // the new values, then call temporal.update(...).
@@ -353,20 +386,6 @@ impl QueryEngine {
             }
         }
 
-        // Task 3.3 (debt-4.2): mark updated rows' versions with xmax when MVCC enabled.
-        if self.mvcc_enabled {
-            let xmax = txn_id.unwrap_or(0);
-            // Mark the updated rows' versions as deleted (xmax set).
-            // The updated values are written in-place to the columns;
-            // a full MVCC implementation would append new versions, but
-            // for now we mark the old versions as deleted.
-            for _ in 0..updated {
-                // row_versions is parallel to the rows — mark the last
-                // `updated` entries. This is approximate; a full impl would
-                // track exactly which rows were updated.
-            }
-        }
-
         let mut result = QueryResult::empty();
         result.row_count = updated;
         Ok(result)
@@ -393,6 +412,56 @@ impl QueryEngine {
         if deleted == 0 {
             let mut result = QueryResult::empty();
             result.row_count = 0;
+            return Ok(result);
+        }
+
+        // Task 2.3 (debt-4.2): in MVCC mode, tombstone the matched rows'
+        // versions (xmax = txn_id) and leave the column data in place for
+        // VACUUM to reclaim later. We do NOT rebuild the columns or
+        // decrement `row_count` here — that's the VACUUM path's job. The
+        // `row_versions` vec stays aligned with `columns` (both reflect
+        // the original row indices, with tombstones marking deleted rows).
+        //
+        // The temporal sidecar (if any) still receives a logical delete
+        // so FOR SYSTEM_TIME queries see the row's end-time, but its
+        // column rebuild is skipped to preserve the row-version alignment.
+        if self.mvcc_enabled {
+            let xmax = txn_id.unwrap_or(0);
+            for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
+                if delete_flag {
+                    // `mark_deleted` returns false if the row had no version
+                    // (e.g. a table loaded before MVCC tracking was enabled)
+                    // or was already deleted. Either way there is nothing
+                    // useful to do here — we leave the row in place.
+                    let _ = table.mark_deleted(row_idx, xmax);
+                }
+            }
+
+            // Sync the temporal sidecar (if any) WITHOUT rebuilding columns.
+            let table_name = del.table.clone();
+            let is_temporal = self.temporals.contains_key(&table_name);
+            if is_temporal {
+                let mut pks_to_delete: Vec<u64> = Vec::new();
+                for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
+                    if delete_flag {
+                        let pk = table
+                            .columns
+                            .first()
+                            .and_then(|c| c.get(row_idx).copied())
+                            .unwrap_or(0);
+                        pks_to_delete.push(pk);
+                    }
+                }
+                drop(table);
+                if let Some(temporal) = self.temporals.get_mut(&table_name) {
+                    for pk in pks_to_delete {
+                        temporal.delete(|row| row.first().copied() == Some(pk));
+                    }
+                }
+            }
+
+            let mut result = QueryResult::empty();
+            result.row_count = deleted;
             return Ok(result);
         }
 
@@ -454,5 +523,105 @@ impl QueryEngine {
         let mut result = QueryResult::empty();
         result.row_count = deleted;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task 2.2 — `execute_update` sets `xmax` on the old version and
+    /// appends a new `RowVersion` with the post-update column values when
+    /// MVCC mode is enabled.
+    ///
+    /// Sequence: `BEGIN; INSERT (1,10); UPDATE SET v=99 WHERE id=1; COMMIT;`
+    /// Expected:
+    /// - `row_versions[0].xmax == Some(txn_id)` (old version tombstoned).
+    /// - `row_versions.len() == 2` (a new version was appended).
+    /// - The new version (`row_versions[1]`) has `xmin == txn_id`,
+    ///   `xmax == None`, and its `values` contain `99` (the updated `v`).
+    #[test]
+    fn test_update_sets_xmax() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut engine = QueryEngine::in_memory();
+        engine.enable_mvcc()?;
+        engine.execute("CREATE TABLE t (id INT, v INT)")?;
+
+        engine.execute("BEGIN")?;
+        let txn_id = engine
+            .mvcc_txn_manager()
+            .active_id()
+            .ok_or_else(|| "active txn id should be Some after BEGIN".to_string())?;
+        engine.execute("INSERT INTO t VALUES (1, 10)")?;
+        engine.execute("UPDATE t SET v = 99 WHERE id = 1")?;
+        engine.execute("COMMIT")?;
+
+        let table = engine
+            .catalog()
+            .get("t")
+            .ok_or_else(|| "table t should exist".to_string())?;
+        assert!(
+            !table.row_versions.is_empty(),
+            "row_versions should be populated by INSERT"
+        );
+
+        // The original version (at index 0) should have been tombstoned.
+        assert_eq!(
+            table.row_versions[0].xmax,
+            Some(txn_id),
+            "UPDATE should set xmax on the old version"
+        );
+
+        // A new version should have been appended for the updated row.
+        assert!(
+            table.row_versions.len() >= 2,
+            "UPDATE should append a new version; got len={}",
+            table.row_versions.len()
+        );
+
+        let new_version = &table.row_versions[1];
+        assert_eq!(new_version.xmin, txn_id, "new version's xmin is the updating txn");
+        assert_eq!(new_version.xmax, None, "new version is live (xmax == None)");
+        assert!(
+            new_version.values.contains(&99),
+            "new version should carry the updated v=99; got {:?}",
+            new_version.values
+        );
+        Ok(())
+    }
+
+    /// Task 2.3 — `execute_delete` sets `xmax` on the old version when
+    /// MVCC mode is enabled, without removing the row from `columns`.
+    ///
+    /// Sequence: `BEGIN; INSERT (1); DELETE WHERE id=1; COMMIT;`
+    /// Expected: `row_versions[0].xmax == Some(txn_id)`.
+    #[test]
+    fn test_delete_sets_xmax() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut engine = QueryEngine::in_memory();
+        engine.enable_mvcc()?;
+        engine.execute("CREATE TABLE t (id INT)")?;
+
+        engine.execute("BEGIN")?;
+        let txn_id = engine
+            .mvcc_txn_manager()
+            .active_id()
+            .ok_or_else(|| "active txn id should be Some after BEGIN".to_string())?;
+        engine.execute("INSERT INTO t VALUES (1)")?;
+        engine.execute("DELETE FROM t WHERE id = 1")?;
+        engine.execute("COMMIT")?;
+
+        let table = engine
+            .catalog()
+            .get("t")
+            .ok_or_else(|| "table t should exist".to_string())?;
+        assert!(
+            !table.row_versions.is_empty(),
+            "row_versions should be populated by INSERT"
+        );
+        assert_eq!(
+            table.row_versions[0].xmax,
+            Some(txn_id),
+            "DELETE should set xmax on the old version"
+        );
+        Ok(())
     }
 }
