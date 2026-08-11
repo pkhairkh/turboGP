@@ -2094,3 +2094,34 @@ Deviations from the plan:
 Stage Summary:
 - Gap 10 (Operational tooling) — RESOLVED.
 - Wave 9 complete. All 10 production-wiring gaps closed.
+
+---
+Task ID: 10.1 + 10.2 + 10.3 + 10.4 + 10.5
+Agent: prod-wiring-orchestrator
+Task: Final verification, documentation update, merge to main.
+
+Work Log:
+- Task 10.1 (regression test): all 33 production-wiring tests pass (raft, raft_store, raft_network, wal_append_and_sync, async_pgwire, vacuum, admin). Full lib suite: 904+ tests pass (default), 919+ tests pass (--features raft).
+- Task 10.2 (check scripts + zero warnings):
+  - check_file_size.sh: OK, all files within 2000-LOC limit.
+  - check_no_panics.sh: OK, no panic-on-input paths in production code.
+  - check_dead_code.sh: OK, no dead modules detected.
+  - cargo check --jobs 1: zero warnings.
+  - cargo check --jobs 1 --features raft: zero warnings.
+- Task 10.3 (production deployment verification matrix):
+  - Raft log survives restart: ✅ (sled_store_persists_log_entries_across_reopen, raft_manager_persistent_survives_restart)
+  - 3-node TCP cluster with failover: ✅ (raft_3_node_tcp_cluster_replicates_records, raft_3_node_cluster_failover)
+  - Commits require quorum: ✅ (wal_append_and_sync_routes_through_raft)
+  - Async pgwire server accepts connections: ✅ (async_pgwire_startup_and_simple_select_round_trip)
+  - Connection pool limits concurrency: ✅ (async_pgwire_pool_limits_concurrency)
+  - VACUUM reclaims space: ✅ (vacuum_removes_dead_rows_from_columns, vacuum_integration_test)
+  - No string hacks: ✅ (grep -rnE 'fn (split_union_all|parse_merge|parse_pivot_clause|strip_pivot_clause)' src/engine/ returns zero matches)
+  - Admin CLI works: ✅ (admin_end_to_end_backup_restore_round_trip)
+- Task 10.4 (documentation): appended Production Wiring Final Report section to FINAL_REPORT.md; added v1.3.0 entry to CHANGELOG.md.
+- Task 10.5 (merge to main): merge feat/prod-wiring into main with --no-ff, push main.
+
+Stage Summary:
+- All 10 waves complete. All 10 production-wiring gaps resolved.
+- Production deployment verification matrix: all 8 capabilities verified.
+- feat/prod-wiring merged into main and pushed.
+- Production Wiring Completion Programme complete.

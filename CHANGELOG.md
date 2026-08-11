@@ -3,6 +3,75 @@
 All notable changes to turboGP are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.3.0] — Production Wiring Completion (Waves 1-10 done)
+
+Transformed turboGP from "architecturally complete but unwired" into a
+deployable production database. All 10 production-wiring gaps closed.
+
+### Added
+- **Persistent Raft storage** (`src/storage/raft_store.rs`): `SledRaftStore`
+  implements openraft's `RaftStorage` trait via `sled::Db`. The Raft log,
+  vote, committed index, applied state machine, and snapshots persist
+  across process restarts.
+- **TCP Raft network** (`src/storage/raft_network.rs`): `TcpRaftNetwork`
+  and `TcpRaftServer` replace the in-process `mpsc` channel transport
+  with real `tokio::net::TcpStream` connections. A 3-node cluster can
+  now run on separate machines.
+- **Raft-wired write path**: `Wal::append_and_sync` now routes through
+  `RaftManager::propose()` (via `raft.client_write`) before the local
+  WAL append. Commits require quorum ACK on HA deployments.
+- **Production async pgwire server** (`src/server/async_pgwire.rs`):
+  full PostgreSQL wire protocol over tokio — startup, authentication,
+  simple query, extended query (Parse/Bind/Describe/Execute/Sync/Close),
+  and error responses. Uses `ConnectionPool` for admission control.
+- **Sync replication default**: `enable_raft()` sets
+  `Wal::sync_mode = Synchronous` and attaches a `MultiWalStreamSink`
+  with `QuorumPolicy::Majority`.
+- **VACUUM column compaction**: `vacuum_table` now removes dead rows
+  from the `columns: Vec<Arc<Vec<u64>>>` (not just version chains).
+  After VACUUM, `columns[0].len() == row_count == SELECT COUNT(*)`.
+- **Formal MERGE parser**: `MergeStmt` AST in `src/sql/ast.rs` +
+  `parse_merge_stmt()` in `src/sql/parser.rs`. Replaces the
+  `parse_merge` string-scan hack.
+- **Formal PIVOT parser**: `PivotClause` AST in `src/sql/ast.rs` +
+  `src/sql/pivot.rs` module. Replaces the `parse_pivot_clause` and
+  `strip_pivot_clause` string-scan hacks.
+- **Admin CLI** (`src/bin/turbogp-admin.rs` + `src/admin/mod.rs`):
+  `turboGP admin {backup,restore,cluster-status,vacuum,checkpoint}`
+  for operators.
+
+### Changed
+- `enable_raft()` now sets sync replication mode + quorum by default.
+- `execute_inner` dispatches UNION ALL via the formal `SetQuery::UnionAll`
+  AST (no string scanning).
+- `RaftManager` exposes both in-memory (`MemStore`) and persistent
+  (`SledRaftStore`) constructors, plus `new_multi_node` for TCP clusters.
+- `src/storage/raft.rs`'s `RpcMessage` enum is now `pub(crate)` (was
+  private, which caused a privacy-interface warning).
+
+### Removed
+- `#![allow(missing_docs)]` suppression from `src/lib.rs` — all public
+  items are documented.
+- `split_union_all`, `parse_merge`, `parse_pivot_clause`,
+  `strip_pivot_clause` string-scan hacks from `src/engine/helpers.rs`.
+
+### Migration notes
+- The `raft` Cargo feature now pulls in both `openraft` (with `serde`)
+  and `sled`. Default builds are unchanged.
+- `Wal::append_and_sync` is backward compatible — when no Raft handle
+  is attached, it falls back to the local-only WAL path.
+- The `PivotClause` struct in `src/engine/helpers.rs` is now an internal
+  shape used by `apply_pivot`; the formal AST lives in
+  `src/sql/ast::PivotClause` and the parser lives in `src/sql/pivot`.
+
+### Build quality
+- `cargo check --jobs 1` — zero warnings.
+- `cargo check --jobs 1 --features raft` — zero warnings.
+- `cargo test --jobs 1 --lib` — 904+ tests pass (default features).
+- `cargo test --jobs 1 --lib --features raft` — 919+ tests pass.
+- `check_file_size.sh`, `check_no_panics.sh`, `check_dead_code.sh` —
+  all pass.
+
 ## [1.1.0] — v3 Architecture Remediation (Waves 1-4, 9-10 done; 5-8, 11-14 in progress)
 
 The v3 cycle is a top-to-bottom architecture remediation: dead code purge,
