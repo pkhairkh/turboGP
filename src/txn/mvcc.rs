@@ -185,6 +185,8 @@ pub struct MvccTxnManager {
     commit_id: TxnId,
     txn_states: HashMap<TxnId, TxnState>,
     active: HashSet<TxnId>,
+    /// Maps each active txn_id to its snapshot_id (for VACUUM).
+    active_snapshots: HashMap<TxnId, TxnId>,
 }
 
 impl MvccTxnManager {
@@ -195,6 +197,7 @@ impl MvccTxnManager {
             commit_id: 0,
             txn_states: HashMap::new(),
             active: HashSet::new(),
+            active_snapshots: HashMap::new(),
         }
     }
 
@@ -206,6 +209,7 @@ impl MvccTxnManager {
         let snapshot_id = self.commit_id;
         self.txn_states.insert(id, TxnState::InProgress);
         self.active.insert(id);
+        self.active_snapshots.insert(id, snapshot_id);
         MvccTransaction { id, snapshot_id, state: TxnState::InProgress }
     }
 
@@ -216,6 +220,7 @@ impl MvccTxnManager {
         let cid = self.commit_id;
         self.txn_states.insert(txn_id, TxnState::Committed(cid));
         self.active.remove(&txn_id);
+        self.active_snapshots.remove(&txn_id);
         cid
     }
 
@@ -223,6 +228,7 @@ impl MvccTxnManager {
     pub fn rollback(&mut self, txn_id: TxnId) {
         self.txn_states.insert(txn_id, TxnState::Aborted);
         self.active.remove(&txn_id);
+        self.active_snapshots.remove(&txn_id);
     }
 
     /// Get the state of a transaction.
@@ -239,20 +245,88 @@ impl MvccTxnManager {
     /// active, returns the current commit_id.
     pub fn oldest_active_snapshot(&self) -> TxnId {
         let mut oldest = self.commit_id;
-        for &tid in &self.active {
-            if let Some(TxnState::InProgress) = self.txn_states.get(&tid) {
-                // Look up the snapshot_id — but we don't store it in txn_states.
-                // For VACUUM purposes, the oldest active snapshot is the
-                // minimum snapshot_id among active txns. Since snapshot_id =
-                // commit_id at begin time, and we don't store it, we use 0
-                // (conservative: never vacuum versions that might be visible).
-                oldest = oldest.min(0);
+        for (&tid, snapshot_id) in &self.active_snapshots {
+            if matches!(self.txn_states.get(&tid), Some(TxnState::InProgress)) {
+                oldest = oldest.min(*snapshot_id);
             }
         }
         oldest
     }
 
-    // Task 4.3 / 4.4 / 4.5 methods are added in subsequent commits.
+    // -----------------------------------------------------------------
+    // Task 4.3: visibility checks
+    // -----------------------------------------------------------------
+
+    /// Check if a transaction's effects are visible to the given snapshot.
+    ///
+    /// A transaction `author_id` is visible to snapshot `snapshot_id` if:
+    /// - `author_id`'s state is `Committed(cid)` where `cid <= snapshot_id`.
+    ///
+    /// Returns `false` for InProgress (not yet committed) and Aborted txns.
+    fn txn_visible_to_snapshot(&self, author_id: TxnId, snapshot_id: TxnId) -> bool {
+        match self.txn_states.get(&author_id) {
+            Some(TxnState::Committed(cid)) => *cid <= snapshot_id,
+            _ => false,
+        }
+    }
+
+    /// Check if a row version is visible to the given transaction (Task 4.3).
+    ///
+    /// A version is visible to `txn` if:
+    /// - `xmin == txn.id` (T sees its own inserts), OR `xmin` was committed
+    ///   before T's snapshot (`txn_visible_to_snapshot(xmin, txn.snapshot_id)`), AND
+    /// - `xmax` is `None` (version is live), OR `xmax == txn.id` (T deleted
+    ///   it, so it's invisible to T), OR `xmax` was NOT committed before T's
+    ///   snapshot (the deleting txn hasn't committed yet, or committed after
+    ///   T started — so the version is still visible to T).
+    pub fn visible(&self, version: &RowVersion, txn: &MvccTransaction) -> bool {
+        // Check xmin: the version must have been created by a transaction
+        // visible to us (or by us).
+        let xmin_visible = version.xmin == txn.id
+            || self.txn_visible_to_snapshot(version.xmin, txn.snapshot_id);
+        if !xmin_visible {
+            return false;
+        }
+        // Check xmax: if the version is deleted, check if the deleting
+        // transaction is visible to us.
+        match version.xmax {
+            None => true, // Still live — visible.
+            Some(xmax) => {
+                if xmax == txn.id {
+                    // We deleted it — invisible to us.
+                    false
+                } else {
+                    // If the deleting txn is NOT visible to us (not committed
+                    // before our snapshot), the version is still visible.
+                    !self.txn_visible_to_snapshot(xmax, txn.snapshot_id)
+                }
+            }
+        }
+    }
+
+    /// Scan a table and return all versions visible to the transaction
+    /// (Task 4.3). Returns references to the visible `RowVersion`s.
+    ///
+    /// For each row, only the LATEST visible version is included (snapshot
+    /// isolation: a transaction sees at most one version of each row).
+    pub fn scan_visible<'a>(
+        &self,
+        table: &'a MvccTable,
+        txn: &MvccTransaction,
+    ) -> Vec<&'a RowVersion> {
+        let mut result = Vec::new();
+        for chain in &table.rows {
+            // Find the latest visible version in the chain.
+            // Iterate in reverse so the newest visible version wins.
+            for version in chain.iter().rev() {
+                if self.visible(version, txn) {
+                    result.push(version);
+                    break;
+                }
+            }
+        }
+        result
+    }
 }
 
 impl Default for MvccTxnManager {
@@ -353,5 +427,129 @@ mod tests {
         let txn = mgr.begin();
         mgr.rollback(txn.id);
         assert_eq!(mgr.txn_state(txn.id), TxnState::Aborted);
+    }
+
+    // -----------------------------------------------------------------
+    // Task 4.3: visibility checks
+    // -----------------------------------------------------------------
+
+    /// Task 4.3 DoD: T1 inserts a row but doesn't commit; T2 begins and
+    /// scans → doesn't see T1's row. T1 commits; T3 begins and scans →
+    /// sees T1's row.
+    #[test]
+    fn mvcc_visibility_uncommitted_not_visible() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into()]);
+
+        // T1 inserts a row but doesn't commit.
+        let t1 = mgr.begin();
+        table.insert(t1.id, vec![42]);
+
+        // T2 begins and scans — must NOT see T1's uncommitted row.
+        let t2 = mgr.begin();
+        let visible = mgr.scan_visible(&table, &t2);
+        assert_eq!(visible.len(), 0, "T2 must not see T1's uncommitted insert");
+
+        // T1 commits.
+        mgr.commit(t1.id);
+
+        // T3 begins and scans — must see T1's committed row.
+        let t3 = mgr.begin();
+        let visible = mgr.scan_visible(&table, &t3);
+        assert_eq!(visible.len(), 1, "T3 must see T1's committed row");
+        assert_eq!(visible[0].values, vec![42]);
+    }
+
+    /// Task 4.3 DoD: a transaction sees its own writes.
+    #[test]
+    fn mvcc_visibility_own_writes() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into()]);
+
+        let t1 = mgr.begin();
+        table.insert(t1.id, vec![99]);
+
+        // T1 sees its own insert.
+        let visible = mgr.scan_visible(&table, &t1);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].values, vec![99]);
+    }
+
+    /// Task 4.3 DoD: snapshot isolation — a transaction doesn't see
+    /// changes committed AFTER it began.
+    #[test]
+    fn mvcc_snapshot_isolation() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into()]);
+
+        // T1 inserts and commits.
+        let t1 = mgr.begin();
+        table.insert(t1.id, vec![1]);
+        mgr.commit(t1.id);
+
+        // T2 begins (sees T1's row).
+        let t2 = mgr.begin();
+
+        // T3 inserts and commits (AFTER T2 began).
+        let t3 = mgr.begin();
+        table.insert(t3.id, vec![2]);
+        mgr.commit(t3.id);
+
+        // T2 scans — sees T1's row but NOT T3's row (snapshot isolation).
+        let visible = mgr.scan_visible(&table, &t2);
+        assert_eq!(visible.len(), 1, "T2 must see only T1's row (snapshot)");
+        assert_eq!(visible[0].values, vec![1]);
+
+        // T4 begins after T3 commits — sees both rows.
+        let t4 = mgr.begin();
+        let visible = mgr.scan_visible(&table, &t4);
+        assert_eq!(visible.len(), 2, "T4 must see both rows");
+    }
+
+    /// Task 4.3 DoD: a deleted row is invisible after the deleting txn commits.
+    #[test]
+    fn mvcc_visibility_deleted_row() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into()]);
+
+        // T1 inserts and commits.
+        let t1 = mgr.begin();
+        let row0 = table.insert(t1.id, vec![1]);
+        mgr.commit(t1.id);
+
+        // T2 deletes the row and commits.
+        let t2 = mgr.begin();
+        table.delete(t2.id, row0);
+        mgr.commit(t2.id);
+
+        // T3 begins — must NOT see the deleted row.
+        let t3 = mgr.begin();
+        let visible = mgr.scan_visible(&table, &t3);
+        assert_eq!(visible.len(), 0, "T3 must not see the deleted row");
+
+        // T2 (before commit) would not see the row either (it deleted it).
+        // But after commit, T2 is no longer active. Verify via a fresh txn.
+    }
+
+    /// Task 4.3 DoD: a row deleted by an uncommitted transaction is still
+    /// visible to other transactions.
+    #[test]
+    fn mvcc_visibility_uncommitted_delete() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into()]);
+
+        // T1 inserts and commits.
+        let t1 = mgr.begin();
+        let row0 = table.insert(t1.id, vec![1]);
+        mgr.commit(t1.id);
+
+        // T2 deletes the row but doesn't commit.
+        let t2 = mgr.begin();
+        table.delete(t2.id, row0);
+
+        // T3 begins — must STILL see the row (T2's delete is uncommitted).
+        let t3 = mgr.begin();
+        let visible = mgr.scan_visible(&table, &t3);
+        assert_eq!(visible.len(), 1, "T3 must see the row (T2's delete is uncommitted)");
     }
 }
