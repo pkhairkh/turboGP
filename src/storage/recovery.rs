@@ -21,8 +21,20 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose, Engine as _};
+
+/// A sink for streaming WAL records to replicas (Task 5.1).
+///
+/// Implemented by `WalStreamer` in `src/storage/replication.rs`. The Wal
+/// holds an `Option<Arc<Mutex<dyn WalStreamSink>>>` and calls `stream()`
+/// after each `append_and_sync()` so records are replicated to followers.
+pub trait WalStreamSink: Send {
+    /// Stream a record to the replica. Returns the number of bytes sent,
+    /// or an error.
+    fn stream(&mut self, record: &WalRecord) -> Result<usize, String>;
+}
 
 /// A WAL record: one DML operation or a transaction boundary marker.
 ///
@@ -192,17 +204,14 @@ pub struct Wal {
     /// The file handle for the current segment (None if closed).
     file: Option<File>,
     /// Monotonic LSN counter. The next record appended gets this LSN.
-    /// On `open()`, initialised by scanning the existing WAL for the max
-    /// LSN. On `truncate()`, preserved (NOT reset) so that post-checkpoint
-    /// records get LSNs strictly greater than the checkpoint's `last_lsn`.
-    /// `advance_lsn_to()` lets the engine bump this past the checkpoint's
-    /// `last_lsn` when the WAL was truncated to empty.
     next_lsn: u64,
     /// Rotate to a new segment when the current one reaches this many bytes.
     segment_limit: u64,
     /// The highest LSN that has been fsynced to disk (Task 2.4 group commit).
-    /// `sync_to_lsn(lsn)` only fsyncs if `lsn > last_synced_lsn`.
     last_synced_lsn: u64,
+    /// Optional replication sink (Task 5.1). When set, `append_and_sync()`
+    /// calls `sink.stream(&record)` after fsync so the record is replicated.
+    stream_sink: Option<Arc<Mutex<dyn WalStreamSink>>>,
 }
 
 impl Wal {
@@ -234,6 +243,7 @@ impl Wal {
             next_lsn: 1,
             segment_limit,
             last_synced_lsn: 0,
+            stream_sink: None,
         };
         // Scan existing records to find the max LSN.
         if let Ok(records) = wal.read_all() {
@@ -345,7 +355,24 @@ impl Wal {
     pub fn append_and_sync(&mut self, record: &WalRecord) -> std::io::Result<()> {
         self.append(record)?;
         self.sync()?;
+        // Task 5.1: stream the record to replicas if a sink is attached.
+        if let Some(ref sink) = self.stream_sink {
+            if let Ok(mut sink) = sink.lock() {
+                let _ = sink.stream(record);
+            }
+        }
         Ok(())
+    }
+
+    /// Attach a replication sink (Task 5.1). After this, every
+    /// `append_and_sync()` call streams the record to the sink (replica).
+    pub fn set_stream_sink(&mut self, sink: Arc<Mutex<dyn WalStreamSink>>) {
+        self.stream_sink = Some(sink);
+    }
+
+    /// Detach the replication sink (Task 5.1).
+    pub fn clear_stream_sink(&mut self) {
+        self.stream_sink = None;
     }
 
     /// Append a record WITHOUT fsyncing, returning the assigned LSN
@@ -1559,6 +1586,35 @@ mod tests {
         // Records are durable.
         let records = wal.read_all().unwrap();
         assert_eq!(records.len(), 1);
+    }
+
+    /// Task 5.1 DoD: append_and_sync streams to the attached sink.
+    #[test]
+    fn wal_append_and_sync_streams_to_sink() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// A test sink that counts records streamed to it.
+        struct CountingSink {
+            count: AtomicU64,
+        }
+        impl WalStreamSink for CountingSink {
+            fn stream(&mut self, _record: &WalRecord) -> Result<usize, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        let sink = Arc::new(Mutex::new(CountingSink { count: AtomicU64::new(0) }));
+        wal.set_stream_sink(sink.clone());
+
+        wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
+        wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
+        wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (3)")).unwrap();
+
+        let count = sink.lock().unwrap().count.load(Ordering::SeqCst);
+        assert_eq!(count, 3, "sink must have received 3 records");
     }
 
     /// Task 3.1 DoD: PhysicalChange variants serialize and round-trip.
