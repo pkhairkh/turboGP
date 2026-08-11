@@ -496,3 +496,93 @@ fn test_write_write_conflict_aborts() {
     );
     engine.execute("COMMIT").expect("T3 COMMIT");
 }
+
+/// Task 3.1 — MVCC-mode ROLLBACK marks inserted rows invisible (atomicity).
+///
+/// Scenario (mirrors the task description):
+/// 1. `enable_mvcc()`.
+/// 2. `CREATE TABLE t (id INT)`.
+/// 3. `BEGIN`.
+/// 4. `INSERT INTO t VALUES (1)`.
+/// 5. `ROLLBACK` — the txn's state becomes `Aborted`.
+/// 6. `SELECT COUNT(*) FROM t` (autocommit, no active txn) → must return 0.
+///
+/// **Why this test exists:** `is_row_visible_to_active` (Task 2.4) already
+/// returns `false` for rows whose `xmin` is in the `Aborted` state, so
+/// rolled-back inserts *should* be invisible. However, Task 2.4 gated the
+/// visibility filter on `txn_id.is_some()` — i.e. it only applied when an
+/// MVCC transaction was active. That meant an autocommit `SELECT` (the
+/// common case after `ROLLBACK`) bypassed the filter entirely and still
+/// saw the rolled-back row, violating atomicity.
+///
+/// Task 3.1 fixes the gate: `execute_inner` now applies MVCC visibility
+/// filtering whenever `mvcc_enabled` is true, regardless of whether a
+/// transaction is active. In autocommit mode, `is_row_visible_to_active`
+/// treats the reader as txn `0` (never in `txn_states`), so:
+/// - Aborted `xmin` (the rolled-back insert) → `xmin != 0` and
+///   `txn_state(xmin) = Aborted` (not `Committed`) → invisible. ✓
+/// - Committed `xmin` (a prior committed insert) → `txn_state = Committed`
+///   → visible. ✓
+/// - Autocommit `xmin = 0` (an autocommit insert) → `xmin == active_id`
+///   → visible (preserves autocommit semantics). ✓
+#[test]
+fn test_mvcc_rollback_marks_inserts_invisible() {
+    let mut engine = QueryEngine::in_memory();
+    engine.enable_mvcc().expect("enable_mvcc");
+    engine.execute("CREATE TABLE t (id INT)").expect("CREATE TABLE");
+
+    // Insert a row inside an explicit transaction, then ROLLBACK.
+    engine.execute("BEGIN").expect("BEGIN");
+    let txn_id = engine
+        .mvcc_txn_manager()
+        .active_id()
+        .expect("txn should be active after BEGIN");
+    engine.execute("INSERT INTO t VALUES (1)").expect("INSERT");
+    engine.execute("ROLLBACK").expect("ROLLBACK");
+    assert!(
+        !engine.mvcc_txn_manager().is_active(),
+        "no active txn after ROLLBACK"
+    );
+    // Sanity: the rolled-back txn's state is Aborted.
+    assert!(
+        matches!(engine.mvcc_txn_manager().txn_state(txn_id), TxnState::Aborted),
+        "rolled-back txn must be in Aborted state"
+    );
+
+    // Autocommit SELECT — the rolled-back insert must be invisible.
+    // Before the Task 3.1 fix, this returned 1 (atomicity violation).
+    let r = engine
+        .execute("SELECT COUNT(*) FROM t")
+        .expect("SELECT COUNT(*) after ROLLBACK");
+    assert_eq!(
+        r.columns[0].values[0], 0,
+        "rolled-back insert must be invisible (atomicity): Aborted xmin \
+         filtered out by is_row_visible_to_active"
+    );
+
+    // Regression guard: a subsequent committed insert IS visible, proving
+    // the filter doesn't over-aggressively hide committed data.
+    engine.execute("BEGIN").expect("BEGIN (committed insert)");
+    engine.execute("INSERT INTO t VALUES (42)").expect("INSERT (committed)");
+    engine.execute("COMMIT").expect("COMMIT");
+    let r = engine
+        .execute("SELECT COUNT(*) FROM t")
+        .expect("SELECT COUNT(*) after COMMIT");
+    assert_eq!(
+        r.columns[0].values[0], 1,
+        "committed insert must be visible (Committed xmin passes the filter)"
+    );
+
+    // Regression guard: autocommit inserts (xmin = 0) are still visible to
+    // autocommit readers (active_id = 0 → xmin == active_id).
+    engine
+        .execute("INSERT INTO t VALUES (99)")
+        .expect("autocommit INSERT");
+    let r = engine
+        .execute("SELECT COUNT(*) FROM t")
+        .expect("SELECT COUNT(*) after autocommit INSERT");
+    assert_eq!(
+        r.columns[0].values[0], 2,
+        "autocommit insert must be visible to autocommit reader"
+    );
+}

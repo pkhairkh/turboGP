@@ -1602,12 +1602,23 @@ impl QueryEngine {
 
         // Wave 53: Temporal query handling is done above (before parsing).
 
-        // Task 2.4: when MVCC mode is enabled AND a transaction is active,
-        // pass `Some(&mgr)` so `execute_select` applies visibility filtering
-        // (eliminates dirty reads of uncommitted inserts / committed deletes).
-        // Pass `None` for autocommit (no active txn) and for non-MVCC mode —
-        // preserves the legacy behaviour.
-        let mvcc_for_select = if self.mvcc_enabled && txn_id.is_some() {
+        // Task 2.4 / Task 3.1: when MVCC mode is enabled, ALWAYS pass
+        // `Some(&mgr)` so `execute_select` applies visibility filtering —
+        // even in autocommit mode (no active txn).
+        //
+        // Task 3.1 fix: previously this was gated on `txn_id.is_some()`,
+        // which meant a `BEGIN; INSERT; ROLLBACK;` followed by an
+        // autocommit `SELECT COUNT(*)` would NOT filter — the rolled-back
+        // insert (xmin = aborted_txn_id, txn_state = Aborted) would still
+        // be counted, violating atomicity. By applying the filter whenever
+        // `mvcc_enabled` is true, the autocommit reader (treated as txn 0
+        // by `is_row_visible_to_active`) sees only rows whose xmin is
+        // Committed (or txn 0 itself, for autocommit inserts) — Aborted
+        // inserts are correctly hidden.
+        //
+        // Pass `None` only for non-MVCC mode — preserves the legacy
+        // behaviour (no row_versions, no visibility filtering).
+        let mvcc_for_select = if self.mvcc_enabled {
             Some(&self.mvcc_txn_manager)
         } else {
             None
