@@ -112,6 +112,41 @@ impl AsyncPgwireServer {
         })
     }
 
+    /// Bind a new async pgwire server that gates admission through a
+    /// [`ConnectionPool`] (Task 5.3).
+    ///
+    /// Each accepted connection calls [`ConnectionPool::acquire`] before
+    /// processing; if no permit is available within
+    /// [`AsyncPgwireServer::acquire_timeout`] (default 5 s, override via
+    /// [`AsyncPgwireServer::with_acquire_timeout`]), the client receives
+    /// a FATAL `ErrorResponse` ("too many connections", SQLSTATE 53300)
+    /// and the connection is closed. The permit is held for the entire
+    /// connection lifetime and released when the handler returns (RAII).
+    ///
+    /// The engine is taken from `pool.engine` so that the pool and the
+    /// server share the same `Arc<RwLock<QueryEngine>>`.
+    pub async fn bind_with_pool(addr: &str, pool: Arc<crate::server::pool::ConnectionPool>) -> io::Result<Self> {
+        let engine = pool.engine.clone();
+        let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+        Ok(Self {
+            local_addr,
+            engine,
+            pool: Some(pool),
+            listener,
+            acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
+        })
+    }
+
+    /// Override the default 5 s pool-acquire timeout (Task 5.3).
+    ///
+    /// Chainable builder: `server.with_acquire_timeout(Duration::from_secs(1))`.
+    /// Ignored when no pool is configured.
+    pub fn with_acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.acquire_timeout = timeout;
+        self
+    }
+
     /// Run the accept loop. Returns only on a fatal listener error; per-
     /// connection errors are logged and do not propagate.
     ///
@@ -214,13 +249,19 @@ impl PgConn {
 /// Handle one connection: startup → permit acquisition → run loop → flush.
 ///
 /// This is the entry point spawned by [`AsyncPgwireServer::serve`]. It:
-/// 1. Reads the startup message and responds with `AuthenticationOk` +
-///    parameter statuses + `BackendKeyData` + `ReadyForQuery`. SSLRequest
-///    and GSSAPIRequest are declined; CancelRequest closes the connection.
+/// 1. Reads the startup message (handling SSLRequest / GSSAPIRequest by
+///    declining with 'N' and re-reading). On a real v3 startup, the
+///    user/database is parsed (currently unused — trust auth). On an
+///    unknown protocol, sends a FATAL `ErrorResponse` and returns.
 /// 2. If `pool` is `Some`, acquires a [`PoolPermit`] within
-///    `acquire_timeout`. On failure, sends a FATAL `ErrorResponse` and
-///    returns. (Task 5.3.)
-/// 3. Enters the request loop, dispatching on the message tag byte.
+///    `acquire_timeout`. On failure, sends a FATAL `ErrorResponse`
+///    ("too many connections", SQLSTATE 53300) and returns. (Task 5.3.)
+///    The permit is acquired BEFORE sending `AuthenticationOk` so a
+///    rejected client sees only the FATAL — not a misleading
+///    `ReadyForQuery` first.
+/// 3. Sends `AuthenticationOk` + parameter statuses + `BackendKeyData` +
+///    `ReadyForQuery`.
+/// 4. Enters the request loop, dispatching on the message tag byte.
 ///
 /// All I/O errors are mapped to `io::Error` and propagated; the caller
 /// (`serve`) logs them at `debug` level.
@@ -238,8 +279,11 @@ async fn handle_connection(
         BufWriter::with_capacity(8 * 1024, wh),
     );
 
-    // 1. Startup handshake.
-    if let Err(e) = conn.handle_startup().await {
+    // 1. Read (and validate) the startup message. No response is sent
+    //    yet — we wait until we have a pool permit to either accept or
+    //    reject the connection. (SSLRequest / GSSAPIRequest are
+    //    declined with 'N' inline so the client can retry.)
+    if let Err(e) = conn.read_startup_message().await {
         let _ = conn.write.flush().await;
         return Err(e);
     }
@@ -268,21 +312,32 @@ async fn handle_connection(
         None => None,
     };
 
-    // 3. Request loop.
+    // 3. Send AuthenticationOk + parameter statuses + BackendKeyData +
+    //    ReadyForQuery. (Done after permit acquisition so a rejected
+    //    client doesn't see a spurious ReadyForQuery before the FATAL.)
+    if let Err(e) = conn.send_authentication_ok_and_params().await {
+        let _ = conn.write.flush().await;
+        return Err(e);
+    }
+    conn.write.flush().await?;
+
+    // 4. Request loop.
     let result = conn.run_loop(&engine).await;
     let _ = conn.write.flush().await;
     result
 }
 
 impl PgConn {
-    /// Read the startup message and respond.
+    /// Read (and validate) the startup message.
     ///
     /// Loops to handle SSLRequest / GSSAPIRequest (declined with 'N',
     /// then the client retries with a real startup). On a real v3
-    /// startup, sends `AuthenticationOk` + parameter statuses +
-    /// `BackendKeyData` + `ReadyForQuery`. On an unknown protocol,
+    /// startup, parses the user/database (currently unused — trust auth)
+    /// and returns `Ok(())` WITHOUT sending any response. The caller
+    /// is responsible for calling [`Self::send_authentication_ok_and_params`]
+    /// after pool-permit acquisition (Task 5.3). On an unknown protocol,
     /// sends a FATAL `ErrorResponse` and returns `Err`.
-    async fn handle_startup(&mut self) -> io::Result<()> {
+    async fn read_startup_message(&mut self) -> io::Result<()> {
         loop {
             let len = self.read_i32_be().await?;
             if !(4..=(MAX_STARTUP_BODY as i32 + 4)).contains(&len) {
@@ -318,9 +373,9 @@ impl PgConn {
                 m if (PROTOCOL_3_0..=PROTOCOL_3_0 + 12).contains(&m) => {
                     // Protocol v3.x — parse user/database/application_name.
                     // We accept any user (trust auth) and ignore the rest.
+                    // The actual response is sent by the caller AFTER
+                    // pool-permit acquisition (Task 5.3).
                     let _pairs = parse_startup_pairs(&buf[4..]);
-                    self.send_authentication_ok_and_params().await?;
-                    self.write.flush().await?;
                     return Ok(());
                 }
                 _ => {

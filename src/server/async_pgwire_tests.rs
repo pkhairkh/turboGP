@@ -15,6 +15,7 @@ use tokio::net::TcpStream;
 
 use super::AsyncPgwireServer;
 use crate::engine::QueryEngine;
+use crate::server::pool::{ConnectionPool, PoolConfig};
 
 // ---------------------------------------------------------------------------
 // Byte-level pgwire client helpers
@@ -496,5 +497,128 @@ async fn async_pgwire_extended_query_close_drops_statement() {
     assert!(has_err, "expected an ErrorResponse after Close + Describe of closed statement");
 
     drop(stream);
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Task 5.3: connection-pool admission control
+// ---------------------------------------------------------------------------
+
+/// Helper: connect, send startup, and drain AuthOk + ParameterStatus* +
+/// BackendKeyData + ReadyForQuery. Returns the connected stream (with
+/// the startup handshake already completed). Used by pool tests to
+/// establish "ready" connections that hold their pool permits.
+async fn connect_and_startup(addr: std::net::SocketAddr) -> TcpStream {
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    s.write_all(&build_startup("u")).await.expect("startup write");
+    let _ = read_until_ready(&mut s).await;
+    s
+}
+
+/// Task 5.3 DoD — start a server with pool size 2, open 2 connections
+/// (which hold their permits by not sending any queries), then open 2
+/// more and verify they receive FATAL ErrorResponse ("too many
+/// connections") after the acquire timeout elapses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_pgwire_pool_limits_concurrency() {
+    let engine = Arc::new(RwLock::new(QueryEngine::in_memory()));
+    let pool = Arc::new(ConnectionPool::new(
+        engine,
+        PoolConfig { max_size: 2, acquire_timeout_secs: 30 },
+    ));
+    let server = AsyncPgwireServer::bind_with_pool("127.0.0.1:0", pool.clone())
+        .await
+        .expect("bind")
+        .with_acquire_timeout(Duration::from_millis(200));
+    let addr = server.local_addr;
+    let task = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 1. Open 2 connections — they acquire permits and sit idle (holding
+    //    the permits) by not sending any query.
+    let mut c1 = connect_and_startup(addr).await;
+    let mut c2 = connect_and_startup(addr).await;
+
+    // Sanity: the pool reports 2 active / 0 idle.
+    let m = pool.metrics();
+    assert_eq!(m.active, 2, "pool should have 2 active permits, got {m:?}");
+    assert_eq!(m.idle, 0, "pool should have 0 idle permits, got {m:?}");
+
+    // 2. Open connections 3 and 4 — they should time out (200ms) and
+    //    receive a FATAL ErrorResponse with "too many connections".
+    let mut c3 = TcpStream::connect(addr).await.expect("c3 connect");
+    c3.write_all(&build_startup("u")).await.expect("c3 startup");
+    let (tag, body) = tokio::time::timeout(Duration::from_secs(2), read_message(&mut c3))
+        .await
+        .expect("c3 read timed out > 2s (acquire should fail at 200ms)");
+    assert_eq!(tag, b'E', "c3 should receive ErrorResponse ('E'), got {tag:#x}");
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("too many connections"),
+        "c3 body should contain 'too many connections', got: {body_str:?}"
+    );
+
+    let mut c4 = TcpStream::connect(addr).await.expect("c4 connect");
+    c4.write_all(&build_startup("u")).await.expect("c4 startup");
+    let (tag, body) = tokio::time::timeout(Duration::from_secs(2), read_message(&mut c4))
+        .await
+        .expect("c4 read timed out > 2s (acquire should fail at 200ms)");
+    assert_eq!(tag, b'E', "c4 should receive ErrorResponse ('E'), got {tag:#x}");
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("too many connections"),
+        "c4 body should contain 'too many connections', got: {body_str:?}"
+    );
+
+    // 3. Verify the pool counters reflect the rejected acquires.
+    let m = pool.metrics();
+    assert_eq!(m.active, 2, "active should still be 2 (c1/c2 hold permits), got {m:?}");
+    // total_acquired should be exactly 2 (c1, c2) — c3 and c4 timed out
+    // before acquire() returned Ok.
+    assert_eq!(m.total_acquired, 2, "total_acquired should be 2, got {m:?}");
+
+    drop(c1);
+    drop(c2);
+    drop(c3);
+    drop(c4);
+    task.abort();
+}
+
+/// Task 5.3 — when a permit is released (a connection closes), a
+/// waiting connection can acquire it and proceed. This proves the pool
+/// isn't permanently stuck after rejections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_pgwire_pool_releases_permit_on_disconnect() {
+    let engine = Arc::new(RwLock::new(QueryEngine::in_memory()));
+    let pool = Arc::new(ConnectionPool::new(
+        engine,
+        PoolConfig { max_size: 1, acquire_timeout_secs: 30 },
+    ));
+    let server = AsyncPgwireServer::bind_with_pool("127.0.0.1:0", pool.clone())
+        .await
+        .expect("bind")
+        .with_acquire_timeout(Duration::from_millis(200));
+    let addr = server.local_addr;
+    let task = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Open 1 connection — fills the pool (max_size = 1).
+    let c1 = connect_and_startup(addr).await;
+    assert_eq!(pool.metrics().active, 1);
+
+    // Drop c1 — releases the permit.
+    drop(c1);
+    // Give the server a moment to drop the permit.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(pool.metrics().active, 0, "permit should be released after c1 drops");
+
+    // Now a new connection should succeed.
+    let _c2 = connect_and_startup(addr).await;
+    assert_eq!(pool.metrics().active, 1, "new connection should acquire the freed permit");
+
     task.abort();
 }
