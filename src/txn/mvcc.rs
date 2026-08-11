@@ -355,6 +355,16 @@ impl MvccTxnManager {
         self.current_active.as_ref().map(|t| t.snapshot_id)
     }
 
+    /// Get the active transaction's `isolation_level` (Task 3.5).
+    ///
+    /// Returns `Some(level)` when an MVCC transaction is active, `None` in
+    /// autocommit mode. Used by `execute_update`/`execute_delete` to decide
+    /// whether to run Serializable write-write conflict detection before
+    /// modifying a row.
+    pub fn active_isolation_level(&self) -> Option<IsolationLevel> {
+        self.current_active.as_ref().map(|t| t.isolation_level)
+    }
+
     /// Snapshot-isolation visibility check (Task 3.2).
     ///
     /// Determines whether `version` is visible to a reader with the given
@@ -742,6 +752,150 @@ impl MvccTxnManager {
             }
         }
         removed
+    }
+
+    // -----------------------------------------------------------------
+    // Task 3.4 + 3.5: engine-level VACUUM and Serializable conflict
+    // detection for the engine's `Table` type (not `MvccTable`).
+    // -----------------------------------------------------------------
+
+    /// The oldest active snapshot_id, or `current_commit_id` if no
+    /// transactions are active (Task 3.4 helper).
+    ///
+    /// This is the threshold below which dead row versions can be safely
+    /// reclaimed by [`vacuum_table`](Self::vacuum_table): a version with
+    /// `xmax` committed at `cid <= oldest` is invisible to every active
+    /// transaction (and to all future autocommit readers, whose snapshot
+    /// will be `>= current_commit_id >= oldest`).
+    ///
+    /// Equivalent to [`oldest_active_snapshot`](Self::oldest_active_snapshot)
+    /// — exposed under a separate name to match the Task 3.4 spec wording.
+    pub fn oldest_active_snapshot_or_current(&self) -> u64 {
+        self.oldest_active_snapshot()
+    }
+
+    /// Remove dead row versions from a [`Table`]'s version chains
+    /// (Task 3.4).
+    ///
+    /// A version is **dead** — and therefore removed — when EITHER:
+    /// - its `xmin` is `Aborted` (the creating transaction rolled back,
+    ///   so the version never became visible to anyone), OR
+    /// - its `xmax` is `Some(deleter)` where `deleter` is
+    ///   `Committed(cid)` with `cid <= oldest_active_snapshot_or_current()`
+    ///   (the version was superseded by a committed delete that no active
+    ///   transaction can see anymore).
+    ///
+    /// This **only** cleans the version chains — it does NOT compact the
+    /// column data (`table.columns`). Column compaction is a separate
+    /// step (reclaiming space from tombstoned rows) that a future wave
+    /// will wire into `execute_vacuum`.
+    ///
+    /// Returns the total number of versions removed across all chains.
+    pub fn vacuum_table(&mut self, table: &mut crate::datasource::Table) -> usize {
+        let oldest = self.oldest_active_snapshot_or_current();
+        let mut removed = 0;
+        for chain in &mut table.row_versions {
+            let before = chain.len();
+            chain.retain(|version| {
+                // Remove versions whose creating transaction aborted.
+                if matches!(self.txn_state(version.xmin), TxnState::Aborted) {
+                    return false;
+                }
+                // Remove versions whose deleting transaction committed
+                // at or before the oldest active snapshot (no active txn
+                // can see this version anymore).
+                if let Some(xmax) = version.xmax {
+                    if let TxnState::Committed(cid) = self.txn_state(xmax) {
+                        if cid <= oldest {
+                            return false; // dead version
+                        }
+                    }
+                }
+                true
+            });
+            removed += before - chain.len();
+        }
+        removed
+    }
+
+    /// Serializable write-write conflict detection for the engine's
+    /// [`Table`] type (Task 3.5).
+    ///
+    /// Determines whether the active transaction (`active_txn_id` with
+    /// snapshot `active_snapshot_id`) can safely modify the row at
+    /// `row_idx` without producing a non-serializable schedule. A
+    /// conflict occurs when the row was modified by a **concurrent
+    /// committed** transaction — i.e. one that committed AFTER our
+    /// snapshot.
+    ///
+    /// # Conflict rule
+    ///
+    /// 1. Find the **latest version visible to the active transaction**
+    ///    (iterating the chain at `table.row_versions[row_idx]` in
+    ///    reverse, using [`is_visible_with_snapshot`](Self::is_visible_with_snapshot)).
+    ///    If no version is visible, the row doesn't exist from our
+    ///    perspective — return `Ok(())` (not a conflict; the row is
+    ///    already gone).
+    /// 2. If that visible version's `xmax` is `Some(deleter)` where:
+    ///    - `deleter != active_txn_id` (not our own prior delete), AND
+    ///    - `txn_state(deleter)` is `Committed(cid)` with
+    ///      `cid > active_snapshot_id` (the delete committed after our
+    ///      snapshot),
+    ///    then the row was modified under us → return `Err(ConflictError)`
+    ///    (first-committer-wins).
+    /// 3. Otherwise, return `Ok(())`.
+    ///
+    /// This mirrors [`check_write_conflict`](Self::check_write_conflict)
+    /// (which operates on `MvccTable`), adapted to the engine's `Table`
+    /// and to the snapshot-id-based visibility check. Per the Task 3.5
+    /// spec, only the committed-after-snapshot case triggers a conflict;
+    /// an uncommitted concurrent deleter does NOT (it will be detected
+    /// at that txn's commit time by the same rule).
+    pub fn check_write_conflict_for_table(
+        &self,
+        table: &crate::datasource::Table,
+        active_txn_id: u64,
+        active_snapshot_id: u64,
+        row_idx: usize,
+    ) -> Result<(), ConflictError> {
+        let chain = match table.row_versions.get(row_idx) {
+            Some(c) => c,
+            None => return Ok(()), // No chain — row doesn't exist.
+        };
+        // Find the latest version visible to the active transaction.
+        let visible_version = chain
+            .iter()
+            .rev()
+            .find(|v| self.is_visible_with_snapshot(v, active_snapshot_id, active_txn_id));
+        let version = match visible_version {
+            Some(v) => v,
+            None => {
+                // No visible version — the row doesn't exist from our
+                // perspective. Not a write-write conflict (it's a
+                // "row not found" — the caller may choose to no-op).
+                return Ok(());
+            }
+        };
+        if let Some(xmax) = version.xmax {
+            if xmax == active_txn_id {
+                // We already deleted it in this txn — idempotent, no conflict.
+                return Ok(());
+            }
+            if let TxnState::Committed(cid) = self.txn_state(xmax) {
+                if cid > active_snapshot_id {
+                    // The deleter committed AFTER our snapshot — the row
+                    // was modified under us. First-committer-wins.
+                    return Err(ConflictError {
+                        message: format!(
+                            "write-write conflict: row {} was modified by transaction {} (committed at cid={}, after our snapshot {})",
+                            row_idx, xmax, cid, active_snapshot_id
+                        ),
+                        conflicting_txn: xmax,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
