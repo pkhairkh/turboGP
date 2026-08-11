@@ -319,3 +319,42 @@ visibility-check overhead.
 d1a3cc8 docs(6): append worklog entry for replication wiring fix + openraft deferral
 ... (Waves 1-5 commits in the worklog)
 ```
+
+---
+
+## HA & Concurrency Completion (Waves 1-9)
+
+### Overview
+
+Completed the 6 remaining production gaps from the Production Hardening
+Programme: real Raft, sync ACK, Catalog RwLock, snapshot isolation,
+connection pooling, zero warnings.
+
+### Gaps Resolved
+
+| Gap | Before | After | Wave |
+|-----|--------|-------|------|
+| Real Raft | Stub | openraft (3-node, failover) | 5 |
+| Sync ACK | Flush-based | Wire protocol + quorum | 6 |
+| Catalog RwLock | No internal lock | parking_lot::RwLock | 2 |
+| Snapshot Isolation | Read-committed | Serializable (snapshot_id) | 3 |
+| Connection Pool | None | Configurable + metrics | 7 |
+| Code Quality | 463 warnings | 0 warnings | 8 |
+
+### Test Summary
+
+- 870 lib tests pass (was 850)
+- 6 openraft tests pass (with --features raft)
+- 15 MVCC integration tests pass
+- 13 replication tests pass
+- 6 concurrency tests pass
+- Zero compiler warnings
+- All check scripts pass (file_size, no_panics, dead_code)
+
+### Architecture
+
+- **Catalog**: internal `parking_lot::RwLock<HashMap>` — concurrent readers
+- **MVCC**: `Vec<Vec<RowVersion>>` version chains, `snapshot_id` visibility
+- **Raft**: `openraft::Raft` with `MemStore` backend, 3-node cluster, failover
+- **Replication**: ACK wire protocol, `QuorumPolicy::Majority`, sync mode
+- **Server**: tokio async runtime, `ConnectionPool` with configurable size
