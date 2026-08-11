@@ -320,7 +320,7 @@ fn smoke_durability_wal() {
     let tmp = TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     wal.append(&WalRecord {
-        lsn: 0,
+        lsn: 0, timestamp_us: 0,
         txn_id: 0,
         sql: "CREATE TABLE t (id INT)".into(),
         is_commit: false,

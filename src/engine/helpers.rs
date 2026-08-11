@@ -152,13 +152,12 @@ pub(crate) fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bo
                 i += 1;
                 continue;
             }
-            crate::sql::lexer::Token::LParen => {
-                // Parenthesised expressions in DML WHERE are not supported
-                // here — fall back to the dispatcher's mask evaluator if
-                // the caller needs full boolean expression support.
-                return Err(Error::Other(
-                    "parenthesised expressions are not supported in DML WHERE; use SELECT WHERE instead".into(),
-                ));
+            crate::sql::lexer::Token::LParen | crate::sql::lexer::Token::RParen => {
+                // Task 5.1: skip parens — Expr::to_string() wraps binary
+                // expressions in parens (e.g. "(id = 1)"), and we need to
+                // handle this gracefully for simple col op value predicates.
+                i += 1;
+                continue;
             }
             _ => {}
         }
