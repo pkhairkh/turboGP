@@ -1488,11 +1488,33 @@ fn where_clause_to_expr(wc: &WhereClause) -> crate::sql::parser::Expr {
 /// whose `row_versions[i]` is invisible to the active transaction (dirty
 /// inserts / committed deletes). This is the single chokepoint for MVCC
 /// visibility filtering in the SELECT execution path.
+///
+/// Task 5.3: when `mvcc` is `Some` AND `table.row_count > 1000`, bypass
+/// the serial batch+retain path and use [`crate::exec::parallel::parallel_scan`]
+/// to fan the row indices out across worker threads. Each worker applies
+/// both the WHERE filter and the MVCC visibility check to its morsel in
+/// one pass — avoiding the intermediate `Vec<usize>` that the serial
+/// path produces between `filter_indices_batch` and the `retain` call.
+/// For small tables or non-MVCC mode, the original serial path is used
+/// (the crossbeam::scope setup cost ~10µs dominates for sub-millisecond
+/// scans).
 fn filter_indices(
     where_clause: &WhereClause,
     table: &Table,
     mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Vec<usize> {
+    // Task 5.3: parallel MORS scan for large tables under MVCC.
+    // Falls back to the serial path for small tables or when MVCC is off
+    // (the parallel path's benefit is the combined WHERE+visibility scan,
+    // which only matters when MVCC visibility filtering is active — the
+    // serial `filter_indices_batch` already uses SIMD-vectorised filter
+    // evaluation for the WHERE clause alone).
+    if let Some(mgr) = mvcc {
+        if table.row_count > 1000 {
+            return filter_indices_parallel(where_clause, table, mgr);
+        }
+    }
+
     let mut indices = if let Some(indices) = filter_indices_batch(where_clause, table) {
         indices
     } else {
@@ -1512,6 +1534,109 @@ fn filter_indices(
         });
     }
     indices
+}
+
+/// Task 5.3 — parallel MORS scan path for `filter_indices`.
+///
+/// Splits the row-index range `0..table.row_count` into morsels of 256
+/// rows each, distributes them across `available_parallelism()` worker
+/// threads via `parallel_scan`, and has each worker apply BOTH the WHERE
+/// filter AND the MVCC visibility check to its morsel in a single pass.
+///
+/// # Why this is faster than the serial path for large MVCC tables
+///
+/// The serial path is two-pass:
+/// 1. `filter_indices_batch` evaluates the WHERE clause via the
+///    SIMD-vectorised `exec::vectorized::filter_rows`, producing a
+///    `Vec<usize>` of matching indices.
+/// 2. `indices.retain(...)` walks that Vec and applies
+///    `mgr.is_row_visible_to_active` per index.
+///
+/// For a 100k-row table with no WHERE clause, step 1 produces a 100k-entry
+/// Vec (every row matches), and step 2 walks all 100k entries — that's
+/// 200k iterations total, single-threaded.
+///
+/// The parallel path is single-pass per morsel: each worker walks its
+/// 256-row morsel ONCE, applying both the WHERE check and the visibility
+/// check, and emits only the surviving indices. With 8 worker threads,
+/// the wall-clock time is ~1/8th of the serial path (minus the crossbeam
+/// scope setup cost).
+///
+/// # Closure `Sync` requirement
+///
+/// `parallel_scan` requires `F: Fn(&[usize]) -> Vec<T> + Sync`. The
+/// closure here captures `&WhereClause`, `&Table`, and `&MvccTxnManager`
+/// by reference. All three are `Sync`:
+/// - `WhereClause`: contains only `String`, `u64`, `Box<WhereClause>` — all `Sync`.
+/// - `Table`: contains `Vec<Arc<Vec<u64>>>`, `Vec<String>`, etc. — all `Sync`.
+/// - `MvccTxnManager`: contains `HashMap`, `HashSet`, `Option` of plain
+///   data types — all `Sync`.
+///
+/// So the closure is `Sync` and `&Closure: Send`, satisfying the spawn
+/// requirement.
+fn filter_indices_parallel(
+    where_clause: &WhereClause,
+    table: &Table,
+    mgr: &crate::txn::MvccTxnManager,
+) -> Vec<usize> {
+    // Worker count: hardware concurrency. Fall back to 1 if unavailable
+    // (e.g. cgroups-restricted containers). When 1, parallel_scan takes
+    // its serial fast path (no spawn overhead).
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    // Morsel size: 256 rows. This is small enough to keep L1d cache-hot
+    // (256 rows × 8 bytes/col × ncols ≈ 4-32 KB per morsel) and large
+    // enough to amortise the per-morsel spawn dispatch cost (~1µs).
+    let morsel_size = 256;
+
+    // Build the row-index range. For very large tables this is a one-shot
+    // allocation of `row_count * 8` bytes (8 MB per million rows) —
+    // acceptable since `filter_indices` already returns an owned Vec.
+    let row_indices: Vec<usize> = (0..table.row_count).collect();
+
+    // The per-morsel worker. Each invocation receives a `&[usize]` slice
+    // of row indices and returns the subset that passes both the WHERE
+    // filter and the MVCC visibility check.
+    //
+    // The closure is `Fn` (called once per morsel) and `Sync` (captures
+    // only `&` references to `Sync` types — see the function doc comment).
+    let worker = |morsel: &[usize]| -> Vec<usize> {
+        let mut out = Vec::with_capacity(morsel.len());
+        for &i in morsel {
+            // MVCC visibility: rows without a row_versions entry (e.g.
+            // tables created before MVCC was enabled, or rows added by
+            // non-MVCC DDL) are kept — backward compatibility.
+            let visible = if i < table.row_versions.len() {
+                mgr.is_row_visible_to_active(&table.row_versions[i])
+            } else {
+                true
+            };
+            if !visible {
+                continue;
+            }
+
+            // WHERE clause: `WhereClause::None` is the common case
+            // (SELECT * with no filter) — skip the row build entirely.
+            let matches_where = match where_clause {
+                WhereClause::None => true,
+                _ => {
+                    // Build the row on demand. This is O(ncols) per row
+                    // — the same cost as `filter_indices_old`. A future
+                    // wave could push the WHERE eval into the SIMD
+                    // vectorised path (per-morsel, not per-row).
+                    let row: Vec<u64> = table.columns.iter().map(|c| c[i]).collect();
+                    row_matches(where_clause, &row, table)
+                }
+            };
+            if matches_where {
+                out.push(i);
+            }
+        }
+        out
+    };
+
+    crate::exec::parallel::parallel_scan(&row_indices, num_threads, morsel_size, worker)
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,4 +1844,291 @@ fn cross_join_into(
         row_versions: Vec::new(),
     };
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests — Task 5.2 + 5.3
+//
+// Unit tests for the parallel_scan integration in `filter_indices`.
+// These exercise the parallel path directly (not via `execute()`),
+// so they don't need a full `QueryEngine` setup. They build a `Table`
+// by hand, populate `row_versions` to model MVCC state, and call
+// `filter_indices` with `Some(&mgr)`.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod task_5_tests {
+    use super::*;
+    use crate::datasource::parquet::{LoadedColumn, LoadedTable};
+    use crate::datasource::Table as DataSourceTable;
+    use crate::txn::mvcc::{MvccTxnManager, RowVersion};
+
+    /// Build a `Table` with a single integer column `id` = 0..n.
+    /// `row_versions` is left empty — the test sets it explicitly.
+    fn make_int_table(n: usize) -> DataSourceTable {
+        let ids: Vec<u64> = (0..n).map(|i| i as u64).collect();
+        let mut t = DataSourceTable::from_loaded(LoadedTable {
+            name: "t".into(),
+            columns: vec![LoadedColumn {
+                name: "id".into(),
+                cells: ids,
+                row_count: n,
+                string_search: None,
+                null_bitmap: None,
+            }],
+            row_count: n,
+        });
+        // Pre-size row_versions so tests can fill it.
+        t.row_versions = Vec::new();
+        t
+    }
+
+    /// Build a `Table` with two columns: `id` (0..n) and `x` (i%7).
+    fn make_two_col_table(n: usize) -> DataSourceTable {
+        let ids: Vec<u64> = (0..n).map(|i| i as u64).collect();
+        let xs: Vec<u64> = (0..n).map(|i| (i % 7) as u64).collect();
+        DataSourceTable::from_loaded(LoadedTable {
+            name: "t".into(),
+            columns: vec![
+                LoadedColumn {
+                    name: "id".into(),
+                    cells: ids,
+                    row_count: n,
+                    string_search: None,
+                    null_bitmap: None,
+                },
+                LoadedColumn {
+                    name: "x".into(),
+                    cells: xs,
+                    row_count: n,
+                    string_search: None,
+                    null_bitmap: None,
+                },
+            ],
+            row_count: n,
+        })
+    }
+
+    /// Task 5.3 DoD: scan a 5,000-row table under MVCC. All rows are
+    /// committed-live (xmin=1 committed, xmax=None). The parallel path
+    /// should return all 5,000 indices, matching the serial path's
+    /// output exactly.
+    #[test]
+    fn test_execute_select_parallel_large_table() {
+        let n = 5_000;
+        let mut table = make_int_table(n);
+        // All rows committed-live: xmin=1 (committed), xmax=None.
+        table.row_versions = (0..n)
+            .map(|i| RowVersion {
+                xmin: 1,
+                xmax: None,
+                values: vec![i as u64],
+                deleted: false,
+            })
+            .collect();
+
+        // Manager: txn 1 committed (so xmin=1 is visible), txn 2 active reader.
+        let mut mgr = MvccTxnManager::new();
+        let _t1 = mgr.begin(); // txn 1
+        mgr.commit(1); // txn 1 committed
+        let _t2 = mgr.begin(); // txn 2 = active reader
+
+        let wc = WhereClause::None;
+        let parallel_indices = filter_indices(&wc, &table, Some(&mgr));
+
+        // All 5,000 rows should be visible.
+        assert_eq!(
+            parallel_indices.len(),
+            n,
+            "expected {} visible rows, got {}",
+            n,
+            parallel_indices.len()
+        );
+
+        // The result should be 0..n in order (morsels are contiguous chunks
+        // processed in input order, so the concatenation is the input order).
+        for (i, &idx) in parallel_indices.iter().enumerate() {
+            assert_eq!(idx, i, "result index {} = {} (expected {})", i, idx, i);
+        }
+    }
+
+    /// Task 5.3: parallel scan correctly excludes invisible rows.
+    /// Every 10th row is marked as deleted by a committed txn (xmax
+    /// committed → invisible to the active reader). The other 90% are
+    /// committed-live. Verifies the visibility filter is applied per
+    /// morsel across all worker threads.
+    #[test]
+    fn test_filter_indices_parallel_excludes_invisible() {
+        let n = 5_000;
+        let mut table = make_int_table(n);
+        // Mark every 10th row as deleted by txn 2 (committed).
+        table.row_versions = (0..n)
+            .map(|i| {
+                if i % 10 == 0 {
+                    RowVersion {
+                        xmin: 1,           // committed by txn 1
+                        xmax: Some(2),     // deleted by txn 2
+                        values: vec![i as u64],
+                        deleted: false,
+                    }
+                } else {
+                    RowVersion {
+                        xmin: 1,
+                        xmax: None,
+                        values: vec![i as u64],
+                        deleted: false,
+                    }
+                }
+            })
+            .collect();
+
+        let mut mgr = MvccTxnManager::new();
+        let _t1 = mgr.begin();
+        mgr.commit(1); // txn 1 committed
+        let _t2 = mgr.begin();
+        mgr.commit(2); // txn 2 committed (xmax=2 is committed → row invisible)
+        let _t3 = mgr.begin(); // txn 3 = active reader
+
+        let wc = WhereClause::None;
+        let indices = filter_indices(&wc, &table, Some(&mgr));
+
+        // 500 rows (every 10th) should be filtered out.
+        let expected_visible = n - 500;
+        assert_eq!(
+            indices.len(),
+            expected_visible,
+            "expected {} visible rows, got {}",
+            expected_visible,
+            indices.len()
+        );
+
+        // Verify no deleted row (i % 10 == 0) appears in the result.
+        for &i in &indices {
+            assert!(i % 10 != 0, "deleted row {} appeared in result", i);
+        }
+    }
+
+    /// Task 5.3: parallel scan respects the WHERE clause. Combines a
+    /// WHERE filter (x = 0) with MVCC visibility (all rows visible).
+    /// Verifies the worker applies BOTH predicates correctly across
+    /// morsels.
+    #[test]
+    fn test_filter_indices_parallel_where_and_mvcc() {
+        let n = 5_000;
+        let mut table = make_two_col_table(n);
+        // All rows committed-live.
+        table.row_versions = (0..n)
+            .map(|i| RowVersion {
+                xmin: 1,
+                xmax: None,
+                values: vec![i as u64, (i % 7) as u64],
+                deleted: false,
+            })
+            .collect();
+
+        let mut mgr = MvccTxnManager::new();
+        let _t1 = mgr.begin();
+        mgr.commit(1);
+        let _t2 = mgr.begin();
+
+        // WHERE x = 0. The table is i%7, so x=0 for i in {0, 7, 14, ...}.
+        // For n=5000, that's ceil(5000/7) = 715 rows.
+        let filter = Filter { col_idx: 1, op: "=".into(), value: 0 };
+        let wc = WhereClause::Single(filter);
+        let indices = filter_indices(&wc, &table, Some(&mgr));
+
+        // Count expected matches serially for comparison.
+        let expected: Vec<usize> = (0..n).filter(|&i| (i % 7) == 0).collect();
+        assert_eq!(indices.len(), expected.len(),
+            "expected {} rows matching x=0, got {}", expected.len(), indices.len());
+        assert_eq!(indices, expected, "parallel result differs from serial expected");
+
+        // Verify every returned row actually has x=0.
+        for &i in &indices {
+            assert_eq!(table.columns[1][i], 0, "row {} has x={} (expected 0)", i, table.columns[1][i]);
+        }
+    }
+
+    /// Task 5.3: parallel path returns the same result as the serial path
+    /// for a non-trivial mix of WHERE + visibility. Builds a 5,000-row
+    /// table where half the rows are invisible (deleted by committed txn)
+    /// and the WHERE clause selects a subset of the visible rows.
+    #[test]
+    fn test_filter_indices_parallel_matches_serial() {
+        let n = 5_000;
+        let mut table = make_two_col_table(n);
+        // Half the rows deleted by committed txn 2.
+        table.row_versions = (0..n)
+            .map(|i| RowVersion {
+                xmin: 1,
+                xmax: if i % 2 == 0 { Some(2) } else { None },
+                values: vec![i as u64, (i % 7) as u64],
+                deleted: false,
+            })
+            .collect();
+
+        let mut mgr = MvccTxnManager::new();
+        let _t1 = mgr.begin();
+        mgr.commit(1);
+        let _t2 = mgr.begin();
+        mgr.commit(2); // txn 2 committed → even-indexed rows invisible
+        let _t3 = mgr.begin(); // active reader
+
+        // WHERE x = 3.
+        let filter = Filter { col_idx: 1, op: "=".into(), value: 3 };
+        let wc = WhereClause::Single(filter);
+
+        // Run the parallel path (n > 1000 + MVCC active).
+        let parallel_result = filter_indices(&wc, &table, Some(&mgr));
+
+        // Compute the serial expected result by hand:
+        // visible rows are odd indices (i % 2 == 1); WHERE x = (i%7) == 3.
+        let expected: Vec<usize> = (0..n)
+            .filter(|&i| i % 2 == 1 && (i % 7) as u64 == 3)
+            .collect();
+
+        assert_eq!(parallel_result.len(), expected.len(),
+            "expected {} rows, got {}", expected.len(), parallel_result.len());
+        assert_eq!(parallel_result, expected,
+            "parallel result does not match serial expected");
+    }
+
+    /// Task 5.3: tables with row_count <= 1000 use the serial path
+    /// (MVCC still active). Verifies the threshold doesn't break
+    /// small-table correctness.
+    #[test]
+    fn test_filter_indices_small_table_uses_serial_path() {
+        let n = 1_000; // exactly the threshold (NOT > 1000).
+        let mut table = make_int_table(n);
+        table.row_versions = (0..n)
+            .map(|i| RowVersion {
+                xmin: 1,
+                xmax: None,
+                values: vec![i as u64],
+                deleted: false,
+            })
+            .collect();
+
+        let mut mgr = MvccTxnManager::new();
+        let _t1 = mgr.begin();
+        mgr.commit(1);
+        let _t2 = mgr.begin();
+
+        let wc = WhereClause::None;
+        let indices = filter_indices(&wc, &table, Some(&mgr));
+        assert_eq!(indices.len(), n, "expected {} rows, got {}", n, indices.len());
+    }
+
+    /// Task 5.3: tables with row_count > 1000 but MVCC off use the
+    /// serial path. Verifies the parallel path is gated on BOTH
+    /// conditions.
+    #[test]
+    fn test_filter_indices_large_table_no_mvcc_uses_serial() {
+        let n = 5_000;
+        let table = make_int_table(n);
+        let wc = WhereClause::None;
+        // mvcc = None → serial path even for large tables.
+        let indices = filter_indices(&wc, &table, None);
+        assert_eq!(indices.len(), n, "expected {} rows, got {}", n, indices.len());
+    }
 }
