@@ -7,14 +7,189 @@
 //! This eliminates ALL abstraction overhead:
 //! SQL → Parse Tree → Pattern Match → Kernel Call → Result
 //! No ScalarValue, no Expr tree, no per-row evaluation.
+//!
+//! ## Statement classification (Wave 3 — Agent C)
+//!
+//! [`StatementKind`] and [`classify_statement`] use the formal SQL tokenizer
+//! (`crate::sql::lexer::tokenize`) — not `starts_with()` string-prefix
+//! matching — to determine the top-level verb of a SQL statement. This is
+//! used by `QueryEngine::execute()` for dispatch.
 
 use crate::datasource::table::Table;
 use crate::engine::result::{QueryResult, ResultColumn};
 use crate::exec::vectorized;
+use crate::sql::lexer::{tokenize, Token};
 use crate::sql::parser::{Expr, SelectItem, SelectQuery, Value};
 use crate::Error;
 
 type Result<T> = std::result::Result<T, Error>;
+
+// =========================================================================
+// Wave 3 Task 3.1 — Statement classification via tokenizer.
+// =========================================================================
+
+/// The top-level kind of a SQL statement, determined by tokenizing the SQL
+/// and inspecting the first keyword.
+///
+/// This is used by [`QueryEngine::execute`](crate::engine::QueryEngine::execute)
+/// to dispatch to the right executor method (execute_select, execute_dml,
+/// execute_ddl, execute_transaction, execute_copy, execute_vacuum,
+/// execute_explain, execute_backup, execute_merge, etc.) without relying
+/// on `starts_with()` string-prefix matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    /// `SELECT ...` (incl. `SELECT DISTINCT`, `SELECT ... INTO`, etc.)
+    Select,
+    /// `WITH ... SELECT ...` (CTE — handled like Select for dispatch).
+    With,
+    /// `INSERT ...`
+    Insert,
+    /// `UPDATE ...`
+    Update,
+    /// `DELETE ...`
+    Delete,
+    /// `CREATE ...` (TABLE, VIEW, SCHEMA, PROCEDURE, INDEX, MATERIALIZED VIEW)
+    Create,
+    /// `DROP ...`
+    Drop,
+    /// `ALTER ...`
+    Alter,
+    /// `BEGIN` or `START TRANSACTION`
+    Begin,
+    /// `COMMIT`
+    Commit,
+    /// `ROLLBACK` (without `TO`) — aborts the current transaction.
+    Rollback,
+    /// `ROLLBACK TO <savepoint>` — partial rollback to a named savepoint.
+    RollbackTo,
+    /// `SAVEPOINT <name>`
+    Savepoint,
+    /// `RELEASE <name>` (releases a savepoint)
+    Release,
+    /// `COPY ...`
+    Copy,
+    /// `VACUUM`
+    Vacuum,
+    /// `CHECKPOINT`
+    Checkpoint,
+    /// `EXPLAIN ...`
+    Explain,
+    /// `ANALYZE ...`
+    Analyze,
+    /// `MERGE ...`
+    Merge,
+    /// `BACKUP TO '...'`
+    Backup,
+    /// `RESTORE FROM '...'`
+    Restore,
+    /// `SHOW ...`
+    Show,
+    /// `EXEC <procedure>`
+    Exec,
+    /// `TRUNCATE ...`
+    Truncate,
+    /// Anything else (unknown verb, malformed SQL, etc.)
+    Other,
+}
+
+impl StatementKind {
+    /// Returns `true` if this statement kind is read-only (safe to execute
+    /// with a read lock via `execute_readonly`).
+    #[must_use]
+    pub fn is_readonly(self) -> bool {
+        matches!(
+            self,
+            StatementKind::Select | StatementKind::Explain | StatementKind::Show
+        )
+    }
+}
+
+/// Classify a SQL statement by tokenizing it and inspecting the first
+/// keyword. This is more robust than `starts_with()` because it handles
+/// leading whitespace, case differences, and comments (when the tokenizer
+/// supports them).
+///
+/// Returns [`StatementKind::Other`] if the SQL is empty, the tokenizer
+/// fails, or the first token isn't a recognized keyword.
+///
+/// # Examples
+///
+/// ```
+/// use turbogp::engine::dispatch::{classify_statement, StatementKind};
+/// assert_eq!(classify_statement("SELECT * FROM t"), StatementKind::Select);
+/// assert_eq!(classify_statement("  explain select 1"), StatementKind::Explain);
+/// assert_eq!(classify_statement("BEGIN"), StatementKind::Begin);
+/// assert_eq!(classify_statement("rollback to sp1"), StatementKind::RollbackTo);
+/// ```
+#[must_use]
+pub fn classify_statement(sql: &str) -> StatementKind {
+    // Fast path: empty SQL is Other.
+    let trimmed = sql.trim_start();
+    if trimmed.is_empty() {
+        return StatementKind::Other;
+    }
+
+    // Tokenize. If the tokenizer fails, fall back to Other (the caller's
+    // execute() will likely return a parse error shortly after).
+    let tokens = match tokenize(sql) {
+        Ok(t) => t,
+        Err(_) => return StatementKind::Other,
+    };
+
+    // The first non-EOF token determines the statement kind.
+    let first = tokens.iter().find(|t| !matches!(t, Token::EOF)).cloned();
+    let first_kw = match first {
+        Some(Token::Keyword(k)) | Some(Token::Ident(k)) => k.to_uppercase(),
+        _ => return StatementKind::Other,
+    };
+
+    // Match on the uppercased keyword. For two-word verbs (START TRANSACTION,
+    // ROLLBACK TO), peek at the second token.
+    let second_kw = tokens
+        .iter()
+        .skip_while(|t| matches!(t, Token::EOF))
+        .skip(1)
+        .next()
+        .and_then(|t| match t {
+            Token::Keyword(k) | Token::Ident(k) => Some(k.to_uppercase()),
+            _ => None,
+        });
+
+    match first_kw.as_str() {
+        "SELECT" => StatementKind::Select,
+        "WITH" => StatementKind::With,
+        "INSERT" => StatementKind::Insert,
+        "UPDATE" => StatementKind::Update,
+        "DELETE" => StatementKind::Delete,
+        "CREATE" => StatementKind::Create,
+        "DROP" => StatementKind::Drop,
+        "ALTER" => StatementKind::Alter,
+        "BEGIN" => StatementKind::Begin,
+        "START" if second_kw.as_deref() == Some("TRANSACTION") => StatementKind::Begin,
+        "COMMIT" => StatementKind::Commit,
+        "ROLLBACK" => {
+            if second_kw.as_deref() == Some("TO") {
+                StatementKind::RollbackTo
+            } else {
+                StatementKind::Rollback
+            }
+        }
+        "SAVEPOINT" => StatementKind::Savepoint,
+        "RELEASE" => StatementKind::Release,
+        "COPY" => StatementKind::Copy,
+        "VACUUM" => StatementKind::Vacuum,
+        "CHECKPOINT" => StatementKind::Checkpoint,
+        "EXPLAIN" => StatementKind::Explain,
+        "ANALYZE" => StatementKind::Analyze,
+        "MERGE" => StatementKind::Merge,
+        "BACKUP" => StatementKind::Backup,
+        "RESTORE" => StatementKind::Restore,
+        "SHOW" => StatementKind::Show,
+        "EXEC" | "EXECUTE" => StatementKind::Exec,
+        "TRUNCATE" => StatementKind::Truncate,
+        _ => StatementKind::Other,
+    }
+}
 
 /// Query shape classification — determines which kernel combination to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
