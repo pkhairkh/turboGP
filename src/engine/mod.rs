@@ -268,6 +268,10 @@ impl QueryEngine {
             &self.catalog,
             &self.kernel_table,
             &self.cost_model,
+            // Task 2.4: read-only path holds only `&self`, so the engine
+            // cannot have an active MVCC transaction (those require a write
+            // lock to BEGIN/COMMIT). Pass `None` here — no MVCC filtering.
+            None,
         ) {
             Ok(mut result) => {
                 result.elapsed_us = start.elapsed().as_micros() as u64;
@@ -524,6 +528,36 @@ impl QueryEngine {
     #[must_use]
     pub fn mvcc_txn_manager(&self) -> &crate::txn::MvccTxnManager {
         &self.mvcc_txn_manager
+    }
+
+    /// Test-only: begin a background MVCC transaction without checking
+    /// whether one is already active (Task 2.4).
+    ///
+    /// Unlike `execute("BEGIN")` (which calls `begin_compat` and errors if
+    /// a txn is active), this calls `MvccTxnManager::begin` directly — the
+    /// previously-active transaction remains in `txn_states` as
+    /// `InProgress`, and `current_active` is overwritten to the new txn.
+    ///
+    /// This enables integration tests to simulate concurrent transactions
+    /// on a single `QueryEngine` for verifying MVCC visibility filtering
+    /// (e.g. T1 uncommitted INSERT → T2 SELECT must not see it).
+    ///
+    /// Returns the new transaction's ID.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn begin_background_txn(&mut self) -> u64 {
+        self.mvcc_txn_manager.begin().id
+    }
+
+    /// Test-only: commit a specific MVCC transaction by ID (Task 2.4).
+    ///
+    /// Used in conjunction with [`begin_background_txn`](Self::begin_background_txn)
+    /// to simulate a concurrent transaction's commit while a different txn
+    /// is the `current_active`. Only the specified `txn_id` is committed;
+    /// `current_active` is cleared only if it matches `txn_id`.
+    #[doc(hidden)]
+    pub fn commit_background_txn(&mut self, txn_id: u64) {
+        self.mvcc_txn_manager.commit(txn_id);
     }
 
     /// Create a QueryEngine with on-disk persistence (Wave 63).
@@ -1568,14 +1602,33 @@ impl QueryEngine {
 
         // Wave 53: Temporal query handling is done above (before parsing).
 
+        // Task 2.4: when MVCC mode is enabled AND a transaction is active,
+        // pass `Some(&mgr)` so `execute_select` applies visibility filtering
+        // (eliminates dirty reads of uncommitted inserts / committed deletes).
+        // Pass `None` for autocommit (no active txn) and for non-MVCC mode —
+        // preserves the legacy behaviour.
+        let mvcc_for_select = if self.mvcc_enabled && txn_id.is_some() {
+            Some(&self.mvcc_txn_manager)
+        } else {
+            None
+        };
+
         // Wave 66: fast path — if the query is a simple
         // `SELECT ... FROM t WHERE col = literal` and there's an index on
         // (t, col), use the index for O(1) lookup instead of a full scan.
         // Returns None if the fast path doesn't apply.
-        if let Some(indexed) = self.try_indexed_lookup(&query) {
-            let mut result = indexed?;
-            result.elapsed_us = start.elapsed().as_micros() as u64;
-            return Ok(result);
+        //
+        // Task 2.4: skip the indexed-lookup fast path when MVCC visibility
+        // filtering is active — `try_indexed_lookup` returns row indices
+        // directly from the index without consulting `row_versions`, so dirty
+        // / deleted rows would leak through. Fall through to `execute_select`,
+        // which applies the visibility filter via `filter_indices`.
+        if mvcc_for_select.is_none() {
+            if let Some(indexed) = self.try_indexed_lookup(&query) {
+                let mut result = indexed?;
+                result.elapsed_us = start.elapsed().as_micros() as u64;
+                return Ok(result);
+            }
         }
 
         // Execute the parsed query.
@@ -1585,6 +1638,7 @@ impl QueryEngine {
             &self.catalog,
             &self.kernel_table,
             &self.cost_model,
+            mvcc_for_select,
         ) {
             Ok(mut result) => {
                 // Wave 53: apply window functions if any SelectItem::Window
