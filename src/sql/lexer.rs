@@ -296,6 +296,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     // Line comment: `-- ...` skips until newline (or EOF).
                     chars.next(); // consume second '-'
                     skip_line_comment(&mut chars);
+                } else if chars.peek() == Some(&'>') {
+                    chars.next(); // consume '>'
+                    if chars.peek() == Some(&'>') {
+                        chars.next(); // consume second '>'
+                        tokens.push(Token::Op("->>".to_string()));
+                    } else {
+                        tokens.push(Token::Op("->".to_string()));
+                    }
                 } else {
                     tokens.push(Token::Op("-".to_string()));
                 }
@@ -312,6 +320,28 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     skip_block_comment(&mut chars)?;
                 } else {
                     tokens.push(Token::Op("/".to_string()));
+                }
+            }
+            '%' => {
+                chars.next();
+                tokens.push(Token::Op("%".to_string()));
+            }
+            '|' => {
+                chars.next();
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push(Token::Op("||".to_string()));
+                } else {
+                    return Err("expected '||' but found '|' followed by another character".to_string());
+                }
+            }
+            ':' => {
+                chars.next();
+                if chars.peek() == Some(&':') {
+                    chars.next();
+                    tokens.push(Token::Op("::".to_string()));
+                } else {
+                    return Err("expected '::' but found ':' followed by another character".to_string());
                 }
             }
             // String literal.
@@ -1025,6 +1055,108 @@ mod tests {
     fn tokenize_param_missing_digit_errors() {
         assert!(tokenize("SELECT $").is_err());
         assert!(tokenize("SELECT $abc").is_err());
+    }
+
+    #[test]
+    fn tokenize_concat_op() {
+        let toks = tokenize("a || b").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Ident("a".into()),
+                Token::Op("||".into()),
+                Token::Ident("b".into()),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_modulo_op() {
+        let toks = tokenize("a % b").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Ident("a".into()),
+                Token::Op("%".into()),
+                Token::Ident("b".into()),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_cast_op() {
+        // `int` is a keyword; the cast operator splits identifier/keyword
+        // from the type name. Use a non-keyword identifier for clarity.
+        let toks = tokenize("a::int").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Ident("a".into()),
+                Token::Op("::".into()),
+                Token::Keyword("INT".into()),
+                Token::EOF,
+            ],
+        );
+        let toks = tokenize("name::varchar").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Ident("name".into()),
+                Token::Op("::".into()),
+                Token::Keyword("VARCHAR".into()),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_json_arrow_ops() {
+        // `->` returns JSON; `->>` returns text.
+        let toks = tokenize("j->'key'").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Ident("j".into()),
+                Token::Op("->".into()),
+                Token::String("key".into()),
+                Token::EOF,
+            ],
+        );
+        let toks = tokenize("j->>'key'").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Ident("j".into()),
+                Token::Op("->>".into()),
+                Token::String("key".into()),
+                Token::EOF,
+            ],
+        );
+    }
+
+    #[test]
+    fn tokenize_lone_pipe_errors() {
+        assert!(tokenize("a | b").is_err());
+    }
+
+    #[test]
+    fn tokenize_lone_colon_errors() {
+        assert!(tokenize("a : b").is_err());
+    }
+
+    #[test]
+    fn tokenize_arrow_at_eof() {
+        let toks = tokenize("a->").unwrap();
+        assert_tokens_eq(
+            &toks,
+            &[
+                Token::Ident("a".into()),
+                Token::Op("->".into()),
+                Token::EOF,
+            ],
+        );
     }
 
     #[test]
