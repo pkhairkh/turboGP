@@ -36,7 +36,7 @@ Branch: `feat/prod-wiring`.
   persists log entries, votes, snapshots, and the applied state machine across
   process restarts. The Raft log survives crash recovery.
 - **Resolved by:** Wave 2 (Tasks 2.1–2.3).
-- **Resolved:** ☐
+- **Resolved:** ☑ (commit d66ddd2)
 
 ---
 
@@ -170,7 +170,7 @@ Branch: `feat/prod-wiring`.
 | Gap | Wave | Target | Resolved |
 |-----|------|--------|----------|
 | 1 — Raft write path | 4 | `append_and_sync` → `RaftManager::propose()` | ☐ |
-| 2 — Persistent Raft storage | 2 | `SledRaftStore` (disk-backed) | ☐ |
+| 2 — Persistent Raft storage | 2 | `SledRaftStore` (disk-backed) | ☑ |
 | 3 — TCP Raft network | 3 | `TcpRaftNetwork` over tokio TCP | ☐ |
 | 4 — Production pgwire server | 5 | Full PostgreSQL wire protocol over tokio | ☐ |
 | 5 — Connection pool on production path | 5 | pgwire server uses `ConnectionPool` | ☐ |

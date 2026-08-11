@@ -1342,3 +1342,73 @@ Work Log:
 Stage Summary:
 - WIRING_GAPS.md ready. All 10 gaps documented with target state and closing wave.
 - Wave 1 complete.
+
+---
+Task ID: 2.1
+Agent: prod-wiring-orchestrator
+Task: Add sled dependency for persistent Raft storage.
+
+Work Log:
+- Added `sled = { version = "0.34", optional = true }` to [dependencies] in Cargo.toml.
+- Updated the `raft` feature in [features] to include `dep:sled`.
+- Enabled `serde` feature on openraft so LogId/Vote/Entry/SnapshotMeta/StoredMembership are (de)serializable.
+- `cargo check --jobs 1 --features raft` passes (one pre-existing RpcMessage privacy warning).
+
+Stage Summary:
+- sled 0.34 optional dep available when --features raft is enabled.
+- openraft serde feature enabled for storage traits.
+- Task 2.1 done.
+
+---
+Task ID: 2.2
+Agent: prod-wiring-orchestrator
+Task: Implement SledRaftStore (disk-backed Raft log + state machine).
+
+Work Log:
+- Created src/storage/raft_store.rs (920 LOC).
+- SledRaftStore implements openraft::storage::RaftStorage<TypeConfig>.
+  - raft_log tree: log entries indexed by u64 (8-byte big-endian keys).
+  - raft_vote tree: single key 'v' → bincode-serialized Vote.
+  - raft_committed tree: single key 'c' → bincode-serialized Option<LogId>.
+  - raft_sm tree: single key 'applied' → bincode-serialized Vec<Vec<u8>>.
+  - raft_sm_meta tree: 'last_applied', 'last_membership' keys.
+  - raft_snapshot tree: 'data', 'meta' keys for current snapshot.
+- All write paths call sled Tree::flush() to force durability.
+- Snapshot builder reads current applied_records + meta and persists a snapshot.
+- Install_snapshot overwrites applied_records, meta, and snapshot data.
+- Unit tests:
+  - sled_store_persists_log_entries_across_reopen: write 10 entries, drop, reopen, verify 10 entries.
+  - sled_store_persists_vote_and_state_machine_across_reopen: vote, committed, applied survive reopen.
+- Made encode_snapshot/decode_snapshot pub(crate) in raft.rs so raft_store.rs can reuse them.
+- Updated src/storage/mod.rs to expose `pub mod raft_store;` when --features raft.
+- All tests pass via `cargo test --jobs 1 --features raft --lib raft_store::`.
+
+Stage Summary:
+- SledRaftStore ready, implements RaftStorage v1 trait (Adaptor wraps for v2).
+- Task 2.2 done.
+
+---
+Task ID: 2.3
+Agent: prod-wiring-orchestrator
+Task: Wire SledRaftStore into RaftManager.
+
+Work Log:
+- Added `sled_store: Option<SledRaftStore>` field to RaftManager (alongside `store: Option<MemStore>`).
+- Changed `store: MemStore` → `store: Option<MemStore>`. Updated all three existing call sites of `mgr.store().applied_records()` to use `mgr.store().expect("memstore").applied_records()`.
+- Added `RaftManager::new_single_node_persistent(node_id, data_dir)`:
+  - Opens SledRaftStore rooted at data_dir.
+  - Checks if raft_log tree is empty (fresh) before calling raft.initialize (avoids NotAllowToInitialize error on restart).
+  - Returns a RaftManager with sled_store = Some(store), store = None.
+- Added `RaftManager::new_persistent(node_id, peers, factory, data_dir)` for multi-node clusters.
+- Added `RaftManager::sled_store()` accessor returning `Option<&SledRaftStore>`.
+- Added `SledRaftStore::db_ref()` accessor for direct tree inspection.
+- Test: raft_manager_persistent_survives_restart
+  - Phase 1: create persistent manager, propose 5 records (r-1..r-5), wait for apply.
+  - Explicitly call mgr.shutdown().await and sleep 600ms to release sled file lock.
+  - Phase 2: re-open with same data dir, verify all 5 records are present and correct.
+- All 7 raft tests pass (no regressions).
+
+Stage Summary:
+- SledRaftStore wired into RaftManager via new_single_node_persistent / new_persistent.
+- Raft log survives process restart.
+- Wave 2 complete.
