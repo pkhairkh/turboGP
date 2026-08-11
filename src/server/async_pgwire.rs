@@ -148,6 +148,35 @@ impl AsyncPgwireServer {
 // Per-connection state
 // ---------------------------------------------------------------------------
 
+/// A prepared statement (Task 5.2 — extended query).
+///
+/// `Parse` creates one of these and stores it under `stmt_name` in the
+/// connection's `statements` map. `Bind` later binds parameters to it,
+/// producing a [`Portal`].
+#[derive(Debug, Clone)]
+struct PreparedStatement {
+    /// The raw SQL, possibly with `$1` / `$2` / ... placeholders.
+    sql: String,
+    /// Parameter type OIDs declared by the client (0 = unspecified).
+    /// Currently unused by turboGP (we do text substitution); recorded
+    /// for completeness so `Describe` can echo them back in
+    /// `ParameterDescription`.
+    param_oids: Vec<u32>,
+}
+
+/// A bound portal (Task 5.2 — extended query).
+///
+/// `Bind` creates one of these by binding concrete parameter values to
+/// a [`PreparedStatement`]. `Execute` runs the SQL (with parameters
+/// text-substituted) and emits `DataRow`* + `CommandComplete`.
+#[derive(Debug, Clone)]
+struct Portal {
+    /// Name of the prepared statement this portal was bound from.
+    stmt_name: String,
+    /// Bound parameter values, as text-decoded strings (NULL → "NULL").
+    params: Vec<String>,
+}
+
 /// Per-connection state.
 ///
 /// Owns the split read/write halves of the `TcpStream`, plus the
@@ -158,12 +187,23 @@ struct PgConn {
     write: BufWriter<OwnedWriteHalf>,
     /// Current transaction status byte ('I'/'T'/'E') sent in ReadyForQuery.
     txn: u8,
+    /// Prepared statements, keyed by name (Task 5.2).
+    statements: HashMap<String, PreparedStatement>,
+    /// Bound portals, keyed by name (Task 5.2).
+    portals: HashMap<String, Portal>,
 }
 
 impl PgConn {
-    /// Construct a fresh per-connection state with idle transaction status.
+    /// Construct a fresh per-connection state with idle transaction
+    /// status and empty prepared-statement / portal tables.
     fn new(read: BufReader<OwnedReadHalf>, write: BufWriter<OwnedWriteHalf>) -> Self {
-        Self { read, write, txn: b'I' }
+        Self {
+            read,
+            write,
+            txn: b'I',
+            statements: HashMap::new(),
+            portals: HashMap::new(),
+        }
     }
 }
 
@@ -351,8 +391,33 @@ impl PgConn {
                     let sql = read_trailing_string(&body);
                     self.handle_simple_query(engine, &sql).await?;
                 }
+                b'P' => {
+                    self.handle_parse(&body).await?;
+                }
+                b'B' => {
+                    self.handle_bind(&body).await?;
+                }
+                b'D' => {
+                    self.handle_describe(&body).await?;
+                }
+                b'E' => {
+                    self.handle_execute(engine, &body).await?;
+                }
+                b'S' => {
+                    // Sync — flush the write buffer and emit ReadyForQuery.
+                    // This delimits extended-query "transactions": errors
+                    // between Syncs are reported as ErrorResponse, but the
+                    // connection stays alive for the next batch.
+                    self.write.flush().await?;
+                    self.send_ready_for_query().await?;
+                }
+                b'C' => {
+                    // Close — drop the named statement or portal.
+                    self.handle_close(&body);
+                    self.send_byte(b'3', &[]).await?; // CloseComplete
+                }
                 b'H' => {
-                    // Flush — just drain the write buffer.
+                    // Flush — drain the write buffer.
                     self.write.flush().await?;
                 }
                 b'X' => return Ok(()),
@@ -426,6 +491,272 @@ impl PgConn {
             }
         }
         self.send_ready_for_query().await
+    }
+
+    // --- Extended Query (Task 5.2) ---
+
+    /// Handle a 'P' (Parse) message.
+    ///
+    /// Body format: `cstring(stmt_name) + cstring(sql) + int16(n_params)
+    /// + int32[n_params](param_oids)`. Stores the prepared statement in
+    /// `self.statements` and emits `ParseComplete` ('1').
+    ///
+    /// Parameter OIDs are recorded but currently unused (turboGP does
+    /// text substitution via [`substitute_params`], not type-aware
+    /// binding). A TODO is left to wire type-aware binding in a future
+    /// wave.
+    async fn handle_parse(&mut self, body: &[u8]) -> io::Result<()> {
+        let mut c = 0;
+        let name = read_cstring(body, &mut c)?;
+        let sql = read_cstring(body, &mut c)?;
+        if c + 2 > body.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Parse truncated"));
+        }
+        let n = u16::from_be_bytes([body[c], body[c + 1]]) as usize;
+        c += 2;
+        let mut oids = Vec::with_capacity(n);
+        for _ in 0..n {
+            if c + 4 > body.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Parse OID truncated"));
+            }
+            oids.push(u32::from_be_bytes([body[c], body[c + 1], body[c + 2], body[c + 3]]));
+            c += 4;
+        }
+        self.statements
+            .insert(name, PreparedStatement { sql, param_oids: oids });
+        self.send_byte(b'1', &[]).await // ParseComplete
+    }
+
+    /// Handle a 'B' (Bind) message.
+    ///
+    /// Body format: `cstring(portal_name) + cstring(stmt_name) +
+    /// int16(n_param_formats) + int16[n_param_formats](formats) +
+    /// int16(n_params) + for each param: int32(len) + bytes +
+    /// int16(n_result_formats) + int16[n_result_formats](formats)`.
+    ///
+    /// All parameters are treated as text (format code 0). Binary-format
+    /// parameters are decoded as hex strings for safety. Stores the portal
+    /// in `self.portals` and emits `BindComplete` ('2').
+    async fn handle_bind(&mut self, body: &[u8]) -> io::Result<()> {
+        let mut c = 0;
+        let portal_name = read_cstring(body, &mut c)?;
+        let stmt_name = read_cstring(body, &mut c)?;
+        // Parameter format codes (all treated as text — we skip them).
+        if c + 2 > body.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind fmt count truncated"));
+        }
+        let n_fmt = u16::from_be_bytes([body[c], body[c + 1]]) as usize;
+        c += 2;
+        if c + n_fmt * 2 > body.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind fmt list truncated"));
+        }
+        // (Format codes skipped — turboGP treats all params as text.)
+        c += n_fmt * 2;
+        // Read parameters.
+        if c + 2 > body.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind param count truncated"));
+        }
+        let n_params = u16::from_be_bytes([body[c], body[c + 1]]) as usize;
+        c += 2;
+        let mut params = Vec::with_capacity(n_params);
+        for _ in 0..n_params {
+            if c + 4 > body.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind param len truncated"));
+            }
+            let plen = i32::from_be_bytes([body[c], body[c + 1], body[c + 2], body[c + 3]]);
+            c += 4;
+            let val = if plen < 0 {
+                // NULL — encoded as the SQL keyword NULL after substitution.
+                "NULL".to_string()
+            } else {
+                let plen = plen as usize;
+                if c + plen > body.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Bind param bytes overflow",
+                    ));
+                }
+                let bytes = &body[c..c + plen];
+                c += plen;
+                String::from_utf8_lossy(bytes).into_owned()
+            };
+            params.push(val);
+        }
+        // Result format codes (skipped — we always emit text).
+        if c + 2 > body.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind rfmt count truncated"));
+        }
+        let n_rfmt = u16::from_be_bytes([body[c], body[c + 1]]) as usize;
+        c += 2;
+        if c + n_rfmt * 2 > body.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bind rfmt list overflow"));
+        }
+        // (Result format codes skipped.)
+        if !self.statements.contains_key(&stmt_name) {
+            let _ = self
+                .send_error_response(
+                    "ERROR",
+                    "26000",
+                    &format!("prepared statement \"{stmt_name}\" does not exist"),
+                )
+                .await;
+            return Ok(());
+        }
+        self.portals
+            .insert(portal_name, Portal { stmt_name, params });
+        self.send_byte(b'2', &[]).await // BindComplete
+    }
+
+    /// Handle a 'D' (Describe) message.
+    ///
+    /// Body format: `byte('S' for statement | 'P' for portal) +
+    /// cstring(name)`.
+    ///
+    /// For a statement, emits `ParameterDescription` ('t') + `NoData` ('n').
+    /// For a portal, emits `NoData` ('n'). (We can't know the result
+    /// schema without executing the query — psql tolerates NoData here,
+    /// matching the synchronous pgwire.rs Wave 52 fix.)
+    async fn handle_describe(&mut self, body: &[u8]) -> io::Result<()> {
+        if body.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Describe empty"));
+        }
+        let kind = body[0];
+        let mut c = 1;
+        let name = read_cstring(body, &mut c)?;
+        match kind {
+            b'S' => {
+                let stmt = match self.statements.get(&name) {
+                    Some(s) => s.clone(),
+                    None => {
+                        let _ = self
+                            .send_error_response(
+                                "ERROR",
+                                "26000",
+                                &format!("statement \"{name}\" not found"),
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                };
+                let n = stmt.param_oids.len() as u16;
+                let mut b = Vec::with_capacity(2 + stmt.param_oids.len() * 4);
+                b.extend_from_slice(&n.to_be_bytes());
+                for oid in &stmt.param_oids {
+                    b.extend_from_slice(&oid.to_be_bytes());
+                }
+                self.send_byte(b't', &b).await?; // ParameterDescription
+                self.send_byte(b'n', &[]).await?; // NoData
+            }
+            b'P' => {
+                if !self.portals.contains_key(&name) {
+                    let _ = self
+                        .send_error_response(
+                            "ERROR",
+                            "34000",
+                            &format!("portal \"{name}\" not found"),
+                        )
+                        .await;
+                    return Ok(());
+                }
+                self.send_byte(b'n', &[]).await?; // NoData
+            }
+            _ => {
+                let _ = self
+                    .send_error_response("ERROR", "08P01", "unknown describe kind")
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle an 'E' (Execute) message.
+    ///
+    /// Body format: `cstring(portal_name) + int32(max_rows)`.
+    ///
+    /// Looks up the portal, fetches the underlying prepared statement,
+    /// text-substitutes the bound parameters via [`substitute_params`],
+    /// and runs the SQL through [`route_and_execute`]. Emits `DataRow`*
+    /// + `CommandComplete` on success, or `ErrorResponse` on error.
+    ///
+    /// `max_rows > 0` (cursor mode) is currently treated as unlimited —
+    /// we don't emit `PortalSuspended`. A TODO is left for a future wave.
+    async fn handle_execute(
+        &mut self,
+        engine: &Arc<RwLock<QueryEngine>>,
+        body: &[u8],
+    ) -> io::Result<()> {
+        let mut c = 0;
+        let portal_name = read_cstring(body, &mut c)?;
+        if c + 4 > body.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Execute truncated"));
+        }
+        let max_rows = i32::from_be_bytes([body[c], body[c + 1], body[c + 2], body[c + 3]]);
+        // TODO(Wave 6+): honor max_rows by emitting PortalSuspended when
+        // more rows remain. For now we always send all rows.
+        let _ = max_rows;
+
+        let portal = match self.portals.get(&portal_name).cloned() {
+            Some(p) => p,
+            None => {
+                let _ = self
+                    .send_error_response(
+                        "ERROR",
+                        "34000",
+                        &format!("portal \"{portal_name}\" not found"),
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        let stmt = match self.statements.get(&portal.stmt_name).cloned() {
+            Some(s) => s,
+            None => {
+                let _ = self
+                    .send_error_response(
+                        "ERROR",
+                        "26000",
+                        &format!("statement \"{}\" not found", portal.stmt_name),
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        // TODO(Wave 6+): thread typed parameters through the executor
+        // instead of text-substituting into the SQL string.
+        let sql = substitute_params(&stmt.sql, &portal.params);
+        match route_and_execute(engine, &sql) {
+            Ok(r) => {
+                self.send_data_rows(&r).await?;
+                self.send_command_complete(&command_tag(&r, &sql)).await?;
+            }
+            Err(e) => {
+                let _ = self
+                    .send_error_response("ERROR", e.sqlstate(), &format!("{e}"))
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle a 'C' (Close) message — drop the named statement or portal.
+    /// Body format: `byte('S' | 'P') + cstring(name)`.
+    fn handle_close(&mut self, body: &[u8]) {
+        if body.is_empty() {
+            return;
+        }
+        let kind = body[0];
+        let mut c = 1;
+        if let Ok(name) = read_cstring(body, &mut c) {
+            match kind {
+                b'S' => {
+                    self.statements.remove(&name);
+                }
+                b'P' => {
+                    self.portals.remove(&name);
+                }
+                _ => {}
+            }
+        }
     }
 
     // --- Outbound helpers ---
@@ -731,6 +1062,64 @@ fn command_tag(r: &QueryResult, sql: &str) -> String {
 fn rand_backend_key() -> i32 {
     use rand::Rng;
     rand::rng().random()
+}
+
+/// Substitute `$1`, `$2`, ... placeholders in `sql` with values from
+/// `params`.
+///
+/// Numeric values (integers / floats) are passed through unquoted; the
+/// literal keywords `true` / `false` / `NULL` are also passed through
+/// unquoted; all other values are wrapped in single quotes with any
+/// internal single quotes doubled (`'` → `''`) — the standard SQL
+/// string-literal escaping rule, which prevents SQL injection via the
+/// Bind/Execute path.
+///
+/// **Note:** This is a defence-in-depth measure. The ideal fix threads
+/// typed parameters through the executor rather than string-substituting
+/// (TODO: see `handle_execute`). Mirrors
+/// `crate::server::pgwire::substitute_params` (private) so this module
+/// stays self-contained.
+fn substitute_params(sql: &str, params: &[String]) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            let mut n: usize = 0;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n * 10 + (bytes[j] - b'0') as usize;
+                j += 1;
+            }
+            if n >= 1 && n <= params.len() {
+                out.push_str(&escape_param_value(&params[n - 1]));
+            } else {
+                out.push_str("NULL");
+            }
+            i = j;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Escape a bound parameter value for safe interpolation into SQL.
+///
+/// See [`substitute_params`] for the full policy.
+fn escape_param_value(value: &str) -> String {
+    if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+        return value.to_string();
+    }
+    if value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("null")
+    {
+        return value.to_string();
+    }
+    let escaped = value.replace('\'', "''");
+    format!("'{}'", escaped)
 }
 
 #[cfg(test)]

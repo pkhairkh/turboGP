@@ -45,6 +45,73 @@ fn build_query(sql: &str) -> Vec<u8> {
     msg
 }
 
+/// Build a 'P' (Parse) message: 'P' + int32(length) + cstring(stmt_name)
+/// + cstring(sql) + int16(0) (no param OIDs).
+fn build_parse(stmt_name: &str, sql: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(stmt_name.as_bytes());
+    body.push(0);
+    body.extend_from_slice(sql.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0u16.to_be_bytes()); // 0 param types
+    let len = body.len() as u32 + 4;
+    let mut msg = Vec::with_capacity(1 + 4 + body.len());
+    msg.push(b'P');
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&body);
+    msg
+}
+
+/// Build a 'B' (Bind) message: 'B' + int32(length) + cstring(portal_name)
+/// + cstring(stmt_name) + int16(0) param fmts + int16(n_params) +
+/// for each param: int32(len) + bytes + int16(0) result fmts.
+fn build_bind(portal_name: &str, stmt_name: &str, params: &[&str]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal_name.as_bytes());
+    body.push(0);
+    body.extend_from_slice(stmt_name.as_bytes());
+    body.push(0);
+    // 0 parameter format codes (use text).
+    body.extend_from_slice(&0u16.to_be_bytes());
+    // n_params + each param's length-prefixed bytes.
+    body.extend_from_slice(&(params.len() as u16).to_be_bytes());
+    for p in params {
+        body.extend_from_slice(&(p.len() as i32).to_be_bytes());
+        body.extend_from_slice(p.as_bytes());
+    }
+    // 0 result format codes.
+    body.extend_from_slice(&0u16.to_be_bytes());
+    let len = body.len() as u32 + 4;
+    let mut msg = Vec::with_capacity(1 + 4 + body.len());
+    msg.push(b'B');
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&body);
+    msg
+}
+
+/// Build an 'E' (Execute) message: 'E' + int32(length) + cstring(portal_name)
+/// + int32(0) (max_rows = 0 = unlimited).
+fn build_execute(portal_name: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal_name.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0i32.to_be_bytes()); // max_rows = 0
+    let len = body.len() as u32 + 4;
+    let mut msg = Vec::with_capacity(1 + 4 + body.len());
+    msg.push(b'E');
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&body);
+    msg
+}
+
+/// Build an 'S' (Sync) message: 'S' + int32(4).
+fn build_sync() -> Vec<u8> {
+    let mut msg = Vec::with_capacity(5);
+    msg.push(b'S');
+    msg.extend_from_slice(&4u32.to_be_bytes());
+    msg
+}
+
 /// Read one backend message: tag byte + 4-byte BE length + body.
 ///
 /// Returns `(tag, body)`. Panics on EOF (tests use `?`/`unwrap`).
@@ -245,6 +312,188 @@ async fn async_pgwire_multi_statement_simple_query() {
         .map(|(_, b)| cc_tag(b))
         .collect();
     assert_eq!(ccs, vec!["INSERT 0 1", "INSERT 0 1"], "two INSERT tags, got {ccs:?}");
+
+    drop(stream);
+    task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Task 5.2: extended query protocol (Parse / Bind / Execute)
+// ---------------------------------------------------------------------------
+
+/// Helper: send a batch of byte buffers (Parse, Bind, Execute, Sync)
+/// back-to-back over a single connection. Used by the extended-query
+/// tests to mirror what psql / JDBC do (pipeline the Parse+Bind+Execute+
+/// Sync without waiting for individual responses).
+async fn write_all_batch(stream: &mut TcpStream, bufs: &[&[u8]]) {
+    for b in bufs {
+        stream.write_all(b).await.expect("write batch");
+    }
+}
+
+/// Task 5.2 DoD — Parse an INSERT with a `$1` placeholder, Bind a
+/// concrete value, Execute, verify `CommandComplete`. Then Parse a
+/// SELECT, Bind, Execute, verify rows.
+#[tokio::test]
+async fn async_pgwire_extended_query_parse_bind_execute() {
+    let engine = Arc::new(RwLock::new(QueryEngine::in_memory()));
+    // Pre-create the table for the INSERT.
+    {
+        let mut g = engine.write().unwrap();
+        g.execute("CREATE TABLE t (id INT)").expect("create");
+    }
+    let server = AsyncPgwireServer::bind("127.0.0.1:0", engine)
+        .await
+        .expect("bind");
+    let addr = server.local_addr;
+    let task = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(&build_startup("alice")).await.expect("startup");
+    // Drain startup → ReadyForQuery.
+    let _ = read_until_ready(&mut stream).await;
+
+    // --- Phase 1: Parse + Bind + Execute an INSERT with $1. ---
+    let parse = build_parse("ins_stmt", "INSERT INTO t VALUES ($1)");
+    let bind = build_bind("ins_portal", "ins_stmt", &["42"]);
+    let exec = build_execute("ins_portal");
+    let sync = build_sync();
+    write_all_batch(&mut stream, &[&parse, &bind, &exec, &sync]).await;
+
+    // Expect: ParseComplete ('1') + BindComplete ('2') + DataRow* +
+    // CommandComplete ('C' = "INSERT 0 1") + ReadyForQuery ('Z'). The
+    // engine may emit 0 or more DataRows depending on whether INSERT
+    // returns the inserted row; we assert on the structural messages.
+    let msgs = read_until_ready(&mut stream).await;
+    let tags: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+    assert_eq!(tags[0], b'1', "first message should be ParseComplete, got {:?}", tags);
+    assert_eq!(tags[1], b'2', "second message should be BindComplete, got {:?}", tags);
+    assert!(tags.contains(&b'C'), "expected a CommandComplete, got {:?}", tags);
+    assert_eq!(*tags.last().unwrap(), b'Z', "last message should be ReadyForQuery");
+    let cc = msgs
+        .iter()
+        .find(|(t, _)| *t == b'C')
+        .map(|(_, b)| cc_tag(b))
+        .expect("expected CommandComplete");
+    assert_eq!(cc, "INSERT 0 1", "insert command tag, got {cc:?}");
+
+    // --- Phase 2: Parse + Bind + Execute a SELECT, verify rows. ---
+    let parse2 = build_parse("sel_stmt", "SELECT * FROM t");
+    let bind2 = build_bind("sel_portal", "sel_stmt", &[]);
+    let exec2 = build_execute("sel_portal");
+    let sync2 = build_sync();
+    write_all_batch(&mut stream, &[&parse2, &bind2, &exec2, &sync2]).await;
+
+    let msgs = read_until_ready(&mut stream).await;
+    // ParseComplete + BindComplete + DataRow + CommandComplete + ReadyForQuery.
+    let data_rows: Vec<_> = msgs.iter().filter(|(t, _)| *t == b'D').collect();
+    assert_eq!(data_rows.len(), 1, "expected 1 DataRow, got {}", data_rows.len());
+
+    let cc = msgs
+        .iter()
+        .find(|(t, _)| *t == b'C')
+        .map(|(_, b)| cc_tag(b))
+        .expect("expected CommandComplete for SELECT");
+    assert_eq!(cc, "SELECT 1", "select command tag, got {cc:?}");
+
+    drop(stream);
+    task.abort();
+}
+
+/// Task 5.2 — Describe on a parsed statement emits
+/// `ParameterDescription` ('t') + `NoData` ('n').
+#[tokio::test]
+async fn async_pgwire_extended_query_describe_statement() {
+    let engine = Arc::new(RwLock::new(QueryEngine::in_memory()));
+    let server = AsyncPgwireServer::bind("127.0.0.1:0", engine)
+        .await
+        .expect("bind");
+    let addr = server.local_addr;
+    let task = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(&build_startup("alice")).await.expect("startup");
+    let _ = read_until_ready(&mut stream).await;
+
+    // Parse "sel" then Describe statement 'S' "sel".
+    let parse = build_parse("sel", "SELECT 1");
+    let mut desc_body = Vec::new();
+    desc_body.push(b'S'); // describe a statement
+    desc_body.extend_from_slice(b"sel\0");
+    let desc_len = desc_body.len() as u32 + 4;
+    let mut desc = Vec::new();
+    desc.push(b'D');
+    desc.extend_from_slice(&desc_len.to_be_bytes());
+    desc.extend_from_slice(&desc_body);
+    let sync = build_sync();
+    write_all_batch(&mut stream, &[&parse, &desc, &sync]).await;
+
+    let msgs = read_until_ready(&mut stream).await;
+    // ParseComplete + ParameterDescription + NoData + ReadyForQuery.
+    let has_param_desc = msgs.iter().any(|(t, _)| *t == b't');
+    assert!(has_param_desc, "expected ParameterDescription ('t')");
+    let has_nodata = msgs.iter().any(|(t, _)| *t == b'n');
+    assert!(has_nodata, "expected NoData ('n')");
+
+    drop(stream);
+    task.abort();
+}
+
+/// Task 5.2 — Close ('C') on a parsed statement drops it; subsequent
+/// Describe returns an ErrorResponse.
+#[tokio::test]
+async fn async_pgwire_extended_query_close_drops_statement() {
+    let engine = Arc::new(RwLock::new(QueryEngine::in_memory()));
+    let server = AsyncPgwireServer::bind("127.0.0.1:0", engine)
+        .await
+        .expect("bind");
+    let addr = server.local_addr;
+    let task = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(&build_startup("alice")).await.expect("startup");
+    let _ = read_until_ready(&mut stream).await;
+
+    // Parse + Close + Describe + Sync.
+    let parse = build_parse("foo", "SELECT 1");
+    // Close: 'C' + len + 'S' + cstring(name).
+    let mut close_body = Vec::new();
+    close_body.push(b'S');
+    close_body.extend_from_slice(b"foo\0");
+    let close_len = close_body.len() as u32 + 4;
+    let mut close = Vec::new();
+    close.push(b'C');
+    close.extend_from_slice(&close_len.to_be_bytes());
+    close.extend_from_slice(&close_body);
+    // Describe.
+    let mut desc_body = Vec::new();
+    desc_body.push(b'S');
+    desc_body.extend_from_slice(b"foo\0");
+    let desc_len = desc_body.len() as u32 + 4;
+    let mut desc = Vec::new();
+    desc.push(b'D');
+    desc.extend_from_slice(&desc_len.to_be_bytes());
+    desc.extend_from_slice(&desc_body);
+    let sync = build_sync();
+    write_all_batch(&mut stream, &[&parse, &close, &desc, &sync]).await;
+
+    let msgs = read_until_ready(&mut stream).await;
+    // Expect: ParseComplete + CloseComplete + ErrorResponse (statement
+    // not found) + ReadyForQuery.
+    let has_err = msgs.iter().any(|(t, _)| *t == b'E');
+    assert!(has_err, "expected an ErrorResponse after Close + Describe of closed statement");
 
     drop(stream);
     task.abort();
