@@ -5,6 +5,27 @@
 
 use super::*;
 
+/// Strip the leading SQL keyword from a statement (Wave 3 — Agent C).
+///
+/// Given a trimmed SQL string like `"EXPLAIN SELECT * FROM t"` or
+/// `"ANALYZE SELECT COUNT(*) FROM t"`, returns the substring after the
+/// first keyword: `"SELECT * FROM t"` / `"SELECT COUNT(*) FROM t"`.
+///
+/// Used by `execute()` to extract the inner SQL for `EXPLAIN` and
+/// `ANALYZE` after `classify_statement` has identified the verb. This
+/// replaces the previous `&trimmed[8..]` byte-slicing approach, which was
+/// fragile (it assumed the keyword was always exactly 8 bytes including
+/// the trailing space).
+pub(crate) fn strip_first_keyword(sql: &str) -> &str {
+    let trimmed = sql.trim_start();
+    // Find the end of the first run of non-whitespace characters.
+    let end = trimmed
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(trimmed.len());
+    // Skip the keyword and the whitespace after it.
+    trimmed[end..].trim_start()
+}
+
 pub(crate) fn extract_string_literal(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if !(trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2) {

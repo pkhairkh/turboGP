@@ -170,24 +170,30 @@ impl QueryEngine {
     pub fn execute_readonly(&self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let trimmed = sql.trim();
-        let lower = trimmed.to_lowercase();
+
+        // Wave 3 (Agent C): dispatch via classify_statement, not starts_with.
+        use crate::engine::dispatch::{classify_statement, StatementKind};
+        let kind = classify_statement(sql);
 
         // EXPLAIN is read-only (uses the planner, doesn't touch catalog).
         // We re-use the planner-pipeline EXPLAIN path from Wave 1 Task 1.2,
-        // but we need &mut self to call execute_explain (which currently
-        // lives in the QueryEngine impl that takes &mut self). Since we
-        // only have &self here, we inline the planner path.
-        if lower.starts_with("explain ") {
-            return self.execute_readonly_explain(&trimmed[8..], &start);
-        }
-
-        // Only SELECT and SHOW can be readonly.
-        if !lower.starts_with("select") && !lower.starts_with("show") {
-            // Identify the offending verb for a nicer error message.
-            let verb = trimmed.split_whitespace().next().unwrap_or("unknown");
-            return Err(Error::Other(format!(
-                "read-only transaction: {verb} requires a write lock"
-            )));
+        // but with only &self (no &mut self needed).
+        match kind {
+            StatementKind::Explain => {
+                let inner_sql = crate::engine::helpers::strip_first_keyword(trimmed);
+                return self.execute_readonly_explain(inner_sql, &start);
+            }
+            StatementKind::Select | StatementKind::Show => {
+                // Fall through to the readonly execution path below.
+            }
+            _ => {
+                // Any other verb (INSERT, UPDATE, DELETE, CREATE, DROP,
+                // BEGIN, COMMIT, COPY, VACUUM, ...) requires a write lock.
+                let verb = trimmed.split_whitespace().next().unwrap_or("unknown");
+                return Err(Error::Other(format!(
+                    "read-only transaction: {verb} requires a write lock"
+                )));
+            }
         }
 
         // DDL/DML are not readonly even if they happen to start with SELECT
@@ -292,16 +298,11 @@ impl QueryEngine {
 /// actually DML) is correctly classified as a write statement.
 #[must_use]
 pub fn is_readonly_sql(sql: &str) -> bool {
-    let trimmed = sql.trim();
-    let lower = trimmed.to_lowercase();
+    use crate::engine::dispatch::{classify_statement, StatementKind};
+    let kind = classify_statement(sql);
 
-    // Quick reject: anything that doesn't start with SELECT/EXPLAIN/SHOW/WITH
-    // is definitely not readonly.
-    if !(lower.starts_with("select")
-        || lower.starts_with("explain")
-        || lower.starts_with("show")
-        || lower.starts_with("with"))
-    {
+    // Only SELECT, EXPLAIN, and SHOW are candidates for the read-only path.
+    if !matches!(kind, StatementKind::Select | StatementKind::Explain | StatementKind::Show) {
         return false;
     }
 
@@ -314,6 +315,9 @@ pub fn is_readonly_sql(sql: &str) -> bool {
     }
 
     // WITH ... SELECT ... is a CTE — needs write lock (temp-table registration).
+    if matches!(kind, StatementKind::With) {
+        return false;
+    }
     if crate::sql::parse_with(sql).is_some() {
         return false;
     }
@@ -833,7 +837,15 @@ impl QueryEngine {
     /// - [`Error::Other`] for unsupported SQL features.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
+        let trimmed = sql.trim();
 
+        // Wave 3 (Agent C): top-level dispatch via the formal tokenizer
+        // (classify_statement), NOT string-prefix matching. The classifier
+        // tokenizes the SQL once and returns a StatementKind enum that we
+        // match on below. This is more robust than `starts_with()` because
+        // it handles leading whitespace, case differences, and is the
+        // foundation for Agent A's future unified AST.
+        //
         // Transaction control: BEGIN/COMMIT/ROLLBACK.
         //
         // Wave 51 fix (Bug 8): BEGIN/COMMIT/ROLLBACK now write corresponding
@@ -842,60 +854,64 @@ impl QueryEngine {
         // is_commit: false`, so a `BEGIN; INSERT; INSERT; COMMIT;` block
         // was indistinguishable from three autocommit INSERTs on replay
         // — and a `BEGIN; INSERT; ROLLBACK;` would still replay the INSERT.
-        let trimmed = sql.trim();
-        let lower = trimmed.to_lowercase();
+        let kind = crate::engine::dispatch::classify_statement(sql);
 
-        // EXPLAIN: show the query plan (Wave 68).
-        if lower.starts_with("explain ") {
-            let inner_sql = &trimmed[8..];
-            return self.execute_explain(inner_sql, &start);
-        }
-        // ANALYZE: execute the query and return timing stats (Wave 68).
-        if lower.starts_with("analyze ") {
-            let inner_sql = &trimmed[8..];
-            return self.execute_analyze(inner_sql, &start);
-        }
-        // VACUUM: reclaim space from deleted rows (Wave 68).
-        if lower.starts_with("vacuum") {
-            return self.execute_vacuum(&start);
-        }
-        // COPY table TO 'file' / COPY table FROM 'file' (Wave 68).
-        if lower.starts_with("copy ") {
-            return self.execute_copy(trimmed, &start);
-        }
-        // CHECKPOINT: flush + write checkpoint file (Wave 2 fix).
-        // Previously this just called flush(), which left the WAL
-        // un-truncated and no checkpoint file was written. Now it
-        // calls flush_with_checkpoint() for consistency with VACUUM.
-        if lower.starts_with("checkpoint") {
-            self.flush_with_checkpoint()?;
-            return Ok(QueryResult::empty());
-        }
-
-        // SAVEPOINT, ROLLBACK TO, RELEASE are handled inside execute_inner
-        // (after the txn snapshot is swapped in) so they operate on the
-        // transaction's catalog, not the main catalog.
-
-        if lower.starts_with("begin") || lower.starts_with("start transaction") {
-            let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
-            self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
-            return Ok(QueryResult::empty());
-        }
-        if lower.starts_with("commit") {
-            // Capture the txn_id before we drain the transaction.
-            let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
-            let committed = self.txn_manager.commit().map_err(Error::Other)?;
-            self.catalog = committed;
-            self.savepoints.clear(); // Wave 69: clear savepoints on commit.
-            self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id));
-            return Ok(QueryResult::empty());
-        }
-        if lower.starts_with("rollback") && !lower.starts_with("rollback to ") {
-            let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
-            self.txn_manager.rollback().map_err(Error::Other)?;
-            self.savepoints.clear(); // Wave 69: clear savepoints on rollback.
-            self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id));
-            return Ok(QueryResult::empty());
+        match kind {
+            crate::engine::dispatch::StatementKind::Explain => {
+                // EXPLAIN: show the query plan (Wave 1 Task 1.2 — uses the
+                // planner pipeline, not a string-based description).
+                // Strip the leading "EXPLAIN " keyword.
+                let inner_sql = strip_first_keyword(trimmed);
+                return self.execute_explain(inner_sql, &start);
+            }
+            crate::engine::dispatch::StatementKind::Analyze => {
+                // ANALYZE: execute the query and return timing stats (Wave 68).
+                let inner_sql = strip_first_keyword(trimmed);
+                return self.execute_analyze(inner_sql, &start);
+            }
+            crate::engine::dispatch::StatementKind::Vacuum => {
+                // VACUUM: reclaim space from deleted rows (Wave 68).
+                return self.execute_vacuum(&start);
+            }
+            crate::engine::dispatch::StatementKind::Copy => {
+                // COPY table TO 'file' / COPY table FROM 'file' (Wave 68).
+                return self.execute_copy(trimmed, &start);
+            }
+            crate::engine::dispatch::StatementKind::Checkpoint => {
+                // CHECKPOINT: flush + write checkpoint file (Wave 2 fix).
+                self.flush_with_checkpoint()?;
+                return Ok(QueryResult::empty());
+            }
+            crate::engine::dispatch::StatementKind::Begin => {
+                let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
+                self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
+                return Ok(QueryResult::empty());
+            }
+            crate::engine::dispatch::StatementKind::Commit => {
+                // Capture the txn_id before we drain the transaction.
+                let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
+                let committed = self.txn_manager.commit().map_err(Error::Other)?;
+                self.catalog = committed;
+                self.savepoints.clear(); // Wave 69: clear savepoints on commit.
+                self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id));
+                return Ok(QueryResult::empty());
+            }
+            crate::engine::dispatch::StatementKind::Rollback => {
+                // Full ROLLBACK (no `TO` savepoint). RollbackTo is handled
+                // in execute_inner below so it operates on the txn snapshot.
+                let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
+                self.txn_manager.rollback().map_err(Error::Other)?;
+                self.savepoints.clear(); // Wave 69: clear savepoints on rollback.
+                self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id));
+                return Ok(QueryResult::empty());
+            }
+            _ => {
+                // SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / ALTER /
+                // MERGE / PIVOT / SAVEPOINT / ROLLBACK TO / RELEASE / CTE /
+                // View DDL / Procedure DDL / EXEC / etc. → route to
+                // execute_inner, which handles txn-snapshot swapping and
+                // the inner dispatch.
+            }
         }
 
         // If a transaction is active, route all DML/DDL/SELECT to the
@@ -956,19 +972,36 @@ impl QueryEngine {
         // Wave 69: SAVEPOINT / ROLLBACK TO / RELEASE — handle these here
         // (after the txn snapshot is swapped in by the caller) so they
         // operate on the transaction's catalog.
+        //
+        // Wave 3 (Agent C): dispatch via classify_statement instead of
+        // starts_with() string matching. The classifier tokenizes once
+        // and returns a StatementKind enum.
         let trimmed = sql.trim();
-        let lower = trimmed.to_lowercase();
-        if lower.starts_with("savepoint ") {
-            let name = trimmed[10..].trim().to_string();
-            return self.execute_savepoint(name, start);
-        }
-        if lower.starts_with("rollback to ") {
-            let name = trimmed[12..].trim().to_string();
-            return self.execute_rollback_to(&name, start);
-        }
-        if lower.starts_with("release ") {
-            let name = trimmed[8..].trim().to_string();
-            return self.execute_release_savepoint(&name, start);
+        let kind = crate::engine::dispatch::classify_statement(sql);
+        match kind {
+            crate::engine::dispatch::StatementKind::Savepoint => {
+                // SAVEPOINT <name> — strip the keyword and parse the name.
+                let rest = crate::engine::helpers::strip_first_keyword(trimmed);
+                let name = rest.trim().to_string();
+                return self.execute_savepoint(name, start);
+            }
+            crate::engine::dispatch::StatementKind::RollbackTo => {
+                // ROLLBACK TO <name> — strip "ROLLBACK TO" (two keywords).
+                let after_rollback = crate::engine::helpers::strip_first_keyword(trimmed);
+                let after_to = crate::engine::helpers::strip_first_keyword(after_rollback);
+                let name = after_to.trim().to_string();
+                return self.execute_rollback_to(&name, start);
+            }
+            crate::engine::dispatch::StatementKind::Release => {
+                // RELEASE <name>
+                let rest = crate::engine::helpers::strip_first_keyword(trimmed);
+                let name = rest.trim().to_string();
+                return self.execute_release_savepoint(&name, start);
+            }
+            _ => {
+                // Not a savepoint-related statement; fall through to the
+                // rest of execute_inner.
+            }
         }
 
         // Wave 53: Temporal query — FOR SYSTEM_TIME AS OF <timestamp>.
