@@ -216,6 +216,7 @@ impl PageHeader {
 
 /// A 4 KB page.
 #[repr(C, align(64))]
+#[derive(Clone)]
 pub struct Page {
     /// The header (64 bytes).
     pub header: PageHeader,
