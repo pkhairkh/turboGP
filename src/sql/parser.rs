@@ -10,20 +10,29 @@
 //!
 //! 1. `OR`
 //! 2. `AND`
-//! 3. comparison (`=`, `!=`, `<`, `>`, `<=`, `>=`)
-//! 4. additive (`+`, `-`)
-//! 5. multiplicative (`*`, `/`)
-//! 6. primary (literal, column, parenthesized)
+//! 3. `NOT` (prefix)
+//! 4. comparison (`=`, `!=`, `<`, `>`, `<=`, `>=`, `LIKE`, `IN`, `BETWEEN`)
+//! 5. additive (`+`, `-`)
+//! 6. multiplicative (`*`, `/`, `%`)
+//! 7. unary (`-`, `+`)
+//! 8. primary (literal, column, parenthesized, function call)
 //!
-//! ## Not yet supported
+//! ## Unified AST
 //!
-//! - `JOIN` (the spec defers joins to a later wave)
-//! - `NOT` (the [`Expr`] enum has no `Unary` variant)
-//! - implicit aliases (require `AS` keyword)
-//! - subqueries
-//! - `INSERT` / `UPDATE` / `DELETE` (only `SELECT` is parsed)
+//! Since Wave 2 of the SQL Frontend Remediation, this module produces the
+//! unified [`crate::sql::ast::Expr`] type. The historical 7-variant
+//! `parser::Expr` has been deleted; `parser::Expr` and `parser::Value` are
+//! now re-exports of `ast::Expr` and `ast::Value` so existing call sites
+//! (`use crate::sql::parser::Expr`) continue to resolve.
 
 use crate::sql::lexer::Token;
+
+/// Re-export of the unified [`crate::sql::ast::Expr`] type.
+///
+/// Historical code that wrote `crate::sql::parser::Expr` continues to
+/// resolve via this re-export. The old 7-variant `parser::Expr` enum
+/// has been deleted.
+pub use crate::sql::ast::{BinOp, Expr, UnaryOp, Value};
 
 /// A parsed SELECT query.
 #[derive(Debug, Clone)]
@@ -41,13 +50,35 @@ pub struct SelectQuery {
     /// Optional HAVING predicate (Wave 60b). Filters groups after aggregation.
     /// The expression can reference aggregates (e.g. `count(*) > 2`).
     pub having: Option<Expr>,
-    /// ORDER BY column list with ascending flag (`true` = ASC).
-    pub order_by: Vec<(String, bool)>,
+    /// ORDER BY column list with ascending flag (`true` = ASC) and NULLS
+    /// placement (Wave 8). Each entry is `(column_name, ascending, nulls_order)`.
+    pub order_by: Vec<(String, bool, NullsOrder)>,
     /// Optional LIMIT row count.
     pub limit: Option<usize>,
+    /// Optional OFFSET row count (Wave 8). Number of rows to skip before
+    /// returning results.
+    pub offset: Option<usize>,
+    /// Optional FETCH FIRST n ROWS ONLY count (Wave 8). Alternative to LIMIT.
+    pub fetch: Option<usize>,
     /// Whether SELECT DISTINCT was specified (Wave 60d). When true, the
     /// executor deduplicates the result rows.
     pub distinct: bool,
+    /// Optional DISTINCT ON column list (Wave 8). `SELECT DISTINCT ON (a, b)`
+    /// keeps only the first row of each group where (a, b) are equal.
+    /// None means no DISTINCT ON clause. If Some, `distinct` is also true.
+    pub distinct_on: Option<Vec<String>>,
+}
+
+/// NULLS ordering in ORDER BY clauses (Wave 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullsOrder {
+    /// `NULLS FIRST` — NULLs sort before non-NULLs.
+    First,
+    /// `NULLS LAST` — NULLs sort after non-NULLs.
+    Last,
+    /// No NULLS clause — use the default (NULLs last for ASC, NULLs first
+    /// for DESC in most SQL dialects).
+    Default,
 }
 
 /// A parsed JOIN clause.
@@ -109,89 +140,125 @@ pub enum SelectItem {
     },
 }
 
-/// A literal value extracted from a [`Token`].
+/// A set operation tree: `SELECT ... UNION SELECT ... INTERSECT SELECT ...`.
+///
+/// Wave 4 introduces this type to represent SQL set operations. The
+/// leaves are [`SelectQuery`] instances; internal nodes are set
+/// operators (`UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`).
+///
+/// # Precedence
+///
+/// `INTERSECT` binds tighter than `UNION` and `EXCEPT`, matching the
+/// SQL standard. `UNION` and `EXCEPT` are left-associative and have
+/// equal precedence.
 #[derive(Debug, Clone)]
-pub enum Value {
-    /// An integer literal.
-    Int(i64),
-    /// A floating-point literal.
-    Float(f64),
-    /// A single-quoted string literal.
-    String(String),
-    /// A hex literal `x'...'`.
-    Hex(Vec<u8>),
+pub enum SetQuery {
+    /// A single SELECT query (no set operation).
+    Select(SelectQuery),
+    /// `left UNION right` — deduplicates rows across both inputs.
+    Union(Box<SetQuery>, Box<SetQuery>),
+    /// `left UNION ALL right` — preserves duplicates.
+    UnionAll(Box<SetQuery>, Box<SetQuery>),
+    /// `left INTERSECT right` — keeps rows present in both inputs.
+    Intersect(Box<SetQuery>, Box<SetQuery>),
+    /// `left EXCEPT right` — keeps rows in left but not in right.
+    Except(Box<SetQuery>, Box<SetQuery>),
 }
 
-/// A boolean expression in WHERE / ON.
-#[derive(Debug, Clone)]
-pub enum Expr {
-    /// A column reference.
-    Column(String),
-    /// A literal value.
-    Literal(Value),
-    /// A binary operator application: `left op right`.
-    Binary {
-        /// Left operand.
-        left: Box<Expr>,
-        /// Operator: `=`, `!=`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/`,
-        /// `AND`, or `OR`.
-        op: String,
-        /// Right operand.
-        right: Box<Expr>,
-    },
-    /// A CASE WHEN expression (Wave 60a).
-    /// Evaluates WHEN clauses in order; returns the first matching THEN
-    /// value, or the ELSE value if no WHEN matches.
-    Case {
-        /// List of (condition, result) pairs.
-        when_clauses: Vec<(Expr, Expr)>,
-        /// Optional ELSE clause (defaults to NULL/0).
-        else_clause: Option<Box<Expr>>,
-    },
-    /// A function call (Wave 62 fix). Used in HAVING expressions to represent
-    /// aggregate calls like `count(*)`, `sum(col)`, `avg(col)`. The executor
-    /// evaluates the function against the current group's row set.
-    /// The `arg` is `*` for COUNT(*), a column name, or empty for no-arg funcs.
-    Function {
-        /// The function name, uppercased (e.g. `COUNT`, `SUM`, `AVG`).
-        name: String,
-        /// The function argument as a raw string (e.g. `*`, `col`, `col1 * col2`).
-        arg: String,
-    },
-    /// `EXTRACT(field FROM expr)` (Wave 67). Extracts a sub-field (YEAR,
-    /// MONTH, DAY, etc.) from a date/timestamp expression. The field is
-    /// stored as an uppercased string; the expr is the date source.
-    Extract {
-        /// The field name, uppercased (e.g. `YEAR`, `MONTH`, `DAY`).
-        field: String,
-        /// The date/timestamp expression to extract from.
-        expr: Box<Expr>,
-    },
-    /// `CAST(expr AS target_type)` (Wave 67). Converts the expr to the
-    /// target type. The target_type is stored as an uppercased string
-    /// (e.g. `INT`, `FLOAT`, `VARCHAR`, `BIGINT`).
-    Cast {
-        /// The expression to convert.
-        expr: Box<Expr>,
-        /// The target type name, uppercased.
-        target_type: String,
-    },
+impl SetQuery {
+    /// If this `SetQuery` is a single SELECT (no set operation), return
+    /// a reference to the inner [`SelectQuery`]. Returns `None` for
+    /// `Union`, `UnionAll`, `Intersect`, `Except`.
+    pub fn as_select(&self) -> Option<&SelectQuery> {
+        match self {
+            SetQuery::Select(q) => Some(q),
+            _ => None,
+        }
+    }
+
+    /// If this `SetQuery` is a single SELECT, return the inner
+    /// [`SelectQuery`] by value. Returns `Err` with a human-readable
+    /// message for set operations (which cannot be flattened to a
+    /// single SELECT).
+    pub fn into_select(self) -> Result<SelectQuery, String> {
+        match self {
+            SetQuery::Select(q) => Ok(q),
+            other => Err(format!("expected single SELECT, got set operation: {other:?}")),
+        }
+    }
+}
+
+impl std::fmt::Display for SetQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetQuery::Select(q) => write!(f, "{q:?}"),
+            SetQuery::Union(l, r) => write!(f, "({l} UNION {r})"),
+            SetQuery::UnionAll(l, r) => write!(f, "({l} UNION ALL {r})"),
+            SetQuery::Intersect(l, r) => write!(f, "({l} INTERSECT {r})"),
+            SetQuery::Except(l, r) => write!(f, "({l} EXCEPT {r})"),
+        }
+    }
 }
 
 /// Parse a token stream into a [`SelectQuery`].
+///
+/// **Wave 4:** This function now delegates to [`parse_set`] and extracts
+/// the single `SelectQuery` for backward compatibility. For queries that
+/// contain set operations (`UNION`, `INTERSECT`, `EXCEPT`), use
+/// [`parse_set`] directly.
 ///
 /// # Errors
 ///
 /// Returns `Err(String)` with a human-readable message for any malformed
 /// input — missing keywords, unexpected tokens, unterminated expressions,
-/// etc. The error message is intended for display to a human, not for
-/// programmatic matching.
+/// etc. Also returns `Err` if the parsed query is a set operation (use
+/// [`parse_set`] to handle those). The error message is intended for
+/// display to a human, not for programmatic matching.
 pub fn parse(tokens: Vec<Token>) -> Result<SelectQuery, String> {
+    let set = parse_set(tokens)?;
+    set.into_select()
+}
+
+/// Parse a token stream into a [`SetQuery`], which may be a single
+/// `SELECT` or a tree of set operations (`UNION`, `UNION ALL`,
+/// `INTERSECT`, `EXCEPT`).
+///
+/// Set operation precedence (per SQL standard):
+/// 1. `INTERSECT` binds tightest
+/// 2. `UNION` and `EXCEPT` are left-associative with equal precedence
+///
+/// Parenthesised set operations are supported: `(SELECT ... UNION SELECT ...)
+/// ORDER BY ...` parses with the parenthesised body as one operand.
+///
+/// # Errors
+///
+/// Returns `Err(String)` for malformed input.
+pub fn parse_set(tokens: Vec<Token>) -> Result<SetQuery, String> {
     let mut p = Parser::new(tokens);
-    let q = p.parse_select()?;
+    let q = p.parse_set_expr()?;
     match p.peek() {
         Token::Semicolon | Token::EOF => Ok(q),
         other => Err(format!("unexpected trailing token: {other:?}")),
+    }
+}
+
+/// Parse a single SQL expression from a token slice. Used by the DML
+/// parser to parse SET expressions and WHERE predicates without
+/// wrapping them in a synthetic SELECT.
+///
+/// The token slice should NOT include a trailing EOF — this function
+/// adds one internally. All tokens in the slice are consumed (an error
+/// is returned if trailing tokens remain after the expression).
+///
+/// # Errors
+///
+/// Returns `Err(String)` for malformed expressions or trailing tokens.
+pub fn parse_expression(tokens: Vec<Token>) -> Result<Expr, String> {
+    let mut p = Parser::new(tokens);
+    let e = p.parse_expr()?;
+    match p.peek() {
+        Token::Semicolon | Token::EOF => Ok(e),
+        other => Err(format!("unexpected trailing token in expression: {other:?}")),
     }
 }
 
@@ -271,6 +338,75 @@ impl Parser {
     }
 
     // -----------------------------------------------------------------------
+    // Set expression (UNION / INTERSECT / EXCEPT)
+    // -----------------------------------------------------------------------
+
+    /// Parse a set expression: a chain of SELECTs joined by set operators.
+    /// Precedence: INTERSECT > UNION = EXCEPT (left-associative).
+    fn parse_set_expr(&mut self) -> Result<SetQuery, String> {
+        // Left-associative chain of UNION / EXCEPT, each operand being an
+        // INTERSECT chain.
+        let mut left = self.parse_intersect_expr()?;
+        loop {
+            if self.match_keyword("UNION") {
+                let all = self.match_keyword("ALL");
+                let right = self.parse_intersect_expr()?;
+                left = if all {
+                    SetQuery::UnionAll(Box::new(left), Box::new(right))
+                } else {
+                    SetQuery::Union(Box::new(left), Box::new(right))
+                };
+            } else if self.match_keyword("EXCEPT") {
+                let _ = self.match_keyword("ALL"); // EXCEPT ALL is non-standard but tolerated
+                let right = self.parse_intersect_expr()?;
+                left = SetQuery::Except(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    /// Parse an INTERSECT chain (binds tighter than UNION/EXCEPT).
+    fn parse_intersect_expr(&mut self) -> Result<SetQuery, String> {
+        let mut left = self.parse_set_primary()?;
+        while self.match_keyword("INTERSECT") {
+            let _ = self.match_keyword("ALL");
+            let right = self.parse_set_primary()?;
+            left = SetQuery::Intersect(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// Parse a single set operand: either a parenthesised set expression
+    /// or a single SELECT.
+    fn parse_set_primary(&mut self) -> Result<SetQuery, String> {
+        // Parenthesised set expression: ( SELECT ... UNION SELECT ... )
+        if matches!(self.peek(), Token::LParen) {
+            // Save position so we can backtrack if the parens turn out to
+            // be part of a primary expression rather than a set operand.
+            let save = self.pos;
+            self.next(); // consume (
+            // Peek: if the next token is SELECT, this is a parenthesised
+            // set expression. Otherwise, it's a parenthesised expression
+            // and we should let parse_select handle it.
+            if matches!(self.peek(), Token::Keyword(k) if k == "SELECT") {
+                let inner = self.parse_set_expr()?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(format!("expected ) after set expression, got {:?}", self.peek()));
+                }
+                self.next(); // consume )
+                // TODO: attach ORDER BY / LIMIT to the parenthesised body.
+                return Ok(inner);
+            }
+            // Not a parenthesised set expression; restore and fall through.
+            self.pos = save;
+        }
+        let q = self.parse_select()?;
+        Ok(SetQuery::Select(q))
+    }
+
+    // -----------------------------------------------------------------------
     // SELECT statement
     // -----------------------------------------------------------------------
 
@@ -278,7 +414,42 @@ impl Parser {
         self.expect_keyword("SELECT")?;
         // Wave 60d: SELECT DISTINCT — consume the DISTINCT keyword and set
         // the distinct flag. The executor deduplicates the result rows.
-        let distinct = self.match_keyword("DISTINCT");
+        // Wave 8: DISTINCT ON (cols) — consume DISTINCT, then optional ON (cols).
+        let mut distinct_on: Option<Vec<String>> = None;
+        let distinct = if self.match_keyword("DISTINCT") {
+            // Check for ON (col1, col2, ...)
+            if self.match_keyword("ON") {
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err("expected ( after DISTINCT ON".into());
+                }
+                self.next(); // consume (
+                let mut cols = Vec::new();
+                loop {
+                    let col = match self.peek().clone() {
+                        Token::Ident(s) => {
+                            self.next();
+                            s
+                        }
+                        other => return Err(format!("expected column in DISTINCT ON, got {other:?}")),
+                    };
+                    cols.push(col);
+                    match self.peek() {
+                        Token::Comma => {
+                            self.next();
+                        }
+                        Token::RParen => {
+                            self.next();
+                            break;
+                        }
+                        other => return Err(format!("expected , or ) in DISTINCT ON, got {other:?}")),
+                    }
+                }
+                distinct_on = Some(cols);
+            }
+            true
+        } else {
+            false
+        };
         let select = self.parse_select_list()?;
         // FROM is optional — allows `SELECT 1` and `SELECT count(*)`.
         let from = if self.match_keyword("FROM") {
@@ -312,7 +483,29 @@ impl Parser {
             Vec::new()
         };
 
+        // Wave 8: LIMIT / OFFSET / FETCH FIRST n ROWS ONLY
         let limit = if self.match_ident("LIMIT") { Some(self.parse_usize()?) } else { None };
+        let offset = if self.match_keyword("OFFSET") {
+            let n = self.parse_usize()?;
+            // Optional ROWS keyword
+            let _ = self.match_keyword("ROWS");
+            Some(n)
+        } else {
+            None
+        };
+        let fetch = if self.match_keyword("FETCH") {
+            // Optional FIRST or NEXT keyword
+            let _ = self.match_keyword("FIRST");
+            let _ = self.match_keyword("NEXT");
+            let n = self.parse_usize()?;
+            // Optional ROWS keyword
+            let _ = self.match_keyword("ROWS");
+            // Optional ONLY keyword
+            let _ = self.match_keyword("ONLY");
+            Some(n)
+        } else {
+            None
+        };
 
         Ok(SelectQuery {
             select,
@@ -323,7 +516,10 @@ impl Parser {
             having,
             order_by,
             limit,
+            offset,
+            fetch,
             distinct,
+            distinct_on,
         })
     }
 
@@ -375,7 +571,7 @@ impl Parser {
                 // CROSS JOIN has no ON clause — synthesize a trivially-true
                 // predicate (literal 1) so the downstream executor's
                 // `extract_join_keys` / `hash_join` path does not require one.
-                let on = crate::sql::parser::Expr::Literal(crate::sql::parser::Value::Int(1));
+                let on = Expr::Literal(Value::Int(1));
                 joins.push(JoinClause { table, on, join_type: "CROSS".to_string() });
             } else {
                 break;
@@ -409,6 +605,28 @@ impl Parser {
                 let alias = self.parse_optional_alias()?;
                 return Ok(SelectItem::Expression { expr, alias });
             }
+        }
+        // Wave 4: Scalar subquery or parenthesised expression in SELECT list.
+        // `(SELECT ...)` produces a scalar subquery; `(a + b)` produces an
+        // arithmetic expression. Both are wrapped in SelectItem::Expression.
+        if matches!(self.peek(), Token::LParen) {
+            let expr = self.parse_expr()?;
+            let alias = self.parse_optional_alias()?;
+            return Ok(SelectItem::Expression { expr, alias });
+        }
+        // Wave 4: Unary minus / plus in SELECT list (e.g. SELECT -1 FROM t).
+        if matches!(self.peek(), Token::Op(op) if op == "-" || op == "+") {
+            let expr = self.parse_expr()?;
+            let alias = self.parse_optional_alias()?;
+            return Ok(SelectItem::Expression { expr, alias });
+        }
+        // Wave 5: String / Float / Hex literals in SELECT list (used by
+        // DML expression parser when it wraps expressions in synthetic
+        // SELECT <expr> FROM __dummy__).
+        if matches!(self.peek(), Token::String(_) | Token::Float(_) | Token::Hex(_)) {
+            let expr = self.parse_expr()?;
+            let alias = self.parse_optional_alias()?;
+            return Ok(SelectItem::Expression { expr, alias });
         }
         // Non-negative integer literal → `Literal(u64)`
         // (e.g. `SELECT 1, URL, count(*) ...` in ClickBench Q15-Q42).
@@ -497,6 +715,31 @@ impl Parser {
                 return Ok(SelectItem::Aggregate { func, arg, alias });
             }
             let _ = self.parse_optional_alias()?;
+            // Qualified column reference: t.col or t.*
+            let name = if let Token::Op(op) = self.peek() {
+                if op == "." {
+                    self.next(); // consume .
+                    match self.peek().clone() {
+                        Token::Ident(s) => {
+                            self.next();
+                            format!("{name}.{s}")
+                        }
+                        Token::Keyword(k) => {
+                            self.next();
+                            format!("{name}.{k}")
+                        }
+                        Token::Op(o) if o == "*" => {
+                            self.next();
+                            format!("{name}.*")
+                        }
+                        other => return Err(format!("expected name after '.', got {other:?}")),
+                    }
+                } else {
+                    name
+                }
+            } else {
+                name
+            };
             return Ok(SelectItem::Column(name));
         }
         Err(format!("expected select item, got {:?}", self.peek()))
@@ -658,7 +901,7 @@ impl Parser {
         Ok(cols)
     }
 
-    fn parse_order_list(&mut self) -> Result<Vec<(String, bool)>, String> {
+    fn parse_order_list(&mut self) -> Result<Vec<(String, bool, NullsOrder)>, String> {
         let mut items = Vec::new();
         loop {
             if let Token::Ident(name) = self.peek().clone() {
@@ -669,7 +912,19 @@ impl Parser {
                     let _ = self.match_ident("ASC");
                     true
                 };
-                items.push((name, ascending));
+                // Wave 8: NULLS FIRST / NULLS LAST
+                let nulls_order = if self.match_keyword("NULLS") {
+                    if self.match_keyword("FIRST") {
+                        NullsOrder::First
+                    } else if self.match_keyword("LAST") {
+                        NullsOrder::Last
+                    } else {
+                        return Err("expected FIRST or LAST after NULLS".into());
+                    }
+                } else {
+                    NullsOrder::Default
+                };
+                items.push((name, ascending, nulls_order));
             } else {
                 return Err(format!("expected column name in ORDER BY, got {:?}", self.peek()));
             }
@@ -705,78 +960,121 @@ impl Parser {
         let mut left = self.parse_and_expr()?;
         while self.match_keyword("OR") {
             let right = self.parse_and_expr()?;
-            left =
-                Expr::Binary { left: Box::new(left), op: "OR".to_string(), right: Box::new(right) };
+            left = Expr::binary(left, BinOp::Or, right);
         }
         Ok(left)
     }
 
     fn parse_and_expr(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_comparison_expr()?;
+        let mut left = self.parse_not_expr()?;
         while self.match_keyword("AND") {
-            let right = self.parse_comparison_expr()?;
-            left = Expr::Binary {
-                left: Box::new(left),
-                op: "AND".to_string(),
-                right: Box::new(right),
-            };
+            let right = self.parse_not_expr()?;
+            left = Expr::binary(left, BinOp::And, right);
         }
         Ok(left)
     }
 
+    /// Parse a prefix `NOT` expression. NOT has lower precedence than
+    /// comparison but higher than AND, so `NOT a = 1 AND b = 2` parses as
+    /// `(NOT (a = 1)) AND (b = 2)`.
+    ///
+    /// Also handles `EXISTS (SELECT ...)` and `NOT EXISTS (SELECT ...)`
+    /// as prefix predicates (EXISTS is technically a primary expression
+    /// but is most naturally handled alongside NOT since both are prefix
+    /// logical operators).
+    fn parse_not_expr(&mut self) -> Result<Expr, String> {
+        if self.match_keyword("NOT") {
+            // NOT EXISTS (SELECT ...)
+            if self.match_keyword("EXISTS") {
+                if self.peek() != &Token::LParen {
+                    return Err("expected ( after EXISTS".into());
+                }
+                self.next(); // consume (
+                if !matches!(self.peek(), Token::Keyword(k) if k == "SELECT") {
+                    return Err("expected SELECT after EXISTS (".into());
+                }
+                let subquery_sql = self.capture_subquery_sql()?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(format!("expected ) after EXISTS subquery, got {:?}", self.peek()));
+                }
+                self.next(); // consume )
+                return Ok(Expr::Exists { subquery_sql, negated: true });
+            }
+            let inner = self.parse_not_expr()?;
+            return Ok(Expr::Not(Box::new(inner)));
+        }
+        // EXISTS (SELECT ...) — non-negated form
+        if self.match_keyword("EXISTS") {
+            if self.peek() != &Token::LParen {
+                return Err("expected ( after EXISTS".into());
+            }
+            self.next(); // consume (
+            if !matches!(self.peek(), Token::Keyword(k) if k == "SELECT") {
+                return Err("expected SELECT after EXISTS (".into());
+            }
+            let subquery_sql = self.capture_subquery_sql()?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(format!("expected ) after EXISTS subquery, got {:?}", self.peek()));
+            }
+            self.next(); // consume )
+            return Ok(Expr::Exists { subquery_sql, negated: false });
+        }
+        self.parse_comparison_expr()
+    }
+
     fn parse_comparison_expr(&mut self) -> Result<Expr, String> {
         let left = self.parse_additive_expr()?;
+        // IS NULL / IS NOT NULL
+        if self.match_keyword("IS") {
+            let negated = self.match_keyword("NOT");
+            if !self.match_keyword("NULL") {
+                return Err("expected NULL after IS [NOT]".into());
+            }
+            return Ok(Expr::IsNull { expr: Box::new(left), negated });
+        }
         // Comparison operators: = != <> < > <= >=
         if let Token::Op(op) = self.peek().clone() {
-            if matches!(op.as_str(), "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=") {
-                self.next();
-                let right = self.parse_additive_expr()?;
-                // Normalize <> to != so the executor's existing arm handles it.
-                let op = if op == "<>" { "!=".to_string() } else { op };
-                return Ok(Expr::Binary { left: Box::new(left), op, right: Box::new(right) });
+            if let Some(binop) = BinOp::from_str(&op) {
+                if binop.is_comparison() {
+                    self.next();
+                    let right = self.parse_additive_expr()?;
+                    return Ok(Expr::binary(left, binop, right));
+                }
             }
         }
-        // LIKE keyword
+        // LIKE / NOT LIKE
         if self.match_ident("LIKE") {
             let right = self.parse_additive_expr()?;
-            return Ok(Expr::Binary {
-                left: Box::new(left),
-                op: "LIKE".to_string(),
-                right: Box::new(right),
+            return Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(right),
+                negated: false,
             });
         }
-        // NOT LIKE
         if self.match_keyword("NOT") {
             if self.match_ident("LIKE") {
                 let right = self.parse_additive_expr()?;
-                return Ok(Expr::Binary {
-                    left: Box::new(left),
-                    op: "NOT LIKE".to_string(),
-                    right: Box::new(right),
+                return Ok(Expr::Like {
+                    expr: Box::new(left),
+                    pattern: Box::new(right),
+                    negated: true,
                 });
             }
             // NOT could be part of another construct; put it back
             self.pos -= 1;
         }
-        // BETWEEN x AND y — lower to (expr >= x AND expr <= y)
+        // BETWEEN x AND y
         if self.match_keyword("BETWEEN") {
             let low = self.parse_additive_expr()?;
-            // Expect AND
             if !self.match_keyword("AND") {
                 return Err("expected AND after BETWEEN low".into());
             }
             let high = self.parse_additive_expr()?;
-            let ge = Expr::Binary {
-                left: Box::new(left.clone()),
-                op: ">=".to_string(),
-                right: Box::new(low),
-            };
-            let le =
-                Expr::Binary { left: Box::new(left), op: "<=".to_string(), right: Box::new(high) };
-            return Ok(Expr::Binary {
-                left: Box::new(ge),
-                op: "AND".to_string(),
-                right: Box::new(le),
+            return Ok(Expr::Between {
+                expr: Box::new(left),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated: false,
             });
         }
         // NOT BETWEEN
@@ -787,49 +1085,41 @@ impl Parser {
                     return Err("expected AND after NOT BETWEEN low".into());
                 }
                 let high = self.parse_additive_expr()?;
-                // NOT BETWEEN → (expr < low OR expr > high)
-                let lt = Expr::Binary {
-                    left: Box::new(left.clone()),
-                    op: "<".to_string(),
-                    right: Box::new(low),
-                };
-                let gt = Expr::Binary {
-                    left: Box::new(left),
-                    op: ">".to_string(),
-                    right: Box::new(high),
-                };
-                return Ok(Expr::Binary {
-                    left: Box::new(lt),
-                    op: "OR".to_string(),
-                    right: Box::new(gt),
+                return Ok(Expr::Between {
+                    expr: Box::new(left),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    negated: true,
                 });
             }
             self.pos -= 1;
         }
-        // IN (val1, val2, ...) — lower to (expr = val1 OR expr = val2 OR ...)
+        // IN (val1, val2, ...) or IN (SELECT ...)
         if self.match_keyword("IN") {
             if self.peek() != &Token::LParen {
                 return Err("expected ( after IN".into());
             }
             self.next(); // consume (
-            let mut or_expr: Option<Expr> = None;
-            loop {
-                let val = self.parse_additive_expr()?;
-                let eq = Expr::Binary {
-                    left: Box::new(left.clone()),
-                    op: "=".to_string(),
-                    right: Box::new(val),
-                };
-                match or_expr {
-                    None => or_expr = Some(eq),
-                    Some(existing) => {
-                        or_expr = Some(Expr::Binary {
-                            left: Box::new(existing),
-                            op: "OR".to_string(),
-                            right: Box::new(eq),
-                        });
-                    }
+            // Check if this is a subquery (SELECT ...) or a value list.
+            if matches!(self.peek(), Token::Keyword(k) if k == "SELECT") {
+                // IN (SELECT ...) — parse a subquery and capture its SQL.
+                let subquery_sql = self.capture_subquery_sql()?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(format!(
+                        "expected ) after IN subquery, got {:?}",
+                        self.peek()
+                    ));
                 }
+                self.next(); // consume )
+                return Ok(Expr::InSubquery {
+                    expr: Box::new(left),
+                    subquery_sql,
+                    negated: false,
+                });
+            }
+            let mut list: Vec<Expr> = Vec::new();
+            loop {
+                list.push(self.parse_additive_expr()?);
                 match self.peek() {
                     Token::Comma => {
                         self.next();
@@ -841,33 +1131,33 @@ impl Parser {
                     other => return Err(format!("expected , or ) in IN list, got {other:?}")),
                 }
             }
-            return Ok(or_expr.unwrap_or(left));
+            return Ok(Expr::InList { expr: Box::new(left), list, negated: false });
         }
-        // NOT IN
+        // NOT IN (val1, ...) or NOT IN (SELECT ...)
         if self.match_keyword("NOT") {
             if self.match_keyword("IN") {
                 if self.peek() != &Token::LParen {
                     return Err("expected ( after NOT IN".into());
                 }
                 self.next();
-                let mut and_expr: Option<Expr> = None;
-                loop {
-                    let val = self.parse_additive_expr()?;
-                    let ne = Expr::Binary {
-                        left: Box::new(left.clone()),
-                        op: "!=".to_string(),
-                        right: Box::new(val),
-                    };
-                    match and_expr {
-                        None => and_expr = Some(ne),
-                        Some(existing) => {
-                            and_expr = Some(Expr::Binary {
-                                left: Box::new(existing),
-                                op: "AND".to_string(),
-                                right: Box::new(ne),
-                            });
-                        }
+                if matches!(self.peek(), Token::Keyword(k) if k == "SELECT") {
+                    let subquery_sql = self.capture_subquery_sql()?;
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(format!(
+                            "expected ) after NOT IN subquery, got {:?}",
+                            self.peek()
+                        ));
                     }
+                    self.next(); // consume )
+                    return Ok(Expr::InSubquery {
+                        expr: Box::new(left),
+                        subquery_sql,
+                        negated: true,
+                    });
+                }
+                let mut list: Vec<Expr> = Vec::new();
+                loop {
+                    list.push(self.parse_additive_expr()?);
                     match self.peek() {
                         Token::Comma => {
                             self.next();
@@ -881,21 +1171,112 @@ impl Parser {
                         }
                     }
                 }
-                return Ok(and_expr.unwrap_or(left));
+                return Ok(Expr::InList { expr: Box::new(left), list, negated: true });
             }
             self.pos -= 1;
         }
         Ok(left)
     }
 
+    /// Capture the raw SQL text of a subquery (from the current token
+    /// position to the matching closing parenthesis). Used for
+    /// `IN (SELECT ...)` and `EXISTS (SELECT ...)` where the subquery
+    /// is re-parsed by the executor at runtime.
+    ///
+    /// The opening `(` is assumed to already be consumed; this function
+    /// consumes through the matching `)` (but the caller is responsible
+    /// for consuming the final `)` — actually no, this function consumes
+    /// the closing `)` too. Wait, let me re-check: the caller checks for
+    /// `)` after this returns, so this function should NOT consume it.
+    /// Actually, looking at the callers above, they DO consume the `)`.
+    /// So this function captures tokens until the matching `)` (without
+    /// consuming it) and joins them into a SQL string.
+    fn capture_subquery_sql(&mut self) -> Result<String, String> {
+        let mut depth: i32 = 0;
+        let mut parts: Vec<String> = Vec::new();
+        loop {
+            match self.peek().clone() {
+                Token::EOF => return Err("unterminated subquery".into()),
+                Token::LParen => {
+                    depth += 1;
+                    parts.push("(".into());
+                    self.next();
+                }
+                Token::RParen => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    parts.push(")".into());
+                    self.next();
+                }
+                Token::Keyword(k) => {
+                    parts.push(k);
+                    self.next();
+                }
+                Token::Ident(s) => {
+                    parts.push(s);
+                    self.next();
+                }
+                Token::Int(i) => {
+                    parts.push(i.to_string());
+                    self.next();
+                }
+                Token::Float(f) => {
+                    parts.push(f.to_string());
+                    self.next();
+                }
+                Token::String(s) => {
+                    parts.push(format!("'{}'", s.replace('\'', "''")));
+                    self.next();
+                }
+                Token::Hex(bytes) => {
+                    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+                    parts.push(format!("x'{hex}'"));
+                    self.next();
+                }
+                Token::Op(op) => {
+                    parts.push(op);
+                    self.next();
+                }
+                Token::Comma => {
+                    parts.push(",".into());
+                    self.next();
+                }
+                Token::Semicolon => {
+                    parts.push(";".into());
+                    self.next();
+                }
+                Token::Param(n) => {
+                    parts.push(format!("${n}"));
+                    self.next();
+                }
+                Token::QuestionMark => {
+                    parts.push("?".into());
+                    self.next();
+                }
+            }
+        }
+        Ok(parts.join(" "))
+    }
+
     fn parse_additive_expr(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_multiplicative_expr()?;
         loop {
             if let Token::Op(op) = self.peek().clone() {
-                if matches!(op.as_str(), "+" | "-") {
+                if let Some(binop) = BinOp::from_str(&op) {
+                    if binop == BinOp::Add || binop == BinOp::Sub {
+                        self.next();
+                        let right = self.parse_multiplicative_expr()?;
+                        left = Expr::binary(left, binop, right);
+                        continue;
+                    }
+                }
+                // String concatenation ||
+                if op == "||" {
                     self.next();
                     let right = self.parse_multiplicative_expr()?;
-                    left = Expr::Binary { left: Box::new(left), op, right: Box::new(right) };
+                    left = Expr::binary(left, BinOp::Concat, right);
                     continue;
                 }
             }
@@ -905,19 +1286,39 @@ impl Parser {
     }
 
     fn parse_multiplicative_expr(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_primary()?;
+        let mut left = self.parse_unary_expr()?;
         loop {
             if let Token::Op(op) = self.peek().clone() {
-                if matches!(op.as_str(), "*" | "/") {
-                    self.next();
-                    let right = self.parse_primary()?;
-                    left = Expr::Binary { left: Box::new(left), op, right: Box::new(right) };
-                    continue;
+                if let Some(binop) = BinOp::from_str(&op) {
+                    if binop == BinOp::Mul || binop == BinOp::Div || binop == BinOp::Mod {
+                        self.next();
+                        let right = self.parse_unary_expr()?;
+                        left = Expr::binary(left, binop, right);
+                        continue;
+                    }
                 }
             }
             break;
         }
         Ok(left)
+    }
+
+    /// Parse a unary prefix expression: `-expr`, `+expr`. Falls through
+    /// to `parse_primary` if no unary operator is present.
+    fn parse_unary_expr(&mut self) -> Result<Expr, String> {
+        if let Token::Op(op) = self.peek().clone() {
+            if op == "-" {
+                self.next();
+                let inner = self.parse_unary_expr()?;
+                return Ok(Expr::Unary { op: UnaryOp::Neg, expr: Box::new(inner) });
+            }
+            if op == "+" {
+                self.next();
+                let inner = self.parse_unary_expr()?;
+                return Ok(Expr::Unary { op: UnaryOp::Pos, expr: Box::new(inner) });
+            }
+        }
+        self.parse_primary()
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
@@ -945,11 +1346,15 @@ impl Parser {
                     if let Token::String(s) = self.peek().clone() {
                         self.next();
                         if let Ok(d) = crate::types::Date::from_str(&s) {
-                            return Ok(Expr::Literal(Value::Int(d.0 as i64)));
+                            return Ok(Expr::Literal(Value::Date(d.0)));
                         }
                         return Ok(Expr::Literal(Value::String(s)));
                     }
                     return Ok(Expr::Column(kw));
+                }
+                if kw_upper == "NULL" {
+                    self.next();
+                    return Ok(Expr::Literal(Value::Null));
                 }
                 // Wave 60a: CASE WHEN expression.
                 if kw_upper == "CASE" {
@@ -972,12 +1377,30 @@ impl Parser {
                 // Wave 62 fix: if the next token is '(', this is a function
                 // call (e.g. count(*), sum(col), avg(col)). Parse it as
                 // Expr::Function so HAVING expressions can reference aggregates.
-                // Previously, parse_primary returned Expr::Column(name) and
-                // left the '(' unconsumed, causing "unexpected trailing token:
-                // LParen" errors.
                 if matches!(self.peek(), Token::LParen) {
                     self.next(); // consume (
-                    let arg = self.parse_agg_arg()?;
+                    let distinct = self.match_ident("DISTINCT");
+                    let mut args: Vec<Expr> = Vec::new();
+                    // COUNT(*) — single wildcard arg.
+                    if self.match_op("*") {
+                        args.push(Expr::Wildcard);
+                    } else if !matches!(self.peek(), Token::RParen) {
+                        // Parse comma-separated argument list.
+                        loop {
+                            args.push(self.parse_expr()?);
+                            match self.peek() {
+                                Token::Comma => {
+                                    self.next();
+                                }
+                                Token::RParen => break,
+                                other => {
+                                    return Err(format!(
+                                        "expected , or ) in function args, got {other:?}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     if !matches!(self.peek(), Token::RParen) {
                         return Err(format!(
                             "expected ) after function args, got {:?}",
@@ -985,18 +1408,69 @@ impl Parser {
                         ));
                     }
                     self.next(); // consume )
-                    return Ok(Expr::Function { name: name.to_uppercase(), arg });
+                    return Ok(Expr::Function {
+                        name: name.to_uppercase(),
+                        args,
+                        distinct,
+                    });
+                }
+                // Qualified column reference: t.col or t.*
+                if let Token::Op(op) = self.peek() {
+                    if op == "." {
+                        self.next(); // consume .
+                        let second = match self.peek().clone() {
+                            Token::Ident(s) => s,
+                            Token::Keyword(k) => k,
+                            Token::Op(o) if o == "*" => {
+                                // t.* — qualified wildcard. Stored as a
+                                // Column with the dotted name so the
+                                // executor can detect the trailing `.*`.
+                                return Ok(Expr::Column(format!("{name}.*")));
+                            }
+                            other => {
+                                return Err(format!(
+                                    "expected name after '.', got {other:?}"
+                                ));
+                            }
+                        };
+                        self.next();
+                        return Ok(Expr::Column(format!("{name}.{second}")));
+                    }
                 }
                 Ok(Expr::Column(name))
             }
             Token::LParen => {
                 self.next();
+                // Scalar subquery: ( SELECT ... ) — capture as a subquery SQL
+                // string for the executor to re-parse. Scalar subqueries
+                // return a single value used in expression context.
+                if matches!(self.peek(), Token::Keyword(k) if k == "SELECT") {
+                    let subquery_sql = self.capture_subquery_sql()?;
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(format!(
+                            "expected ) after scalar subquery, got {:?}",
+                            self.peek()
+                        ));
+                    }
+                    self.next(); // consume )
+                    // Store as an InSubquery-like variant? No — scalar
+                    // subqueries are values, not predicates. We reuse the
+                    // subquery SQL string and wrap in a synthetic Function
+                    // call so the executor can detect it. This is a
+                    // simplification; a proper ScalarSubquery variant
+                    // would be cleaner but requires more downstream changes.
+                    return Ok(Expr::Function {
+                        name: "__scalar_subquery__".to_string(),
+                        args: vec![Expr::Literal(Value::String(subquery_sql))],
+                        distinct: false,
+                    });
+                }
                 let e = self.parse_expr()?;
                 if !matches!(self.peek(), Token::RParen) {
                     return Err(format!("expected ), got {:?}", self.peek()));
                 }
                 self.next();
-                Ok(e)
+                Ok(Expr::Paren(Box::new(e)))
             }
             other => Err(format!("expected expression, got {other:?}")),
         }
@@ -1089,517 +1563,7 @@ impl Parser {
     }
 }
 
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sql::lexer::tokenize;
-
-    /// Helper: tokenize + parse in one step.
-    fn parse_sql(s: &str) -> Result<SelectQuery, String> {
-        parse(tokenize(s)?)
-    }
-
-    #[test]
-    fn parse_select_star_with_where() {
-        let q = parse_sql("SELECT * FROM t WHERE x = 5").unwrap();
-        assert_eq!(q.select.len(), 1);
-        assert!(matches!(q.select[0], SelectItem::Star));
-        assert_eq!(q.from, "t");
-        let w = q.where_clause.expect("WHERE clause");
-        match w {
-            Expr::Binary { left, op, right } => {
-                assert_eq!(op, "=");
-                match *left {
-                    Expr::Column(c) => assert_eq!(c, "x"),
-                    other => panic!("expected Column, got {other:?}"),
-                }
-                match *right {
-                    Expr::Literal(Value::Int(5)) => {}
-                    other => panic!("expected Int(5), got {other:?}"),
-                }
-            }
-            other => panic!("expected Binary, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_count_star() {
-        let q = parse_sql("SELECT COUNT(*) FROM t").unwrap();
-        assert_eq!(q.select.len(), 1);
-        match &q.select[0] {
-            SelectItem::Aggregate { func, arg, alias } => {
-                assert_eq!(func, "COUNT");
-                assert_eq!(arg, "*");
-                assert_eq!(*alias, None);
-            }
-            other => panic!("expected Aggregate, got {other:?}"),
-        }
-        assert_eq!(q.from, "t");
-        assert!(q.where_clause.is_none());
-    }
-
-    #[test]
-    fn parse_sum_with_alias() {
-        let q = parse_sql("SELECT SUM(price) AS total FROM sales").unwrap();
-        match &q.select[0] {
-            SelectItem::Aggregate { func, arg, alias } => {
-                assert_eq!(func, "SUM");
-                assert_eq!(arg, "price");
-                assert_eq!(*alias, Some("total".to_string()));
-            }
-            other => panic!("expected Aggregate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_avg_group_by() {
-        let q = parse_sql("SELECT AVG(price) FROM sales GROUP BY area").unwrap();
-        assert_eq!(q.group_by, vec!["area"]);
-    }
-
-    #[test]
-    fn parse_order_by_asc_desc() {
-        let q = parse_sql("SELECT * FROM t ORDER BY a ASC, b DESC, c").unwrap();
-        assert_eq!(q.order_by.len(), 3);
-        assert_eq!(q.order_by[0], ("a".to_string(), true));
-        assert_eq!(q.order_by[1], ("b".to_string(), false));
-        assert_eq!(q.order_by[2], ("c".to_string(), true));
-    }
-
-    #[test]
-    fn parse_limit() {
-        let q = parse_sql("SELECT * FROM t LIMIT 100").unwrap();
-        assert_eq!(q.limit, Some(100));
-    }
-
-    #[test]
-    fn parse_multiple_columns() {
-        let q = parse_sql("SELECT a, b, c FROM t").unwrap();
-        assert_eq!(q.select.len(), 3);
-        assert!(matches!(&q.select[0], SelectItem::Column(c) if c == "a"));
-        assert!(matches!(&q.select[1], SelectItem::Column(c) if c == "b"));
-        assert!(matches!(&q.select[2], SelectItem::Column(c) if c == "c"));
-    }
-
-    #[test]
-    fn parse_and_or_precedence() {
-        // a = 1 AND b = 2 OR c = 3  →  (a=1 AND b=2) OR (c=3)
-        let q = parse_sql("SELECT * FROM t WHERE a = 1 AND b = 2 OR c = 3").unwrap();
-        let w = q.where_clause.unwrap();
-        match w {
-            Expr::Binary { left, op, right } => {
-                assert_eq!(op, "OR");
-                // Left should be AND.
-                match *left {
-                    Expr::Binary { op, .. } => assert_eq!(op, "AND"),
-                    other => panic!("expected AND, got {other:?}"),
-                }
-                // Right should be a comparison.
-                match *right {
-                    Expr::Binary { op, .. } => assert_eq!(op, "="),
-                    other => panic!("expected =, got {other:?}"),
-                }
-            }
-            other => panic!("expected OR at top, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_arithmetic_precedence() {
-        // a + b * c  →  a + (b * c)
-        let q = parse_sql("SELECT * FROM t WHERE x = a + b * c").unwrap();
-        let w = q.where_clause.unwrap();
-        match w {
-            Expr::Binary { left, op: op_eq, right } => {
-                assert_eq!(op_eq, "=");
-                assert!(matches!(*left, Expr::Column(_)));
-                match *right {
-                    Expr::Binary { op, right: mul_right, .. } => {
-                        assert_eq!(op, "+");
-                        match *mul_right {
-                            Expr::Binary { op, .. } => assert_eq!(op, "*"),
-                            other => panic!("expected *, got {other:?}"),
-                        }
-                    }
-                    other => panic!("expected +, got {other:?}"),
-                }
-            }
-            other => panic!("expected =, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_parenthesized_expr() {
-        let q = parse_sql("SELECT * FROM t WHERE (a = 1 OR b = 2) AND c = 3").unwrap();
-        let w = q.where_clause.unwrap();
-        match w {
-            Expr::Binary { left, op, .. } => {
-                assert_eq!(op, "AND");
-                match *left {
-                    Expr::Binary { op, .. } => assert_eq!(op, "OR"),
-                    other => panic!("expected OR, got {other:?}"),
-                }
-            }
-            other => panic!("expected AND at top, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_trailing_semicolon_ok() {
-        let q = parse_sql("SELECT * FROM t;").unwrap();
-        assert_eq!(q.from, "t");
-    }
-
-    #[test]
-    fn parse_string_literal_in_where() {
-        let q = parse_sql("SELECT * FROM t WHERE name = 'alice'").unwrap();
-        let w = q.where_clause.unwrap();
-        match w {
-            Expr::Binary { right, .. } => match *right {
-                Expr::Literal(Value::String(s)) => assert_eq!(s, "alice"),
-                other => panic!("expected String, got {other:?}"),
-            },
-            other => panic!("expected Binary, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_invalid_missing_select_list() {
-        let r = parse_sql("SELECT FROM WHERE");
-        assert!(r.is_err(), "expected error for SELECT FROM WHERE");
-    }
-
-    #[test]
-    fn parse_invalid_missing_table() {
-        let r = parse_sql("SELECT * FROM WHERE");
-        assert!(r.is_err(), "expected error for missing table name");
-    }
-
-    #[test]
-    fn parse_invalid_negative_limit() {
-        let r = parse_sql("SELECT * FROM t LIMIT -5");
-        assert!(r.is_err(), "expected error for negative LIMIT");
-    }
-
-    #[test]
-    fn parse_invalid_unexpected_eof() {
-        // FROM is now optional (Wave 6), so "SELECT *" should parse
-        // successfully and use the __dummy__ table.
-        let r = parse_sql("SELECT *");
-        assert!(r.is_ok(), "SELECT * without FROM should parse, got: {r:?}");
-    }
-
-    #[test]
-    fn parse_invalid_trailing_garbage() {
-        let r = parse_sql("SELECT * FROM t WHERE x = 5 garbage");
-        assert!(r.is_err(), "expected error for trailing garbage");
-    }
-
-    #[test]
-    fn parse_count_distinct_keyword() {
-        // `COUNT(DISTINCT col)` is normalised to
-        // `Aggregate { func: "COUNT_DISTINCT", arg: "col" }`.
-        let q = parse_sql("SELECT COUNT(DISTINCT user_id) FROM events").unwrap();
-        match &q.select[0] {
-            SelectItem::Aggregate { func, arg, alias } => {
-                assert_eq!(func, "COUNT_DISTINCT");
-                assert_eq!(arg, "user_id");
-                assert_eq!(*alias, None);
-            }
-            other => panic!("expected Aggregate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_count_distinct_case_insensitive() {
-        // `count(distinct col)` should normalise the same way.
-        let q = parse_sql("SELECT count(distinct x) FROM t").unwrap();
-        match &q.select[0] {
-            SelectItem::Aggregate { func, arg, .. } => {
-                assert_eq!(func, "COUNT_DISTINCT");
-                assert_eq!(arg, "x");
-            }
-            other => panic!("expected Aggregate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_count_distinct_requires_column() {
-        // `COUNT(DISTINCT)` with no column should error.
-        let r = parse_sql("SELECT COUNT(DISTINCT) FROM t");
-        assert!(r.is_err(), "expected error for COUNT(DISTINCT) without column");
-    }
-
-    #[test]
-    fn parse_sum_distinct_keyword() {
-        // `SUM(DISTINCT col)` works the same way (produces SUM_DISTINCT).
-        let q = parse_sql("SELECT SUM(DISTINCT price) FROM sales").unwrap();
-        match &q.select[0] {
-            SelectItem::Aggregate { func, arg, .. } => {
-                assert_eq!(func, "SUM_DISTINCT");
-                assert_eq!(arg, "price");
-            }
-            other => panic!("expected Aggregate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_select_integer_literal() {
-        // `SELECT 1, URL, count(*)` — ClickBench Q15-Q42 shape.
-        let q = parse_sql("SELECT 1, URL, count(*) FROM t").unwrap();
-        assert_eq!(q.select.len(), 3);
-        assert!(matches!(&q.select[0], SelectItem::Literal(1)));
-        assert!(matches!(&q.select[1], SelectItem::Column(c) if c == "URL"));
-        assert!(
-            matches!(&q.select[2], SelectItem::Aggregate { func, arg, .. } if func == "COUNT" && arg == "*")
-        );
-    }
-
-    #[test]
-    fn parse_group_by_positional_and_column() {
-        // `GROUP BY 1, URL` — the positional `1` is skipped, only URL
-        // remains as a real GROUP BY key.
-        let q = parse_sql("SELECT 1, URL, count(*) FROM t GROUP BY 1, URL").unwrap();
-        assert_eq!(q.group_by, vec!["URL"]);
-    }
-
-    #[test]
-    fn parse_group_by_positional_only() {
-        // `GROUP BY 1` alone (degenerate but legal) → empty group_by.
-        let q = parse_sql("SELECT 1, count(*) FROM t GROUP BY 1").unwrap();
-        assert!(q.group_by.is_empty());
-    }
-
-    #[test]
-    fn parse_select_negative_literal_rejected() {
-        // Negative integer literals in the SELECT list are rejected.
-        assert!(parse_sql("SELECT -1 FROM t").is_err());
-    }
-
-    #[test]
-    fn parse_clickbench_q15_shape() {
-        // Full Q15 shape: SELECT 1, URL, count(*) AS c FROM t WHERE URL LIKE 'https://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10
-        let q = parse_sql(
-            "SELECT 1, URL, count(*) AS c FROM t WHERE URL LIKE 'https://%' GROUP BY 1, URL ORDER BY c DESC LIMIT 10",
-        )
-        .unwrap();
-        assert_eq!(q.select.len(), 3);
-        assert!(matches!(&q.select[0], SelectItem::Literal(1)));
-        assert!(matches!(&q.select[2], SelectItem::Aggregate { alias: Some(a), .. } if a == "c"));
-        assert_eq!(q.group_by, vec!["URL"]);
-        assert_eq!(q.order_by, vec![("c".to_string(), false)]);
-        assert_eq!(q.limit, Some(10));
-    }
-
-    /// Wave 62 fix: HAVING with count(*) must parse without error.
-    /// Previously, parse_primary didn't handle `IDENT(` as a function call
-    /// in expression context, causing "unexpected trailing token: LParen".
-    #[test]
-    fn parse_having_with_count_star() {
-        let q =
-            parse_sql("SELECT dept, count(*) FROM t GROUP BY dept HAVING count(*) > 1").unwrap();
-        assert!(q.having.is_some(), "HAVING clause must be parsed");
-        // Verify the HAVING expression is a Binary comparison.
-        match &q.having {
-            Some(Expr::Binary { left, op, right }) => {
-                assert_eq!(op, ">");
-                // Left should be Expr::Function { name: "COUNT", arg: "*" }
-                match left.as_ref() {
-                    Expr::Function { name, arg } => {
-                        assert_eq!(name, "COUNT");
-                        assert_eq!(arg, "*");
-                    }
-                    other => panic!("expected Function, got {other:?}"),
-                }
-                // Right should be Literal(Int(1))
-                match right.as_ref() {
-                    Expr::Literal(Value::Int(1)) => {}
-                    other => panic!("expected Int(1), got {other:?}"),
-                }
-            }
-            other => panic!("expected Binary, got {other:?}"),
-        }
-    }
-
-    /// Wave 62 fix: HAVING with sum(col) must also parse.
-    #[test]
-    fn parse_having_with_sum() {
-        let q = parse_sql("SELECT dept FROM t GROUP BY dept HAVING sum(salary) > 400").unwrap();
-        assert!(q.having.is_some());
-        match &q.having {
-            Some(Expr::Binary { left, op, .. }) => {
-                assert_eq!(op, ">");
-                match left.as_ref() {
-                    Expr::Function { name, arg } => {
-                        assert_eq!(name, "SUM");
-                        assert_eq!(arg, "salary");
-                    }
-                    other => panic!("expected Function, got {other:?}"),
-                }
-            }
-            other => panic!("expected Binary, got {other:?}"),
-        }
-    }
-
-    /// Wave 60d: SELECT DISTINCT must parse and set the distinct flag.
-    #[test]
-    fn parse_select_distinct() {
-        let q = parse_sql("SELECT DISTINCT dept FROM t").unwrap();
-        assert!(q.distinct, "distinct flag must be true");
-        assert_eq!(q.select.len(), 1);
-    }
-
-    /// SELECT without DISTINCT must have distinct = false.
-    #[test]
-    fn parse_select_without_distinct() {
-        let q = parse_sql("SELECT dept FROM t").unwrap();
-        assert!(!q.distinct, "distinct flag must be false");
-    }
-
-    /// Wave 60a: CASE WHEN in SELECT list must parse as SelectItem::Expression.
-    #[test]
-    fn parse_case_when_in_select() {
-        let q = parse_sql("SELECT CASE WHEN x > 5 THEN 1 ELSE 0 END FROM t").unwrap();
-        assert_eq!(q.select.len(), 1);
-        match &q.select[0] {
-            SelectItem::Expression { expr, alias } => {
-                assert!(alias.is_none());
-                assert!(matches!(expr, Expr::Case { .. }));
-            }
-            other => panic!("expected Expression, got {other:?}"),
-        }
-    }
-
-    /// Wave 67: EXTRACT(YEAR FROM d) must parse to Expr::Extract.
-    #[test]
-    fn parse_extract_year() {
-        let q = parse_sql("SELECT EXTRACT(YEAR FROM d) FROM t").unwrap();
-        assert_eq!(q.select.len(), 1);
-        match &q.select[0] {
-            SelectItem::Expression { expr, alias } => {
-                assert!(alias.is_none());
-                match expr {
-                    Expr::Extract { field, expr } => {
-                        assert_eq!(field, "YEAR", "field must be YEAR (uppercased)");
-                        // The inner expr should be a Column("d").
-                        match expr.as_ref() {
-                            Expr::Column(name) => assert_eq!(name, "d"),
-                            other => panic!("expected Column(d), got {other:?}"),
-                        }
-                    }
-                    other => panic!("expected Expr::Extract, got {other:?}"),
-                }
-            }
-            other => panic!("expected Expression, got {other:?}"),
-        }
-    }
-
-    /// Wave 67: EXTRACT with MONTH and DAY fields also parse.
-    #[test]
-    fn parse_extract_month_day() {
-        let q = parse_sql("SELECT EXTRACT(MONTH FROM d) FROM t").unwrap();
-        match &q.select[0] {
-            SelectItem::Expression { expr, .. } => match expr {
-                Expr::Extract { field, .. } => assert_eq!(field, "MONTH"),
-                other => panic!("expected Extract, got {other:?}"),
-            },
-            _ => panic!("expected Expression"),
-        }
-        let q = parse_sql("SELECT EXTRACT(DAY FROM d) FROM t").unwrap();
-        match &q.select[0] {
-            SelectItem::Expression { expr, .. } => match expr {
-                Expr::Extract { field, .. } => assert_eq!(field, "DAY"),
-                other => panic!("expected Extract, got {other:?}"),
-            },
-            _ => panic!("expected Expression"),
-        }
-    }
-
-    /// Wave 67: EXTRACT is case-insensitive (extract(year from d)).
-    #[test]
-    fn parse_extract_case_insensitive() {
-        let q = parse_sql("SELECT extract(year from d) FROM t").unwrap();
-        match &q.select[0] {
-            SelectItem::Expression { expr, .. } => match expr {
-                Expr::Extract { field, .. } => assert_eq!(field, "YEAR"),
-                other => panic!("expected Extract, got {other:?}"),
-            },
-            _ => panic!("expected Expression"),
-        }
-    }
-
-    /// Wave 67: CAST(x AS INT) must parse to Expr::Cast.
-    #[test]
-    fn parse_cast_int() {
-        let q = parse_sql("SELECT CAST(x AS INT) FROM t").unwrap();
-        assert_eq!(q.select.len(), 1);
-        match &q.select[0] {
-            SelectItem::Expression { expr, alias } => {
-                assert!(alias.is_none());
-                match expr {
-                    Expr::Cast { expr, target_type } => {
-                        assert_eq!(target_type, "INT", "target_type must be INT");
-                        match expr.as_ref() {
-                            Expr::Column(name) => assert_eq!(name, "x"),
-                            other => panic!("expected Column(x), got {other:?}"),
-                        }
-                    }
-                    other => panic!("expected Expr::Cast, got {other:?}"),
-                }
-            }
-            other => panic!("expected Expression, got {other:?}"),
-        }
-    }
-
-    /// Wave 67: CAST with FLOAT, VARCHAR, BIGINT target types.
-    #[test]
-    fn parse_cast_other_types() {
-        for (sql, expected_type) in [
-            ("SELECT CAST(x AS FLOAT) FROM t", "FLOAT"),
-            ("SELECT CAST(x AS BIGINT) FROM t", "BIGINT"),
-            ("SELECT CAST(x AS VARCHAR) FROM t", "VARCHAR"),
-            ("SELECT CAST(x AS VARCHAR(50)) FROM t", "VARCHAR"),
-        ] {
-            let q = parse_sql(sql).unwrap();
-            match &q.select[0] {
-                SelectItem::Expression { expr, .. } => match expr {
-                    Expr::Cast { target_type, .. } => {
-                        assert_eq!(*target_type, expected_type, "SQL: {sql}");
-                    }
-                    other => panic!("SQL {sql}: expected Cast, got {other:?}"),
-                },
-                other => panic!("SQL {sql}: expected Expression, got {other:?}"),
-            }
-        }
-    }
-
-    /// Wave 67: CAST is case-insensitive (cast(x as int)).
-    #[test]
-    fn parse_cast_case_insensitive() {
-        let q = parse_sql("SELECT cast(x as int) FROM t").unwrap();
-        match &q.select[0] {
-            SelectItem::Expression { expr, .. } => match expr {
-                Expr::Cast { target_type, .. } => assert_eq!(*target_type, "INT"),
-                other => panic!("expected Cast, got {other:?}"),
-            },
-            _ => panic!("expected Expression"),
-        }
-    }
-
-    /// Wave 67: EXTRACT in WHERE clause must parse (not error).
-    #[test]
-    fn parse_extract_in_where() {
-        let q = parse_sql("SELECT * FROM t WHERE EXTRACT(YEAR FROM d) = 2024").unwrap();
-        let w = q.where_clause.expect("WHERE clause");
-        match w {
-            Expr::Binary { left, op, .. } => {
-                assert_eq!(op, "=");
-                match *left {
-                    Expr::Extract { field, .. } => assert_eq!(field, "YEAR"),
-                    other => panic!("expected Extract in WHERE left, got {other:?}"),
-                }
-            }
-            other => panic!("expected Binary in WHERE, got {other:?}"),
-        }
-    }
-}
+#[path = "parser_tests.rs"]
+mod tests;

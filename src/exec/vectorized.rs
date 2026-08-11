@@ -88,14 +88,14 @@ fn eval_where(
 ) {
     match expr {
         crate::sql::parser::Expr::Binary { left, op, right } => {
-            let op_upper = op.to_uppercase();
-            if op_upper == "AND" {
+            use crate::sql::parser::BinOp;
+            if *op == BinOp::And {
                 eval_where(columns, column_names, row_count, left, mask);
                 let mut right_mask = vec![true; row_count];
                 eval_where(columns, column_names, row_count, right, &mut right_mask);
                 let left_mask = mask.to_vec();
                 and_mask(&left_mask, &right_mask, mask);
-            } else if op_upper == "OR" {
+            } else if *op == BinOp::Or {
                 let mut left_mask = vec![true; row_count];
                 let mut right_mask = vec![true; row_count];
                 eval_where(columns, column_names, row_count, left, &mut left_mask);
@@ -107,39 +107,42 @@ fn eval_where(
                     extract_col_and_value_batch(left, right, column_names)
                 {
                     let col = &columns[col_idx];
-                    match op_upper.as_str() {
-                        "=" => filter_eq(col, val, mask),
-                        "!=" => filter_ne(col, val, mask),
-                        "<" => filter_lt(col, val, mask),
-                        ">" => filter_gt(col, val, mask),
-                        "<=" => filter_le(col, val, mask),
-                        ">=" => filter_ge(col, val, mask),
+                    match op {
+                        BinOp::Eq => filter_eq(col, val, mask),
+                        BinOp::NotEq => filter_ne(col, val, mask),
+                        BinOp::Lt => filter_lt(col, val, mask),
+                        BinOp::Gt => filter_gt(col, val, mask),
+                        BinOp::LtEq => filter_le(col, val, mask),
+                        BinOp::GtEq => filter_ge(col, val, mask),
                         _ => {}
                     }
-                } else if op_upper == "LIKE" || op_upper == "NOT LIKE" {
-                    // LIKE: compile pattern, match against u64 values as if they were string hashes
-                    if let (Some(col_idx), Some(pattern_str)) =
-                        extract_col_and_string(left, right, column_names)
-                    {
-                        // For u64 columns: compare against the hash of the pattern
-                        // This is an approximation — real string matching needs StringColumn
-                        let col = &columns[col_idx];
-                        for i in 0..col.len() {
-                            // Simple wildcard: % matches anything, so if pattern is %, match all
-                            if pattern_str == "%" {
-                                mask[i] = true;
-                            } else {
-                                // Hash the pattern and compare (works for exact match on hashed strings)
-                                let pattern_hash =
-                                    xxhash_rust::xxh3::xxh3_64(pattern_str.as_bytes());
-                                mask[i] = col[i] == pattern_hash;
-                            }
-                        }
-                        if op_upper == "NOT LIKE" {
-                            for i in 0..mask.len() {
-                                mask[i] = !mask[i];
-                            }
-                        }
+                }
+                // LIKE / NOT LIKE are handled by Expr::Like below (the new AST
+                // represents LIKE as a distinct variant, not as Binary op).
+            }
+        }
+        crate::sql::parser::Expr::Like { expr, pattern, negated } => {
+            // LIKE: compile pattern, match against u64 values as if they were string hashes
+            if let (Some(col_idx), Some(pattern_str)) =
+                extract_col_and_string(expr, pattern, column_names)
+            {
+                // For u64 columns: compare against the hash of the pattern
+                // This is an approximation — real string matching needs StringColumn
+                let col = &columns[col_idx];
+                for i in 0..col.len() {
+                    // Simple wildcard: % matches anything, so if pattern is %, match all
+                    if pattern_str == "%" {
+                        mask[i] = true;
+                    } else {
+                        // Hash the pattern and compare (works for exact match on hashed strings)
+                        let pattern_hash =
+                            xxhash_rust::xxh3::xxh3_64(pattern_str.as_bytes());
+                        mask[i] = col[i] == pattern_hash;
+                    }
+                }
+                if *negated {
+                    for i in 0..mask.len() {
+                        mask[i] = !mask[i];
                     }
                 }
             }
@@ -209,6 +212,8 @@ fn value_to_u64(val: &crate::sql::parser::Value) -> Option<u64> {
         Value::Hex(bytes) => {
             Some(bytes.iter().enumerate().fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i))))
         }
+        Value::Date(d) => Some(*d as u64),
+        Value::Null => None,
     }
 }
 

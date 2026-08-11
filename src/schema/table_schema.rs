@@ -141,6 +141,10 @@ mod tests {
                 default: None,
                 identity: false,
                 references: None,
+                unique: false,
+                check: None,
+                on_delete: None,
+                on_update: None,
             },
             crate::sql::ddl::ColumnDef {
                 name: "price".into(),
@@ -150,6 +154,10 @@ mod tests {
                 default: None,
                 identity: false,
                 references: None,
+                unique: false,
+                check: None,
+                on_delete: None,
+                on_update: None,
             },
         ];
         let schema = TableSchema::from_ddl(&cols);
