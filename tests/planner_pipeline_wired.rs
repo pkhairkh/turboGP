@@ -69,3 +69,40 @@ fn test_filtered_select_still_invokes_planner() {
         planner_pipeline_invoked_count()
     );
 }
+
+#[test]
+fn test_explain_uses_planner_plan_tree() {
+    // Wave 1 Task 1.2: EXPLAIN must print the planner's plan tree (with
+    // Scan, Filter, etc.) — not the legacy string-based description.
+    let mut engine = QueryEngine::in_memory();
+    engine.execute("CREATE TABLE t (id INT, name VARCHAR(50))").unwrap();
+    engine.execute("INSERT INTO t VALUES (5, 'alice')").unwrap();
+
+    let result = engine.execute("EXPLAIN SELECT * FROM t WHERE id = 5").unwrap();
+    assert_eq!(result.row_count, 1, "EXPLAIN returns 1 row");
+    assert_eq!(result.columns.len(), 1, "EXPLAIN returns 1 column");
+    assert_eq!(result.columns[0].name, "QUERY PLAN");
+
+    // The plan text must come from the planner's PlanNode Display impl,
+    // which prints "Scan(table=...)" and "Filter(pred=[...])" lines.
+    let plan_text = result.columns[0]
+        .string_values
+        .as_ref()
+        .and_then(|v| v.first())
+        .expect("EXPLAIN must produce plan text");
+    assert!(
+        plan_text.contains("Scan"),
+        "plan tree must contain 'Scan' (got: {})",
+        plan_text
+    );
+    assert!(
+        plan_text.contains("Filter"),
+        "plan tree must contain 'Filter' (got: {})",
+        plan_text
+    );
+    assert!(
+        plan_text.contains("t"),
+        "plan tree must reference the table 't' (got: {})",
+        plan_text
+    );
+}

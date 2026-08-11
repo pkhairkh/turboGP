@@ -4,43 +4,31 @@ use super::*;
 
 impl QueryEngine {
     pub(crate) fn execute_explain(&mut self, sql: &str, start: &Instant) -> Result<QueryResult> {
+        // Wave 1 (Agent C): EXPLAIN now uses the formal planner pipeline
+        // (build_plan → Cascades) to print the actual logical plan tree,
+        // not a string-based description of the query shape.
+        //
+        // This makes EXPLAIN a faithful representation of what the
+        // optimizer will actually do, and it lets users see the effect of
+        // Cascades rules (predicate pushdown, projection pruning, constant
+        // folding) on their queries.
         let (query, _extensions) = match crate::sql::parse_with_extensions(sql) {
             Ok(qe) => qe,
             Err(e) => return Err(Error::Parse(e)),
         };
-        // Build a textual plan description.
-        let mut plan_lines = Vec::new();
-        plan_lines.push(format!("Query: {}", sql.trim()));
-        plan_lines.push(format!("Table: {}", query.from));
-        plan_lines.push(format!("Select items: {}", query.select.len()));
-        if !query.joins.is_empty() {
-            plan_lines.push(format!("Joins: {}", query.joins.len()));
-        }
-        if query.where_clause.is_some() {
-            plan_lines.push("Where: present".into());
-        }
-        if !query.group_by.is_empty() {
-            plan_lines.push(format!("Group By: {:?}", query.group_by));
-        }
-        if query.having.is_some() {
-            plan_lines.push("Having: present".into());
-        }
-        if !query.order_by.is_empty() {
-            plan_lines.push(format!("Order By: {} columns", query.order_by.len()));
-        }
-        if let Some(limit) = query.limit {
-            plan_lines.push(format!("Limit: {}", limit));
-        }
-        if query.distinct {
-            plan_lines.push("Distinct: true".into());
-        }
-        let table = self.catalog.get(&query.from);
-        if let Some(t) = table {
-            plan_lines.push(format!("Rows: {}", t.row_count));
-            plan_lines.push(format!("Columns: {}", t.column_names.join(", ")));
-        }
-        // Return as a single-column text result.
-        let plan_text = plan_lines.join("\n");
+
+        // Build the logical plan from the parsed SELECT.
+        let plan = crate::planner::build_plan(&query)?;
+
+        // Optimize via Cascades (predicate pushdown, projection pruning,
+        // constant folding). The optimized tree is what we print.
+        let optimizer = crate::planner::CascadesOptimizer::new();
+        let optimized = optimizer.optimize(plan);
+
+        // Render the plan tree as an indented string.
+        let plan_text = format!("{}", optimized);
+
+        // Build a one-column text result with the plan tree.
         let mut result = QueryResult::empty();
         result.row_count = 1;
         result.columns = vec![ResultColumn {
