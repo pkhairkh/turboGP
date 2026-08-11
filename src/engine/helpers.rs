@@ -763,148 +763,19 @@ pub(crate) struct PivotSpec {
 
 /// A parsed PIVOT clause extracted from a SQL string (Wave 56b).
 /// `group_col` is auto-detected at apply time (see execute_inner).
+///
+/// Production Wiring Wave 7: the parsing logic that produced this struct
+/// (`parse_pivot_clause` + `strip_pivot_clause`) has been **deleted**.
+/// The formal PIVOT AST now lives in [`crate::sql::ast::PivotClause`] and
+/// the parsing logic lives in [`crate::sql::pivot`]. Callers should use
+/// the new module directly. The local `PivotClause` struct is retained
+/// only for the [`PivotSpec`] group_col-detected shape used by
+/// [`apply_pivot`]; the engine constructs it from the formal AST.
 pub(crate) struct PivotClause {
     pub(crate) agg: String,
     pub(crate) value_col: String,
     pub(crate) pivot_col: String,
     pub(crate) pivot_values: Vec<String>,
-}
-
-/// Parse a PIVOT clause from a SQL string. Returns None if no PIVOT clause
-/// is present.
-///
-/// Supported syntax (case-insensitive):
-///   PIVOT (SUM(amount) FOR quarter IN ('Q1', 'Q2', 'Q3'))
-///   PIVOT (COUNT(*) FOR quarter IN (1, 2, 3))
-///   PIVOT (AVG(price) FOR region IN ('NA', 'EU', 'APAC'))
-///
-/// The clause may be followed by `AS <alias>` (which is stripped by
-/// strip_pivot_clause before re-execution of the underlying SELECT).
-pub(crate) fn parse_pivot_clause(sql: &str) -> Option<PivotClause> {
-    let lower = sql.to_lowercase();
-    let pivot_pos = lower.find("pivot ")?;
-    // Must be followed by '(' (possibly with whitespace).
-    let after_pivot = &sql[pivot_pos + "pivot ".len()..];
-    let after_pivot_trimmed = after_pivot.trim_start();
-    if !after_pivot_trimmed.starts_with('(') {
-        return None;
-    }
-    // Find the matching close paren for the PIVOT (...) group.
-    let mut depth = 0i32;
-    let mut close = None;
-    for (i, c) in after_pivot_trimmed.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let close = close?;
-    let inner = &after_pivot_trimmed[1..close];
-    // inner should look like: SUM(amount) FOR quarter IN ('Q1', 'Q2')
-    // or: COUNT(*) FOR quarter IN (1, 2, 3)
-    let inner_lower = inner.to_lowercase();
-    let for_pos = inner_lower.find(" for ")?;
-    let agg_part = inner[..for_pos].trim();
-    let after_for = &inner[for_pos + " for ".len()..];
-    let after_for_lower = after_for.to_lowercase();
-    let in_pos = after_for_lower.find(" in ")?;
-    let pivot_col = after_for[..in_pos].trim().to_string();
-    let after_in = &after_for[in_pos + " in ".len()..].trim_start();
-    // after_in should start with '(' and end with ')'.
-    if !after_in.starts_with('(') {
-        return None;
-    }
-    let in_close = after_in.find(')')?;
-    let values_str = &after_in[1..in_close];
-    // Parse the values: split on commas, strip quotes/brackets.
-    let pivot_values: Vec<String> = values_str
-        .split(',')
-        .map(|s| {
-            let s = s.trim();
-            // Strip single quotes.
-            let s = if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
-                &s[1..s.len() - 1]
-            } else {
-                s
-            };
-            // Strip square brackets (SQL Server style [Q1]).
-            let s = if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
-                &s[1..s.len() - 1]
-            } else {
-                s
-            };
-            s.to_string()
-        })
-        .filter(|s| !s.is_empty())
-        .collect();
-    if pivot_values.is_empty() {
-        return None;
-    }
-    // Parse the agg part: AGG_FUNC(arg). The arg may be '*' or a column name.
-    let open = agg_part.find('(')?;
-    let close_paren = agg_part.rfind(')')?;
-    let agg = agg_part[..open].trim().to_uppercase();
-    let value_col = agg_part[open + 1..close_paren].trim().to_string();
-    if agg.is_empty() || value_col.is_empty() {
-        return None;
-    }
-    Some(PivotClause { agg, value_col, pivot_col, pivot_values })
-}
-
-/// Strip the PIVOT clause (and any trailing `AS alias`) from a SQL string,
-/// returning the underlying SELECT that should be executed to produce the
-/// input rows for the pivot transformation.
-pub(crate) fn strip_pivot_clause(sql: &str) -> String {
-    let lower = sql.to_lowercase();
-    let pivot_pos = match lower.find("pivot ") {
-        Some(p) => p,
-        None => return sql.to_string(),
-    };
-    // Walk forward from pivot_pos to find the matching close paren.
-    let after_pivot = &sql[pivot_pos + "pivot ".len()..];
-    let after_pivot_trimmed = after_pivot.trim_start();
-    let paren_offset = after_pivot.len() - after_pivot_trimmed.len();
-    let mut depth = 0i32;
-    let mut close = None;
-    for (i, c) in after_pivot_trimmed.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let close = match close {
-        Some(c) => c,
-        None => return sql.to_string(),
-    };
-    // The PIVOT clause spans [pivot_pos, pivot_pos + "pivot ".len() + paren_offset + close + 1).
-    let end_of_pivot = pivot_pos + "pivot ".len() + paren_offset + close + 1;
-    // After the PIVOT clause, there may be `AS <alias>` — strip that too.
-    let rest = &sql[end_of_pivot..];
-    let rest_trimmed_start = rest.trim_start();
-    if rest_trimmed_start.to_uppercase().starts_with("AS ") {
-        let after_as = &rest_trimmed_start["AS ".len()..];
-        // Skip the alias identifier (alphanumeric + underscore).
-        let alias_len = after_as.chars().take_while(|c| c.is_alphanumeric() || *c == '_').count();
-        let after_alias = &after_as[alias_len..];
-        // Build the result: sql[..pivot_pos] + after_alias.
-        return format!("{}{}", &sql[..pivot_pos], after_alias);
-    }
-    // No AS clause — just concatenate.
-    format!("{}{}", &sql[..pivot_pos], &sql[end_of_pivot..])
 }
 
 /// Apply a PIVOT transformation to a QueryResult (Wave 53 wiring for

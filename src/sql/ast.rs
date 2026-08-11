@@ -548,6 +548,55 @@ impl fmt::Display for Expr {
     }
 }
 
+// =========================================================================
+// Production Wiring Wave 7 — formal PIVOT AST
+// =========================================================================
+
+/// Formal AST for a PIVOT clause (Production Wiring Wave 7).
+///
+/// Replaces the previous `PivotClause` string-scan hack in
+/// `src/engine/helpers.rs`. The parser module
+/// ([`crate::sql::parser::parse_pivot_clause`]) produces this AST; the
+/// engine dispatches on it via [`crate::engine::QueryEngine::execute_inner`].
+///
+/// # Supported syntax
+///
+/// ```sql
+/// PIVOT (SUM(amount) FOR quarter IN ('Q1', 'Q2', 'Q3'))
+/// PIVOT (COUNT(*) FOR quarter IN (1, 2, 3))
+/// PIVOT (AVG(price) FOR region IN ('NA', 'EU', 'APAC'))
+/// ```
+///
+/// The clause may be followed by `AS <alias>` (which is stripped by
+/// [`crate::sql::parser::strip_pivot_clause`] before re-execution of the
+/// underlying SELECT).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PivotClause {
+    /// The aggregation function name (e.g. "SUM", "COUNT", "AVG").
+    pub agg: String,
+    /// The column being aggregated (e.g. "amount"; may be "*" for COUNT).
+    pub value_col: String,
+    /// The column whose distinct values become the new pivot columns.
+    pub pivot_col: String,
+    /// The list of pivot values to project as columns.
+    pub pivot_values: Vec<String>,
+}
+
+/// Formal AST for a stripped SELECT statement that had a PIVOT clause
+/// attached (Production Wiring Wave 7). The PIVOT clause is parsed off
+/// the SQL string and the remaining SELECT is executed to produce the
+/// input rows for the pivot transformation.
+///
+/// This struct is the parsed form returned by
+/// [`crate::sql::parser::split_pivot_clause`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedPivot {
+    /// The PIVOT clause AST.
+    pub pivot: PivotClause,
+    /// The underlying SELECT SQL (with the PIVOT clause removed).
+    pub select_sql: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

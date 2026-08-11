@@ -38,6 +38,7 @@ pub mod dml;
 pub mod extensions;
 pub mod lexer;
 pub mod parser;
+pub mod pivot;
 
 pub use cte::{parse_with, CteDef, WithClause};
 pub use ddl::{

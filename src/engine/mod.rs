@@ -1697,9 +1697,9 @@ impl QueryEngine {
         // Supported syntax (simplified):
         //   SELECT * FROM <table> PIVOT (SUM(amount) FOR quarter IN ('Q1','Q2')) AS p
         //   SELECT * FROM <table> PIVOT (COUNT(*) FOR quarter IN (1, 2, 3))
-        if let Some(pivot_spec) = parse_pivot_clause(sql) {
+        if let Some(pivot_spec) = crate::sql::pivot::parse_pivot_clause(sql) {
             // Strip the PIVOT clause (and any trailing alias) from the SQL.
-            let stripped = strip_pivot_clause(sql);
+            let stripped = crate::sql::pivot::strip_pivot_clause(sql);
             // Execute the stripped SELECT to get the input rows.
             let input = self.execute_inner(&stripped, start, txn_id)?;
             // Auto-detect the group_col: the first column in the input that's
@@ -1723,7 +1723,6 @@ impl QueryEngine {
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }
-
         // Wave 56c: JSON_VALUE / JSON_QUERY. Detect `JSON_VALUE(` in the SQL
         // and intercept: rewrite the SQL to replace each JSON_VALUE(col, path)
         // with `col AS __json_value_N__`, execute the rewritten SQL, then
