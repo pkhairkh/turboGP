@@ -1102,6 +1102,12 @@ impl QueryEngine {
                 node_id,
                 peers.len()
             );
+            // Production Wiring Wave 4: wire the Raft handle into the Wal
+            // so append_and_sync routes through Raft consensus before the
+            // local WAL append.
+            if let Some(ref mut wal) = self.wal {
+                wal.set_raft_handle(mgr.raft.clone(), runtime.handle().clone());
+            }
             self.raft_manager = Some(mgr);
             self.raft_runtime = Some(runtime);
             return Ok(());
