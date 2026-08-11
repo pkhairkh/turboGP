@@ -5,6 +5,27 @@
 
 use super::*;
 
+/// Strip the leading SQL keyword from a statement (Wave 3 — Agent C).
+///
+/// Given a trimmed SQL string like `"EXPLAIN SELECT * FROM t"` or
+/// `"ANALYZE SELECT COUNT(*) FROM t"`, returns the substring after the
+/// first keyword: `"SELECT * FROM t"` / `"SELECT COUNT(*) FROM t"`.
+///
+/// Used by `execute()` to extract the inner SQL for `EXPLAIN` and
+/// `ANALYZE` after `classify_statement` has identified the verb. This
+/// replaces the previous `&trimmed[8..]` byte-slicing approach, which was
+/// fragile (it assumed the keyword was always exactly 8 bytes including
+/// the trailing space).
+pub(crate) fn strip_first_keyword(sql: &str) -> &str {
+    let trimmed = sql.trim_start();
+    // Find the end of the first run of non-whitespace characters.
+    let end = trimmed
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(trimmed.len());
+    // Skip the keyword and the whitespace after it.
+    trimmed[end..].trim_start()
+}
+
 pub(crate) fn extract_string_literal(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if !(trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2) {
@@ -131,13 +152,12 @@ pub(crate) fn eval_simple_where(table: &Table, where_str: &str) -> Result<Vec<bo
                 i += 1;
                 continue;
             }
-            crate::sql::lexer::Token::LParen => {
-                // Parenthesised expressions in DML WHERE are not supported
-                // here — fall back to the dispatcher's mask evaluator if
-                // the caller needs full boolean expression support.
-                return Err(Error::Other(
-                    "parenthesised expressions are not supported in DML WHERE; use SELECT WHERE instead".into(),
-                ));
+            crate::sql::lexer::Token::LParen | crate::sql::lexer::Token::RParen => {
+                // Task 5.1: skip parens — Expr::to_string() wraps binary
+                // expressions in parens (e.g. "(id = 1)"), and we need to
+                // handle this gracefully for simple col op value predicates.
+                i += 1;
+                continue;
             }
             _ => {}
         }
@@ -1408,7 +1428,7 @@ pub(crate) fn default_cell_for_type(col_def: &crate::sql::ColumnDef, _row_count:
 pub(crate) fn extract_eq_predicate(expr: &crate::sql::parser::Expr) -> Option<(String, u64)> {
     use crate::sql::parser::{Expr, Value};
     match expr {
-        Expr::Binary { left, op, right } if op == "=" => {
+        Expr::Binary { left, op, right } if *op == crate::sql::parser::BinOp::Eq => {
             // Try left=column, right=literal.
             if let (Expr::Column(name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
                 return Some((name.clone(), literal_to_cell(val)?));
@@ -1443,5 +1463,7 @@ pub(crate) fn literal_to_cell(val: &crate::sql::parser::Value) -> Option<u64> {
                 bytes.iter().enumerate().fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i)));
             Some(v)
         }
+        Value::Date(d) => Some(*d as u64),
+        Value::Null => None,
     }
 }

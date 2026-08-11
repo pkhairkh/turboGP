@@ -182,3 +182,34 @@ and 10 are complete; Waves 5-8 and 11-14 are in progress.
 ## [0.1.0] — 2025-07-28
 ### Added
 - Initial NaN-boxed Cell prototype, basic encoders, LSM storage
+
+## Integration (Waves 1-7) — Three-Branch Merge
+
+### Wave 1: Three-Way Branch Merge
+- Merged `feat/engine-planner` (Agent C), `feat/storage-txn` (Agent B),
+  `feat/sql-frontend` (Agent A) into `integ/three-branch-merge`.
+- Resolved conflicts on `src/engine/mod.rs` (Wal API, MVCC compat).
+- 817 lib tests pass after merge.
+
+### Wave 2: Parser Debt
+- Documented UNION ALL, MERGE, PIVOT parser hacks in `INTEG_DEBT_LOG.md`.
+- Agent A added `SetQuery::UnionAll` but engine lacks `execute_select_query()`.
+
+### Wave 3: MVCC Row Versions
+- `execute_insert` now populates `Table.row_versions` when MVCC enabled.
+- `MvccTxnManager` compat methods (begin_compat, commit_compat, etc.) added.
+
+### Wave 4: WAL & Replication
+- `enable_replication` now calls `wal.set_stream_sink()`.
+- `enable_raft` creates `RaftNode`, calls `on_become_leader()`.
+- `WalRecord` has `timestamp_us` field; `Wal::append` sets it.
+
+### Wave 5: Bug Fixes
+- SHOW TABLES dispatched by `execute()`.
+- `eval_simple_where` handles parenthesized expressions.
+- `parse_iso8601_to_micros` accepts plain numeric timestamps.
+
+### Wave 7: Final Verification
+- All check scripts pass (file size, no panics, dead code).
+- `FINAL_REPORT.md` updated with integration summary.
+- `INTEG_DEBT_LOG.md` created with remaining debt items.

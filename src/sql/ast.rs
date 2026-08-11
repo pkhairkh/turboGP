@@ -41,7 +41,7 @@ use std::fmt;
 ///
 /// Replaces the former `Value` (in `sql::parser`) and `Value2` (in
 /// `engine::query_interpreter`). Every value is one of: 64-bit integer, 64-bit float,
-/// UTF-8 string, days-since-epoch date, or NULL.
+/// UTF-8 string, days-since-epoch date, hex byte string, or NULL.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// A 64-bit signed integer literal (e.g., `42`, `-1`).
@@ -49,9 +49,11 @@ pub enum Value {
     /// A 64-bit floating-point literal (e.g., `3.14`, `1e10`).
     Float(f64),
     /// A string literal (e.g., `'hello'`).
-    Str(String),
+    String(String),
     /// A date literal stored as days since the Unix epoch (e.g., `DATE '2024-01-15'`).
     Date(i32),
+    /// A hex literal `x'...'` decoded into raw bytes.
+    Hex(Vec<u8>),
     /// SQL NULL.
     Null,
 }
@@ -63,14 +65,15 @@ impl Value {
     }
 
     /// Convert this value to a `u64` cell (the engine's universal storage format).
-    /// Int → as-is, Float → `to_bits`, Date → as u64, Str → 0 (strings are
-    /// stored in a sidecar), Null → 0.
+    /// Int → as-is, Float → `to_bits`, Date → as u64, String → 0 (strings are
+    /// stored in a sidecar), Hex → 0, Null → 0.
     pub fn to_cell(&self) -> u64 {
         match self {
             Value::Int(n) => *n as u64,
             Value::Float(f) => f.to_bits(),
             Value::Date(d) => *d as u64,
-            Value::Str(_) => 0, // String hash stored in sidecar
+            Value::String(_) => 0, // String hash stored in sidecar
+            Value::Hex(_) => 0,
             Value::Null => 0,
         }
     }
@@ -81,8 +84,15 @@ impl fmt::Display for Value {
         match self {
             Value::Int(n) => write!(f, "{n}"),
             Value::Float(fl) => write!(f, "{fl}"),
-            Value::Str(s) => write!(f, "'{}'", s.replace('\'', "''")),
+            Value::String(s) => write!(f, "'{}'", s.replace('\'', "''")),
             Value::Date(d) => write!(f, "DATE '{d}'"),
+            Value::Hex(bytes) => {
+                write!(f, "x'")?;
+                for b in bytes {
+                    write!(f, "{b:02X}")?;
+                }
+                write!(f, "'")
+            }
             Value::Null => write!(f, "NULL"),
         }
     }
@@ -179,6 +189,35 @@ impl fmt::Display for BinOp {
     }
 }
 
+/// A unary operator.
+///
+/// Used by `Expr::Unary`. Currently only `Neg` (prefix `-`) is supported;
+/// `Pos` (prefix `+`) is included for completeness and may be used by
+/// future parsers that distinguish `+x` from `x`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryOp {
+    /// Unary negation: `-expr`.
+    Neg,
+    /// Unary plus: `+expr` (no-op, preserved for AST fidelity).
+    Pos,
+}
+
+impl UnaryOp {
+    /// Returns the SQL string representation of this operator.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UnaryOp::Neg => "-",
+            UnaryOp::Pos => "+",
+        }
+    }
+}
+
+impl fmt::Display for UnaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// The unified SQL expression AST.
 ///
 /// This single type replaces the former `sql::parser::Expr` (6 variants)
@@ -211,6 +250,14 @@ pub enum Expr {
         op: BinOp,
         /// Right operand.
         right: Box<Expr>,
+    },
+
+    /// A unary operator application: `op expr` (e.g., `-x`, `+x`).
+    Unary {
+        /// The operator (typed).
+        op: UnaryOp,
+        /// The operand.
+        expr: Box<Expr>,
     },
 
     /// Logical NOT: `NOT expr`.
@@ -267,6 +314,14 @@ pub enum Expr {
         /// The list of values.
         list: Vec<Expr>,
         /// `true` for `NOT IN`.
+        negated: bool,
+    },
+
+    /// `expr IS NULL` (or `IS NOT NULL` if `negated`).
+    IsNull {
+        /// The expression to test for NULL-ness.
+        expr: Box<Expr>,
+        /// `true` for `IS NOT NULL`.
         negated: bool,
     },
 
@@ -332,7 +387,7 @@ impl Expr {
 
     /// Convenience constructor for a string literal.
     pub fn str(s: impl Into<String>) -> Self {
-        Expr::Literal(Value::Str(s.into()))
+        Expr::Literal(Value::String(s.into()))
     }
 
     /// Convenience constructor for NULL.
@@ -372,7 +427,7 @@ impl Expr {
                 cols.extend(right.columns());
                 cols
             }
-            Expr::Not(e) | Expr::Paren(e) => e.columns(),
+            Expr::Unary { expr: e, .. } | Expr::Not(e) | Expr::Paren(e) => e.columns(),
             Expr::Case { when_clauses, else_clause } => {
                 let mut cols = Vec::new();
                 for (cond, val) in when_clauses {
@@ -403,6 +458,7 @@ impl Expr {
                 }
                 cols
             }
+            Expr::IsNull { expr, .. } => expr.columns(),
             Expr::InSubquery { expr, .. } => expr.columns(),
             Expr::Exists { .. } => vec![],
             Expr::Extract { expr, .. } => expr.columns(),
@@ -417,6 +473,7 @@ impl fmt::Display for Expr {
             Expr::Column(name) => write!(f, "{name}"),
             Expr::Literal(v) => write!(f, "{v}"),
             Expr::Binary { left, op, right } => write!(f, "({left} {op} {right})"),
+            Expr::Unary { op, expr } => write!(f, "({op}{expr})"),
             Expr::Not(e) => write!(f, "NOT {e}"),
             Expr::Case { when_clauses, else_clause } => {
                 write!(f, "CASE")?;
@@ -463,6 +520,13 @@ impl fmt::Display for Expr {
                 let strs: Vec<String> = list.iter().map(|v| v.to_string()).collect();
                 write!(f, " IN ({})", strs.join(", "))
             }
+            Expr::IsNull { expr, negated } => {
+                write!(f, "{expr} IS")?;
+                if *negated {
+                    write!(f, " NOT")?;
+                }
+                write!(f, " NULL")
+            }
             Expr::InSubquery { expr, negated, .. } => {
                 write!(f, "{expr}")?;
                 if *negated {
@@ -508,8 +572,8 @@ mod tests {
     #[test]
     fn test_value_display() {
         assert_eq!(Value::Int(42).to_string(), "42");
-        assert_eq!(Value::Str("hello".into()).to_string(), "'hello'");
-        assert_eq!(Value::Str("it's".into()).to_string(), "'it''s'");
+        assert_eq!(Value::String("hello".into()).to_string(), "'hello'");
+        assert_eq!(Value::String("it's".into()).to_string(), "'it''s'");
         assert_eq!(Value::Null.to_string(), "NULL");
     }
 
@@ -538,7 +602,7 @@ mod tests {
         assert_eq!(Expr::col("name"), Expr::Column("name".into()));
         assert_eq!(Expr::int(42), Expr::Literal(Value::Int(42)));
         assert_eq!(Expr::float(3.14), Expr::Literal(Value::Float(3.14)));
-        assert_eq!(Expr::str("hi"), Expr::Literal(Value::Str("hi".into())));
+        assert_eq!(Expr::str("hi"), Expr::Literal(Value::String("hi".into())));
         assert_eq!(Expr::null(), Expr::Literal(Value::Null));
     }
 
@@ -606,6 +670,31 @@ mod tests {
             negated: true,
         };
         assert_eq!(e.to_string(), "name NOT LIKE '%foo%'");
+    }
+
+    #[test]
+    fn test_expr_display_unary() {
+        let e = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(Expr::int(1)),
+        };
+        assert_eq!(e.to_string(), "(-1)");
+    }
+
+    #[test]
+    fn test_expr_unary_columns() {
+        let e = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(Expr::col("x")),
+        };
+        let cols = e.columns();
+        assert_eq!(cols, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn test_unary_op_display() {
+        assert_eq!(UnaryOp::Neg.to_string(), "-");
+        assert_eq!(UnaryOp::Pos.to_string(), "+");
     }
 
     #[test]

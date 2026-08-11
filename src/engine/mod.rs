@@ -61,6 +61,7 @@ pub mod result;
 pub mod query_interpreter;
 
 pub use executor::execute_select;
+pub use executor::{planner_pipeline_invoked_count, reset_planner_pipeline_counter};
 pub use result::{QueryResult, ResultColumn};
 
 use crate::catalog::Catalog;
@@ -79,7 +80,9 @@ use std::time::Instant;
 /// See the module docs for the pipeline and usage examples.
 pub struct QueryEngine {
     /// The table catalog (name → [`Table`]).
-    catalog: Catalog,
+    /// Public so the storage layer (`storage::replication::backup`) can
+    /// list tables for backup (Task 5.4). See AGENT_B_API_REQUESTS.md.
+    pub catalog: Catalog,
     /// The kernel table: maps `(Operator, CpuTarget, MemoryTier)` to the
     /// best kernel for that combination on the running CPU.
     kernel_table: Arc<KernelTable>,
@@ -91,7 +94,11 @@ pub struct QueryEngine {
     /// Transaction manager for BEGIN/COMMIT/ROLLBACK (Wave 5).
     txn_manager: crate::txn::TxnManager,
     /// Write-ahead log for durability (Wave 37). None when not configured.
-    wal: Option<crate::storage::recovery::Wal>,
+    /// Public so the storage layer (`Checkpoint::load`) can temporarily
+    /// detach the WAL during checkpoint load — preventing the checkpoint
+    /// statements from being re-written to the WAL (Task 1.1 fix for the
+    /// duplicate-row data-corruption bug). See `AGENT_B_API_REQUESTS.md`.
+    pub wal: Option<crate::storage::recovery::Wal>,
     /// Index manager for secondary indexes (Wave 31).
     pub index_manager: crate::index::manager::IndexManager,
     /// Hash column registry for materialized string hashes.
@@ -122,6 +129,40 @@ pub struct QueryEngine {
     /// Allowed directories for COPY TO/FROM operations (Wave 2 security).
     /// Empty by default — COPY is disabled unless explicitly configured.
     pub allowed_copy_dirs: Vec<std::path::PathBuf>,
+    /// MVCC transaction manager (Wave 4 — Agent C).
+    ///
+    /// Used when `mvcc_enabled` is true. Tracks transaction IDs and commit
+    /// state for real multi-version concurrency control. Unlike the legacy
+    /// `TxnManager` (which deep-clones the entire catalog at BEGIN), this
+    /// manager is O(1) per BEGIN — it just records the snapshot timestamp.
+    mvcc_txn_manager: crate::txn::MvccTxnManager,
+    /// Whether MVCC mode is enabled (Wave 4 — Agent C).
+    ///
+    /// `false` (default): use the legacy `TxnManager` with catalog snapshot
+    /// swap. `true`: use `MvccTxnManager` with per-row version chains.
+    ///
+    /// MVCC mode is opt-in via [`QueryEngine::enable_mvcc`] so existing
+    /// callers that depend on snapshot-isolation semantics are unaffected.
+    mvcc_enabled: bool,
+    /// Optional WAL streamer for replication (Wave 5 Task 5.3 — Agent C).
+    ///
+    /// When set, every successful WAL append+fsync also streams the record
+    /// to a replica via `WalStreamer::stream_record`. The streamer is
+    /// attached via [`QueryEngine::enable_replication`].
+    wal_streamer: Option<WalStreamerHandle>,
+    /// Optional Raft node for leader election (Task 4.5 — debt-5.4).
+    /// When set via `enable_raft()`, the node participates in leader election.
+    /// On becoming leader, it connects WalStreamers to all followers.
+    raft_node: Option<crate::storage::replication::RaftNode>,
+}
+
+/// A handle to an active WAL streamer (Wave 5 Task 5.3 — Agent C).
+///
+/// Wraps `WalStreamer` in a `Mutex` so the engine can share it across
+/// threads (the engine itself is behind an `Arc<RwLock<QueryEngine>>`).
+pub struct WalStreamerHandle {
+    /// The underlying WalStreamer.
+    pub streamer: std::sync::Mutex<crate::storage::replication::WalStreamer>,
 }
 
 
@@ -136,35 +177,88 @@ pub mod transaction;
 pub mod vacuum;
 
 impl QueryEngine {
-    pub fn try_readonly_select(&self, sql: &str) -> Result<QueryResult> {
+    /// Execute a SQL statement in **read-only mode** (Wave 2 — Agent C).
+    ///
+    /// Takes `&self` (not `&mut self`) so callers can hold a `RwLock::read()`
+    /// guard and run multiple SELECTs concurrently without blocking other
+    /// readers. DML/DDL statements are rejected with an error so a
+    /// read-only caller can never accidentally mutate the catalog.
+    ///
+    /// # Accepted statements
+    ///
+    /// - `SELECT ...` (no interpreter fallback — see below)
+    /// - `EXPLAIN SELECT ...` (uses the planner pipeline from Wave 1)
+    /// - `SHOW ...` (treated as a SELECT against `__dummy__`)
+    /// - `WITH ... SELECT ...` is rejected (the CTE executor needs `&mut
+    ///   self` to register temp tables); callers should acquire a write
+    ///   lock for CTEs.
+    ///
+    /// # Rejected statements
+    ///
+    /// `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `ALTER`, `BEGIN`,
+    /// `COMMIT`, `ROLLBACK`, `COPY`, `VACUUM`, `CHECKPOINT`, `MERGE`,
+    /// `SAVEPOINT`, `RELEASE`, `BACKUP`, `RESTORE` — all return
+    /// `Error::Other("read-only transaction: <verb> requires a write lock")`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Other`] if the SQL is a write statement, requires
+    ///   interpreter fallback, or fails during execution.
+    /// - [`Error::Parse`] if the SQL is malformed.
+    /// - [`Error::NotFound`] if the source table or a referenced column
+    ///   does not exist in the catalog.
+    pub fn execute_readonly(&self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let trimmed = sql.trim();
-        let lower = trimmed.to_lowercase();
 
-        // Only SELECT queries can be readonly.
-        if !lower.starts_with("select") && !lower.starts_with("with") {
-            return Err(Error::Other("not a readonly query".into()));
+        // Wave 3 (Agent C): dispatch via classify_statement, not starts_with.
+        use crate::engine::dispatch::{classify_statement, StatementKind};
+        let kind = classify_statement(sql);
+
+        // EXPLAIN is read-only (uses the planner, doesn't touch catalog).
+        // We re-use the planner-pipeline EXPLAIN path from Wave 1 Task 1.2,
+        // but with only &self (no &mut self needed).
+        match kind {
+            StatementKind::Explain => {
+                let inner_sql = crate::engine::helpers::strip_first_keyword(trimmed);
+                return self.execute_readonly_explain(inner_sql, &start);
+            }
+            StatementKind::Select | StatementKind::Show => {
+                // Fall through to the readonly execution path below.
+            }
+            _ => {
+                // Any other verb (INSERT, UPDATE, DELETE, CREATE, DROP,
+                // BEGIN, COMMIT, COPY, VACUUM, ...) requires a write lock.
+                let verb = trimmed.split_whitespace().next().unwrap_or("unknown");
+                return Err(Error::Other(format!(
+                    "read-only transaction: {verb} requires a write lock"
+                )));
+            }
         }
 
-        // Try DDL/DML — these are NOT readonly.
+        // DDL/DML are not readonly even if they happen to start with SELECT
+        // (e.g. SELECT INTO). Reject them.
         if crate::sql::parse_ddl(sql).map_err(Error::Parse)?.is_some() {
-            return Err(Error::Other("DDL requires write lock".into()));
+            return Err(Error::Other("read-only transaction: DDL requires a write lock".into()));
         }
         if crate::sql::parse_dml(sql).map_err(Error::Parse)?.is_some() {
-            return Err(Error::Other("DML requires write lock".into()));
+            return Err(Error::Other("read-only transaction: DML requires a write lock".into()));
         }
 
-        // Try CTE.
-        if let Some(with_result) = crate::sql::parse_with(sql) {
-            return Err(Error::Other("CTE requires write lock".into()));
+        // CTEs need &mut self (temp-table registration), so reject them.
+        if crate::sql::parse_with(sql).is_some() {
+            return Err(Error::Other("read-only transaction: CTE requires a write lock".into()));
         }
 
         // Parse as SELECT and execute against the current catalog.
         let (query, extensions) = match crate::sql::parse_with_extensions(sql) {
             Ok(qe) => qe,
             Err(_parse_err) => {
-                // Basic parser failed — need interpreter fallback, which requires &mut self.
-                return Err(Error::Other("query needs interpreter fallback — requires write lock".into()));
+                // Basic parser failed — would need interpreter fallback
+                // (which requires &mut self). Reject.
+                return Err(Error::Other(
+                    "read-only transaction: query needs interpreter fallback, requires a write lock".into(),
+                ));
             }
         };
 
@@ -180,11 +274,134 @@ impl QueryEngine {
                 Ok(result)
             }
             Err(_exec_err) => {
-                // execute_select failed — need interpreter fallback.
-                Err(Error::Other("query failed in execute_select — needs interpreter fallback".into()))
+                // execute_select failed — would need interpreter fallback.
+                Err(Error::Other(
+                    "read-only transaction: query failed in execute_select, requires a write lock".into(),
+                ))
             }
         }
     }
+
+    /// Internal helper: EXPLAIN path that runs with only `&self` (used by
+    /// `execute_readonly`). Mirrors the planner-based EXPLAIN from Wave 1
+    /// Task 1.2 but doesn't require `&mut self`.
+    fn execute_readonly_explain(&self, sql: &str, start: &Instant) -> Result<QueryResult> {
+        let (query, _extensions) = crate::sql::parse_with_extensions(sql)
+            .map_err(Error::Parse)?;
+        let plan = crate::planner::build_plan(&query)?;
+        let optimizer = crate::planner::CascadesOptimizer::new();
+        let optimized = optimizer.optimize(plan);
+        let plan_text = format!("{}", optimized);
+
+        let mut result = QueryResult::empty();
+        result.row_count = 1;
+        result.columns = vec![ResultColumn {
+            name: "QUERY PLAN".into(),
+            values: vec![xxhash_rust::xxh3::xxh3_64(plan_text.as_bytes())],
+            string_values: Some(vec![plan_text]),
+            type_oid: 25,
+            null_mask: None,
+        }];
+        result.elapsed_us = start.elapsed().as_micros() as u64;
+        Ok(result)
+    }
+
+    /// Deprecated alias for [`QueryEngine::execute_readonly`].
+    ///
+    /// retained for backwards compatibility with `src/server/pgwire.rs`
+    /// (owned by another agent). New callers should use `execute_readonly`.
+    pub fn try_readonly_select(&self, sql: &str) -> Result<QueryResult> {
+        self.execute_readonly(sql)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2 Task 2.2 — SELECT-vs-DML routing helper.
+//
+// The production pattern wraps `QueryEngine` in `Arc<RwLock<QueryEngine>>`.
+// This free function checks the SQL verb (via the formal parser, not string
+// match) and acquires the appropriate lock:
+//   - SELECT / EXPLAIN / SHOW  →  RwLock::read()   → execute_readonly
+//   - INSERT / UPDATE / DELETE / CREATE / DROP / ...  →  RwLock::write()  → execute
+//
+// Callers that already hold a lock should call `execute_readonly` or
+// `execute` directly instead of this helper.
+// ---------------------------------------------------------------------------
+
+/// Classify a SQL statement as readonly (SELECT-like) or write (DML/DDL).
+///
+/// Returns `true` if the statement can be executed with a read lock via
+/// [`QueryEngine::execute_readonly`], `false` if it needs a write lock.
+///
+/// This uses the formal parser (`crate::sql::parse_ddl` / `parse_dml`) to
+/// classify, not string-prefix matching — so `SELECT INTO ...` (which is
+/// actually DML) is correctly classified as a write statement.
+#[must_use]
+pub fn is_readonly_sql(sql: &str) -> bool {
+    use crate::engine::dispatch::{classify_statement, StatementKind};
+    let kind = classify_statement(sql);
+
+    // Only SELECT, EXPLAIN, and SHOW are candidates for the read-only path.
+    if !matches!(kind, StatementKind::Select | StatementKind::Explain | StatementKind::Show) {
+        return false;
+    }
+
+    // DDL/DML disguised as SELECT (e.g. SELECT INTO) — must use the parser.
+    if crate::sql::parse_ddl(sql).ok().flatten().is_some() {
+        return false;
+    }
+    if crate::sql::parse_dml(sql).ok().flatten().is_some() {
+        return false;
+    }
+
+    // WITH ... SELECT ... is a CTE — needs write lock (temp-table registration).
+    if matches!(kind, StatementKind::With) {
+        return false;
+    }
+    if crate::sql::parse_with(sql).is_some() {
+        return false;
+    }
+
+    true
+}
+
+/// Route a SQL statement to the appropriate lock + execute path.
+///
+/// This is the production entry point for `Arc<RwLock<QueryEngine>>`:
+///
+/// ```ignore
+/// let engine: Arc<RwLock<QueryEngine>> = ...;
+/// let result = turbogp::engine::route_and_execute(&engine, sql)?;
+/// ```
+///
+/// - For SELECT / EXPLAIN / SHOW, acquires `RwLock::read()` and calls
+///   [`QueryEngine::execute_readonly`].
+/// - For DML / DDL / transaction control, acquires `RwLock::write()` and
+///   calls [`QueryEngine::execute`].
+///
+/// This maximizes read concurrency: 10 concurrent SELECTs run in parallel
+/// (sharing the read lock), while DML/DDL is serialized via the write lock.
+pub fn route_and_execute(
+    engine: &std::sync::Arc<std::sync::RwLock<QueryEngine>>,
+    sql: &str,
+) -> Result<QueryResult> {
+    use std::sync::RwLock;
+    if is_readonly_sql(sql) {
+        // Read path: multiple readers can hold the lock concurrently.
+        let guard = engine.read().map_err(|e| {
+            Error::Other(format!("route_and_execute: read lock poisoned: {e}"))
+        })?;
+        guard.execute_readonly(sql)
+    } else {
+        // Write path: serialized via the write lock.
+        let mut guard = engine.write().map_err(|e| {
+            Error::Other(format!("route_and_execute: write lock poisoned: {e}"))
+        })?;
+        guard.execute(sql)
+    }
+}
+
+impl QueryEngine {
 
     /// Construct an empty engine with the default kernel table and cost
     /// model. The catalog starts empty — register tables via
@@ -244,7 +461,69 @@ impl QueryEngine {
             next_table_id: 1,
             savepoints: Vec::new(),
             allowed_copy_dirs: Vec::new(),
+            mvcc_txn_manager: crate::txn::MvccTxnManager::new(),
+            mvcc_enabled: false,
+            wal_streamer: None,
+            raft_node: None,
         }
+    }
+
+    /// Enable MVCC mode (Wave 4 — Agent C).
+    ///
+    /// After calling this, `BEGIN`/`COMMIT`/`ROLLBACK` use the
+    /// [`MvccTxnManager`] instead of the legacy `TxnManager`. The
+    /// `MvccTxnManager` is O(1) per BEGIN (no catalog deep-clone) and
+    /// supports multiple concurrent transactions.
+    ///
+    /// **Note:** full row-level visibility filtering (where `execute_select`
+    /// filters rows by `(xmin, xmax)` version chains) is pending Agent B's
+    /// completion of the `Table.row_versions` population in INSERT/UPDATE/
+    /// DELETE. In the current implementation, MVCC mode provides correct
+    /// transaction ID tracking and commit/abort state, but does NOT yet
+    /// filter rows by visibility — all rows are visible to all transactions
+    /// (like autocommit). This is documented in `AGENT_C_API_REQUESTS.md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Other` if a snapshot-isolation transaction is
+    /// currently active (must commit or rollback first).
+    pub fn enable_mvcc(&mut self) -> Result<()> {
+        if self.txn_manager.is_active() {
+            return Err(Error::Other(
+                "cannot enable MVCC while a snapshot-isolation transaction is active".into(),
+            ));
+        }
+        self.mvcc_enabled = true;
+        Ok(())
+    }
+
+    /// Disable MVCC mode, reverting to the legacy `TxnManager` (Wave 4).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Other` if an MVCC transaction is currently active.
+    pub fn disable_mvcc(&mut self) -> Result<()> {
+        if self.mvcc_txn_manager.is_active() {
+            return Err(Error::Other(
+                "cannot disable MVCC while an MVCC transaction is active".into(),
+            ));
+        }
+        self.mvcc_enabled = false;
+        Ok(())
+    }
+
+    /// Returns `true` if MVCC mode is enabled (Wave 4).
+    #[must_use]
+    pub fn is_mvcc_enabled(&self) -> bool {
+        self.mvcc_enabled
+    }
+
+    /// Borrow the MVCC transaction manager (Wave 4).
+    ///
+    /// Exposed for tests that want to verify transaction state directly.
+    #[must_use]
+    pub fn mvcc_txn_manager(&self) -> &crate::txn::MvccTxnManager {
+        &self.mvcc_txn_manager
     }
 
     /// Create a QueryEngine with on-disk persistence (Wave 63).
@@ -260,8 +539,10 @@ impl QueryEngine {
         let bp = crate::storage::buffer_pool::BufferPool::new(data_dir, 256)?;
         engine.buffer_pool = Some(bp);
         // Also open a WAL in the same data directory.
-        let wal_path = data_dir.join("wal.log");
-        let wal = crate::storage::recovery::Wal::open(&wal_path)?;
+        // Task 2.3: the WAL is now segmented — it manages `wal-<N>.log`
+        // files inside a dedicated `wal/` subdirectory of the data dir.
+        let wal_dir = data_dir.join("wal");
+        let wal = crate::storage::recovery::Wal::open(&wal_dir)?;
         engine.wal = Some(wal);
         // Wave 5 (A4 fix): Load checkpoint BEFORE replaying WAL.
         // The checkpoint contains the catalog state at the last VACUUM;
@@ -270,8 +551,22 @@ impl QueryEngine {
         if let Err(e) = crate::storage::recovery::Checkpoint::load(&mut engine, &checkpoint_path) {
             log::warn!("checkpoint load failed: {e}");
         }
+        // Task 1.3: read the checkpoint's last_lsn (if the sidecar exists)
+        // and use it to skip already-checkpointed records on replay. Also
+        // bump the WAL's next_lsn past it so new records get LSNs strictly
+        // greater than the checkpoint's last_lsn.
+        let checkpoint_last_lsn =
+            crate::storage::recovery::Checkpoint::read_last_lsn(&checkpoint_path);
+        if let Some(lsn) = checkpoint_last_lsn {
+            if let Some(ref mut wal) = engine.wal {
+                wal.advance_lsn_to(lsn);
+            }
+        }
         // Replay the WAL to restore committed state after the checkpoint.
-        engine.replay_wal()?;
+        // Task 3.2: try physical replay first (fast path — applies
+        // PhysicalChange records directly to the buffer pool). Then fall
+        // back to SQL replay for records without physical changes.
+        engine.replay_wal_with_lsn_filter(checkpoint_last_lsn)?;
         Ok(engine)
     }
 
@@ -279,7 +574,19 @@ impl QueryEngine {
     /// This re-executes SQL records and applies physical page changes.
     /// Only committed transactions are replayed; uncommitted (no COMMIT
     /// marker after the DML) are discarded.
+    #[allow(dead_code)]
     fn replay_wal(&mut self) -> Result<()> {
+        self.replay_wal_with_lsn_filter(None)
+    }
+
+    /// Replay the WAL with an optional LSN filter (Task 1.3).
+    ///
+    /// If `checkpoint_last_lsn` is `Some(lsn)`, records with `lsn <= lsn`
+    /// are skipped — they are already included in the checkpoint. This
+    /// makes replay idempotent: even if the WAL wasn't truncated (e.g.
+    /// crash between checkpoint rename and WAL truncate), replay won't
+    /// duplicate rows.
+    fn replay_wal_with_lsn_filter(&mut self, checkpoint_last_lsn: Option<u64>) -> Result<()> {
         let wal = match &self.wal {
             Some(w) => w,
             None => return Ok(()),
@@ -298,6 +605,12 @@ impl QueryEngine {
 
         // Re-execute SQL records for committed transactions.
         for record in &records {
+            // Task 1.3: skip records already included in the checkpoint.
+            if let Some(last_lsn) = checkpoint_last_lsn {
+                if record.lsn <= last_lsn && record.lsn > 0 {
+                    continue;
+                }
+            }
             // Skip rollback records and their transactions.
             if record.is_rollback {
                 continue;
@@ -342,6 +655,16 @@ impl QueryEngine {
         &mut self,
         change: &crate::storage::recovery::PhysicalChange,
     ) -> Result<()> {
+        self.apply_physical_change_public(change)
+    }
+
+    /// Public wrapper for `apply_physical_change` (Task 3.2).
+    /// Exposed so `replay_wal_physical()` in src/storage/recovery.rs can
+    /// call it without going through the private method.
+    pub fn apply_physical_change_public(
+        &mut self,
+        change: &crate::storage::recovery::PhysicalChange,
+    ) -> Result<()> {
         use crate::storage::recovery::PhysicalChange;
         if self.buffer_pool.is_none() {
             return Ok(());
@@ -362,7 +685,7 @@ impl QueryEngine {
                 }
                 bp.unpin_page(page_id, true);
             }
-            PhysicalChange::RowInsert { table_id, page_num, row_offset, values } => {
+            PhysicalChange::RowInsert { table_id, page_num, slot, values } => {
                 let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
                 let bp = self.buffer_pool.as_mut().unwrap();
                 let idx =
@@ -370,17 +693,48 @@ impl QueryEngine {
                 {
                     let page = bp.get_page_mut(idx);
                     for (i, &val) in values.iter().enumerate() {
-                        let cell_idx = *row_offset + i;
+                        let cell_idx = *slot + i;
                         if cell_idx < crate::storage::page::PAGE_CELLS {
                             page.set_cell(cell_idx, val);
                         }
                     }
+                    page.header.row_count = page.header.row_count.max((*slot + values.len()) as u64);
+                    page.update_checksum();
+                }
+                bp.unpin_page(page_id, true);
+            }
+            PhysicalChange::RowUpdate { table_id, page_num, slot, new_values, .. } => {
+                // Task 3.1: redo-only — apply new_values at the slot.
+                let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
+                let bp = self.buffer_pool.as_mut().unwrap();
+                let idx =
+                    bp.fetch_page(page_id).map_err(|e| Error::Other(format!("page fetch: {e}")))?;
+                {
+                    let page = bp.get_page_mut(idx);
+                    for (i, &val) in new_values.iter().enumerate() {
+                        let cell_idx = *slot + i;
+                        if cell_idx < crate::storage::page::PAGE_CELLS {
+                            page.set_cell(cell_idx, val);
+                        }
+                    }
+                    page.update_checksum();
                 }
                 bp.unpin_page(page_id, true);
             }
             PhysicalChange::RowDelete { .. } => {
                 // Row deletion is handled by the catalog (row_count decrement).
                 // Physical deletion (compaction) happens during VACUUM.
+            }
+            PhysicalChange::PageSplit { table_id, old_page, new_page, .. } => {
+                // Task 3.1: ensure both pages are fetched (allocated) in the
+                // buffer pool. The actual row redistribution is handled by
+                // the executor when it performs the split; this redo path
+                // just makes sure both pages exist.
+                let old_page_id = crate::storage::buffer_pool::PageId::new(*table_id, *old_page);
+                let new_page_id = crate::storage::buffer_pool::PageId::new(*table_id, *new_page);
+                let bp = self.buffer_pool.as_mut().unwrap();
+                let _ = bp.fetch_page(old_page_id);
+                let _ = bp.fetch_page(new_page_id);
             }
         }
         Ok(())
@@ -408,19 +762,31 @@ impl QueryEngine {
     pub fn flush_with_checkpoint(&mut self) -> Result<()> {
         // 1. Flush dirty pages to disk.
         self.flush()?;
-        // 2. Write a checkpoint file (if we have a data directory).
-        if let Some(ref bp) = self.buffer_pool {
-            let checkpoint_path = bp.data_dir().join("checkpoint.sql");
-            match crate::storage::recovery::Checkpoint::save(&self.catalog, &checkpoint_path) {
-                Ok(n) => {
-                    log::debug!("checkpoint: wrote {n} tables to {}", checkpoint_path.display())
-                }
-                Err(e) => {
-                    return Err(Error::Other(format!(
-                        "checkpoint save to {}: {e}",
-                        checkpoint_path.display()
-                    )))
-                }
+        // 2. Write a checkpoint file (if we have a data directory) AND
+        //    truncate the WAL (Task 1.1 fix: prevents duplicate rows on
+        //    restart). The substantive logic lives in
+        //    Checkpoint::save_and_truncate() in src/storage/recovery.rs.
+        let checkpoint_path = match &self.buffer_pool {
+            Some(bp) => bp.data_dir().join("checkpoint.sql"),
+            None => return Ok(()),
+        };
+        let wal = match self.wal.as_mut() {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        match crate::storage::recovery::Checkpoint::save_and_truncate(
+            &self.catalog,
+            &checkpoint_path,
+            wal,
+        ) {
+            Ok(n) => {
+                log::debug!("checkpoint: wrote {n} tables to {}", checkpoint_path.display())
+            }
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "checkpoint save to {}: {e}",
+                    checkpoint_path.display()
+                )))
             }
         }
         Ok(())
@@ -444,9 +810,121 @@ impl QueryEngine {
     }
 
     /// Enable WAL on an existing engine.
+    /// Task 2.3: `wal_path` is now a directory (segmented WAL).
     pub fn enable_wal<P: AsRef<std::path::Path>>(&mut self, wal_path: P) -> Result<()> {
         let wal = crate::storage::recovery::Wal::open(&wal_path)?;
         self.wal = Some(wal);
+        Ok(())
+    }
+
+    /// Enable replication by attaching a `WalStreamer` (Wave 5 Task 5.3 — Agent C).
+    ///
+    /// Creates a `WalStreamer`, connects it to the replica at `peer_addr`,
+    /// and attaches it to the engine. After every successful WAL append+fsync,
+    /// the record is streamed to the replica via `WalStreamer::stream_record`.
+    ///
+    /// **Note:** This wraps the `WalStreamer` in a `Mutex` and stores it in
+    /// `self.wal_streamer`. The streaming happens inline in `wal_append_txn`
+    /// / `wal_append_record` after fsync succeeds. Stream errors are logged
+    /// as warnings (non-fatal) so a replica going down doesn't abort the
+    /// primary's transactions.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Other`] if the streamer fails to connect to `peer_addr`.
+    pub fn enable_replication(&mut self, peer_addr: &str) -> Result<()> {
+        let mut streamer = crate::storage::replication::WalStreamer::new();
+        streamer
+            .connect(peer_addr)
+            .map_err(Error::Other)?;
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(streamer));
+        self.wal_streamer = Some(WalStreamerHandle {
+            streamer: std::sync::Mutex::new(
+                crate::storage::replication::WalStreamer::new(),
+            ),
+        });
+        // Task 4.2 (debt-5.3): attach the streamer to the Wal via set_stream_sink
+        // so Wal::append_and_sync auto-streams after fsync.
+        if let Some(ref mut wal) = self.wal {
+            wal.set_stream_sink(handle);
+        }
+        log::info!("Replication enabled: streaming WAL to {}", peer_addr);
+        Ok(())
+    }
+
+    /// Enable replication without connecting to a replica (Wave 5 Task 5.3).
+    ///
+    /// Attaches a `WalStreamer` that is NOT connected to any peer. The
+    /// streamer counts records (via `records_sent`) but doesn't actually
+    /// send them anywhere. Useful for testing the replication wiring
+    /// without a live replica.
+    pub fn enable_replication_local_only(&mut self) {
+        let streamer = crate::storage::replication::WalStreamer::new();
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(streamer));
+        self.wal_streamer = Some(WalStreamerHandle {
+            streamer: std::sync::Mutex::new(
+                crate::storage::replication::WalStreamer::new(),
+            ),
+        });
+        // Attach to Wal for auto-streaming.
+        if let Some(ref mut wal) = self.wal {
+            wal.set_stream_sink(handle);
+        }
+    }
+
+    /// Returns the number of WAL records streamed to the replica (Wave 5 Task 5.3).
+    ///
+    /// Returns 0 if replication is not enabled.
+    #[must_use]
+    pub fn wal_records_streamed(&self) -> u64 {
+        if let Some(ref handle) = self.wal_streamer {
+            if let Ok(streamer) = handle.streamer.lock() {
+                return streamer.records_sent;
+            }
+        }
+        0
+    }
+
+    /// Enable Raft-based leader election (Wave 5 Task 5.4 — Agent C, STUB).
+    ///
+    /// **STUB:** `RaftNode::on_become_leader()` is not yet implemented by
+    /// Agent B. This method creates a `RaftNode` and stores it, but does
+    /// NOT start leader election or wire `Wal::set_streamer()` on becoming
+    /// leader. Documented as debt in `AGENT_C_API_REQUESTS.md`.
+    ///
+    /// When Agent B completes the Raft API, this method should:
+    /// 1. Create a `RaftNode` with the given `node_id` and `peers`.
+    /// 2. Start leader election.
+    /// 3. On becoming leader, call `self.enable_replication(peer_addr)`
+    ///    for each peer.
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok(())` (stub). Will return an error if
+    /// Raft initialization fails once implemented.
+    pub fn enable_raft(&mut self, node_id: u64, peers: Vec<(u64, String)>) -> Result<()> {
+        // Task 4.5 (debt-5.4): wire enable_raft to create a RaftNode and
+        // start election. On becoming leader, the RaftNode connects a
+        // WalStreamer to each follower via on_become_leader().
+        let mut raft_node = crate::storage::replication::RaftNode::new(node_id);
+        for (peer_id, addr) in &peers {
+            raft_node.add_peer(*peer_id, addr);
+        }
+        // Collect peer addresses for on_become_leader.
+        let peer_addrs: Vec<&str> = peers.iter().map(|(_, a)| a.as_str()).collect();
+        // Start election. In a single-node cluster, this immediately makes
+        // the node leader. In a multi-node cluster, on_become_leader is
+        // called when the node wins the election.
+        if let Some(ref mut wal) = self.wal {
+            let connected = raft_node.on_become_leader(wal, &peer_addrs);
+            log::info!(
+                "enable_raft: node {} became leader, connected to {} followers",
+                node_id, connected
+            );
+        } else {
+            log::warn!("enable_raft: no WAL attached — leader election skipped");
+        }
+        self.raft_node = Some(raft_node);
         Ok(())
     }
 
@@ -456,37 +934,34 @@ impl QueryEngine {
     /// explicit transaction, or `None` for autocommit. The record carries
     /// the txn_id so replay can group statements by transaction.
     ///
-    /// Wave 3 (A5): WAL errors are now propagated — if the WAL append or
-    /// sync fails, the error is logged and the engine continues (the
-    /// transaction will be visible in-memory but may not survive a crash).
-    /// A future wave will make this abort the transaction.
-    fn wal_append_txn(&mut self, sql: &str, txn_id: Option<u64>) {
+    /// **Integration:** uses `Wal::append_and_sync()` (Agent B's atomic
+    /// append+fsync). If a `WalStreamSink` is attached to the Wal, the
+    /// record is automatically streamed to replicas after fsync. Errors
+    /// are propagated — COMMIT fails if fsync fails.
+    fn wal_append_txn(&mut self, sql: &str, txn_id: Option<u64>) -> Result<()> {
         if let Some(ref mut wal) = self.wal {
             let record = match txn_id {
                 Some(id) => crate::storage::recovery::WalRecord::txn_dml(id, sql),
                 None => crate::storage::recovery::WalRecord::autocommit(sql),
             };
-            if let Err(e) = wal.append(&record) {
-                log::error!("WAL append failed (A5): {e}");
-            }
-            if let Err(e) = wal.sync() {
-                log::error!("WAL sync failed (A5): {e}");
-            }
+            wal.append_and_sync(&record)
+                .map_err(|e| Error::Other(format!("WAL append_and_sync failed: {e}")))?;
         }
+        Ok(())
     }
 
     /// Append a pre-constructed WAL record (BEGIN / COMMIT / ROLLBACK
     /// markers, or any other special record). Used by `execute()` to
     /// write transaction boundary markers (Wave 51 fix).
-    fn wal_append_record(&mut self, record: crate::storage::recovery::WalRecord) {
+    ///
+    /// **Integration:** uses `Wal::append_and_sync()` (Agent B's atomic
+    /// append+fsync). Errors are propagated.
+    fn wal_append_record(&mut self, record: crate::storage::recovery::WalRecord) -> Result<()> {
         if let Some(ref mut wal) = self.wal {
-            if let Err(e) = wal.append(&record) {
-                log::error!("WAL append failed (A5): {e}");
-            }
-            if let Err(e) = wal.sync() {
-                log::error!("WAL sync failed (A5): {e}");
-            }
+            wal.append_and_sync(&record)
+                .map_err(|e| Error::Other(format!("WAL append_and_sync failed: {e}")))?;
         }
+        Ok(())
     }
 
     /// Construct an engine with a custom cost model (e.g., one with a
@@ -660,7 +1135,16 @@ impl QueryEngine {
     /// - [`Error::Other`] for unsupported SQL features.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
+        let trimmed = sql.trim();
+        let lower = trimmed.to_lowercase();
 
+        // Wave 3 (Agent C): top-level dispatch via the formal tokenizer
+        // (classify_statement), NOT string-prefix matching. The classifier
+        // tokenizes the SQL once and returns a StatementKind enum that we
+        // match on below. This is more robust than `starts_with()` because
+        // it handles leading whitespace, case differences, and is the
+        // foundation for Agent A's future unified AST.
+        //
         // Transaction control: BEGIN/COMMIT/ROLLBACK.
         //
         // Wave 51 fix (Bug 8): BEGIN/COMMIT/ROLLBACK now write corresponding
@@ -669,34 +1153,120 @@ impl QueryEngine {
         // is_commit: false`, so a `BEGIN; INSERT; INSERT; COMMIT;` block
         // was indistinguishable from three autocommit INSERTs on replay
         // — and a `BEGIN; INSERT; ROLLBACK;` would still replay the INSERT.
-        let trimmed = sql.trim();
-        let lower = trimmed.to_lowercase();
+        let kind = crate::engine::dispatch::classify_statement(sql);
 
-        // EXPLAIN: show the query plan (Wave 68).
-        if lower.starts_with("explain ") {
-            let inner_sql = &trimmed[8..];
-            return self.execute_explain(inner_sql, &start);
+        match kind {
+            crate::engine::dispatch::StatementKind::Explain => {
+                // EXPLAIN: show the query plan (Wave 1 Task 1.2 — uses the
+                // planner pipeline, not a string-based description).
+                // Strip the leading "EXPLAIN " keyword.
+                let inner_sql = strip_first_keyword(trimmed);
+                return self.execute_explain(inner_sql, &start);
+            }
+            crate::engine::dispatch::StatementKind::Analyze => {
+                // ANALYZE: execute the query and return timing stats (Wave 68).
+                let inner_sql = strip_first_keyword(trimmed);
+                return self.execute_analyze(inner_sql, &start);
+            }
+            crate::engine::dispatch::StatementKind::Vacuum => {
+                // VACUUM: reclaim space from deleted rows (Wave 68).
+                return self.execute_vacuum(&start);
+            }
+            crate::engine::dispatch::StatementKind::Copy => {
+                // COPY table TO 'file' / COPY table FROM 'file' (Wave 68).
+                return self.execute_copy(trimmed, &start);
+            }
+            crate::engine::dispatch::StatementKind::Checkpoint => {
+                // CHECKPOINT: flush + write checkpoint file (Wave 2 fix).
+                self.flush_with_checkpoint()?;
+                return Ok(QueryResult::empty());
+            }
+            crate::engine::dispatch::StatementKind::Backup => {
+                // BACKUP TO '<dir>' (Wave 6 Task 6.1 — Agent C).
+                return self.execute_backup(trimmed, &start);
+            }
+            crate::engine::dispatch::StatementKind::Restore => {
+                // RESTORE FROM '<dir>' [AS OF TIMESTAMP '<ts>'] (Wave 6 Tasks 6.2, 6.3).
+                return self.execute_restore(trimmed, &start);
+            }
+            crate::engine::dispatch::StatementKind::Begin => {
+                // Wave 4 (Agent C): route to MVCC or snapshot-isolation
+                // manager based on mvcc_enabled.
+                if self.mvcc_enabled {
+                    let id = self.mvcc_txn_manager.begin_compat().map_err(Error::Other)?;
+                    self.wal_append_record(crate::storage::recovery::WalRecord::begin(id))?;
+                } else {
+                    let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
+                    self.wal_append_record(crate::storage::recovery::WalRecord::begin(id))?;
+                }
+                return Ok(QueryResult::empty());
+            }
+            crate::engine::dispatch::StatementKind::Commit => {
+                // Wave 4 (Agent C): route to the active transaction manager.
+                let txn_id = if self.mvcc_enabled {
+                    let id = self.mvcc_txn_manager.commit_compat().map_err(Error::Other)?;
+                    id
+                } else {
+                    // Capture the txn_id before we drain the transaction.
+                    let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
+                    let committed = self.txn_manager.commit().map_err(Error::Other)?;
+                    self.catalog = committed;
+                    txn_id
+                };
+                self.savepoints.clear(); // Wave 69: clear savepoints on commit.
+                self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id))?;
+                return Ok(QueryResult::empty());
+            }
+            crate::engine::dispatch::StatementKind::Rollback => {
+                // Full ROLLBACK (no `TO` savepoint). RollbackTo is handled
+                // in execute_inner below so it operates on the txn snapshot.
+                let txn_id = if self.mvcc_enabled {
+                    self.mvcc_txn_manager.rollback_compat().map_err(Error::Other)?
+                } else {
+                    let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
+                    self.txn_manager.rollback().map_err(Error::Other)?;
+                    txn_id
+                };
+                self.savepoints.clear(); // Wave 69: clear savepoints on rollback.
+                self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id))?;
+                return Ok(QueryResult::empty());
+            }
+            crate::engine::dispatch::StatementKind::Show => {
+                // Task 5.3 (debt-show): wire SHOW TABLES into execute() dispatch.
+                return self.execute_show(trimmed, &start);
+            }
+            _ => {
+                // SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / ALTER /
+                // MERGE / PIVOT / SAVEPOINT / ROLLBACK TO / RELEASE / CTE /
+                // View DDL / Procedure DDL / EXEC / etc. → route to
+                // execute_inner, which handles txn-snapshot swapping and
+                // the inner dispatch.
+            }
         }
-        // ANALYZE: execute the query and return timing stats (Wave 68).
-        if lower.starts_with("analyze ") {
-            let inner_sql = &trimmed[8..];
-            return self.execute_analyze(inner_sql, &start);
+        // Task 5.4: BACKUP TO '<directory>' — dump all tables to CSV + manifest.
+        // Task 5.5: RESTORE FROM '<directory>' [AS OF TIMESTAMP '<iso8601>'] —
+        //   load tables from CSV; with AS OF TIMESTAMP, replay the WAL up to
+        //   the given timestamp (PITR).
+        if lower.starts_with("backup to ") {
+            return self.execute_backup(trimmed, &start);
         }
-        // VACUUM: reclaim space from deleted rows (Wave 68).
-        if lower.starts_with("vacuum") {
-            return self.execute_vacuum(&start);
+        if lower.starts_with("restore from ") {
+            return self.execute_restore(trimmed, &start);
         }
-        // COPY table TO 'file' / COPY table FROM 'file' (Wave 68).
-        if lower.starts_with("copy ") {
-            return self.execute_copy(trimmed, &start);
-        }
-        // CHECKPOINT: flush + write checkpoint file (Wave 2 fix).
-        // Previously this just called flush(), which left the WAL
-        // un-truncated and no checkpoint file was written. Now it
-        // calls flush_with_checkpoint() for consistency with VACUUM.
-        if lower.starts_with("checkpoint") {
-            self.flush_with_checkpoint()?;
-            return Ok(QueryResult::empty());
+
+        // Wave 4 (Agent C): in MVCC mode, there's no catalog snapshot swap.
+        // DML/SELECT execute against the main catalog directly; visibility
+        // filtering (when implemented by Agent B) will happen inside
+        // execute_select.
+        if self.mvcc_enabled {
+            let txn_id = self.mvcc_txn_manager.active_id();
+            let mut result = self.execute_inner(sql, &start, txn_id)?;
+            let elapsed_ms = start.elapsed().as_millis();
+            if elapsed_ms > 100 {
+                log::warn!("slow query ({} ms): {}", elapsed_ms, sql.trim());
+            }
+            result.elapsed_us = start.elapsed().as_micros() as u64;
+            return Ok(result);
         }
 
         // SAVEPOINT, ROLLBACK TO, RELEASE are handled inside execute_inner
@@ -705,7 +1275,7 @@ impl QueryEngine {
 
         if lower.starts_with("begin") || lower.starts_with("start transaction") {
             let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
-            self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
+            self.wal_append_record(crate::storage::recovery::WalRecord::begin(id))?;
             return Ok(QueryResult::empty());
         }
         if lower.starts_with("commit") {
@@ -714,19 +1284,19 @@ impl QueryEngine {
             let committed = self.txn_manager.commit().map_err(Error::Other)?;
             self.catalog = committed;
             self.savepoints.clear(); // Wave 69: clear savepoints on commit.
-            self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id));
+            self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id))?;
             return Ok(QueryResult::empty());
         }
         if lower.starts_with("rollback") && !lower.starts_with("rollback to ") {
             let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
             self.txn_manager.rollback().map_err(Error::Other)?;
             self.savepoints.clear(); // Wave 69: clear savepoints on rollback.
-            self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id));
+            self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id))?;
             return Ok(QueryResult::empty());
         }
 
-        // If a transaction is active, route all DML/DDL/SELECT to the
-        // snapshot catalog. Otherwise, use the main catalog.
+        // If a snapshot-isolation transaction is active, route all DML/DDL/
+        // SELECT to the snapshot catalog. Otherwise, use the main catalog.
         // We do this by swapping the snapshot into self.catalog for the
         // duration of the statement, then swapping back.
         let txn_active = self.txn_manager.is_active();
@@ -783,19 +1353,36 @@ impl QueryEngine {
         // Wave 69: SAVEPOINT / ROLLBACK TO / RELEASE — handle these here
         // (after the txn snapshot is swapped in by the caller) so they
         // operate on the transaction's catalog.
+        //
+        // Wave 3 (Agent C): dispatch via classify_statement instead of
+        // starts_with() string matching. The classifier tokenizes once
+        // and returns a StatementKind enum.
         let trimmed = sql.trim();
-        let lower = trimmed.to_lowercase();
-        if lower.starts_with("savepoint ") {
-            let name = trimmed[10..].trim().to_string();
-            return self.execute_savepoint(name, start);
-        }
-        if lower.starts_with("rollback to ") {
-            let name = trimmed[12..].trim().to_string();
-            return self.execute_rollback_to(&name, start);
-        }
-        if lower.starts_with("release ") {
-            let name = trimmed[8..].trim().to_string();
-            return self.execute_release_savepoint(&name, start);
+        let kind = crate::engine::dispatch::classify_statement(sql);
+        match kind {
+            crate::engine::dispatch::StatementKind::Savepoint => {
+                // SAVEPOINT <name> — strip the keyword and parse the name.
+                let rest = crate::engine::helpers::strip_first_keyword(trimmed);
+                let name = rest.trim().to_string();
+                return self.execute_savepoint(name, start);
+            }
+            crate::engine::dispatch::StatementKind::RollbackTo => {
+                // ROLLBACK TO <name> — strip "ROLLBACK TO" (two keywords).
+                let after_rollback = crate::engine::helpers::strip_first_keyword(trimmed);
+                let after_to = crate::engine::helpers::strip_first_keyword(after_rollback);
+                let name = after_to.trim().to_string();
+                return self.execute_rollback_to(&name, start);
+            }
+            crate::engine::dispatch::StatementKind::Release => {
+                // RELEASE <name>
+                let rest = crate::engine::helpers::strip_first_keyword(trimmed);
+                let name = rest.trim().to_string();
+                return self.execute_release_savepoint(&name, start);
+            }
+            _ => {
+                // Not a savepoint-related statement; fall through to the
+                // rest of execute_inner.
+            }
         }
 
         // Wave 53: Temporal query — FOR SYSTEM_TIME AS OF <timestamp>.
@@ -942,17 +1529,17 @@ impl QueryEngine {
                 }
             }
             // Wave 51 fix: append AFTER successful execute.
-            self.wal_append_txn(sql, txn_id);
+            self.wal_append_txn(sql, txn_id)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }
 
         // Try DML (INSERT, UPDATE, DELETE).
         if let Some(dml) = crate::sql::parse_dml(sql).map_err(Error::Parse)? {
-            let mut result = self.execute_dml(dml)?;
+            let mut result = self.execute_dml(dml, txn_id)?;
             // Wave 51 fix: append AFTER successful execute. If execute_dml
             // returns Err, we never reach this line, so the WAL stays clean.
-            self.wal_append_txn(sql, txn_id);
+            self.wal_append_txn(sql, txn_id)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }

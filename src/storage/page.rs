@@ -216,6 +216,7 @@ impl PageHeader {
 
 /// A 4 KB page.
 #[repr(C, align(64))]
+#[derive(Clone)]
 pub struct Page {
     /// The header (64 bytes).
     pub header: PageHeader,
@@ -349,6 +350,15 @@ impl Page {
         out
     }
 
+    /// Write the page to a byte slice, computing the checksum first
+    /// (Task 3.4). This is the "safe" write path: the returned bytes
+    /// always carry a valid CRC32C checksum, so a subsequent `read()`
+    /// will pass verification.
+    pub fn write(&mut self) -> Vec<u8> {
+        self.update_checksum();
+        self.to_bytes()
+    }
+
     /// Read a page from a byte slice.
     pub fn from_bytes(bytes: &[u8]) -> crate::Result<Self> {
         if bytes.len() < PAGE_SIZE {
@@ -358,6 +368,30 @@ impl Page {
         let mut cells = [0u8; PAGE_SIZE - HEADER_SIZE];
         cells.copy_from_slice(&bytes[HEADER_SIZE..PAGE_SIZE]);
         Ok(Self { header, cells })
+    }
+
+    /// Read a page from a byte slice AND verify its CRC32C checksum
+    /// (Task 3.4). Returns `Err(Corruption)` if the checksum doesn't
+    /// match — this detects torn writes and bit-rot. Use this instead
+    /// of `from_bytes` when reading from disk to catch corruption early.
+    ///
+    /// A page with a zero checksum (never `update_checksum`-ed) is
+    /// accepted only if all cells are also zero (a freshly-allocated
+    /// page); otherwise the mismatch is reported as corruption.
+    pub fn read(bytes: &[u8]) -> crate::Result<Self> {
+        let page = Self::from_bytes(bytes)?;
+        if !page.verify_checksum() {
+            // Allow the all-zero page (freshly allocated, never written).
+            let all_zero = page.cells.iter().all(|&b| b == 0) && page.header.checksum == 0;
+            if !all_zero {
+                return Err(crate::Error::Corruption(format!(
+                    "page checksum mismatch: stored {:#018x}, computed {:#018x}",
+                    page.header.checksum,
+                    compute_crc32c(&page.cells) as u64
+                )));
+            }
+        }
+        Ok(page)
     }
 }
 
@@ -613,5 +647,49 @@ mod tests {
         // Flip one cell — parity becomes v (one odd contribution).
         p.set_cell(0, 0);
         assert_eq!(compute_parity(&p.cells), v);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3.4: Page::write() / Page::read() with automatic checksum
+    // -----------------------------------------------------------------------
+
+    /// Task 3.4 DoD: write() computes the checksum; read() verifies it.
+    #[test]
+    fn page_write_read_roundtrip() {
+        let mut p = Page::new();
+        for i in 0..PAGE_CELLS {
+            p.set_cell(i, (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        }
+        p.header.row_count = PAGE_CELLS as u64;
+        let bytes = p.write();
+        // read() must succeed (checksum matches).
+        let p2 = Page::read(&bytes).expect("read must succeed after write");
+        assert_eq!(p2.header.row_count, PAGE_CELLS as u64);
+        assert_eq!(p2.get_cell(0), p.get_cell(0));
+        assert_eq!(p2.get_cell(100), p.get_cell(100));
+    }
+
+    /// Task 3.4 DoD: read() detects a torn page (corrupted cell data).
+    #[test]
+    fn page_read_detects_torn_page() {
+        let mut p = Page::new();
+        for i in 0..PAGE_CELLS {
+            p.set_cell(i, (i as u64).wrapping_mul(31));
+        }
+        let mut bytes = p.write();
+        // Corrupt a byte in the cell payload (after the header).
+        bytes[HEADER_SIZE + 100] ^= 0xFF;
+        // read() must return a Corruption error.
+        let result = Page::read(&bytes);
+        assert!(result.is_err(), "read must reject a corrupted page");
+    }
+
+    /// Task 3.4 DoD: read() accepts a freshly-allocated all-zero page.
+    #[test]
+    fn page_read_accepts_zero_page() {
+        let p = Page::new();
+        let bytes = p.to_bytes();
+        // read() must succeed (all-zero page is allowed).
+        let _ = Page::read(&bytes).expect("read must accept an all-zero page");
     }
 }
