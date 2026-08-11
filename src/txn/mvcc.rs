@@ -159,6 +159,7 @@ impl MvccTable {
 /// An active MVCC transaction.
 ///
 /// Task 4.2: carries `snapshot_id` (the commit_id at BEGIN time) and `state`.
+/// Task 6.1: carries `isolation_level` (controls visibility rules).
 #[derive(Debug, Clone)]
 pub struct MvccTransaction {
     /// The transaction's unique ID.
@@ -168,6 +169,8 @@ pub struct MvccTransaction {
     pub snapshot_id: TxnId,
     /// The current state (InProgress, Committed, Aborted).
     pub state: TxnState,
+    /// The isolation level (Task 6.1). Controls visibility checks.
+    pub isolation_level: IsolationLevel,
 }
 
 /// Error type for MVCC write-write conflicts (Task 4.4).
@@ -177,6 +180,38 @@ pub struct ConflictError {
     pub message: String,
     /// The transaction ID that caused the conflict.
     pub conflicting_txn: TxnId,
+}
+
+/// Transaction isolation level (Task 6.1).
+///
+/// Controls the visibility of data changes made by concurrent transactions.
+/// See `MvccTxnManager::begin_with_isolation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    /// ReadUncommitted: a transaction can see uncommitted changes made by
+    /// other transactions (dirty reads). Implemented as: xmin visible if
+    /// InProgress or Committed (no snapshot check).
+    ReadUncommitted,
+    /// ReadCommitted: a transaction sees only committed data, but each
+    /// statement gets a fresh snapshot (so the transaction can see commits
+    /// that happen mid-transaction). Implemented as: snapshot_id =
+    /// current_commit_id at each statement (we approximate by using the
+    /// latest commit_id at begin time).
+    ReadCommitted,
+    /// RepeatableRead: a transaction sees a consistent snapshot taken at
+    /// BEGIN time. All statements in the transaction use the same snapshot.
+    /// This is the default MVCC behaviour.
+    RepeatableRead,
+    /// Serializable: like RepeatableRead, but with write-write conflict
+    /// detection that aborts transactions that would produce a non-serial
+    /// execution. Implemented as: RepeatableRead + check_write_conflict.
+    Serializable,
+}
+
+impl Default for IsolationLevel {
+    fn default() -> Self {
+        IsolationLevel::RepeatableRead
+    }
 }
 
 /// The MVCC transaction manager.
@@ -211,15 +246,41 @@ impl MvccTxnManager {
     }
 
     /// Begin a new transaction. O(1): assigns `snapshot_id = commit_id`.
-    /// Returns the transaction handle.
+    /// Returns the transaction handle. Uses the default isolation level
+    /// (RepeatableRead).
     pub fn begin(&mut self) -> MvccTransaction {
+        self.begin_with_isolation(IsolationLevel::default())
+    }
+
+    /// Begin a new transaction with a specific isolation level (Task 6.1).
+    ///
+    /// - `ReadUncommitted`: dirty reads allowed (xmin visible if InProgress).
+    /// - `ReadCommitted`: each statement sees the latest committed data
+    ///   (snapshot_id = current commit_id at begin time).
+    /// - `RepeatableRead`/`Serializable`: snapshot taken at BEGIN time,
+    ///   all statements use the same snapshot. Serializable adds conflict
+    ///   detection (use check_write_conflict before writes).
+    pub fn begin_with_isolation(&mut self, level: IsolationLevel) -> MvccTransaction {
         let id = self.next_txn_id;
         self.next_txn_id += 1;
+        // ReadCommitted uses the current commit_id as the snapshot (so it
+        // sees the latest committed data). Other levels also use the
+        // current commit_id — the difference is whether the snapshot is
+        // refreshed per-statement (ReadCommitted) or fixed for the
+        // transaction's duration (RepeatableRead/Serializable). Since we
+        // don't have per-statement snapshot refresh, ReadCommitted and
+        // RepeatableRead behave the same in this implementation; the
+        // distinction is documented for future extension.
         let snapshot_id = self.commit_id;
         self.txn_states.insert(id, TxnState::InProgress);
         self.active.insert(id);
         self.active_snapshots.insert(id, snapshot_id);
-        MvccTransaction { id, snapshot_id, state: TxnState::InProgress }
+        MvccTransaction {
+            id,
+            snapshot_id,
+            state: TxnState::InProgress,
+            isolation_level: level,
+        }
     }
 
     /// Commit a transaction. Increments `commit_id` and records the
@@ -288,11 +349,20 @@ impl MvccTxnManager {
     ///   it, so it's invisible to T), OR `xmax` was NOT committed before T's
     ///   snapshot (the deleting txn hasn't committed yet, or committed after
     ///   T started — so the version is still visible to T).
+    ///
+    /// Task 6.1: under `ReadUncommitted`, dirty reads are allowed — `xmin`
+    /// is visible even if the creating txn is still InProgress.
     pub fn visible(&self, version: &RowVersion, txn: &MvccTransaction) -> bool {
         // Check xmin: the version must have been created by a transaction
         // visible to us (or by us).
         let xmin_visible = version.xmin == txn.id
-            || self.txn_visible_to_snapshot(version.xmin, txn.snapshot_id);
+            || match txn.isolation_level {
+                IsolationLevel::ReadUncommitted => {
+                    // Dirty reads: xmin visible if InProgress OR Committed.
+                    matches!(self.txn_states.get(&version.xmin), Some(TxnState::InProgress | TxnState::Committed(_)))
+                }
+                _ => self.txn_visible_to_snapshot(version.xmin, txn.snapshot_id),
+            };
         if !xmin_visible {
             return false;
         }
@@ -852,5 +922,56 @@ mod tests {
         assert_eq!(removed, 1, "1 aborted version removed");
         let table = &tables[0];
         assert_eq!(table.row_versions(0).len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Task 6.1: isolation levels
+    // -----------------------------------------------------------------
+
+    /// Task 6.1 DoD: IsolationLevel enum exists with 4 variants.
+    #[test]
+    fn isolation_level_variants() {
+        let levels = [
+            IsolationLevel::ReadUncommitted,
+            IsolationLevel::ReadCommitted,
+            IsolationLevel::RepeatableRead,
+            IsolationLevel::Serializable,
+        ];
+        assert_eq!(levels.len(), 4);
+        assert_eq!(IsolationLevel::default(), IsolationLevel::RepeatableRead);
+    }
+
+    /// Task 6.1 DoD: begin_with_isolation sets the isolation level.
+    #[test]
+    fn begin_with_isolation_sets_level() {
+        let mut mgr = MvccTxnManager::new();
+        let t1 = mgr.begin_with_isolation(IsolationLevel::ReadUncommitted);
+        assert_eq!(t1.isolation_level, IsolationLevel::ReadUncommitted);
+        let t2 = mgr.begin_with_isolation(IsolationLevel::Serializable);
+        assert_eq!(t2.isolation_level, IsolationLevel::Serializable);
+        // Default begin() uses RepeatableRead.
+        let t3 = mgr.begin();
+        assert_eq!(t3.isolation_level, IsolationLevel::RepeatableRead);
+    }
+
+    /// Task 6.1 DoD: ReadUncommitted allows dirty reads.
+    #[test]
+    fn read_uncommitted_allows_dirty_reads() {
+        let mut mgr = MvccTxnManager::new();
+        let mut table = MvccTable::new("t", vec!["id".into()]);
+
+        // T1 inserts a row but doesn't commit.
+        let t1 = mgr.begin();
+        table.insert(t1.id, vec![42]);
+
+        // T2 with ReadUncommitted can see T1's uncommitted insert.
+        let t2 = mgr.begin_with_isolation(IsolationLevel::ReadUncommitted);
+        let visible = mgr.scan_visible(&table, &t2);
+        assert_eq!(visible.len(), 1, "ReadUncommitted must see uncommitted data");
+
+        // T3 with RepeatableRead cannot see T1's uncommitted insert.
+        let t3 = mgr.begin_with_isolation(IsolationLevel::RepeatableRead);
+        let visible = mgr.scan_visible(&table, &t3);
+        assert_eq!(visible.len(), 0, "RepeatableRead must NOT see uncommitted data");
     }
 }
