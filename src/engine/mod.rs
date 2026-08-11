@@ -454,7 +454,7 @@ impl QueryEngine {
     /// All data is in-memory and lost on process exit. Use this for
     /// tests and ephemeral workloads where durability is not required.
     pub fn in_memory() -> Self {
-        let mut catalog = Catalog::new();
+        let catalog = Catalog::new();
         // Register a dummy table that allows `SELECT 1` and `SELECT count(*)`
         // without a FROM clause. The table has one row and one column.
         let dummy = Table {
@@ -1848,7 +1848,7 @@ impl QueryEngine {
                     // in the CTE table. For simplicity, we compare by row
                     // content (all columns must match).
                     let new_rows = compute_new_rows(
-                        &self.catalog.get(&temp_name).cloned().unwrap_or_else(|| Table {
+                        &self.catalog.get(&temp_name).unwrap_or_else(|| Table {
                             name: temp_name.clone(),
                             columns: vec![],
                             column_names: vec![],
@@ -1870,11 +1870,11 @@ impl QueryEngine {
                     // ones) because the recursive query should only produce
                     // new rows if written correctly. A proper set-difference
                     // would be more correct but expensive.
-                    let cte_table = self
-                        .catalog
-                        .get_mut(&temp_name)
+                    self.catalog
+                        .with_mut(&temp_name, |cte_table| {
+                            append_result_rows(cte_table, &rec_result);
+                        })
                         .ok_or_else(|| Error::NotFound(format!("CTE table \"{temp_name}\"")))?;
-                    append_result_rows(cte_table, &rec_result);
                 }
             }
         }

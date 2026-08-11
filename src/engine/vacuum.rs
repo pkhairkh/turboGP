@@ -172,7 +172,7 @@ impl QueryEngine {
 
             // Write CSV.
             let csv_path = backup_dir.join(format!("{}.csv", table_name));
-            write_table_csv(&csv_path, table)?;
+            write_table_csv(&csv_path, &table)?;
 
             // Add to manifest.
             manifest_tables.push(serde_json::json!({

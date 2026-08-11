@@ -84,9 +84,9 @@ pub(crate) fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
     let lineitem_tbl =
         catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
-    let customer = ExecTable::from_catalog(customer_tbl, "customer");
-    let orders = ExecTable::from_catalog(orders_tbl, "orders");
-    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
+    let customer = ExecTable::from_catalog(&customer_tbl, "customer");
+    let orders = ExecTable::from_catalog(&orders_tbl, "orders");
+    let lineitem = ExecTable::from_catalog(&lineitem_tbl, "lineitem");
 
     // Column indices (from tpc_h_schema in datasource/csv.rs):
     // customer: 0=c_custkey, 6=c_mktsegment (String hash)
@@ -401,12 +401,12 @@ pub(crate) fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
     let lineitem_tbl =
         catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
-    let region = ExecTable::from_catalog(region_tbl, "region");
-    let nation = ExecTable::from_catalog(nation_tbl, "nation");
-    let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
-    let customer = ExecTable::from_catalog(customer_tbl, "customer");
-    let orders = ExecTable::from_catalog(orders_tbl, "orders");
-    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
+    let region = ExecTable::from_catalog(&region_tbl, "region");
+    let nation = ExecTable::from_catalog(&nation_tbl, "nation");
+    let supplier = ExecTable::from_catalog(&supplier_tbl, "supplier");
+    let customer = ExecTable::from_catalog(&customer_tbl, "customer");
+    let orders = ExecTable::from_catalog(&orders_tbl, "orders");
+    let lineitem = ExecTable::from_catalog(&lineitem_tbl, "lineitem");
 
     // Column indices (from tpc_h_schema in datasource/csv.rs):
     // region:   0=r_regionkey (Int64), 1=r_name (String hash)
@@ -832,11 +832,11 @@ pub(crate) fn execute_q2_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
     let partsupp_tbl =
         catalog.get("partsupp").ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
 
-    let region = ExecTable::from_catalog(region_tbl, "region");
-    let nation = ExecTable::from_catalog(nation_tbl, "nation");
-    let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
-    let part = ExecTable::from_catalog(part_tbl, "part");
-    let partsupp = ExecTable::from_catalog(partsupp_tbl, "partsupp");
+    let region = ExecTable::from_catalog(&region_tbl, "region");
+    let nation = ExecTable::from_catalog(&nation_tbl, "nation");
+    let supplier = ExecTable::from_catalog(&supplier_tbl, "supplier");
+    let part = ExecTable::from_catalog(&part_tbl, "part");
+    let partsupp = ExecTable::from_catalog(&partsupp_tbl, "partsupp");
 
     // Column indices (from tpc_h_schema in datasource/csv.rs):
     // region:   0=r_regionkey (Int64), 1=r_name (String hash)
@@ -1205,7 +1205,7 @@ pub(crate) fn execute_q6_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
     let _ = sql;
     let lineitem_tbl =
         catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
-    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
+    let lineitem = ExecTable::from_catalog(&lineitem_tbl, "lineitem");
 
     let li_quantity = &lineitem.columns[4];
     let li_extendedprice = &lineitem.columns[5];
@@ -1446,8 +1446,8 @@ pub(crate) fn execute_q4_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
     let orders_tbl =
         catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
 
-    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
-    let orders = ExecTable::from_catalog(orders_tbl, "orders");
+    let lineitem = ExecTable::from_catalog(&lineitem_tbl, "lineitem");
+    let orders = ExecTable::from_catalog(&orders_tbl, "orders");
 
     // Column indices (from tpc_h_schema in datasource/csv.rs):
     // lineitem: 0=l_orderkey, 11=l_commitdate, 12=l_receiptdate

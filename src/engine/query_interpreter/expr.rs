@@ -166,7 +166,7 @@ impl<'a> QueryInterpreter<'a> {
                     .get(&t.name)
                     .ok_or_else(|| Error::NotFound(format!("table '{}'", t.name)))?;
                 let alias = t.alias.as_deref().unwrap_or(&t.name);
-                Ok(ExecTable::from_catalog(table, alias))
+                Ok(ExecTable::from_catalog(&table, alias))
             }
             FromItem::Derived(subquery, alias) => {
                 let result = self.execute(subquery)?;

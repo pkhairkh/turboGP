@@ -816,7 +816,7 @@ impl<'a> QueryInterpreter<'a> {
                 if let Some(table) = self.catalog.get(&t.name) {
                     let alias = t.alias.as_deref().unwrap_or(&t.name);
                     // Build a temp ExecTable to use lookup_col
-                    let exec_t = ExecTable::from_catalog(table, alias);
+                    let exec_t = ExecTable::from_catalog(&table, alias);
                     if let Some(idx) = exec_t.lookup_col(col_name) {
                         return Some(idx);
                     }

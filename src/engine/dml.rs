@@ -3,7 +3,11 @@
 use super::*;
 
 impl QueryEngine {
-    pub(crate) fn execute_dml(&mut self, dml: crate::sql::DmlStatement, txn_id: Option<u64>) -> Result<QueryResult> {
+    pub(crate) fn execute_dml(
+        &mut self,
+        dml: crate::sql::DmlStatement,
+        txn_id: Option<u64>,
+    ) -> Result<QueryResult> {
         match dml {
             crate::sql::DmlStatement::Insert(ins) => self.execute_insert(ins, txn_id),
             crate::sql::DmlStatement::Update(upd) => self.execute_update(upd, txn_id),
@@ -59,9 +63,7 @@ impl QueryEngine {
                 let child_idxs: Vec<Option<usize>> =
                     fk.columns.iter().map(|name| child_table.column_idx(name)).collect();
                 // Skip if any child column value is NULL.
-                let any_null = child_idxs
-                    .iter()
-                    .any(|idx| idx.map(|ci| nulls[ci]).unwrap_or(true));
+                let any_null = child_idxs.iter().any(|idx| idx.map(|ci| nulls[ci]).unwrap_or(true));
                 if any_null {
                     continue;
                 }
@@ -86,8 +88,7 @@ impl QueryEngine {
                 'parent_row: for r in 0..parent_table.row_count {
                     for (i, &parent_ci) in parent_idxs.iter().enumerate() {
                         let Some(parent_ci) = parent_ci else { continue 'parent_row };
-                        let existing =
-                            parent_table.columns[parent_ci].get(r).copied().unwrap_or(0);
+                        let existing = parent_table.columns[parent_ci].get(r).copied().unwrap_or(0);
                         if existing != child_vals[i] {
                             continue 'parent_row;
                         }
@@ -187,17 +188,14 @@ impl QueryEngine {
                 }
                 vals
             };
-            let action = fk
-                .on_delete
-                .unwrap_or(crate::sql::ddl::ForeignKeyAction::NoAction);
+            let action = fk.on_delete.unwrap_or(crate::sql::ddl::ForeignKeyAction::NoAction);
             match action {
                 crate::sql::ddl::ForeignKeyAction::Restrict
                 | crate::sql::ddl::ForeignKeyAction::NoAction => {
                     // Check if any child row references a deleted parent row.
-                    let child_table = self
-                        .catalog
-                        .get(&child_table_name)
-                        .ok_or_else(|| Error::NotFound(format!("table \"{}\"", child_table_name)))?;
+                    let child_table = self.catalog.get(&child_table_name).ok_or_else(|| {
+                        Error::NotFound(format!("table \"{}\"", child_table_name))
+                    })?;
                     let child_idxs: Vec<Option<usize>> =
                         fk.columns.iter().map(|name| child_table.column_idx(name)).collect();
                     for child_row_idx in 0..child_table.row_count {
@@ -217,8 +215,10 @@ impl QueryEngine {
                         let child_vals: Vec<u64> = child_idxs
                             .iter()
                             .map(|idx| {
-                                idx.and_then(|ci| child_table.columns[ci].get(child_row_idx).copied())
-                                    .unwrap_or(0)
+                                idx.and_then(|ci| {
+                                    child_table.columns[ci].get(child_row_idx).copied()
+                                })
+                                .unwrap_or(0)
                             })
                             .collect();
                         for parent_vals in &deleted_parent_vals {
@@ -238,8 +238,7 @@ impl QueryEngine {
                     // reference deleted parent rows, then recursively
                     // execute the delete on the child table. The
                     // recursive call handles the child's own FK checks.
-                    let where_clause =
-                        build_cascade_where_expr(&fk.columns, &deleted_parent_vals);
+                    let where_clause = build_cascade_where_expr(&fk.columns, &deleted_parent_vals);
                     let child_del = crate::sql::Delete {
                         table: child_table_name.clone(),
                         where_clause,
@@ -266,58 +265,69 @@ impl QueryEngine {
                     // a proper implementation would set the column to its
                     // DEFAULT value, but DEFAULT-value resolution at DML
                     // time is not yet wired for all column types).
-                    let child_table = self
-                        .catalog
-                        .get_mut(&child_table_name)
-                        .ok_or_else(|| Error::NotFound(format!("table \"{}\"", child_table_name)))?;
-                    let child_idxs: Vec<Option<usize>> =
-                        fk.columns.iter().map(|name| child_table.column_idx(name)).collect();
-                    // Ensure null bitmaps exist for the FK columns.
-                    for idx in &child_idxs {
-                        if let Some(ci) = idx {
-                            while child_table.null_bitmaps.len() <= *ci {
-                                child_table.null_bitmaps.push(None);
-                            }
-                            if child_table.null_bitmaps[*ci].is_none() {
-                                let mut bm =
-                                    crate::types::null_bitmap::NullBitmap::new(child_table.row_count);
-                                for _ in 0..child_table.row_count {
-                                    bm.push_non_null();
-                                }
-                                child_table.null_bitmaps[*ci] = Some(bm);
-                            }
-                        }
-                    }
-                    for child_row_idx in 0..child_table.row_count {
-                        let child_vals: Vec<u64> = child_idxs
-                            .iter()
-                            .map(|idx| {
-                                idx.and_then(|ci| child_table.columns[ci].get(child_row_idx).copied())
-                                    .unwrap_or(0)
-                            })
-                            .collect();
-                        let mut matches = false;
-                        for parent_vals in &deleted_parent_vals {
-                            if child_vals == *parent_vals {
-                                matches = true;
-                                break;
-                            }
-                        }
-                        if matches {
+                    self.catalog
+                        .with_mut(&child_table_name, |child_table| {
+                            let child_idxs: Vec<Option<usize>> = fk
+                                .columns
+                                .iter()
+                                .map(|name| child_table.column_idx(name))
+                                .collect();
+                            // Ensure null bitmaps exist for the FK columns.
                             for idx in &child_idxs {
                                 if let Some(ci) = idx {
-                                    let col = std::sync::Arc::make_mut(&mut child_table.columns[*ci]);
-                                    col[child_row_idx] = 0;
-                                    if let Some(ref mut bm) = child_table.null_bitmaps[*ci] {
-                                        while bm.len() <= child_row_idx {
+                                    while child_table.null_bitmaps.len() <= *ci {
+                                        child_table.null_bitmaps.push(None);
+                                    }
+                                    if child_table.null_bitmaps[*ci].is_none() {
+                                        let mut bm = crate::types::null_bitmap::NullBitmap::new(
+                                            child_table.row_count,
+                                        );
+                                        for _ in 0..child_table.row_count {
                                             bm.push_non_null();
                                         }
-                                        bm.set_null(child_row_idx);
+                                        child_table.null_bitmaps[*ci] = Some(bm);
                                     }
                                 }
                             }
-                        }
-                    }
+                            for child_row_idx in 0..child_table.row_count {
+                                let child_vals: Vec<u64> = child_idxs
+                                    .iter()
+                                    .map(|idx| {
+                                        idx.and_then(|ci| {
+                                            child_table.columns[ci].get(child_row_idx).copied()
+                                        })
+                                        .unwrap_or(0)
+                                    })
+                                    .collect();
+                                let mut matches = false;
+                                for parent_vals in &deleted_parent_vals {
+                                    if child_vals == *parent_vals {
+                                        matches = true;
+                                        break;
+                                    }
+                                }
+                                if matches {
+                                    for idx in &child_idxs {
+                                        if let Some(ci) = idx {
+                                            let col = std::sync::Arc::make_mut(
+                                                &mut child_table.columns[*ci],
+                                            );
+                                            col[child_row_idx] = 0;
+                                            if let Some(ref mut bm) = child_table.null_bitmaps[*ci]
+                                            {
+                                                while bm.len() <= child_row_idx {
+                                                    bm.push_non_null();
+                                                }
+                                                bm.set_null(child_row_idx);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                        .ok_or_else(|| {
+                            Error::NotFound(format!("table \"{}\"", child_table_name))
+                        })?;
                 }
             }
         }
@@ -332,7 +342,11 @@ impl QueryEngine {
     /// was hashed to a u64 (via `parse_value_cell`) and the original was lost —
     /// so subsequent `SELECT col` could only return the hash, and JSON_VALUE
     /// / LIKE / range comparisons on inserted strings were broken.
-    pub(crate) fn execute_insert(&mut self, ins: crate::sql::Insert, txn_id: Option<u64>) -> Result<QueryResult> {
+    pub(crate) fn execute_insert(
+        &mut self,
+        ins: crate::sql::Insert,
+        txn_id: Option<u64>,
+    ) -> Result<QueryResult> {
         // Task 3.4 — Validate FOREIGN KEY constraints (child → parent
         // existence) BEFORE the mutable borrow of the child table extends
         // into the column-extension loop. We need immutable borrows of both
@@ -359,9 +373,9 @@ impl QueryEngine {
                         Some(cols) => {
                             let mut idxs = Vec::with_capacity(cols.len());
                             for col_name in cols {
-                                let idx = child_table
-                                    .column_idx(col_name)
-                                    .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
+                                let idx = child_table.column_idx(col_name).ok_or_else(|| {
+                                    Error::NotFound(format!("column \"{col_name}\""))
+                                })?;
                                 idxs.push(idx);
                             }
                             idxs
@@ -397,11 +411,12 @@ impl QueryEngine {
             }
         }
 
-        let table = self
-            .catalog
-            .get_mut(&ins.table)
-            .ok_or_else(|| Error::NotFound(format!("table \"{}\"", ins.table)))?;
+        let table_name = ins.table.clone();
+        let n_new_rows = ins.values.len();
 
+        let temporal_rows: Vec<Vec<u64>> = self
+            .catalog
+            .with_mut(&ins.table, |table| -> Result<Vec<Vec<u64>>> {
         // Determine column indices.
         let col_indices: Vec<usize> = match &ins.columns {
             Some(cols) => {
@@ -424,8 +439,6 @@ impl QueryEngine {
                 ins.values.first().map(|r| r.len()).unwrap_or(0)
             )));
         }
-
-        let n_new_rows = ins.values.len();
 
         // Wave 3 (A2): Enforce NOT NULL and PRIMARY KEY constraints.
         if let Some(ref schema) = table.schema {
@@ -678,7 +691,6 @@ impl QueryEngine {
         // the TemporalTable sidecar so FOR SYSTEM_TIME AS OF queries see them.
         // We collect the row values (as Vec<u64>) BEFORE releasing the table
         // borrow, then update the temporal sidecar.
-        let table_name = ins.table.clone();
         let mut temporal_rows: Vec<Vec<u64>> = Vec::new();
         if self.temporals.contains_key(&table_name) {
             // Re-read the table (immutable borrow) to get the just-inserted rows.
@@ -694,8 +706,11 @@ impl QueryEngine {
             }
         }
 
+                Ok(temporal_rows)
+            })
+            .ok_or_else(|| Error::NotFound(format!("table \"{}\"", ins.table)))??;
+
         // Now release the table borrow and update the temporal sidecar.
-        drop(table);
         if let Some(temporal) = self.temporals.get_mut(&table_name) {
             for row_vals in temporal_rows {
                 temporal.insert(row_vals);
@@ -716,7 +731,11 @@ impl QueryEngine {
     /// column's NULL bitmap is now updated so subsequent `COUNT(col)` /
     /// `AVG(col)` correctly exclude the row. Previously the cell was set
     /// to 0 but the bitmap still considered it non-NULL.
-    pub(crate) fn execute_update(&mut self, upd: crate::sql::Update, txn_id: Option<u64>) -> Result<QueryResult> {
+    pub(crate) fn execute_update(
+        &mut self,
+        upd: crate::sql::Update,
+        txn_id: Option<u64>,
+    ) -> Result<QueryResult> {
         // Task 3.4 — Validate FOREIGN KEY constraints at UPDATE time.
         // Build the post-update row values for each matched row and check
         // that FK columns still reference an existing parent row. Done
@@ -761,7 +780,7 @@ impl QueryEngine {
                     let n = child_table.row_count;
                     let match_mask: Vec<bool> = if let Some(where_expr) = &upd.where_clause {
                         let where_str = where_expr.to_string();
-                        eval_simple_where(child_table, &where_str)?
+                        eval_simple_where(&child_table, &where_str)?
                     } else {
                         vec![true; n]
                     };
@@ -801,11 +820,11 @@ impl QueryEngine {
             }
         }
 
-        let table = self
-            .catalog
-            .get_mut(&upd.table)
-            .ok_or_else(|| Error::NotFound(format!("table \"{}\"", upd.table)))?;
+        let table_name = upd.table.clone();
 
+        let (updated, updates, is_temporal): (usize, Vec<(u64, Vec<u64>)>, bool) = self
+            .catalog
+            .with_mut(&upd.table, |table| -> Result<(usize, Vec<(u64, Vec<u64>)>, bool)> {
         // Parse assignments into (col_idx, new_value_cell, is_null) triples.
         // `is_null` is true when the RHS is the literal `NULL`.
         let mut assigns: Vec<(usize, u64, bool)> = Vec::with_capacity(upd.assignments.len());
@@ -1063,18 +1082,17 @@ impl QueryEngine {
             }
         }
 
-        // Wave 56d: if this is a temporal table, sync the update to the
-        // TemporalTable sidecar. We collect the matched row indices and
-        // the new values, then call temporal.update(...).
-        let table_name = upd.table.clone();
+        // Wave 56d: if this is a temporal table, collect the matched row
+        // indices and new values for the temporal sidecar. We apply the
+        // updates AFTER releasing the table borrow (below).
         let is_temporal = self.temporals.contains_key(&table_name);
+        let mut updates: Vec<(u64, Vec<u64>)> = Vec::new();
         if is_temporal {
             // Collect (predicate_fn, new_values) for the temporal update.
             // The predicate matches any row whose first column value equals
             // the matched row's first column value (best-effort — the
             // TemporalTable's update() takes a closure, so we match by PK).
             // We build a list of (old_pk, new_row_values) pairs.
-            let mut updates: Vec<(u64, Vec<u64>)> = Vec::new();
             for (row_idx, &matches) in match_mask.iter().enumerate() {
                 if !matches {
                     continue;
@@ -1095,7 +1113,13 @@ impl QueryEngine {
                 }
                 updates.push((old_pk, new_row));
             }
-            drop(table);
+        }
+                Ok((updated, updates, is_temporal))
+            })
+            .ok_or_else(|| Error::NotFound(format!("table \"{}\"", upd.table)))??;
+
+        // Apply the temporal updates now that the table borrow is released.
+        if is_temporal {
             if let Some(temporal) = self.temporals.get_mut(&table_name) {
                 for (old_pk, new_row) in updates {
                     temporal.update(|row| row.first().copied() == Some(old_pk), new_row);
@@ -1109,7 +1133,11 @@ impl QueryEngine {
     }
 
     /// Execute a DELETE statement.
-    pub(crate) fn execute_delete(&mut self, del: crate::sql::Delete, txn_id: Option<u64>) -> Result<QueryResult> {
+    pub(crate) fn execute_delete(
+        &mut self,
+        del: crate::sql::Delete,
+        txn_id: Option<u64>,
+    ) -> Result<QueryResult> {
         // Task 3.4 — Enforce FK constraints on DELETE.
         // Compute the delete_mask with an immutable borrow, then run the
         // FK enforcement (RESTRICT/CASCADE/SET NULL) BEFORE the mutable
@@ -1125,7 +1153,7 @@ impl QueryEngine {
             let n = table.row_count;
             if let Some(where_expr) = &del.where_clause {
                 let where_str = where_expr.to_string();
-                eval_simple_where(table, &where_str)?
+                eval_simple_where(&table, &where_str)?
             } else {
                 vec![true; n]
             }
@@ -1140,12 +1168,11 @@ impl QueryEngine {
         // SET NULL → null FK columns).
         self.enforce_fk_on_delete(&del.table, &delete_mask, txn_id)?;
 
-        let table = self
+        let table_name = del.table.clone();
+        let n = self
             .catalog
-            .get_mut(&del.table)
+            .with(&del.table, |t| t.row_count)
             .ok_or_else(|| Error::NotFound(format!("table \"{}\"", del.table)))?;
-
-        let n = table.row_count;
 
         // Task 2.3 (debt-4.2): in MVCC mode, tombstone the matched rows'
         // versions (xmax = txn_id) and leave the column data in place for
@@ -1158,33 +1185,44 @@ impl QueryEngine {
         // so FOR SYSTEM_TIME queries see the row's end-time, but its
         // column rebuild is skipped to preserve the row-version alignment.
         if self.mvcc_enabled {
-            let xmax = txn_id.unwrap_or(0);
-            for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
-                if delete_flag {
-                    // `mark_deleted` returns false if the row had no version
-                    // (e.g. a table loaded before MVCC tracking was enabled)
-                    // or was already deleted. Either way there is nothing
-                    // useful to do here — we leave the row in place.
-                    let _ = table.mark_deleted(row_idx, xmax);
-                }
-            }
+            // Tombstone the deleted rows under a scoped write lock.
+            self.catalog
+                .with_mut(&del.table, |table| {
+                    let xmax = txn_id.unwrap_or(0);
+                    for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
+                        if delete_flag {
+                            // `mark_deleted` returns false if the row had no version
+                            // (e.g. a table loaded before MVCC tracking was enabled)
+                            // or was already deleted. Either way there is nothing
+                            // useful to do here — we leave the row in place.
+                            let _ = table.mark_deleted(row_idx, xmax);
+                        }
+                    }
+                })
+                .ok_or_else(|| Error::NotFound(format!("table \"{}\"", del.table)))?;
 
             // Sync the temporal sidecar (if any) WITHOUT rebuilding columns.
-            let table_name = del.table.clone();
+            // The table write lock is released, so we can mutably borrow
+            // self.temporals.
             let is_temporal = self.temporals.contains_key(&table_name);
             if is_temporal {
-                let mut pks_to_delete: Vec<u64> = Vec::new();
-                for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
-                    if delete_flag {
-                        let pk = table
-                            .columns
-                            .first()
-                            .and_then(|c| c.get(row_idx).copied())
-                            .unwrap_or(0);
-                        pks_to_delete.push(pk);
-                    }
-                }
-                drop(table);
+                let pks_to_delete: Vec<u64> = self
+                    .catalog
+                    .with(&del.table, |table| {
+                        let mut pks = Vec::new();
+                        for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
+                            if delete_flag {
+                                let pk = table
+                                    .columns
+                                    .first()
+                                    .and_then(|c| c.get(row_idx).copied())
+                                    .unwrap_or(0);
+                                pks.push(pk);
+                            }
+                        }
+                        pks
+                    })
+                    .ok_or_else(|| Error::NotFound(format!("table \"{}\"", del.table)))?;
                 if let Some(temporal) = self.temporals.get_mut(&table_name) {
                     for pk in pks_to_delete {
                         temporal.delete(|row| row.first().copied() == Some(pk));
@@ -1200,57 +1238,53 @@ impl QueryEngine {
         // Wave 56d: if this is a temporal table, sync the delete to the
         // TemporalTable sidecar BEFORE rebuilding the columns (we need the
         // old row values to identify which rows to delete from the temporal).
-        let table_name = del.table.clone();
         let is_temporal = self.temporals.contains_key(&table_name);
         if is_temporal {
-            // Collect the PKs of rows to delete (first column value).
-            let mut pks_to_delete: Vec<u64> = Vec::new();
-            for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
-                if delete_flag {
-                    let pk =
-                        table.columns.first().and_then(|c| c.get(row_idx).copied()).unwrap_or(0);
-                    pks_to_delete.push(pk);
-                }
-            }
-            drop(table);
+            // Collect the PKs of rows to delete (first column value) under a
+            // read lock, then release before mutating self.temporals.
+            let pks_to_delete: Vec<u64> = self
+                .catalog
+                .with(&del.table, |table| {
+                    let mut pks = Vec::new();
+                    for (row_idx, &delete_flag) in delete_mask.iter().enumerate() {
+                        if delete_flag {
+                            let pk = table
+                                .columns
+                                .first()
+                                .and_then(|c| c.get(row_idx).copied())
+                                .unwrap_or(0);
+                            pks.push(pk);
+                        }
+                    }
+                    pks
+                })
+                .ok_or_else(|| Error::NotFound(format!("table \"{}\"", del.table)))?;
             if let Some(temporal) = self.temporals.get_mut(&table_name) {
                 for pk in pks_to_delete {
                     temporal.delete(|row| row.first().copied() == Some(pk));
                 }
             }
-            // Re-acquire the table borrow to rebuild the columns.
-            let table = self
-                .catalog
-                .get_mut(&table_name)
-                .ok_or_else(|| Error::NotFound(format!("table \"{}\"", table_name)))?;
-            // Rebuild each column keeping only non-deleted rows.
-            let keep_mask: Vec<bool> = delete_mask.iter().map(|&d| !d).collect();
-            for col in &mut table.columns {
-                let col_ref = std::sync::Arc::make_mut(col);
-                let mut new_vals = Vec::with_capacity(n - deleted);
-                for (i, &keep) in keep_mask.iter().enumerate() {
-                    if keep {
-                        new_vals.push(col_ref[i]);
-                    }
-                }
-                *col_ref = new_vals;
-            }
-            table.row_count -= deleted;
-        } else {
-            // Rebuild each column keeping only non-deleted rows.
-            let keep_mask: Vec<bool> = delete_mask.iter().map(|&d| !d).collect();
-            for col in &mut table.columns {
-                let col_ref = std::sync::Arc::make_mut(col);
-                let mut new_vals = Vec::with_capacity(n - deleted);
-                for (i, &keep) in keep_mask.iter().enumerate() {
-                    if keep {
-                        new_vals.push(col_ref[i]);
-                    }
-                }
-                *col_ref = new_vals;
-            }
-            table.row_count -= deleted;
         }
+
+        // Rebuild each column keeping only non-deleted rows. This runs for
+        // both temporal and non-temporal tables (the temporal branch above
+        // has already synced its sidecar using the pre-rebuild PKs).
+        self.catalog
+            .with_mut(&del.table, |table| {
+                let keep_mask: Vec<bool> = delete_mask.iter().map(|&d| !d).collect();
+                for col in &mut table.columns {
+                    let col_ref = std::sync::Arc::make_mut(col);
+                    let mut new_vals = Vec::with_capacity(n - deleted);
+                    for (i, &keep) in keep_mask.iter().enumerate() {
+                        if keep {
+                            new_vals.push(col_ref[i]);
+                        }
+                    }
+                    *col_ref = new_vals;
+                }
+                table.row_count -= deleted;
+            })
+            .ok_or_else(|| Error::NotFound(format!("table \"{}\"", del.table)))?;
 
         let mut result = QueryResult::empty();
         result.row_count = deleted;
@@ -1342,14 +1376,8 @@ mod tests {
         engine.execute("UPDATE t SET v = 99 WHERE id = 1")?;
         engine.execute("COMMIT")?;
 
-        let table = engine
-            .catalog()
-            .get("t")
-            .ok_or_else(|| "table t should exist".to_string())?;
-        assert!(
-            !table.row_versions.is_empty(),
-            "row_versions should be populated by INSERT"
-        );
+        let table = engine.catalog().get("t").ok_or_else(|| "table t should exist".to_string())?;
+        assert!(!table.row_versions.is_empty(), "row_versions should be populated by INSERT");
 
         // The original version (at index 0) should have been tombstoned.
         assert_eq!(
@@ -1396,14 +1424,8 @@ mod tests {
         engine.execute("DELETE FROM t WHERE id = 1")?;
         engine.execute("COMMIT")?;
 
-        let table = engine
-            .catalog()
-            .get("t")
-            .ok_or_else(|| "table t should exist".to_string())?;
-        assert!(
-            !table.row_versions.is_empty(),
-            "row_versions should be populated by INSERT"
-        );
+        let table = engine.catalog().get("t").ok_or_else(|| "table t should exist".to_string())?;
+        assert!(!table.row_versions.is_empty(), "row_versions should be populated by INSERT");
         assert_eq!(
             table.row_versions[0].xmax,
             Some(txn_id),

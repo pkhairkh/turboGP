@@ -209,6 +209,7 @@ pub fn execute_select(
     let table = catalog
         .get(&query.from)
         .ok_or_else(|| Error::NotFound(format!("table '{}'", query.from)))?;
+    let table = &table;
 
     // 0. Consult the cost-based optimizer to choose an execution strategy.
     let row_count = table.row_count as u64;
@@ -1661,6 +1662,7 @@ fn execute_with_join(
         let right = catalog
             .get(&join.table)
             .ok_or_else(|| Error::NotFound(format!("table '{}'", join.table)))?;
+        let right = &right;
 
         // Wave 49 fix: respect the parsed join type. Previously the executor
         // always dispatched `JoinType::Inner`, silently turning every LEFT /

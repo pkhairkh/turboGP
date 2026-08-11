@@ -159,8 +159,8 @@ pub fn save(catalog: &crate::catalog::Catalog, path: &Path) -> std::io::Result<u
         .table_names()
         .into_iter()
         .filter(|n| *n != "__dummy__")
-        .filter_map(|name| catalog.get(name))
-        .map(serialize_table)
+        .filter_map(|name| catalog.get(&name))
+        .map(|t| serialize_table(&t))
         .collect();
 
     let tmp_path = path.with_extension("bin.tmp");
@@ -201,7 +201,7 @@ pub fn load(path: &Path) -> std::io::Result<crate::catalog::Catalog> {
     let reader = BufReader::new(file);
     let tables: Vec<SerializedTable> = bincode::deserialize_from(reader)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let mut catalog = crate::catalog::Catalog::new();
+    let catalog = crate::catalog::Catalog::new();
     for st in tables {
         let table = deserialize_table(st);
         catalog.register(table);
