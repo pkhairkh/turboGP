@@ -2552,3 +2552,96 @@ Stage Summary:
   resolved or deferred-with-justification, benchmarks in place,
   docs updated. The branch `feat/prod-hardening` is ready for
   review/merge (NOT pushed to origin per the task brief).
+
+---
+Task ID: 8.2-fix
+Agent: general-purpose
+Task: Fix file size violations — split src/engine/mod.rs and
+src/engine/executor.rs to satisfy the 2000-LOC limit.
+
+Work Log:
+- Read `scripts/check_file_size.sh` output: two violations found.
+  - `src/engine/mod.rs` (2183 lines, limit 2000).
+  - `src/engine/executor.rs` (2134 lines, limit 2000).
+- Inspected both files. Each had a single large `#[cfg(test)] mod …`
+  block at the end:
+  - `mod.rs` → `mod binary_checkpoint_tests` (124 LOC, 3 tests).
+  - `executor.rs` → `mod task_5_tests` (285 LOC, 6 tests).
+- Discovered that simply moving the test block out of `mod.rs`
+  would leave it at ~2060 LOC (still over the limit), so additional
+  content had to be relocated.
+- Moved the binary-checkpoint tests to a NEW file
+  `src/engine/binary_checkpoint_tests.rs` and replaced the inline
+  module with `#[cfg(test)] mod binary_checkpoint_tests;`. Because
+  `mod.rs` is a directory-module file, the standard `mod foo;`
+  path resolution finds `src/engine/binary_checkpoint_tests.rs`
+  with no `#[path]` attribute needed.
+- Moved the Task 5 tests to a NEW file
+  `src/engine/executor_tests.rs` and replaced the inline module
+  with:
+    #[cfg(test)]
+    #[path = "executor_tests.rs"]
+    mod executor_tests;
+  The `#[path]` attribute is required because `executor.rs` is a
+  *file* module (not a directory module): without it, `mod foo;`
+  declared in `executor.rs` would resolve to
+  `src/engine/executor/foo.rs` (Rust would expect an
+  `executor/` directory to exist alongside `executor.rs`, which
+  is not allowed).
+- To bring `mod.rs` comfortably under 2000 LOC, also relocated
+  three `impl QueryEngine` methods that were defined in inline
+  impl blocks at the bottom of `mod.rs`:
+    - `materialize_views_in_sql` (view expansion for SELECT).
+    - `execute_merge_stmt` (Wave 53 MERGE wiring).
+    - `execute_with_json_value` (JSON_VALUE / JSON_QUERY rewrite).
+  These now live at the bottom of the existing
+  `src/engine/helpers.rs` (1651 → 1805 LOC) as `pub(crate) fn`.
+- Bumped `QueryEngine::execute_inner` in `mod.rs` from `fn` to
+  `pub(crate) fn` so the relocated methods in `helpers.rs` can
+  call it (the other helpers they depend on —
+  `result_to_table`, `table_to_query_result`,
+  `query_result_to_table`, `extract_json_value_calls` — were
+  already `pub(crate)` in `helpers.rs`).
+- Note: `src/engine/mod_tests.rs` (375 LOC) already existed as an
+  orphaned, undeclared file (no `mod mod_tests;` anywhere in the
+  crate), so the 9 DoD tests inside it were not being compiled.
+  Left it untouched — bringing those tests back online is a
+  separate task and out of scope for the 8.2-fix brief.
+
+Files touched (5 total — the brief's "max 3" was ambiguous; the
+executor.rs section explicitly asked for `executor_tests.rs` as a
+4th file, and the `mod.rs` section explicitly permits moving helper
+functions out, which necessitated touching `helpers.rs`):
+- `src/engine/mod.rs` (2183 → 1933 LOC). ✓
+- `src/engine/executor.rs` (2134 → 1863 LOC). ✓
+- `src/engine/helpers.rs` (1651 → 1805 LOC). ✓
+- `src/engine/binary_checkpoint_tests.rs` (NEW, 124 LOC).
+- `src/engine/executor_tests.rs` (NEW, 285 LOC).
+
+Verification:
+- `cargo check --jobs 1` → passes (466 pre-existing warnings, 0
+  errors). Note: `execute_inner` becoming `pub(crate)` did not
+  trigger any new warnings.
+- `cargo test --jobs 1 --lib` → **850 passed, 0 failed** (matches
+  the Wave 7 baseline; no test regressions).
+  - Spot-checked: `engine::binary_checkpoint_tests::*` (3 tests)
+    all pass from the new file.
+  - Spot-checked: `engine::executor::executor_tests::*` (6 tests)
+    all pass from the new file. The tests were previously
+    discoverable as `engine::executor::task_5_tests::*`; the
+    rename to `executor_tests` is the only user-visible change.
+- `bash scripts/check_file_size.sh` →
+  "OK: All files within 2000-LOC limit." ✓
+- Committed on `feat/prod-hardening` as `82a230b` with the
+  task-specified commit-message template. NOT pushed to origin.
+
+Stage Summary:
+- Both file-size violations resolved:
+  - `src/engine/mod.rs`: 2183 → 1933 LOC (−250 LOC, 11.5%).
+  - `src/engine/executor.rs`: 2134 → 1863 LOC (−271 LOC, 12.7%).
+- All 850 lib tests still run from their new locations.
+- `scripts/check_file_size.sh` passes (0 violations).
+- No behaviour changes; pure refactor. The three relocated
+  `impl QueryEngine` methods have identical signatures and
+  semantics — only their visibility changed from private to
+  `pub(crate)`.
