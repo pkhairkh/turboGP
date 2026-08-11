@@ -284,3 +284,51 @@ fn test_pitr_restore_as_of_timestamp() {
     let result = engine.execute("RESTORE FROM '/tmp/turbogp_pitr_test' AS OF TIMESTAMP '1000'");
     assert!(result.is_ok(), "PITR restore must not error: {:?}", result.err());
 }
+
+/// Task 6.3 DoD: stress test — 1000 rows across 100 transactions, crash
+/// recovery, verify no data loss, no duplicates, runs in < 10 seconds.
+#[test]
+fn test_stress_crash_recovery() {
+    let start = std::time::Instant::now();
+    let data_dir = "/tmp/turbogp_stress_test";
+    let _ = std::fs::remove_dir_all(data_dir);
+    std::fs::create_dir_all(data_dir).unwrap();
+
+    // Phase 1: insert 1000 rows across 100 explicit transactions (10 rows each).
+    {
+        let mut engine = QueryEngine::with_data_dir(data_dir).unwrap();
+        engine.execute("CREATE TABLE stress (id INT, batch INT)").unwrap();
+        for batch in 0..100 {
+            engine.execute("BEGIN").unwrap();
+            for i in 0..10 {
+                let id = batch * 10 + i;
+                engine.execute(&format!("INSERT INTO stress VALUES ({}, {})", id, batch)).unwrap();
+            }
+            engine.execute("COMMIT").unwrap();
+        }
+        // Verify before crash.
+        let result = engine.execute("SELECT COUNT(*) FROM stress").unwrap();
+        assert_eq!(result.columns[0].values[0], 1000, "must have 1000 rows before crash");
+    } // engine dropped — simulates crash (no explicit checkpoint).
+
+    // Phase 2: reload via with_data_dir — WAL replay restores committed state.
+    let mut engine = QueryEngine::with_data_dir(data_dir).unwrap();
+    let result = engine.execute("SELECT COUNT(*) FROM stress").unwrap();
+    let count = result.columns[0].values[0];
+    assert_eq!(count, 1000, "must have exactly 1000 rows after crash recovery (got {})", count);
+
+    // Verify no duplicates: each id should appear exactly once.
+    let result = engine.execute("SELECT COUNT(DISTINCT id) FROM stress").unwrap();
+    let distinct = result.columns[0].values[0];
+    assert_eq!(distinct, 1000, "must have 1000 distinct ids (no duplicates), got {}", distinct);
+
+    // Verify the data is correct: spot-check a few batches.
+    let result = engine.execute("SELECT COUNT(*) FROM stress WHERE batch = 0").unwrap();
+    assert_eq!(result.columns[0].values[0], 10, "batch 0 must have 10 rows");
+    let result = engine.execute("SELECT COUNT(*) FROM stress WHERE batch = 99").unwrap();
+    assert_eq!(result.columns[0].values[0], 10, "batch 99 must have 10 rows");
+
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(elapsed < 10.0, "stress test must complete in < 10 seconds (took {:.2}s)", elapsed);
+    eprintln!("stress test completed in {:.2}s", elapsed);
+}
