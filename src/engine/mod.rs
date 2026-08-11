@@ -91,7 +91,11 @@ pub struct QueryEngine {
     /// Transaction manager for BEGIN/COMMIT/ROLLBACK (Wave 5).
     txn_manager: crate::txn::TxnManager,
     /// Write-ahead log for durability (Wave 37). None when not configured.
-    wal: Option<crate::storage::recovery::Wal>,
+    /// Public so the storage layer (`Checkpoint::load`) can temporarily
+    /// detach the WAL during checkpoint load — preventing the checkpoint
+    /// statements from being re-written to the WAL (Task 1.1 fix for the
+    /// duplicate-row data-corruption bug). See `AGENT_B_API_REQUESTS.md`.
+    pub wal: Option<crate::storage::recovery::Wal>,
     /// Index manager for secondary indexes (Wave 31).
     pub index_manager: crate::index::manager::IndexManager,
     /// Hash column registry for materialized string hashes.
@@ -408,19 +412,31 @@ impl QueryEngine {
     pub fn flush_with_checkpoint(&mut self) -> Result<()> {
         // 1. Flush dirty pages to disk.
         self.flush()?;
-        // 2. Write a checkpoint file (if we have a data directory).
-        if let Some(ref bp) = self.buffer_pool {
-            let checkpoint_path = bp.data_dir().join("checkpoint.sql");
-            match crate::storage::recovery::Checkpoint::save(&self.catalog, &checkpoint_path) {
-                Ok(n) => {
-                    log::debug!("checkpoint: wrote {n} tables to {}", checkpoint_path.display())
-                }
-                Err(e) => {
-                    return Err(Error::Other(format!(
-                        "checkpoint save to {}: {e}",
-                        checkpoint_path.display()
-                    )))
-                }
+        // 2. Write a checkpoint file (if we have a data directory) AND
+        //    truncate the WAL (Task 1.1 fix: prevents duplicate rows on
+        //    restart). The substantive logic lives in
+        //    Checkpoint::save_and_truncate() in src/storage/recovery.rs.
+        let checkpoint_path = match &self.buffer_pool {
+            Some(bp) => bp.data_dir().join("checkpoint.sql"),
+            None => return Ok(()),
+        };
+        let wal = match self.wal.as_mut() {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        match crate::storage::recovery::Checkpoint::save_and_truncate(
+            &self.catalog,
+            &checkpoint_path,
+            wal,
+        ) {
+            Ok(n) => {
+                log::debug!("checkpoint: wrote {n} tables to {}", checkpoint_path.display())
+            }
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "checkpoint save to {}: {e}",
+                    checkpoint_path.display()
+                )))
             }
         }
         Ok(())
