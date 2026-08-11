@@ -1412,3 +1412,52 @@ Stage Summary:
 - SledRaftStore wired into RaftManager via new_single_node_persistent / new_persistent.
 - Raft log survives process restart.
 - Wave 2 complete.
+
+---
+Task ID: 3.1
+Agent: prod-wiring-orchestrator
+Task: Implement TcpRaftNetwork (real TCP transport for openraft RPCs).
+
+Work Log:
+- Created src/storage/raft_network.rs (~620 LOC).
+- Wire protocol: 1-byte type tag + 4-byte LE length + bincode payload.
+  - 1 = AppendEntries, 2 = InstallSnapshot, 3 = Vote.
+- TcpRaftNetworkFactory: holds Arc<Mutex<BTreeMap<u64, SocketAddr>>> for routing.
+- TcpRaftNetwork: implements RaftNetwork<TypeConfig>. Opens a fresh TCP connection per RPC, sends the frame, reads the response frame.
+- TcpRaftServer: listens on a TCP port, dispatches inbound RPCs to a RaftType handle.
+- Tests:
+  - tcp_network_round_trips_vote_rpc: 2-node setup over localhost, Vote RPC round-trip succeeds.
+  - tcp_network_unregistered_target_is_unreachable: unregistered target returns RPCError::Unreachable.
+- Used RPCOption::hard_ttl() (the openraft 0.9 API) instead of timeout().
+
+Stage Summary:
+- TcpRaftNetwork ready, implements RaftNetworkFactory + RaftNetwork traits.
+- Task 3.1 done.
+
+---
+Task ID: 3.2 + 3.3
+Agent: prod-wiring-orchestrator
+Task: Wire TcpRaftNetwork into RaftManager via new_multi_node; 3-node TCP cluster test.
+
+Work Log:
+- Added factory_tcp: Option<TcpRaftNetworkFactory> and server_tcp: Option<TcpRaftServer> fields to RaftManager.
+- Added RaftManager::new_multi_node(node_id, members: Vec<(u64, SocketAddr)>, data_dir: PathBuf):
+  - Creates a TcpRaftNetworkFactory and registers all member addresses.
+  - Opens SledRaftStore rooted at data_dir.
+  - Creates the Raft handle.
+  - Starts a TcpRaftServer bound to own_addr with the Raft handle.
+  - Returns a RaftManager with factory_tcp and server_tcp set.
+- Updated all 4 existing constructors to set the new fields (factory_tcp = None, server_tcp = None).
+- Test: raft_3_node_tcp_cluster_replicates_records
+  - 3 nodes on localhost ephemeral ports, each with its own sled data dir.
+  - Node 1 calls initialize_cluster({1, 2, 3}).
+  - Wait for leader election (6s timeout).
+  - Propose 5 records (r-1..r-5) on the leader.
+  - Wait for apply on the leader.
+  - Verify at least 2 nodes (leader + 1 follower) have all 5 records.
+- All 12 raft-related tests pass (no regressions).
+
+Stage Summary:
+- RaftManager::new_multi_node uses TcpRaftNetwork for multi-node clusters.
+- 3-node TCP cluster replication verified.
+- Wave 3 complete.

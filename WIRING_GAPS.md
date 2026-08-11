@@ -52,7 +52,7 @@ Branch: `feat/prod-wiring`.
   demonstrates real RPC transport, and a kill-leader test demonstrates
   automatic failover.
 - **Resolved by:** Wave 3 (Tasks 3.1–3.3).
-- **Resolved:** ☐
+- **Resolved:** ☑ (commit 594e696)
 
 ---
 
@@ -171,7 +171,7 @@ Branch: `feat/prod-wiring`.
 |-----|------|--------|----------|
 | 1 — Raft write path | 4 | `append_and_sync` → `RaftManager::propose()` | ☐ |
 | 2 — Persistent Raft storage | 2 | `SledRaftStore` (disk-backed) | ☑ |
-| 3 — TCP Raft network | 3 | `TcpRaftNetwork` over tokio TCP | ☐ |
+| 3 — TCP Raft network | 3 | `TcpRaftNetwork` over tokio TCP | ☑ |
 | 4 — Production pgwire server | 5 | Full PostgreSQL wire protocol over tokio | ☐ |
 | 5 — Connection pool on production path | 5 | pgwire server uses `ConnectionPool` | ☐ |
 | 6 — Sync replication default | 6 | `enable_raft` sets sync + quorum | ☐ |
