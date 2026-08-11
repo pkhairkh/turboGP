@@ -440,6 +440,16 @@ fn extract_first_string_literal(s: &str) -> Option<(String, &str)> {
 ///
 /// Returns None if the string doesn't match.
 fn parse_iso8601_to_micros(s: &str) -> Option<u64> {
+    // Task 5.4: accept plain numeric timestamps (epoch seconds or microseconds).
+    if let Ok(n) = s.parse::<u64>() {
+        // Heuristic: if the number is > 1e12, it's already microseconds.
+        // Otherwise, treat it as seconds and convert.
+        if n > 1_000_000_000_000 {
+            return Some(n);
+        } else {
+            return Some(n * 1_000_000);
+        }
+    }
     // Replace 'T' or space with 'T' for uniform parsing.
     let normalized = s.replacen(' ', "T", 1);
     // Strip trailing 'Z'.
