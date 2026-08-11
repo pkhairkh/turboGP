@@ -25,7 +25,7 @@ use crate::engine::result::{QueryResult, ResultColumn};
 use crate::kernel::{KernelParams, KernelTable, Operator};
 use crate::memory::tier::MemoryTier;
 use crate::sql::extensions::QueryExtensions;
-use crate::sql::parser::{Expr, SelectItem, SelectQuery, Value};
+use crate::sql::parser::{BinOp, Expr, SelectItem, SelectQuery, Value};
 use crate::Error;
 use std::collections::HashMap;
 
@@ -239,19 +239,19 @@ fn parse_where(where_clause: &Option<Expr>, table: &Table) -> Result<WhereClause
 fn parse_expr(expr: &Expr, table: &Table) -> Result<WhereClause> {
     match expr {
         Expr::Binary { left, op, right } => {
-            let op_upper = op.to_uppercase();
-            match op_upper.as_str() {
-                "AND" => {
+            let op_upper = op.as_str().to_string();
+            match op {
+                BinOp::And => {
                     let l = parse_expr(left, table)?;
                     let r = parse_expr(right, table)?;
                     Ok(WhereClause::And(Box::new(l), Box::new(r)))
                 }
-                "OR" => {
+                BinOp::Or => {
                     let l = parse_expr(left, table)?;
                     let r = parse_expr(right, table)?;
                     Ok(WhereClause::Or(Box::new(l), Box::new(r)))
                 }
-                "=" | "!=" | "<" | ">" | "<=" | ">=" => {
+                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
                     let (col, val) = extract_col_and_value(left, right, table)?;
                     Ok(WhereClause::Single(Filter { col_idx: col, op: op_upper, value: val }))
                 }
@@ -298,6 +298,8 @@ fn literal_to_u64(val: &Value) -> Result<u64> {
         Value::Hex(bytes) => {
             Ok(bytes.iter().enumerate().fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i))))
         }
+        Value::Date(d) => Ok(*d as u64),
+        Value::Null => Err(Error::Other("cannot convert NULL to u64".to_string())),
     }
 }
 
@@ -1224,11 +1226,7 @@ fn filter_indices_batch(where_clause: &WhereClause, table: &Table) -> Option<Vec
         WhereClause::And(l, r) => {
             let left_expr = where_clause_to_expr(l);
             let right_expr = where_clause_to_expr(r);
-            let expr = crate::sql::parser::Expr::Binary {
-                left: Box::new(left_expr),
-                op: String::from("AND"),
-                right: Box::new(right_expr),
-            };
+            let expr = crate::sql::parser::Expr::binary(left_expr, crate::sql::parser::BinOp::And, right_expr);
             Some(crate::exec::vectorized::filter_rows(
                 &table.columns,
                 &table.column_names,
@@ -1239,11 +1237,7 @@ fn filter_indices_batch(where_clause: &WhereClause, table: &Table) -> Option<Vec
         WhereClause::Or(l, r) => {
             let left_expr = where_clause_to_expr(l);
             let right_expr = where_clause_to_expr(r);
-            let expr = crate::sql::parser::Expr::Binary {
-                left: Box::new(left_expr),
-                op: String::from("OR"),
-                right: Box::new(right_expr),
-            };
+            let expr = crate::sql::parser::Expr::binary(left_expr, crate::sql::parser::BinOp::Or, right_expr);
             Some(crate::exec::vectorized::filter_rows(
                 &table.columns,
                 &table.column_names,
@@ -1256,28 +1250,29 @@ fn filter_indices_batch(where_clause: &WhereClause, table: &Table) -> Option<Vec
 }
 
 fn filter_to_expr(f: &Filter) -> crate::sql::parser::Expr {
-    crate::sql::parser::Expr::Binary {
-        left: Box::new(crate::sql::parser::Expr::Column(f.col_idx.to_string())),
-        op: f.op.clone(),
-        right: Box::new(crate::sql::parser::Expr::Literal(crate::sql::parser::Value::Int(
+    let op = crate::sql::parser::BinOp::from_str(&f.op).unwrap_or(crate::sql::parser::BinOp::Eq);
+    crate::sql::parser::Expr::binary(
+        crate::sql::parser::Expr::Column(f.col_idx.to_string()),
+        op,
+        crate::sql::parser::Expr::Literal(crate::sql::parser::Value::Int(
             f.value as i64,
-        ))),
-    }
+        )),
+    )
 }
 
 fn where_clause_to_expr(wc: &WhereClause) -> crate::sql::parser::Expr {
     match wc {
         WhereClause::Single(f) => filter_to_expr(f),
-        WhereClause::And(l, r) => crate::sql::parser::Expr::Binary {
-            left: Box::new(where_clause_to_expr(l)),
-            op: String::from("AND"),
-            right: Box::new(where_clause_to_expr(r)),
-        },
-        WhereClause::Or(l, r) => crate::sql::parser::Expr::Binary {
-            left: Box::new(where_clause_to_expr(l)),
-            op: String::from("OR"),
-            right: Box::new(where_clause_to_expr(r)),
-        },
+        WhereClause::And(l, r) => crate::sql::parser::Expr::binary(
+            where_clause_to_expr(l),
+            crate::sql::parser::BinOp::And,
+            where_clause_to_expr(r),
+        ),
+        WhereClause::Or(l, r) => crate::sql::parser::Expr::binary(
+            where_clause_to_expr(l),
+            crate::sql::parser::BinOp::Or,
+            where_clause_to_expr(r),
+        ),
         WhereClause::None => crate::sql::parser::Expr::Literal(crate::sql::parser::Value::Int(1)),
     }
 }
