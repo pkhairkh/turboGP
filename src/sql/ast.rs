@@ -317,6 +317,14 @@ pub enum Expr {
         negated: bool,
     },
 
+    /// `expr IS NULL` (or `IS NOT NULL` if `negated`).
+    IsNull {
+        /// The expression to test for NULL-ness.
+        expr: Box<Expr>,
+        /// `true` for `IS NOT NULL`.
+        negated: bool,
+    },
+
     /// `expr IN (SELECT ...)` (or `NOT IN` if `negated`).
     /// Uses a string representation of the subquery SQL to avoid a
     /// circular dependency with `sql::parser::SelectQuery`.
@@ -450,6 +458,7 @@ impl Expr {
                 }
                 cols
             }
+            Expr::IsNull { expr, .. } => expr.columns(),
             Expr::InSubquery { expr, .. } => expr.columns(),
             Expr::Exists { .. } => vec![],
             Expr::Extract { expr, .. } => expr.columns(),
@@ -510,6 +519,13 @@ impl fmt::Display for Expr {
                 }
                 let strs: Vec<String> = list.iter().map(|v| v.to_string()).collect();
                 write!(f, " IN ({})", strs.join(", "))
+            }
+            Expr::IsNull { expr, negated } => {
+                write!(f, "{expr} IS")?;
+                if *negated {
+                    write!(f, " NOT")?;
+                }
+                write!(f, " NULL")
             }
             Expr::InSubquery { expr, negated, .. } => {
                 write!(f, "{expr}")?;

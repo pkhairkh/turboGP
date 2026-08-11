@@ -169,7 +169,7 @@ fn expr_needs_interpreter_fallback(expr: &Expr) -> bool {
         Expr::Unary { expr, .. } | Expr::Not(expr) | Expr::Paren(expr) => {
             expr_needs_interpreter_fallback(expr)
         }
-        Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::IsNull { .. } => true,
         Expr::Function { args, .. } => args.iter().any(expr_needs_interpreter_fallback),
         Expr::Like { expr, pattern, .. } => {
             expr_needs_interpreter_fallback(expr) || expr_needs_interpreter_fallback(pattern)

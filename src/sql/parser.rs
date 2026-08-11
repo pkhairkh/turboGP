@@ -437,6 +437,31 @@ impl Parser {
                 return Ok(SelectItem::Aggregate { func, arg, alias });
             }
             let _ = self.parse_optional_alias()?;
+            // Qualified column reference: t.col or t.*
+            let name = if let Token::Op(op) = self.peek() {
+                if op == "." {
+                    self.next(); // consume .
+                    match self.peek().clone() {
+                        Token::Ident(s) => {
+                            self.next();
+                            format!("{name}.{s}")
+                        }
+                        Token::Keyword(k) => {
+                            self.next();
+                            format!("{name}.{k}")
+                        }
+                        Token::Op(o) if o == "*" => {
+                            self.next();
+                            format!("{name}.*")
+                        }
+                        other => return Err(format!("expected name after '.', got {other:?}")),
+                    }
+                } else {
+                    name
+                }
+            } else {
+                name
+            };
             return Ok(SelectItem::Column(name));
         }
         Err(format!("expected select item, got {:?}", self.peek()))
@@ -672,6 +697,14 @@ impl Parser {
 
     fn parse_comparison_expr(&mut self) -> Result<Expr, String> {
         let left = self.parse_additive_expr()?;
+        // IS NULL / IS NOT NULL
+        if self.match_keyword("IS") {
+            let negated = self.match_keyword("NOT");
+            if !self.match_keyword("NULL") {
+                return Err("expected NULL after IS [NOT]".into());
+            }
+            return Ok(Expr::IsNull { expr: Box::new(left), negated });
+        }
         // Comparison operators: = != <> < > <= >=
         if let Token::Op(op) = self.peek().clone() {
             if let Some(binop) = BinOp::from_str(&op) {
@@ -940,6 +973,29 @@ impl Parser {
                         distinct,
                     });
                 }
+                // Qualified column reference: t.col or t.*
+                if let Token::Op(op) = self.peek() {
+                    if op == "." {
+                        self.next(); // consume .
+                        let second = match self.peek().clone() {
+                            Token::Ident(s) => s,
+                            Token::Keyword(k) => k,
+                            Token::Op(o) if o == "*" => {
+                                // t.* — qualified wildcard. Stored as a
+                                // Column with the dotted name so the
+                                // executor can detect the trailing `.*`.
+                                return Ok(Expr::Column(format!("{name}.*")));
+                            }
+                            other => {
+                                return Err(format!(
+                                    "expected name after '.', got {other:?}"
+                                ));
+                            }
+                        };
+                        self.next();
+                        return Ok(Expr::Column(format!("{name}.{second}")));
+                    }
+                }
                 Ok(Expr::Column(name))
             }
             Token::LParen => {
@@ -1196,6 +1252,257 @@ mod tests {
                         other => panic!("expected OR inside Paren, got {other:?}"),
                     },
                     other => panic!("expected Paren, got {other:?}"),
+                }
+            }
+            other => panic!("expected AND at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_is_null() {
+        let q = parse_sql("SELECT * FROM t WHERE x IS NULL").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::IsNull { expr, negated } => {
+                assert!(!negated);
+                match *expr {
+                    Expr::Column(c) => assert_eq!(c, "x"),
+                    other => panic!("expected Column(x), got {other:?}"),
+                }
+            }
+            other => panic!("expected IsNull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_is_not_null() {
+        let q = parse_sql("SELECT * FROM t WHERE y IS NOT NULL").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::IsNull { negated, .. } => assert!(negated),
+            other => panic!("expected IsNull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_is_null_with_and() {
+        // x IS NULL AND y > 5 — verify precedence
+        let q = parse_sql("SELECT * FROM t WHERE x IS NULL AND y > 5").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Binary { left, op, .. } => {
+                assert!(op == BinOp::And);
+                match *left {
+                    Expr::IsNull { .. } => {}
+                    other => panic!("expected IsNull on left, got {other:?}"),
+                }
+            }
+            other => panic!("expected AND at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_not_prefix() {
+        // NOT (x > 5)
+        let q = parse_sql("SELECT * FROM t WHERE NOT (x > 5)").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Not(inner) => match *inner {
+                Expr::Paren(p) => match *p {
+                    Expr::Binary { op, .. } => assert!(op == BinOp::Gt),
+                    other => panic!("expected Binary inside Paren, got {other:?}"),
+                },
+                other => panic!("expected Paren inside Not, got {other:?}"),
+            },
+            other => panic!("expected Not, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_not_with_and() {
+        // NOT a = 1 AND b = 2 — should parse as (NOT (a = 1)) AND (b = 2)
+        let q = parse_sql("SELECT * FROM t WHERE NOT a = 1 AND b = 2").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Binary { left, op, .. } => {
+                assert!(op == BinOp::And);
+                match *left {
+                    Expr::Not(_) => {}
+                    other => panic!("expected Not on left, got {other:?}"),
+                }
+            }
+            other => panic!("expected AND at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unary_minus_literal() {
+        // SELECT -1 FROM t — unary minus on a literal
+        let q = parse_sql("SELECT * FROM t WHERE x = -1").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Binary { right, op, .. } => {
+                assert!(op == BinOp::Eq);
+                match *right {
+                    Expr::Unary { op, expr } => {
+                        assert!(op == UnaryOp::Neg);
+                        match *expr {
+                            Expr::Literal(Value::Int(1)) => {}
+                            other => panic!("expected Int(1), got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Unary, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unary_minus_paren() {
+        // -(a + b)
+        let q = parse_sql("SELECT * FROM t WHERE x = -(a + b)").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Binary { right, op, .. } => {
+                assert!(op == BinOp::Eq);
+                match *right {
+                    Expr::Unary { op: UnaryOp::Neg, expr } => {
+                        match *expr {
+                            Expr::Paren(_) => {}
+                            other => panic!("expected Paren inside Unary, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Unary, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_qualified_column_in_select() {
+        let q = parse_sql("SELECT t.col FROM t").unwrap();
+        match &q.select[0] {
+            SelectItem::Column(name) => assert_eq!(name, "t.col"),
+            other => panic!("expected Column(t.col), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_qualified_column_in_where() {
+        let q = parse_sql("SELECT * FROM t WHERE t1.id = t2.id").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Binary { left, op, right } => {
+                assert!(op == BinOp::Eq);
+                match *left {
+                    Expr::Column(c) => assert_eq!(c, "t1.id"),
+                    other => panic!("expected Column(t1.id), got {other:?}"),
+                }
+                match *right {
+                    Expr::Column(c) => assert_eq!(c, "t2.id"),
+                    other => panic!("expected Column(t2.id), got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_scalar_function_upper() {
+        // UPPER(name) — single-arg scalar function
+        let q = parse_sql("SELECT * FROM t WHERE x = UPPER(name)").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Binary { right, op, .. } => {
+                assert!(op == BinOp::Eq);
+                match *right {
+                    Expr::Function { name, args, distinct } => {
+                        assert_eq!(name, "UPPER");
+                        assert!(!distinct);
+                        assert_eq!(args.len(), 1);
+                        match &args[0] {
+                            Expr::Column(c) => assert_eq!(c, "name"),
+                            other => panic!("expected Column(name), got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Function, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_scalar_function_substr_multi_arg() {
+        // SUBSTR(name, 1, 3) — three-arg scalar function
+        let q = parse_sql("SELECT * FROM t WHERE x = SUBSTR(name, 1, 3)").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Binary { right, op, .. } => {
+                assert!(op == BinOp::Eq);
+                match *right {
+                    Expr::Function { name, args, .. } => {
+                        assert_eq!(name, "SUBSTR");
+                        assert_eq!(args.len(), 3);
+                    }
+                    other => panic!("expected Function, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_scalar_function_coalesce_n_args() {
+        // COALESCE(a, b, c) — N-arg function
+        let q = parse_sql("SELECT * FROM t WHERE x = COALESCE(a, b, c)").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Binary { right, op, .. } => {
+                assert!(op == BinOp::Eq);
+                match *right {
+                    Expr::Function { name, args, .. } => {
+                        assert_eq!(name, "COALESCE");
+                        assert_eq!(args.len(), 3);
+                    }
+                    other => panic!("expected Function, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_scalar_function_case_insensitive() {
+        // Function names are case-insensitive — lowercased should still uppercase
+        let q = parse_sql("SELECT * FROM t WHERE x = upper(name)").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Binary { right, op, .. } => {
+                assert!(op == BinOp::Eq);
+                match *right {
+                    Expr::Function { name, .. } => assert_eq!(name, "UPPER"),
+                    other => panic!("expected Function, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_combined_wave3_features() {
+        // WHERE NOT (x > 5) AND y IS NOT NULL — combines NOT, paren, IS NOT NULL, AND
+        let q = parse_sql("SELECT * FROM t WHERE NOT (x > 5) AND y IS NOT NULL").unwrap();
+        let w = q.where_clause.unwrap();
+        match w {
+            Expr::Binary { left, op, right } => {
+                assert!(op == BinOp::And);
+                assert!(matches!(*left, Expr::Not(_)));
+                match *right {
+                    Expr::IsNull { negated, .. } => assert!(negated),
+                    other => panic!("expected IsNull on right, got {other:?}"),
                 }
             }
             other => panic!("expected AND at top, got {other:?}"),
