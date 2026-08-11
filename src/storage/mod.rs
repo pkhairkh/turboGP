@@ -6,10 +6,12 @@
 //! granularity, unit of migration); tablets are 2 GB (NUMA placement unit).
 
 pub mod buffer_pool;
+pub mod checkpoint;
 pub mod page;
 pub mod recovery;
 pub mod replication;
 
 pub use buffer_pool::{BufferPool, PageId};
+pub use checkpoint::BinaryCheckpoint;
 pub use page::{Page, PageHeader, HEADER_SIZE, PAGE_CELLS, PAGE_SIZE};
 pub use replication::{backup, restore, WalStreamer};
