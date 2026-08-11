@@ -1563,6 +1563,437 @@ impl Parser {
     }
 }
 
+// -----------------------------------------------------------------------
+// Wave 7 (Task 7.2): Formal MERGE AST + parser.
+//
+// Replaces the `parse_merge` string-scan hack that lived in
+// `src/engine/helpers.rs`. The formal parser produces a `MergeStmt` AST
+// which is then converted to `crate::exec::merge::Merge` for execution.
+// -----------------------------------------------------------------------
+
+/// Formal AST for a MERGE statement (Wave 7 — replaces the `parse_merge` hack).
+///
+/// Represents the parsed structure of:
+/// ```sql
+/// MERGE [INTO] <target> [AS <alias>]
+/// USING (VALUES (...), (...)) AS <source_alias> (<col1>, <col2>, ...)
+///   ON <target_alias>.<col> = <source_alias>.<col>
+///   [WHEN MATCHED [THEN] UPDATE SET <col> = <val>, ...]
+///   [WHEN NOT MATCHED [BY TARGET] [THEN] INSERT (<cols>) VALUES (<vals>)]
+/// ```
+///
+/// The `to_merge` conversion (defined in `engine::helpers`) bridges this
+/// AST to the existing `exec::merge::Merge` executor struct.
+#[derive(Debug, Clone)]
+pub struct MergeStmt {
+    /// Target table name (the table to merge INTO).
+    pub target: String,
+    /// Source of rows to merge.
+    pub source: MergeSource,
+    /// Join condition: `target.col = source.col` (aliases stripped to just
+    /// the column names).
+    pub on: MergeOn,
+    /// Actions for matched rows (target row has a matching source row).
+    /// The existing `exec::merge::Merge` executor only consumes the first
+    /// action; subsequent actions are silently dropped (TODO: multi-action).
+    pub when_matched: Vec<MergeAction>,
+    /// Actions for not-matched rows (source row has no matching target).
+    pub when_not_matched: Vec<MergeAction>,
+}
+
+/// The source of rows in a MERGE statement.
+#[derive(Debug, Clone)]
+pub enum MergeSource {
+    /// `USING <table_name>` — references a catalog table.
+    /// (Not yet wired through to execution; left for a future wave.)
+    Table(String),
+    /// `USING (VALUES (...), (...)) AS <alias> (<col1>, <col2>, ...)` —
+    /// an inline values list with column names.
+    Values {
+        /// Raw rows from the VALUES list. Each row is a Vec of stringified
+        /// cell values (in `col_names` order).
+        rows: Vec<Vec<String>>,
+        /// Column names (parallel to each row in `rows`).
+        col_names: Vec<String>,
+    },
+    /// `USING (SELECT ...)` — a subquery (stored as a best-effort SQL string).
+    /// (Not yet wired through to execution; left for a future wave.)
+    Subquery(String),
+}
+
+/// Join condition for MERGE: `target.col = source.col`.
+#[derive(Debug, Clone)]
+pub struct MergeOn {
+    /// The column on the target side (alias stripped).
+    pub target_col: String,
+    /// The column on the source side (alias stripped).
+    pub source_col: String,
+}
+
+/// A single MERGE action.
+#[derive(Debug, Clone)]
+pub enum MergeAction {
+    /// `UPDATE SET col = val, ...`
+    Update {
+        /// List of (column, value) pairs. The value is preserved as a raw
+        /// string (e.g. `source.val`, `99`, `'hello'`) so the executor can
+        /// resolve `source.col` references against the current source row.
+        sets: Vec<(String, String)>,
+    },
+    /// `DELETE`
+    Delete,
+    /// `INSERT (cols) VALUES (vals)`
+    Insert {
+        /// Column names to insert into.
+        columns: Vec<String>,
+        /// Values to insert (parallel to `columns`).
+        values: Vec<String>,
+    },
+}
+
+/// Parse a `MERGE` statement into a [`MergeStmt`] AST.
+///
+/// Supported syntax (SQL Server / Snowflake style):
+/// ```sql
+/// MERGE [INTO] <target> [AS <alias>]
+/// USING (VALUES (...), (...)) AS <source_alias> (<col1>, <col2>, ...)
+///   ON <target_alias>.<col> = <source_alias>.<col>
+///   [WHEN MATCHED [THEN] UPDATE SET <col> = <val>, ...]
+///   [WHEN NOT MATCHED [BY TARGET] [THEN] INSERT (<cols>) VALUES (<vals>)]
+/// ```
+///
+/// The parser is token-based (not string-scan), producing a formal AST
+/// that is then converted to `crate::exec::merge::Merge` for execution.
+///
+/// # Errors
+///
+/// Returns `Err(String)` for malformed MERGE statements (missing USING,
+/// missing ON, unbalanced parens, unknown action verb, etc.).
+pub fn parse_merge_stmt(tokens: Vec<Token>) -> Result<MergeStmt, String> {
+    let mut p = Parser::new(tokens);
+    // MERGE is not in the KEYWORDS list, so it tokenizes as `Ident("MERGE")`
+    // (or `Ident("merge")`). `match_ident` does case-insensitive matching
+    // against both Ident and Keyword tokens, so we use it for MERGE and
+    // the other non-keyword tokens (MATCHED, TARGET). Standard SQL keywords
+    // (USING, ON, WHEN, BY, THEN, UPDATE, SET, DELETE, INSERT, VALUES) use
+    // `match_keyword` since they're in the lexer's KEYWORDS list.
+    if !p.match_ident("MERGE") {
+        return Err(format!("expected MERGE, got {:?}", p.peek()));
+    }
+    let _ = p.match_ident("INTO");
+    let target = p.parse_table_name()?;
+    // Optional `AS alias` on target.
+    let _ = p.parse_optional_alias()?;
+    if !p.match_keyword("USING") {
+        return Err(format!("expected USING, got {:?}", p.peek()));
+    }
+    let source = parse_merge_source(&mut p)?;
+    if !p.match_keyword("ON") {
+        return Err(format!("expected ON, got {:?}", p.peek()));
+    }
+    let on = parse_merge_on(&mut p)?;
+    let mut when_matched = Vec::new();
+    let mut when_not_matched = Vec::new();
+    while p.match_keyword("WHEN") {
+        if p.match_ident("MATCHED") {
+            // Optional `AND <pred>` — we don't support predicates yet; skip
+            // the rest of the clause if AND is present (TODO).
+            let _ = p.match_keyword("THEN");
+            let action = parse_merge_action(&mut p)?;
+            when_matched.push(action);
+        } else if p.match_keyword("NOT") {
+            if !p.match_ident("MATCHED") {
+                return Err(format!("expected MATCHED after NOT, got {:?}", p.peek()));
+            }
+            // Optional `BY TARGET` (the default).
+            let _ = p.match_keyword("BY");
+            let _ = p.match_ident("TARGET");
+            let _ = p.match_keyword("THEN");
+            let action = parse_merge_action(&mut p)?;
+            when_not_matched.push(action);
+        } else {
+            return Err(format!(
+                "expected MATCHED or NOT MATCHED in WHEN clause, got {:?}",
+                p.peek()
+            ));
+        }
+    }
+    match p.peek() {
+        Token::Semicolon | Token::EOF => {}
+        other => return Err(format!("unexpected trailing token in MERGE: {other:?}")),
+    }
+    Ok(MergeStmt { target, source, on, when_matched, when_not_matched })
+}
+
+/// Parse the USING clause: either `(VALUES ...) AS alias (cols)` or a
+/// table name. Returns a [`MergeSource`].
+fn parse_merge_source(p: &mut Parser) -> Result<MergeSource, String> {
+    if matches!(p.peek(), Token::LParen) {
+        // Could be (VALUES ...) or (SELECT ...).
+        p.next(); // consume (
+        if p.match_keyword("VALUES") {
+            let mut rows = Vec::new();
+            loop {
+                if !matches!(p.peek(), Token::LParen) {
+                    break;
+                }
+                p.next(); // consume (
+                let mut row = Vec::new();
+                loop {
+                    let val = parse_value_expr(p)?;
+                    row.push(val);
+                    if matches!(p.peek(), Token::Comma) {
+                        p.next();
+                        continue;
+                    }
+                    break;
+                }
+                if !matches!(p.peek(), Token::RParen) {
+                    return Err(format!("expected ) after VALUES row, got {:?}", p.peek()));
+                }
+                p.next(); // consume )
+                rows.push(row);
+                if matches!(p.peek(), Token::Comma) {
+                    p.next();
+                    continue;
+                }
+                break;
+            }
+            if !matches!(p.peek(), Token::RParen) {
+                return Err(format!(
+                    "expected ) to close USING (VALUES ...), got {:?}",
+                    p.peek()
+                ));
+            }
+            p.next(); // consume ) — closes the outer USING (...) group.
+            // Optional `AS alias (col1, col2, ...)`.
+            let _ = p.match_keyword("AS");
+            // Skip the alias identifier if present (and not a SQL keyword
+            // like ON / WHEN — those Keywords aren't consumed by `next`).
+            if let Token::Ident(_) = p.peek() {
+                let _ = p.next();
+            }
+            let mut col_names = Vec::new();
+            if matches!(p.peek(), Token::LParen) {
+                p.next(); // consume (
+                loop {
+                    let col = match p.peek().clone() {
+                        Token::Ident(s) => s,
+                        other => {
+                            return Err(format!(
+                                "expected column name in USING (cols), got {other:?}"
+                            ))
+                        }
+                    };
+                    p.next();
+                    col_names.push(col);
+                    if matches!(p.peek(), Token::Comma) {
+                        p.next();
+                        continue;
+                    }
+                    break;
+                }
+                if !matches!(p.peek(), Token::RParen) {
+                    return Err(format!("expected ) after USING (cols), got {:?}", p.peek()));
+                }
+                p.next(); // consume )
+            }
+            Ok(MergeSource::Values { rows, col_names })
+        } else {
+            // Subquery: (SELECT ...). Collect tokens until matching ).
+            let mut depth = 1i32;
+            let mut tokens: Vec<Token> = Vec::new();
+            while depth > 0 {
+                match p.next() {
+                    Token::LParen => {
+                        depth += 1;
+                        tokens.push(Token::LParen);
+                    }
+                    Token::RParen => {
+                        depth -= 1;
+                        if depth > 0 {
+                            tokens.push(Token::RParen);
+                        }
+                    }
+                    Token::EOF => return Err("unterminated subquery in MERGE USING".into()),
+                    other => tokens.push(other),
+                }
+            }
+            // Best-effort: re-stringify the captured tokens.
+            let sql = tokens.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(" ");
+            Ok(MergeSource::Subquery(sql))
+        }
+    } else {
+        // Table name source.
+        let name = p.parse_table_name()?;
+        Ok(MergeSource::Table(name))
+    }
+}
+
+/// Parse the ON clause: `<alias>.<col> = <alias>.<col>`. Aliases are
+/// stripped; only the column names are kept.
+fn parse_merge_on(p: &mut Parser) -> Result<MergeOn, String> {
+    let lhs = parse_qualified_col(p)?;
+    if !p.match_op("=") {
+        return Err(format!("expected = in ON clause, got {:?}", p.peek()));
+    }
+    let rhs = parse_qualified_col(p)?;
+    Ok(MergeOn {
+        target_col: lhs.col,
+        source_col: rhs.col,
+    })
+}
+
+/// A parsed `<alias>.<col>` reference (used in MERGE ON clauses and SET
+/// assignments). The alias is kept for diagnostics but discarded by the
+/// caller (the executor only needs the column name).
+struct QualifiedCol {
+    #[allow(dead_code)]
+    alias: Option<String>,
+    col: String,
+}
+
+/// Parse a qualified column reference `<alias>.<col>` (or a bare `<col>`).
+/// Returns the alias (if any) and the column name.
+fn parse_qualified_col(p: &mut Parser) -> Result<QualifiedCol, String> {
+    let name = match p.peek().clone() {
+        Token::Ident(s) => s,
+        other => return Err(format!("expected column reference, got {other:?}")),
+    };
+    p.next();
+    if matches!(p.peek(), Token::Op(o) if o == ".") {
+        p.next(); // consume .
+        let col = match p.peek().clone() {
+            Token::Ident(s) => s,
+            other => return Err(format!("expected column name after '.', got {other:?}")),
+        };
+        p.next();
+        Ok(QualifiedCol { alias: Some(name), col })
+    } else {
+        Ok(QualifiedCol { alias: None, col: name })
+    }
+}
+
+/// Parse a MERGE action: `UPDATE SET ...`, `DELETE`, or
+/// `INSERT (...) VALUES (...)`.
+fn parse_merge_action(p: &mut Parser) -> Result<MergeAction, String> {
+    if p.match_keyword("UPDATE") {
+        if !p.match_keyword("SET") {
+            return Err(format!("expected SET after UPDATE, got {:?}", p.peek()));
+        }
+        let mut sets = Vec::new();
+        loop {
+            let col_qualified = parse_qualified_col(p)?;
+            let col = col_qualified.col; // strip alias from LHS
+            if !p.match_op("=") {
+                return Err(format!("expected = in SET assignment, got {:?}", p.peek()));
+            }
+            let val = parse_value_expr(p)?;
+            sets.push((col, val));
+            if matches!(p.peek(), Token::Comma) {
+                p.next();
+                continue;
+            }
+            break;
+        }
+        Ok(MergeAction::Update { sets })
+    } else if p.match_keyword("DELETE") {
+        Ok(MergeAction::Delete)
+    } else if p.match_keyword("INSERT") {
+        let mut columns = Vec::new();
+        if matches!(p.peek(), Token::LParen) {
+            p.next(); // consume (
+            loop {
+                let col = parse_qualified_col(p)?;
+                columns.push(col.col);
+                if matches!(p.peek(), Token::Comma) {
+                    p.next();
+                    continue;
+                }
+                break;
+            }
+            if !matches!(p.peek(), Token::RParen) {
+                return Err(format!("expected ) after INSERT columns, got {:?}", p.peek()));
+            }
+            p.next(); // consume )
+        }
+        let mut values = Vec::new();
+        if p.match_keyword("VALUES") {
+            if !matches!(p.peek(), Token::LParen) {
+                return Err(format!("expected ( after VALUES in INSERT, got {:?}", p.peek()));
+            }
+            p.next(); // consume (
+            loop {
+                let val = parse_value_expr(p)?;
+                values.push(val);
+                if matches!(p.peek(), Token::Comma) {
+                    p.next();
+                    continue;
+                }
+                break;
+            }
+            if !matches!(p.peek(), Token::RParen) {
+                return Err(format!("expected ) after VALUES row, got {:?}", p.peek()));
+            }
+            p.next(); // consume )
+        }
+        Ok(MergeAction::Insert { columns, values })
+    } else {
+        Err(format!(
+            "expected UPDATE/DELETE/INSERT in WHEN clause, got {:?}",
+            p.peek()
+        ))
+    }
+}
+
+/// Parse a single value expression: a literal (int/float/string/hex) or
+/// a (possibly qualified) column reference. Returns the stringified form
+/// (e.g. `42`, `'hello'`, `source.val`) preserving any column references
+/// for the executor to resolve.
+fn parse_value_expr(p: &mut Parser) -> Result<String, String> {
+    let mut prefix = String::new();
+    if matches!(p.peek(), Token::Op(o) if o == "-") {
+        prefix.push('-');
+        p.next();
+    } else if matches!(p.peek(), Token::Op(o) if o == "+") {
+        let _ = p.next();
+    }
+    match p.peek().clone() {
+        Token::Int(i) => {
+            p.next();
+            Ok(format!("{prefix}{i}"))
+        }
+        Token::Float(f) => {
+            p.next();
+            Ok(format!("{prefix}{f}"))
+        }
+        Token::String(s) => {
+            p.next();
+            Ok(format!("{prefix}'{s}'"))
+        }
+        Token::Hex(bytes) => {
+            p.next();
+            let hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
+            Ok(format!("{prefix}x'{hex}'"))
+        }
+        Token::Ident(name) => {
+            p.next();
+            if matches!(p.peek(), Token::Op(o) if o == ".") {
+                p.next();
+                match p.peek().clone() {
+                    Token::Ident(col) => {
+                        p.next();
+                        Ok(format!("{prefix}{name}.{col}"))
+                    }
+                    other => Err(format!("expected column name after '.', got {other:?}")),
+                }
+            } else {
+                Ok(format!("{prefix}{name}"))
+            }
+        }
+        other => Err(format!("expected value in MERGE action, got {other:?}")),
+    }
+}
 
 #[cfg(test)]
 #[path = "parser_tests.rs"]

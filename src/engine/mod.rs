@@ -1669,8 +1669,11 @@ impl QueryEngine {
             return Ok(last_result);
         }
 
-        // Wave 53: MERGE statement.
-        if let Some(merge) = parse_merge(sql) {
+        // Wave 7 (Task 7.2): MERGE via the formal `MergeStmt` AST.
+        // `try_parse_merge_stmt` + `merge_stmt_to_merge` replace the
+        // previous `parse_merge` string-scan hack.
+        if let Some(stmt) = try_parse_merge_stmt(sql) {
+            let merge = merge_stmt_to_merge(&stmt);
             return self.execute_merge_stmt(merge, start);
         }
 
@@ -1977,12 +1980,11 @@ impl Default for QueryEngine {
 }
 
 // -----------------------------------------------------------------------
-// DML helper functions (Wave 4) — moved to `src/engine/helpers.rs` in
-// Task 8.2-fix to satisfy the 2000-LOC file-size limit.
-//
-// The impl-QueryEngine methods (`materialize_views_in_sql`,
-// `execute_merge_stmt`, `execute_with_json_value`, `execute_set_query`,
-// `execute_select_query`) live in `helpers.rs` (declared `pub(crate)`).
+// DML helper functions (Wave 4) — moved to `src/engine/helpers.rs` to
+// satisfy the 2000-LOC file-size limit. The impl-QueryEngine methods
+// (`materialize_views_in_sql`, `execute_merge_stmt`,
+// `execute_with_json_value`, `execute_set_query`, `execute_select_query`,
+// `merge_stmt_to_merge`) live in `helpers.rs` (declared `pub(crate)`).
 // -----------------------------------------------------------------------
 
 // -----------------------------------------------------------------------

@@ -569,311 +569,6 @@ pub(crate) fn substitute_proc_params(body: &str, args: &[String]) -> String {
     result
 }
 
-/// Parse a MERGE statement (Wave 53 wiring for exec/merge.rs).
-///
-/// Supports the form:
-///   MERGE INTO target [AS t]
-///   USING (VALUES (1, 'a'), (2, 'b')) AS s (id, val)
-///   ON t.id = s.id
-///   WHEN MATCHED THEN UPDATE SET col = val [, ...]
-///   WHEN NOT MATCHED THEN INSERT (cols) VALUES (vals)
-///
-/// Wave 56a fix: the previous implementation hardcoded `source_rows: Vec::new()`,
-/// `join_target_col: String::new()`, `join_source_col: String::new()` — so
-/// `execute_merge` could never match any target row and the WHEN MATCHED
-/// branch was dead. We now parse the USING (VALUES ...) clause to populate
-/// `source_rows`, and parse the ON clause to populate the join columns.
-///
-/// Returns None if the SQL is not a MERGE statement.
-pub(crate) fn parse_merge(sql: &str) -> Option<crate::exec::merge::Merge> {
-    use crate::exec::merge::{Merge, MergeAction};
-    let trimmed = sql.trim();
-    let upper = trimmed.to_uppercase();
-    if !upper.starts_with("MERGE ") && !upper.starts_with("MERGE INTO ") {
-        return None;
-    }
-
-    let after_merge = if upper.starts_with("MERGE INTO ") {
-        &trimmed["MERGE INTO ".len()..]
-    } else {
-        &trimmed["MERGE ".len()..]
-    };
-
-    // Target table name is the first whitespace-delimited token (optionally
-    // followed by `AS alias`).
-    let target = after_merge.split_whitespace().next()?.to_string();
-
-    let lower = trimmed.to_lowercase();
-
-    // ---- Parse USING (VALUES (...) , (...), ...) AS alias (col1, col2, ...) ----
-    // The source rows are the (join_value, [full_row]) tuples extracted from
-    // the VALUES list. The merge module's `source_rows` field is shaped as
-    // Vec<(join_value_str, full_row_vals)> — the first element of each tuple
-    // is the join key (a stringified u64 or quoted string), and the second
-    // is the full row (used by the Insert action).
-    let mut source_rows: Vec<(String, Vec<String>)> = Vec::new();
-    let mut source_col_names: Vec<String> = Vec::new();
-    if let Some(using_pos) = lower.find("using ") {
-        let after_using = &trimmed[using_pos + "using ".len()..];
-        // Skip whitespace.
-        let after_using = after_using.trim_start();
-        if after_using.starts_with('(') {
-            // Find the matching close paren for the USING (...) group.
-            // This may contain nested parens for the VALUES list.
-            let mut depth = 0i32;
-            let mut using_close = None;
-            for (i, c) in after_using.char_indices() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            using_close = Some(i);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(close) = using_close {
-                let using_inner = &after_using[1..close];
-                // using_inner should start with "VALUES" then have (..), (..)
-                let using_inner_lower = using_inner.to_lowercase();
-                if let Some(v_pos) = using_inner_lower.find("values") {
-                    let after_values = &using_inner[v_pos + "values".len()..];
-                    // Parse each (...) tuple.
-                    source_rows = parse_values_tuples(after_values);
-                }
-                // After the USING (...) group, look for "AS alias (col1, col2, ...)"
-                // to extract the source column names.
-                let after_group = after_using[close + 1..].trim_start();
-                let after_as = if after_group.to_uppercase().starts_with("AS ") {
-                    &after_group["AS ".len()..]
-                } else {
-                    after_group
-                };
-                // Skip the alias identifier.
-                let after_alias = after_as
-                    .split_whitespace()
-                    .next()
-                    .map(|n| &after_as[n.len()..])
-                    .unwrap_or(after_as)
-                    .trim_start();
-                if after_alias.starts_with('(') {
-                    if let Some(close2) = after_alias.find(')') {
-                        source_col_names = after_alias[1..close2]
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .collect();
-                    }
-                }
-            }
-        }
-    }
-
-    // ---- Parse ON target_col = source_col ----
-    let mut join_target_col = String::new();
-    let mut join_source_col = String::new();
-    if let Some(on_pos) = lower.find(" on ") {
-        // Limit the ON clause to the next WHEN keyword (so we don't grab
-        // any later "on" in a subquery or string literal).
-        let after_on = &trimmed[on_pos + " on ".len()..];
-        let when_pos = after_on.to_lowercase().find(" when ").unwrap_or(after_on.len());
-        let on_clause = after_on[..when_pos].trim();
-        // Parse "target.col = source.col" — split on '=' first.
-        if let Some(eq_pos) = on_clause.find('=') {
-            let lhs = on_clause[..eq_pos].trim();
-            let rhs = on_clause[eq_pos + 1..].trim();
-            // Both sides should be qualified "alias.col" — take the part after the dot.
-            if let Some(dot_pos) = lhs.rfind('.') {
-                join_target_col = lhs[dot_pos + 1..].trim().to_string();
-            } else {
-                join_target_col = lhs.to_string();
-            }
-            if let Some(dot_pos) = rhs.rfind('.') {
-                join_source_col = rhs[dot_pos + 1..].trim().to_string();
-            } else {
-                join_source_col = rhs.to_string();
-            }
-        }
-    }
-
-    // ---- Look for WHEN MATCHED THEN UPDATE SET col = val, ... ----
-    let mut when_matched: Option<MergeAction> = None;
-    let mut when_not_matched_by_target: Option<MergeAction> = None;
-
-    if let Some(pos) = lower.find("when matched then update set") {
-        let after = &trimmed[pos + "when matched then update set".len()..];
-        // The SET clause runs until the next WHEN keyword (or end of string).
-        let set_end = after.to_lowercase().find(" when ").unwrap_or(after.len());
-        let assigns_str = after[..set_end].trim();
-        // Parse `col = val` pairs separated by commas.
-        let assigns: Vec<(String, String)> = split_top_level_commas(assigns_str)
-            .into_iter()
-            .filter_map(|pair| {
-                let pair = pair.trim();
-                let eq_pos = pair.find('=')?;
-                let col_raw = pair[..eq_pos].trim().to_string();
-                let val_raw = pair[eq_pos + 1..].trim().to_string();
-                // Strip any "alias." prefix from the LHS column (target.col → col).
-                // IMPORTANT: do NOT strip the alias from the RHS value —
-                // `source.val` must be preserved so execute_merge can
-                // recognize it as a column reference and resolve it against
-                // the current source row (Wave 56a fix).
-                let col = col_raw.rsplit('.').next().unwrap_or(&col_raw).to_string();
-                if col.is_empty() || val_raw.is_empty() {
-                    None
-                } else {
-                    Some((col, val_raw))
-                }
-            })
-            .collect();
-        if !assigns.is_empty() {
-            when_matched = Some(MergeAction::Update(assigns));
-        }
-    }
-
-    if let Some(pos) = lower.find("when not matched then insert") {
-        let after = &trimmed[pos + "when not matched then insert".len()..];
-        // The INSERT clause runs until the next WHEN keyword (or end of string).
-        let ins_end = after.to_lowercase().find(" when ").unwrap_or(after.len());
-        let ins_str = after[..ins_end].trim();
-        // Parse `(col1, col2) VALUES (val1, val2)` — best-effort.
-        if let Some(open) = ins_str.find('(') {
-            if let Some(close) = ins_str.find(')') {
-                let cols: Vec<String> =
-                    ins_str[open + 1..close].split(',').map(|s| s.trim().to_string()).collect();
-                if let Some(vals_pos) = ins_str[close..].to_lowercase().find("values") {
-                    let vals_str = &ins_str[close + vals_pos + "values".len()..];
-                    if let Some(v_open) = vals_str.find('(') {
-                        if let Some(v_close) = vals_str.find(')') {
-                            let vals: Vec<String> = vals_str[v_open + 1..v_close]
-                                .split(',')
-                                .map(|s| s.trim().to_string())
-                                .collect();
-                            when_not_matched_by_target = Some(MergeAction::Insert(cols, vals));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // If we parsed source column names, find the join source col's index
-    // and rewrite source_rows so the first element of each tuple is the
-    // value of the join column (stringified). The merge module uses
-    // source_rows[i].0 as the join key to match against target.col_values.
-    if !source_col_names.is_empty() && !join_source_col.is_empty() {
-        if let Some(src_idx) =
-            source_col_names.iter().position(|c| c.eq_ignore_ascii_case(&join_source_col))
-        {
-            // Each source_row tuple's first element becomes the join key.
-            // The Vec<String> carries the full row values in source_col_names order.
-            source_rows = source_rows
-                .into_iter()
-                .map(|(_old_key, mut vals)| {
-                    let key = vals.get(src_idx).cloned().unwrap_or_default();
-                    (key, vals)
-                })
-                .collect();
-        }
-    }
-
-    Some(Merge {
-        target,
-        source_rows,
-        source_col_names,
-        join_target_col,
-        join_source_col,
-        when_matched,
-        when_not_matched_by_source: None,
-        when_not_matched_by_target,
-    })
-}
-
-/// Split a string on top-level commas (not inside parentheses or quotes).
-/// Used by `parse_merge` to split SET assignments like
-/// `col1 = source.col1, col2 = 'literal, with comma'`.
-pub(crate) fn split_top_level_commas(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut cur = String::new();
-    for c in s.chars() {
-        match c {
-            '\'' => {
-                in_str = !in_str;
-                cur.push(c);
-            }
-            '(' if !in_str => {
-                depth += 1;
-                cur.push(c);
-            }
-            ')' if !in_str => {
-                depth -= 1;
-                cur.push(c);
-            }
-            ',' if depth == 0 && !in_str => {
-                out.push(cur.clone());
-                cur.clear();
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-/// Parse the body of a SQL VALUES list — e.g. `(1, 'a'), (2, 'b')` — into
-/// a Vec of (first_cell_stringified, full_row) tuples. The first cell is
-/// later used as the join key (it's overwritten in parse_merge if a join
-/// column index is known).
-pub(crate) fn parse_values_tuples(s: &str) -> Vec<(String, Vec<String>)> {
-    let mut out = Vec::new();
-    let mut chars = s.chars().peekable();
-    let mut depth = 0i32;
-    let mut cur = String::new();
-    let mut tuples: Vec<String> = Vec::new();
-    let mut in_str = false;
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' => {
-                in_str = !in_str;
-                cur.push(c);
-            }
-            '(' if !in_str => {
-                depth += 1;
-                if depth == 1 {
-                    cur.clear();
-                } else {
-                    cur.push(c);
-                }
-            }
-            ')' if !in_str => {
-                depth -= 1;
-                if depth == 0 {
-                    tuples.push(cur.clone());
-                    cur.clear();
-                } else {
-                    cur.push(c);
-                }
-            }
-            _ if depth >= 1 => cur.push(c),
-            _ => {}
-        }
-    }
-    for t in &tuples {
-        let vals: Vec<String> =
-            split_top_level_commas(t).into_iter().map(|v| v.trim().to_string()).collect();
-        if !vals.is_empty() {
-            let first = vals[0].clone();
-            out.push((first, vals));
-        }
-    }
-    out
-}
 
 pub(crate) fn table_to_query_result(table: &Table) -> QueryResult {
     let columns: Vec<ResultColumn> = table
@@ -1271,6 +966,104 @@ pub(crate) fn try_parse_as_set_query(
     match &set {
         SetQuery::Union(_, _) | SetQuery::UnionAll(_, _) => Some((set, ext)),
         _ => None,
+    }
+}
+
+// -----------------------------------------------------------------------
+// Wave 7 (Task 7.2): Formal MERGE dispatch via `MergeStmt` AST.
+//
+// The previous `parse_merge` string-scan hack has been deleted. MERGE
+// now goes through the formal `parse_merge_stmt` parser in
+// `src/sql/parser.rs`, which produces a `MergeStmt` AST. This AST is
+// then converted to `crate::exec::merge::Merge` via
+// [`merge_stmt_to_merge`] for execution by the existing `execute_merge`
+// executor.
+// -----------------------------------------------------------------------
+
+/// Try to parse a SQL string as a MERGE statement. Returns `Some(MergeStmt)`
+/// if the SQL is a valid MERGE statement, otherwise `None`.
+///
+/// Used by `execute_inner` to dispatch MERGE via the formal `MergeStmt`
+/// AST instead of the previous `parse_merge` string hack. Non-MERGE
+/// statements (SELECT, INSERT, etc.) return `None` so the caller falls
+/// through to the appropriate handler.
+pub(crate) fn try_parse_merge_stmt(sql: &str) -> Option<crate::sql::parser::MergeStmt> {
+    use crate::sql::lexer::tokenize;
+    use crate::sql::parser::parse_merge_stmt;
+    let tokens = tokenize(sql).ok()?;
+    parse_merge_stmt(tokens).ok()
+}
+
+/// Convert a formal [`MergeStmt`](crate::sql::parser::MergeStmt) AST to
+/// the executor's [`Merge`](crate::exec::merge::Merge) struct.
+///
+/// This bridges the formal parser (which produces `MergeStmt`) and the
+/// existing `execute_merge` function (which consumes `Merge`). The
+/// conversion:
+///
+/// 1. Computes `source_rows: Vec<(join_key, full_row)>` from the parsed
+///    VALUES list, using the join source column index to extract the
+///    join key for each row.
+/// 2. Maps `MergeAction::Update` / `Delete` / `Insert` to the executor's
+///    `MergeAction::Update(Vec)` / `Delete` / `Insert(Vec, Vec)`.
+/// 3. Drops all but the first WHEN MATCHED and first WHEN NOT MATCHED
+///    clause (the existing executor only handles one of each).
+/// 4. Table and subquery sources are not yet wired through — they
+///    produce empty `source_rows` (TODO: read from catalog / run subquery).
+pub(crate) fn merge_stmt_to_merge(stmt: &crate::sql::parser::MergeStmt) -> crate::exec::merge::Merge {
+    use crate::exec::merge::{Merge, MergeAction as ExecMergeAction};
+    use crate::sql::parser::{MergeAction, MergeSource};
+
+    let (source_rows, source_col_names) = match &stmt.source {
+        MergeSource::Values { rows, col_names } => {
+            let src_idx = col_names
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(&stmt.on.source_col));
+            let source_rows: Vec<(String, Vec<String>)> = rows
+                .iter()
+                .map(|vals| {
+                    let key = src_idx
+                        .and_then(|i| vals.get(i).cloned())
+                        .unwrap_or_default();
+                    (key, vals.clone())
+                })
+                .collect();
+            (source_rows, col_names.clone())
+        }
+        MergeSource::Table(_) | MergeSource::Subquery(_) => {
+            // Table/subquery sources would require reading from the catalog
+            // or running the subquery — not yet wired. Return empty so the
+            // executor's no-source-row branch is taken (WHEN NOT MATCHED
+            // fires for every target row, WHEN MATCHED never fires).
+            (Vec::new(), Vec::new())
+        }
+    };
+
+    let when_matched = stmt.when_matched.first().map(convert_merge_action);
+    let when_not_matched_by_target = stmt.when_not_matched.first().map(convert_merge_action);
+
+    Merge {
+        target: stmt.target.clone(),
+        source_rows,
+        source_col_names,
+        join_target_col: stmt.on.target_col.clone(),
+        join_source_col: stmt.on.source_col.clone(),
+        when_matched,
+        when_not_matched_by_source: None,
+        when_not_matched_by_target,
+    }
+}
+
+/// Convert a parser `MergeAction` to the executor's `MergeAction`.
+fn convert_merge_action(a: &crate::sql::parser::MergeAction) -> crate::exec::merge::MergeAction {
+    use crate::exec::merge::MergeAction as ExecMergeAction;
+    use crate::sql::parser::MergeAction;
+    match a {
+        MergeAction::Update { sets } => ExecMergeAction::Update(sets.clone()),
+        MergeAction::Delete => ExecMergeAction::Delete,
+        MergeAction::Insert { columns, values } => {
+            ExecMergeAction::Insert(columns.clone(), values.clone())
+        }
     }
 }
 
@@ -1994,5 +1787,121 @@ mod wave7_union_tests {
             .execute("SELECT * FROM t1 UNION SELECT * FROM t2")
             .expect("UNION should execute");
         assert_eq!(r.row_count, 1, "UNION should dedup, got {}", r.row_count);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Wave 7 (Task 7.2) — formal MERGE dispatch tests.
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod wave7_merge_tests {
+    use super::*;
+
+    /// `try_parse_merge_stmt` recognises a complete MERGE statement and
+    /// returns the parsed `MergeStmt` AST.
+    #[test]
+    fn try_parse_merge_stmt_detects_merge() {
+        let sql = "MERGE INTO target USING (VALUES (1, 99), (2, 42)) AS source (id, v) \
+                   ON target.id = source.id \
+                   WHEN MATCHED THEN UPDATE SET v = source.v \
+                   WHEN NOT MATCHED THEN INSERT (id, v) VALUES (source.id, source.v)";
+        let parsed = try_parse_merge_stmt(sql);
+        assert!(parsed.is_some(), "MERGE should be detected");
+        let stmt = parsed.expect("parsed");
+        assert_eq!(stmt.target, "target");
+        // Source is Values with 2 rows and 2 cols.
+        match &stmt.source {
+            crate::sql::parser::MergeSource::Values { rows, col_names } => {
+                assert_eq!(rows.len(), 2, "rows: {rows:?}");
+                assert_eq!(col_names, &["id".to_string(), "v".to_string()]);
+            }
+            other => panic!("expected Values source, got {other:?}"),
+        }
+        // ON clause: target_col = "id", source_col = "id".
+        assert_eq!(stmt.on.target_col, "id");
+        assert_eq!(stmt.on.source_col, "id");
+        // WHEN MATCHED has 1 Update action.
+        assert_eq!(stmt.when_matched.len(), 1);
+        // WHEN NOT MATCHED has 1 Insert action.
+        assert_eq!(stmt.when_not_matched.len(), 1);
+    }
+
+    /// A non-MERGE statement returns `None`, so the caller falls through.
+    #[test]
+    fn try_parse_merge_stmt_returns_none_for_select() {
+        assert!(try_parse_merge_stmt("SELECT * FROM t").is_none());
+        assert!(try_parse_merge_stmt("INSERT INTO t VALUES (1)").is_none());
+        assert!(try_parse_merge_stmt("CREATE TABLE t (id INT)").is_none());
+    }
+
+    /// A malformed MERGE statement returns `None` (parse failure is
+    /// converted to None by `try_parse_merge_stmt`).
+    #[test]
+    fn try_parse_merge_stmt_returns_none_for_malformed() {
+        // Missing USING clause.
+        assert!(try_parse_merge_stmt("MERGE INTO target ON target.id = source.id").is_none());
+        // Missing ON clause.
+        assert!(
+            try_parse_merge_stmt("MERGE INTO target USING (VALUES (1, 2)) AS s (a, b)").is_none()
+        );
+    }
+
+    /// `merge_stmt_to_merge` produces the same shape as the old
+    /// `parse_merge` hack: source_rows are (join_key, full_row) tuples,
+    /// and join_target_col / join_source_col come from the ON clause.
+    #[test]
+    fn merge_stmt_to_merge_produces_correct_shape() {
+        let sql = "MERGE INTO target USING (VALUES (1, 99), (2, 42)) AS source (id, v) \
+                   ON target.id = source.id \
+                   WHEN MATCHED THEN UPDATE SET v = source.v \
+                   WHEN NOT MATCHED THEN INSERT (id, v) VALUES (source.id, source.v)";
+        let stmt = try_parse_merge_stmt(sql).expect("parsed");
+        let merge = merge_stmt_to_merge(&stmt);
+        assert_eq!(merge.target, "target");
+        assert_eq!(merge.join_target_col, "id");
+        assert_eq!(merge.join_source_col, "id");
+        assert_eq!(merge.source_col_names, vec!["id".to_string(), "v".to_string()]);
+        // source_rows: [(key="1", ["1", "99"]), (key="2", ["2", "42"])]
+        assert_eq!(merge.source_rows.len(), 2);
+        assert_eq!(merge.source_rows[0].0, "1");
+        assert_eq!(merge.source_rows[0].1, vec!["1".to_string(), "99".to_string()]);
+        assert_eq!(merge.source_rows[1].0, "2");
+        assert_eq!(merge.source_rows[1].1, vec!["2".to_string(), "42".to_string()]);
+        // when_matched: Update([("v", "source.v")]).
+        match &merge.when_matched {
+            Some(crate::exec::merge::MergeAction::Update(sets)) => {
+                assert_eq!(sets, &vec![("v".to_string(), "source.v".to_string())]);
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+        // when_not_matched_by_target: Insert(["id", "v"], ["source.id", "source.v"]).
+        match &merge.when_not_matched_by_target {
+            Some(crate::exec::merge::MergeAction::Insert(cols, vals)) => {
+                assert_eq!(cols, &vec!["id".to_string(), "v".to_string()]);
+                assert_eq!(vals, &vec!["source.id".to_string(), "source.v".to_string()]);
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    /// End-to-end: `engine.execute(merge_sql)` executes via the formal
+    /// `MergeStmt` AST path and produces the expected target table state.
+    #[test]
+    fn merge_uses_formal_ast() {
+        let mut engine = QueryEngine::in_memory();
+        engine.execute("CREATE TABLE target (id INT, v INT)").unwrap();
+        engine.execute("INSERT INTO target VALUES (1, 10)").unwrap();
+
+        let merge_sql = "MERGE INTO target USING (VALUES (1, 99), (2, 42)) AS source (id, v) \
+                         ON target.id = source.id \
+                         WHEN MATCHED THEN UPDATE SET v = source.v \
+                         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (source.id, source.v)";
+        let r = engine.execute(merge_sql);
+        assert!(r.is_ok(), "MERGE should execute: {:?}", r.err());
+
+        // After MERGE: target should have 2 rows — (1, 99) updated, (2, 42) inserted.
+        let r = engine.execute("SELECT COUNT(*) FROM target").unwrap();
+        assert_eq!(r.columns[0].values[0], 2, "target should have 2 rows after MERGE");
     }
 }
