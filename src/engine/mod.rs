@@ -501,37 +501,34 @@ impl QueryEngine {
     /// explicit transaction, or `None` for autocommit. The record carries
     /// the txn_id so replay can group statements by transaction.
     ///
-    /// Wave 3 (A5): WAL errors are now propagated — if the WAL append or
-    /// sync fails, the error is logged and the engine continues (the
-    /// transaction will be visible in-memory but may not survive a crash).
-    /// A future wave will make this abort the transaction.
-    fn wal_append_txn(&mut self, sql: &str, txn_id: Option<u64>) {
+    /// Task 2.1 fix (durability correctness): uses `Wal::append_and_sync()`
+    /// so both the append and the fsync are performed atomically. If either
+    /// fails, the error is propagated to the caller — COMMIT no longer
+    /// returns success when fsync failed. The caller MUST treat an `Err`
+    /// return as a failed commit (the transaction is not durable).
+    fn wal_append_txn(&mut self, sql: &str, txn_id: Option<u64>) -> Result<()> {
         if let Some(ref mut wal) = self.wal {
             let record = match txn_id {
                 Some(id) => crate::storage::recovery::WalRecord::txn_dml(id, sql),
                 None => crate::storage::recovery::WalRecord::autocommit(sql),
             };
-            if let Err(e) = wal.append(&record) {
-                log::error!("WAL append failed (A5): {e}");
-            }
-            if let Err(e) = wal.sync() {
-                log::error!("WAL sync failed (A5): {e}");
-            }
+            wal.append_and_sync(&record)
+                .map_err(|e| Error::Other(format!("WAL append_and_sync failed: {e}")))?;
         }
+        Ok(())
     }
 
     /// Append a pre-constructed WAL record (BEGIN / COMMIT / ROLLBACK
     /// markers, or any other special record). Used by `execute()` to
     /// write transaction boundary markers (Wave 51 fix).
-    fn wal_append_record(&mut self, record: crate::storage::recovery::WalRecord) {
+    ///
+    /// Task 2.1 fix: uses `Wal::append_and_sync()` and propagates errors.
+    fn wal_append_record(&mut self, record: crate::storage::recovery::WalRecord) -> Result<()> {
         if let Some(ref mut wal) = self.wal {
-            if let Err(e) = wal.append(&record) {
-                log::error!("WAL append failed (A5): {e}");
-            }
-            if let Err(e) = wal.sync() {
-                log::error!("WAL sync failed (A5): {e}");
-            }
+            wal.append_and_sync(&record)
+                .map_err(|e| Error::Other(format!("WAL append_and_sync failed: {e}")))?;
         }
+        Ok(())
     }
 
     /// Construct an engine with a custom cost model (e.g., one with a
@@ -750,7 +747,7 @@ impl QueryEngine {
 
         if lower.starts_with("begin") || lower.starts_with("start transaction") {
             let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
-            self.wal_append_record(crate::storage::recovery::WalRecord::begin(id));
+            self.wal_append_record(crate::storage::recovery::WalRecord::begin(id))?;
             return Ok(QueryResult::empty());
         }
         if lower.starts_with("commit") {
@@ -759,14 +756,14 @@ impl QueryEngine {
             let committed = self.txn_manager.commit().map_err(Error::Other)?;
             self.catalog = committed;
             self.savepoints.clear(); // Wave 69: clear savepoints on commit.
-            self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id));
+            self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id))?;
             return Ok(QueryResult::empty());
         }
         if lower.starts_with("rollback") && !lower.starts_with("rollback to ") {
             let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
             self.txn_manager.rollback().map_err(Error::Other)?;
             self.savepoints.clear(); // Wave 69: clear savepoints on rollback.
-            self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id));
+            self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id))?;
             return Ok(QueryResult::empty());
         }
 
@@ -987,7 +984,7 @@ impl QueryEngine {
                 }
             }
             // Wave 51 fix: append AFTER successful execute.
-            self.wal_append_txn(sql, txn_id);
+            self.wal_append_txn(sql, txn_id)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }
@@ -997,7 +994,7 @@ impl QueryEngine {
             let mut result = self.execute_dml(dml)?;
             // Wave 51 fix: append AFTER successful execute. If execute_dml
             // returns Err, we never reach this line, so the WAL stays clean.
-            self.wal_append_txn(sql, txn_id);
+            self.wal_append_txn(sql, txn_id)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }
