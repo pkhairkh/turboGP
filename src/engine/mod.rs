@@ -1499,7 +1499,7 @@ impl QueryEngine {
     /// `execute_ddl` / `execute_dml`, so a failed execute (e.g. INSERT
     /// INTO nonexistent) would still leave a record in the WAL — and
     /// replay would fail on restart.
-    fn execute_inner(
+    pub(crate) fn execute_inner(
         &mut self,
         sql: &str,
         start: &Instant,
@@ -1911,273 +1911,23 @@ impl Default for QueryEngine {
 }
 
 // -----------------------------------------------------------------------
-// DML helper functions (Wave 4)
+// DML helper functions (Wave 4) — moved to `src/engine/helpers.rs` in
+// Task 8.2-fix to satisfy the 2000-LOC file-size limit.
+//
+// The three impl-QueryEngine methods that used to live here:
+//   - `materialize_views_in_sql`
+//   - `execute_merge_stmt`
+//   - `execute_with_json_value`
+// are now defined in `helpers.rs` and declared `pub(crate)` so this
+// module (and the rest of the crate) can call them via `self.<method>`.
 // -----------------------------------------------------------------------
-
-/// Extract the inner string from a SQL string literal `'...'`, handling
-/// the `''` escape (a literal single quote inside the string). Returns
-/// None if `s` is not a string literal.
-///
-/// Wave 56c: used by `execute_insert` to preserve the original string
-/// value when inserting into a VARCHAR / NVARCHAR / TEXT column, so that
-/// subsequent SELECTs can recover the string (via the `string_columns`
-/// sidecar) and JSON_VALUE / LIKE / range comparisons work correctly.
-
-
-impl QueryEngine {
-    fn materialize_views_in_sql(&mut self, sql: &str) -> String {
-        let lower = sql.to_lowercase();
-        // Collect view names that appear in the SQL before mutating self.
-        let view_names: Vec<String> = self
-            .views
-            .names()
-            .into_iter()
-            .map(|s| s.to_string())
-            .filter(|view_name| {
-                let pattern = format!("from {}", view_name.to_lowercase());
-                lower.contains(&pattern)
-            })
-            .collect();
-        // Now materialize each view. We collect (name, select_sql) pairs
-        // first to release the immutable borrow on self.views before we
-        // call self.execute_inner (which needs &mut self).
-        let view_specs: Vec<(String, String)> = view_names
-            .into_iter()
-            .filter_map(|name| self.views.get(&name).map(|v| (name, v.select_sql.clone())))
-            .collect();
-        for (view_name, select_sql) in view_specs {
-            if let Ok(result) = self.execute_inner(&select_sql, &Instant::now(), None) {
-                let table = result_to_table(&view_name, &result);
-                self.catalog.register(table);
-            }
-        }
-        sql.to_string()
-    }
-
-    /// Execute a MERGE statement against a catalog table (Wave 53 wiring
-    /// for exec/merge.rs). The target table is loaded into a QueryResult,
-    /// `execute_merge` is applied, and the result is written back to the
-    /// catalog.
-    fn execute_merge_stmt(
-        &mut self,
-        merge: crate::exec::merge::Merge,
-        start: &Instant,
-    ) -> Result<QueryResult> {
-        let target_name = merge.target.clone();
-        // Load the target table into a QueryResult.
-        let table = self
-            .catalog
-            .get(&target_name)
-            .ok_or_else(|| Error::NotFound(format!("MERGE target table \"{target_name}\"")))?
-            .clone();
-        let mut qr = table_to_query_result(&table);
-
-        let merge_result = crate::exec::merge::execute_merge(&mut qr, &merge);
-
-        // Write the mutated QueryResult back into the catalog table.
-        let new_table = query_result_to_table(&target_name, &qr);
-        self.catalog.register(new_table);
-
-        let mut result = QueryResult::empty();
-        result.row_count = merge_result.inserted + merge_result.updated + merge_result.deleted;
-        result.elapsed_us = start.elapsed().as_micros() as u64;
-        Ok(result)
-    }
-}
-
-impl QueryEngine {
-    fn execute_with_json_value(
-        &mut self,
-        sql: &str,
-        start: &Instant,
-        txn_id: Option<u64>,
-    ) -> Result<QueryResult> {
-        let calls = extract_json_value_calls(sql);
-        if calls.is_empty() {
-            // Shouldn't happen — contains_json_value_call returned true — but
-            // fall through to the normal path just in case.
-            return self.execute_inner(sql, start, txn_id);
-        }
-        // Rewrite the SQL: replace each call with the bare column name.
-        let mut rewritten = String::with_capacity(sql.len());
-        let mut last_end = 0;
-        for c in &calls {
-            rewritten.push_str(&sql[last_end..c.start]);
-            rewritten.push_str(&c.col_name);
-            last_end = c.end;
-        }
-        rewritten.push_str(&sql[last_end..]);
-        // Execute the rewritten SQL. The rewritten SQL has no JSON_VALUE(...)
-        // calls, so this won't re-enter execute_with_json_value.
-        let mut result = self.execute_inner(&rewritten, start, txn_id)?;
-        // Post-process: for each call, find the result column at the call's
-        // SELECT position and apply json_value() / json_query() to its string
-        // values.
-        for c in &calls {
-            let col_idx = c.select_position;
-            if col_idx >= result.columns.len() {
-                continue;
-            }
-            // Get the string values from the column. If string_values is
-            // None, we can't extract JSON — skip this call.
-            let strings = result.columns[col_idx].string_values.clone().unwrap_or_default();
-            if strings.is_empty() {
-                continue;
-            }
-            let extracted: Vec<String> = strings
-                .iter()
-                .map(|s| {
-                    if c.is_query {
-                        crate::exec::json::json_query(s, &c.path).unwrap_or_default()
-                    } else {
-                        crate::exec::json::json_value(s, &c.path).unwrap_or_default()
-                    }
-                })
-                .collect();
-            // Replace the column with a new one carrying the extracted strings.
-            use xxhash_rust::xxh3;
-            let values: Vec<u64> = extracted.iter().map(|s| xxh3::xxh3_64(s.as_bytes())).collect();
-            let final_name = c.alias.clone().unwrap_or_else(|| {
-                if c.is_query {
-                    "json_query".into()
-                } else {
-                    "json_value".into()
-                }
-            });
-            result.columns[col_idx] = ResultColumn {
-                name: final_name,
-                values,
-                string_values: Some(extracted),
-                type_oid: 25, // text OID
-                null_mask: None,
-            };
-        }
-        result.elapsed_us = start.elapsed().as_micros() as u64;
-        Ok(result)
-    }
-}
 
 // -----------------------------------------------------------------------
 // Binary checkpoint integration tests (Task 4.1 + 4.2)
+//
+// Moved to `src/engine/binary_checkpoint_tests.rs` in Task 8.2-fix to
+// satisfy the 2000-LOC file-size limit.
 // -----------------------------------------------------------------------
-
 #[cfg(test)]
-mod binary_checkpoint_tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    /// End-to-end persistence test: write 100 rows, CHECKPOINT, drop the
-    /// engine, reload via `with_data_dir`, and verify all 100 rows survive.
-    /// Also verifies `checkpoint.bin` exists after CHECKPOINT.
-    #[test]
-    fn test_binary_checkpoint_persistence() {
-        let tmp = TempDir::new().expect("tempdir");
-        let data_dir = tmp.path();
-
-        // Phase 1: create a table, insert 100 rows, CHECKPOINT.
-        {
-            let mut engine = QueryEngine::with_data_dir(data_dir).expect("with_data_dir");
-            engine
-                .execute("CREATE TABLE t (id INT, v INT)")
-                .expect("create table");
-            for i in 0..100 {
-                let sql = format!("INSERT INTO t VALUES ({i}, {})", i * 2);
-                engine.execute(&sql).expect("insert");
-            }
-            let r = engine.execute("SELECT count(*) FROM t").expect("count");
-            assert_eq!(r.scalar_u64(), Some(100), "expected 100 rows before checkpoint");
-
-            engine.execute("CHECKPOINT").expect("checkpoint");
-
-            // Verify checkpoint.bin was written.
-            let bin_path = data_dir.join("checkpoint.bin");
-            assert!(bin_path.exists(), "checkpoint.bin should exist after CHECKPOINT");
-            // The legacy checkpoint.sql is also written for backward compat.
-            let sql_path = data_dir.join("checkpoint.sql");
-            assert!(sql_path.exists(), "checkpoint.sql should also exist for backward compat");
-        }
-        // Phase 2: drop the engine and reload via with_data_dir.
-        // The catalog should be restored from checkpoint.bin.
-        {
-            let mut engine = QueryEngine::with_data_dir(data_dir).expect("with_data_dir reload");
-            let r = engine.execute("SELECT count(*) FROM t").expect("count after reload");
-            assert_eq!(
-                r.scalar_u64(),
-                Some(100),
-                "expected 100 rows after reload from checkpoint.bin"
-            );
-            // Verify a specific row round-trips.
-            let r = engine
-                .execute("SELECT v FROM t WHERE id = 42")
-                .expect("select v where id=42");
-            // v = id * 2 = 84.
-            assert_eq!(r.scalar_u64(), Some(84), "row id=42 should have v=84");
-        }
-    }
-
-    /// If `checkpoint.bin` is missing, `with_data_dir` falls back to the
-    /// legacy SQL checkpoint. This verifies backward compat with data dirs
-    /// written by older engine versions.
-    #[test]
-    fn test_with_data_dir_falls_back_to_sql_checkpoint() {
-        let tmp = TempDir::new().expect("tempdir");
-        let data_dir = tmp.path();
-
-        // Phase 1: write some data + checkpoint, then delete checkpoint.bin
-        // to simulate an old data dir.
-        {
-            let mut engine = QueryEngine::with_data_dir(data_dir).expect("with_data_dir");
-            engine.execute("CREATE TABLE t (id INT)").expect("create");
-            engine.execute("INSERT INTO t VALUES (7)").expect("insert");
-            engine.execute("CHECKPOINT").expect("checkpoint");
-            // Remove the binary checkpoint to force the legacy path.
-            std::fs::remove_file(data_dir.join("checkpoint.bin")).expect("remove bin");
-        }
-        // Phase 2: reload — should fall back to checkpoint.sql.
-        {
-            let mut engine = QueryEngine::with_data_dir(data_dir).expect("with_data_dir reload");
-            let r = engine.execute("SELECT count(*) FROM t").expect("count after reload");
-            assert_eq!(r.scalar_u64(), Some(1), "row should survive via SQL checkpoint fallback");
-            let r = engine.execute("SELECT id FROM t").expect("select id");
-            assert_eq!(r.scalar_u64(), Some(7));
-        }
-    }
-
-    /// After CHECKPOINT, the WAL is truncated. New writes after the
-    /// checkpoint land in the WAL; on reload, the binary checkpoint
-    /// restores the checkpoint state, then WAL replay applies the
-    /// post-checkpoint writes.
-    #[test]
-    fn test_binary_checkpoint_then_wal_replay() {
-        let tmp = TempDir::new().expect("tempdir");
-        let data_dir = tmp.path();
-
-        // Phase 1: insert 5 rows, CHECKPOINT, then insert 3 more rows.
-        {
-            let mut engine = QueryEngine::with_data_dir(data_dir).expect("with_data_dir");
-            engine.execute("CREATE TABLE t (id INT)").expect("create");
-            for i in 0..5 {
-                engine.execute(&format!("INSERT INTO t VALUES ({i})")).expect("insert");
-            }
-            engine.execute("CHECKPOINT").expect("checkpoint");
-            // 3 more rows after the checkpoint — these go into the WAL.
-            for i in 5..8 {
-                engine.execute(&format!("INSERT INTO t VALUES ({i})")).expect("insert post-cp");
-            }
-            let r = engine.execute("SELECT count(*) FROM t").expect("count pre-reload");
-            assert_eq!(r.scalar_u64(), Some(8));
-        }
-        // Phase 2: reload. Binary checkpoint restores 5 rows; WAL replay
-        // applies the 3 post-checkpoint inserts. Total = 8.
-        {
-            let mut engine = QueryEngine::with_data_dir(data_dir).expect("with_data_dir reload");
-            let r = engine.execute("SELECT count(*) FROM t").expect("count after reload");
-            assert_eq!(
-                r.scalar_u64(),
-                Some(8),
-                "binary checkpoint (5) + WAL replay (3) should yield 8 rows"
-            );
-        }
-    }
-}
+mod binary_checkpoint_tests;
 
