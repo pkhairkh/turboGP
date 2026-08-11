@@ -86,8 +86,8 @@ pub(crate) fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
     let orders_tbl =
         catalog.get("orders").ok_or_else(|| Error::NotFound("table 'orders'".into()))?;
 
-    let customer = ExecTable::from_catalog(customer_tbl, "customer");
-    let orders = ExecTable::from_catalog(orders_tbl, "orders");
+    let customer = ExecTable::from_catalog(&customer_tbl, "customer");
+    let orders = ExecTable::from_catalog(&orders_tbl, "orders");
 
     // Column indices (from tpc_h_schema in datasource/csv.rs):
     // customer: 0=c_custkey
@@ -316,8 +316,8 @@ pub(crate) fn execute_q17_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
     let lineitem_tbl =
         catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
-    let part = ExecTable::from_catalog(part_tbl, "part");
-    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
+    let part = ExecTable::from_catalog(&part_tbl, "part");
+    let lineitem = ExecTable::from_catalog(&lineitem_tbl, "lineitem");
 
     // Column indices (from tpc_h_schema in datasource/csv.rs):
     // part:     0=p_partkey, 3=p_brand (String hash), 6=p_container (String hash)
@@ -484,9 +484,9 @@ pub(crate) fn execute_q18_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
     let lineitem_tbl =
         catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
-    let customer = ExecTable::from_catalog(customer_tbl, "customer");
-    let orders = ExecTable::from_catalog(orders_tbl, "orders");
-    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
+    let customer = ExecTable::from_catalog(&customer_tbl, "customer");
+    let orders = ExecTable::from_catalog(&orders_tbl, "orders");
+    let lineitem = ExecTable::from_catalog(&lineitem_tbl, "lineitem");
 
     // Column indices:
     // customer: 0=c_custkey, 1=c_name (String hash)
@@ -672,8 +672,8 @@ pub(crate) fn execute_q14_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
     let lineitem_tbl =
         catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
-    let part = ExecTable::from_catalog(part_tbl, "part");
-    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
+    let part = ExecTable::from_catalog(&part_tbl, "part");
+    let lineitem = ExecTable::from_catalog(&lineitem_tbl, "lineitem");
 
     // Column indices (from tpc_h_schema in datasource/csv.rs):
     // part:     0=p_partkey (Int64), 4=p_type (String + StringSearchColumn)
@@ -1001,8 +1001,8 @@ pub(crate) fn execute_q16_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
     let partsupp_tbl =
         catalog.get("partsupp").ok_or_else(|| Error::NotFound("table 'partsupp'".into()))?;
 
-    let part = ExecTable::from_catalog(part_tbl, "part");
-    let partsupp = ExecTable::from_catalog(partsupp_tbl, "partsupp");
+    let part = ExecTable::from_catalog(&part_tbl, "part");
+    let partsupp = ExecTable::from_catalog(&partsupp_tbl, "partsupp");
 
     // Column indices (from tpc_h_schema in datasource/csv.rs):
     // part:     0=p_partkey (Int64), 3=p_brand (String hash), 4=p_type (String hash + StringSearchColumn),
@@ -1290,8 +1290,8 @@ pub(crate) fn execute_q15_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
     let lineitem_tbl =
         catalog.get("lineitem").ok_or_else(|| Error::NotFound("table 'lineitem'".into()))?;
 
-    let supplier = ExecTable::from_catalog(supplier_tbl, "supplier");
-    let lineitem = ExecTable::from_catalog(lineitem_tbl, "lineitem");
+    let supplier = ExecTable::from_catalog(&supplier_tbl, "supplier");
+    let lineitem = ExecTable::from_catalog(&lineitem_tbl, "lineitem");
 
     // Column indices (from tpc_h_schema in datasource/csv.rs):
     // supplier: 0=s_suppkey (Int64), 1=s_name (String hash),

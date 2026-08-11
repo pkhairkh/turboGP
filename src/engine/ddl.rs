@@ -68,82 +68,85 @@ impl QueryEngine {
     /// - `DROP COLUMN col` — removes the column; the schema is updated.
     /// - `ALTER COLUMN col TYPE new_type` — changes the column type in
     ///   the schema (a no-op for data, since all cells are u64).
-    pub(crate) fn execute_alter_table(&mut self, at: crate::sql::AlterTable) -> Result<QueryResult> {
+    pub(crate) fn execute_alter_table(
+        &mut self,
+        at: crate::sql::AlterTable,
+    ) -> Result<QueryResult> {
         use crate::sql::AlterAction;
         let full_name =
             if at.schema == "dbo" { at.name.clone() } else { format!("{}.{}", at.schema, at.name) };
         match at.action {
             AlterAction::AddColumn(col_def) => {
-                let table = self
-                    .catalog
-                    .get_mut(&full_name)
-                    .ok_or_else(|| Error::NotFound(format!("table \"{full_name}\"")))?;
-                // Build the default cell value for existing rows.
-                let default_cell = default_cell_for_type(&col_def, table.row_count);
-                // Append a new column with `row_count` copies of the default.
-                let new_col: Vec<u64> = vec![default_cell; table.row_count];
-                table.columns.push(std::sync::Arc::new(new_col));
-                table.column_names.push(col_def.name.clone());
-                table.string_columns.push(None);
-                table.null_bitmaps.push(None);
-                // Update the schema.
-                if let Some(ref mut schema) = table.schema {
-                    schema.columns.push(crate::schema::table_schema::ColumnSchema {
-                        name: col_def.name.clone(),
-                        col_type: col_def.col_type.clone(),
-                        not_null: col_def.not_null,
-                        primary_key: col_def.primary_key,
-                        // Task 3.2 + 3.5: preserve column-level UNIQUE / CHECK.
-                        unique: col_def.unique,
-                        check: col_def.check.clone(),
-                    });
-                }
-                Ok(QueryResult::empty())
+                self.catalog
+                    .with_mut(&full_name, |table| -> Result<QueryResult> {
+                        // Build the default cell value for existing rows.
+                        let default_cell = default_cell_for_type(&col_def, table.row_count);
+                        // Append a new column with `row_count` copies of the default.
+                        let new_col: Vec<u64> = vec![default_cell; table.row_count];
+                        table.columns.push(std::sync::Arc::new(new_col));
+                        table.column_names.push(col_def.name.clone());
+                        table.string_columns.push(None);
+                        table.null_bitmaps.push(None);
+                        // Update the schema.
+                        if let Some(ref mut schema) = table.schema {
+                            schema.columns.push(crate::schema::table_schema::ColumnSchema {
+                                name: col_def.name.clone(),
+                                col_type: col_def.col_type.clone(),
+                                not_null: col_def.not_null,
+                                primary_key: col_def.primary_key,
+                                // Task 3.2 + 3.5: preserve column-level UNIQUE / CHECK.
+                                unique: col_def.unique,
+                                check: col_def.check.clone(),
+                            });
+                        }
+                        Ok(QueryResult::empty())
+                    })
+                    .ok_or_else(|| Error::NotFound(format!("table \"{full_name}\"")))?
             }
             AlterAction::DropColumn(col_name) => {
-                let table = self
-                    .catalog
-                    .get_mut(&full_name)
-                    .ok_or_else(|| Error::NotFound(format!("table \"{full_name}\"")))?;
-                let idx = table
-                    .column_idx(&col_name)
-                    .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
-                table.columns.remove(idx);
-                table.column_names.remove(idx);
-                if idx < table.string_columns.len() {
-                    table.string_columns.remove(idx);
-                }
-                if idx < table.null_bitmaps.len() {
-                    table.null_bitmaps.remove(idx);
-                }
-                if let Some(ref mut schema) = table.schema {
-                    if idx < schema.columns.len() {
-                        schema.columns.remove(idx);
-                    }
-                }
-                // Also drop any index on this column.
-                self.index_manager.drop(&full_name, &col_name);
-                Ok(QueryResult::empty())
+                self.catalog
+                    .with_mut(&full_name, |table| -> Result<QueryResult> {
+                        let idx = table
+                            .column_idx(&col_name)
+                            .ok_or_else(|| Error::NotFound(format!("column \"{col_name}\"")))?;
+                        table.columns.remove(idx);
+                        table.column_names.remove(idx);
+                        if idx < table.string_columns.len() {
+                            table.string_columns.remove(idx);
+                        }
+                        if idx < table.null_bitmaps.len() {
+                            table.null_bitmaps.remove(idx);
+                        }
+                        if let Some(ref mut schema) = table.schema {
+                            if idx < schema.columns.len() {
+                                schema.columns.remove(idx);
+                            }
+                        }
+                        // Also drop any index on this column.
+                        self.index_manager.drop(&full_name, &col_name);
+                        Ok(QueryResult::empty())
+                    })
+                    .ok_or_else(|| Error::NotFound(format!("table \"{full_name}\"")))?
             }
             AlterAction::AlterColumnType { column, new_type } => {
-                let table = self
-                    .catalog
-                    .get_mut(&full_name)
-                    .ok_or_else(|| Error::NotFound(format!("table \"{full_name}\"")))?;
-                let idx = table
-                    .column_idx(&column)
-                    .ok_or_else(|| Error::NotFound(format!("column \"{column}\"")))?;
-                if let Some(ref mut schema) = table.schema {
-                    if idx < schema.columns.len() {
-                        schema.columns[idx].col_type = new_type;
-                    }
-                }
-                // For widening conversions (INT→BIGINT, FLOAT→DOUBLE) this
-                // is a no-op (all stored as u64). For narrowing, the cell
-                // values are unchanged (the spec says "truncate" but u64
-                // storage makes that a no-op too — we'd only need to
-                // truncate if we had a separate typed storage format).
-                Ok(QueryResult::empty())
+                self.catalog
+                    .with_mut(&full_name, |table| -> Result<QueryResult> {
+                        let idx = table
+                            .column_idx(&column)
+                            .ok_or_else(|| Error::NotFound(format!("column \"{column}\"")))?;
+                        if let Some(ref mut schema) = table.schema {
+                            if idx < schema.columns.len() {
+                                schema.columns[idx].col_type = new_type;
+                            }
+                        }
+                        // For widening conversions (INT→BIGINT, FLOAT→DOUBLE) this
+                        // is a no-op (all stored as u64). For narrowing, the cell
+                        // values are unchanged (the spec says "truncate" but u64
+                        // storage makes that a no-op too — we'd only need to
+                        // truncate if we had a separate typed storage format).
+                        Ok(QueryResult::empty())
+                    })
+                    .ok_or_else(|| Error::NotFound(format!("table \"{full_name}\"")))?
             }
         }
     }
@@ -152,7 +155,10 @@ impl QueryEngine {
     ///
     /// Registers a named index in the IndexManager and builds the
     /// in-memory hash index data for fast equality lookups.
-    pub(crate) fn execute_create_index(&mut self, ci: crate::sql::CreateIndex) -> Result<QueryResult> {
+    pub(crate) fn execute_create_index(
+        &mut self,
+        ci: crate::sql::CreateIndex,
+    ) -> Result<QueryResult> {
         // Check if an index with the same name already exists.
         if self.index_manager.get_by_name(&ci.index_name).is_some() {
             if ci.if_not_exists {
@@ -213,7 +219,10 @@ impl QueryEngine {
     /// the query shape doesn't match). Returns `Some(Ok(result))` if the
     /// index was used. Returns `Some(Err(...))` if the index lookup was
     /// attempted but failed (e.g. table not found).
-    pub(crate) fn try_indexed_lookup(&self, query: &crate::sql::SelectQuery) -> Option<Result<QueryResult>> {
+    pub(crate) fn try_indexed_lookup(
+        &self,
+        query: &crate::sql::SelectQuery,
+    ) -> Option<Result<QueryResult>> {
         use crate::sql::parser::{Expr, SelectItem, Value};
 
         // Only consider single-FROM queries without JOINs / GROUP BY /

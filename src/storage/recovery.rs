@@ -981,7 +981,7 @@ impl Checkpoint {
             if name == "__dummy__" {
                 continue;
             }
-            if let Some(table) = catalog.get(name) {
+            if let Some(table) = catalog.get(&name) {
                 // Resolve column types: prefer `table.schema`, fall back to INT.
                 let col_types: Vec<ColumnType> = if let Some(ref schema) = table.schema {
                     table
