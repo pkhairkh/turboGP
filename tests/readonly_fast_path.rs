@@ -310,3 +310,49 @@ fn test_route_and_execute_concurrent_selects_run_in_parallel() {
         one_elapsed
     );
 }
+
+// ---------------------------------------------------------------------------
+// Wave 2 Task 2.3 — Catalog concurrent-read test.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_catalog_concurrent_reads_no_deadlock() {
+    // Wave 2 Task 2.3 DoD: 10 threads call catalog.get() concurrently →
+    // no deadlock, no panic.
+    //
+    // The Catalog itself (src/catalog/) is a plain HashMap owned by Agent B.
+    // Agent C cannot add an internal RwLock to it. However, concurrent reads
+    // already work because:
+    //   - execute_readonly(&self) only takes &self.catalog (a shared ref)
+    //   - multiple &self references coexist via the RwLock<QueryEngine> wrapper
+    //   - shared references to a HashMap are Sync (concurrent reads are safe)
+    //
+    // This test verifies that 10 threads calling execute_readonly (which
+    // internally calls catalog.get()) don't deadlock or panic.
+    let mut engine = QueryEngine::in_memory();
+    engine.execute("CREATE TABLE t (id INT)").unwrap();
+    engine.execute("CREATE TABLE t2 (id INT, name VARCHAR(50))").unwrap();
+    for i in 0..100 {
+        engine.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap();
+        engine.execute(&format!("INSERT INTO t2 VALUES ({}, 'name{}')", i, i)).unwrap();
+    }
+    let engine = Arc::new(RwLock::new(engine));
+
+    let mut handles = Vec::new();
+    for thread_id in 0..10 {
+        let engine = Arc::clone(&engine);
+        handles.push(thread::spawn(move || {
+            // Each thread does a mix of reads against t and t2.
+            let guard = engine.read().unwrap();
+            let r1 = guard.execute_readonly("SELECT COUNT(*) FROM t").unwrap();
+            let r2 = guard.execute_readonly("SELECT COUNT(*) FROM t2").unwrap();
+            (thread_id, r1.columns[0].values[0], r2.columns[0].values[0])
+        }));
+    }
+
+    for h in handles {
+        let (tid, c1, c2) = h.join().expect("thread should not panic");
+        assert_eq!(c1, 100, "thread {} saw {} rows in t, expected 100", tid, c1);
+        assert_eq!(c2, 100, "thread {} saw {} rows in t2, expected 100", tid, c2);
+    }
+}
