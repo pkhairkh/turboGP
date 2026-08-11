@@ -358,6 +358,52 @@ impl MvccTxnManager {
         self.txn_states.get(&txn_id).copied().unwrap_or(TxnState::Aborted)
     }
 
+    /// Check if a row version is visible to the active transaction
+    /// (Task 2.4 — dirty-read elimination in `execute_select`).
+    ///
+    /// Simplified variant of [`visible`](Self::visible) that doesn't require
+    /// the caller to construct a full [`MvccTransaction`]. It uses the
+    /// manager's `current_active` transaction (or `0` when no transaction is
+    /// active, i.e. autocommit) as the reader.
+    ///
+    /// A version is visible when:
+    /// - `xmin` is the active txn itself (T sees its own writes), OR `xmin`
+    ///   has reached the `Committed` state (committed before or after the
+    ///   reader's snapshot — this is a coarse check, not a snapshot-stable
+    ///   one, but it's sufficient for dirty-read elimination); AND
+    /// - `xmax` is `None` (version is live), OR `xmax` is the active txn
+    ///   itself (we deleted it → invisible to us), OR `xmax` has NOT reached
+    ///   the `Committed` state (the deleting txn is still in-progress or has
+    ///   aborted — the version is still live from our perspective).
+    ///
+    /// When no transaction is active (`active_id()` is `None`), the reader
+    /// is treated as txn `0` — which is never in `txn_states`, so only
+    /// versions with a *committed* `xmin` and a *non-committed* `xmax` are
+    /// visible. This matches the autocommit semantics of "see the latest
+    /// committed data".
+    pub fn is_row_visible_to_active(&self, version: &RowVersion) -> bool {
+        let active_id = self.active_id().unwrap_or(0);
+        // xmin must be committed (or be the active txn).
+        let xmin_state = self.txn_state(version.xmin);
+        let xmin_visible = version.xmin == active_id || matches!(xmin_state, TxnState::Committed(_));
+        if !xmin_visible {
+            return false;
+        }
+        // xmax: None = live; Some(xmax) = check if the deleter is committed.
+        match version.xmax {
+            None => true,
+            Some(xmax) => {
+                if xmax == active_id {
+                    // We deleted it — invisible to us.
+                    return false;
+                }
+                let xmax_state = self.txn_state(xmax);
+                // Not committed (in-progress or aborted) = still visible.
+                !matches!(xmax_state, TxnState::Committed(_))
+            }
+        }
+    }
+
     /// The current commit_id (monotonic).
     pub fn current_commit_id(&self) -> TxnId {
         self.commit_id

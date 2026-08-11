@@ -157,12 +157,18 @@ fn try_planner_pipeline(
 }
 
 /// Execute a parsed SELECT query against the catalog.
+///
+/// `mvcc` — when `Some(&mgr)`, MVCC visibility filtering is applied: rows
+/// whose `row_versions[i]` has an uncommitted `xmin` (dirty insert) or a
+/// committed `xmax` (deleted) are skipped. Pass `None` for the legacy
+/// non-MVCC path (no filtering). Task 2.4.
 pub fn execute_select(
     query: &SelectQuery,
     extensions: &QueryExtensions,
     catalog: &Catalog,
     kernel_table: &KernelTable,
     cost_model: &crate::planner::CostModel,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
     // Consult all 7 QueryExtensions fields. Each extension influences
     // execution strategy or acts as a soft constraint.
@@ -177,18 +183,26 @@ pub fn execute_select(
         return Err(Error::Other("HAVING requires interpreter fallback".into()));
     }
 
-    // Wave 1 (Agent C): Wire the planner pipeline into the production
-    // execute() path. We always invoke build_plan → Cascades → PlanLowerer
-    // → Scheduler so the AVX-512 kernel table is reachable from execute(),
-    // not just from tests/kernel_pipeline_test.rs. For shapes the Scheduler
-    // fully implements (simple SELECT *, COUNT(*) FROM t), we use the
-    // planner result directly. For everything else, we let the planner run
-    // (incrementing the reachability counter) and then fall through to the
-    // existing direct-scan path so results stay correct.
-    if let Some(planner_result) = try_planner_pipeline(query, catalog, kernel_table, cost_model)? {
-        let mut result = planner_result;
-        result.elapsed_us = 0; // caller sets elapsed_us
-        return Ok(result);
+    // Task 2.4: when MVCC visibility filtering is active, bypass the planner
+    // pipeline (which returns `table.row_count` directly for SELECT * and
+    // COUNT(*)) and the kernel-direct dispatch path (which has its own
+    // fast paths that don't consult `row_versions`). Fall through to the
+    // direct scan path that uses `filter_indices`, where visibility
+    // filtering is applied.
+    if mvcc.is_none() {
+        // Wave 1 (Agent C): Wire the planner pipeline into the production
+        // execute() path. We always invoke build_plan → Cascades → PlanLowerer
+        // → Scheduler so the AVX-512 kernel table is reachable from execute(),
+        // not just from tests/kernel_pipeline_test.rs. For shapes the Scheduler
+        // fully implements (simple SELECT *, COUNT(*) FROM t), we use the
+        // planner result directly. For everything else, we let the planner run
+        // (incrementing the reachability counter) and then fall through to the
+        // existing direct-scan path so results stay correct.
+        if let Some(planner_result) = try_planner_pipeline(query, catalog, kernel_table, cost_model)? {
+            let mut result = planner_result;
+            result.elapsed_us = 0; // caller sets elapsed_us
+            return Ok(result);
+        }
     }
 
     // 1. Resolve the table(s)
@@ -220,6 +234,11 @@ pub fn execute_select(
     );
 
     // JOIN support: materialize joined table, then dispatch on it.
+    //
+    // Task 2.4 note: the JOIN path is not yet MVCC-aware (it clones the
+    // base/right tables and dispatches on the joined materialisation).
+    // MVCC visibility filtering for JOINs is left to a future wave; the
+    // DoD for Task 2.4 only requires single-table SELECT filtering.
     if !query.joins.is_empty() || plan.strategy == crate::planner::optimizer::ExecStrategy::HashJoin
     {
         return execute_with_join(query, extensions, catalog, kernel_table);
@@ -231,10 +250,14 @@ pub fn execute_select(
         return Err(Error::Other("optimizer chose interpreter fallback".into()));
     }
 
-    // Try kernel-direct dispatch first (10-30x faster than per-row evaluation).
-    // Only attempt if the optimizer recommends KernelDirect or doesn't object.
-    if plan.strategy == crate::planner::optimizer::ExecStrategy::KernelDirect
-        || plan.strategy == crate::planner::optimizer::ExecStrategy::Vectorized
+    // Task 2.4: when MVCC visibility filtering is active, skip the
+    // kernel-direct dispatch path (it has its own fast paths like
+    // `QueryShape::CountAll` that return `table.row_count` directly,
+    // bypassing `filter_indices`). Fall through to the direct scan path
+    // where visibility filtering is applied.
+    if mvcc.is_none()
+        && (plan.strategy == crate::planner::optimizer::ExecStrategy::KernelDirect
+            || plan.strategy == crate::planner::optimizer::ExecStrategy::Vectorized)
     {
         match dispatch::execute_dispatched(query, table) {
             Some(Ok(result)) => return Ok(result),
@@ -278,15 +301,15 @@ pub fn execute_select(
 
     let result = if !query_ref.group_by.is_empty() {
         // GROUP BY query
-        execute_group_by(query_ref, &filter, table, tier, kernel_table)?
+        execute_group_by(query_ref, &filter, table, tier, kernel_table, mvcc)?
     } else if query_ref.select.len() == 1 {
         match &query_ref.select[0] {
             SelectItem::Aggregate { func, arg, alias } => {
-                execute_aggregate(func, arg, alias.as_deref(), &filter, table, tier, kernel_table)?
+                execute_aggregate(func, arg, alias.as_deref(), &filter, table, tier, kernel_table, mvcc)?
             }
-            SelectItem::Star => execute_select_star(&filter, table, query_ref.limit)?,
+            SelectItem::Star => execute_select_star(&filter, table, query_ref.limit, mvcc)?,
             SelectItem::Column(name) => {
-                execute_select_column(name, &filter, table, query_ref.limit)?
+                execute_select_column(name, &filter, table, query_ref.limit, mvcc)?
             }
             // `SELECT <int>` — emit a single-row, single-column literal.
             SelectItem::Literal(v) => QueryResult {
@@ -314,7 +337,7 @@ pub fn execute_select(
         let has_agg = query_ref.select.iter().any(|s| matches!(s, SelectItem::Aggregate { .. }));
         if has_agg {
             // Treat as implicit GROUP BY (aggregate without group = single row)
-            execute_aggregate_no_group(&query_ref.select, &filter, table, tier, kernel_table)?
+            execute_aggregate_no_group(&query_ref.select, &filter, table, tier, kernel_table, mvcc)?
         } else {
             execute_select_multi(
                 &query_ref.select,
@@ -322,6 +345,7 @@ pub fn execute_select(
                 table,
                 query_ref.order_by.as_slice(),
                 query_ref.limit,
+                mvcc,
             )?
         }
     } else {
@@ -493,9 +517,10 @@ fn execute_group_by(
     table: &Table,
     _tier: MemoryTier,
     _kernel_table: &KernelTable,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
     // Get matching row indices
-    let indices = filter_indices(where_clause, table);
+    let indices = filter_indices(where_clause, table, mvcc);
 
     // Resolve GROUP BY column indices
     let group_cols: Vec<usize> = query
@@ -748,8 +773,9 @@ fn execute_aggregate_no_group(
     table: &Table,
     _tier: MemoryTier,
     _kernel_table: &KernelTable,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
-    let indices = filter_indices(where_clause, table);
+    let indices = filter_indices(where_clause, table, mvcc);
     let mut cols = Vec::new();
 
     for item in select {
@@ -904,17 +930,18 @@ fn execute_aggregate(
     table: &Table,
     _tier: MemoryTier,
     kernel_table: &KernelTable,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
     let func_upper = func.to_uppercase();
     let name = alias.unwrap_or(func);
 
     match func_upper.as_str() {
-        "COUNT" => execute_count(arg, name, where_clause, table, kernel_table),
-        "SUM" => execute_sum(arg, name, where_clause, table),
-        "AVG" => execute_avg(arg, name, where_clause, table),
-        "MIN" => execute_min(arg, name, where_clause, table),
-        "COUNT_DISTINCT" => execute_count_distinct(arg, name, where_clause, table),
-        "MAX" => execute_max(arg, name, where_clause, table),
+        "COUNT" => execute_count(arg, name, where_clause, table, kernel_table, mvcc),
+        "SUM" => execute_sum(arg, name, where_clause, table, mvcc),
+        "AVG" => execute_avg(arg, name, where_clause, table, mvcc),
+        "MIN" => execute_min(arg, name, where_clause, table, mvcc),
+        "COUNT_DISTINCT" => execute_count_distinct(arg, name, where_clause, table, mvcc),
+        "MAX" => execute_max(arg, name, where_clause, table, mvcc),
         _ => Err(Error::Other(format!("unsupported aggregate function: {}", func))),
     }
 }
@@ -925,9 +952,15 @@ fn execute_count(
     where_clause: &WhereClause,
     table: &Table,
     kernel_table: &KernelTable,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
-    // Special case: COUNT(*) with no WHERE = row count
-    if arg == "*" {
+    // Special case: COUNT(*) with no WHERE = row count.
+    //
+    // Task 2.4: skip this fast path when MVCC visibility filtering is
+    // active — `table.row_count` includes rows whose `xmin` is uncommitted
+    // (dirty inserts) or whose `xmax` is committed (deletes). Fall through
+    // to `filter_indices`, which applies the visibility filter.
+    if mvcc.is_none() && arg == "*" {
         if let WhereClause::None = where_clause {
             return Ok(QueryResult {
                 columns: vec![ResultColumn {
@@ -943,34 +976,40 @@ fn execute_count(
         }
     }
 
-    // Use kernel for single equality filter
-    if let WhereClause::Single(f) = where_clause {
-        if f.op == "=" {
-            let col = &table.columns[f.col_idx];
-            let kernel = kernel_table
-                .select(Operator::ScanEqU64, MemoryTier::L3)
-                .ok_or_else(|| Error::Unsupported("no ScanEqU64 kernel".into()))?;
-            let params =
-                KernelParams { target_u64: f.value, cell_count: col.len(), ..Default::default() };
-            let mut output = [0u8; 64];
-            let result =
-                unsafe { kernel.execute(col.as_ptr() as *const u8, output.as_mut_ptr(), &params) };
-            return Ok(QueryResult {
-                columns: vec![ResultColumn {
-                    name: name.into(),
-                    values: vec![result.count],
-                    string_values: None,
-                    type_oid: 0,
-                    null_mask: None,
-                }],
-                row_count: 1,
-                elapsed_us: 0,
-            });
+    // Use kernel for single equality filter.
+    //
+    // Task 2.4: skip the kernel path when MVCC is active — the kernel
+    // returns a count without consulting `row_versions`, so dirty / deleted
+    // rows would be counted. Fall through to `filter_indices`.
+    if mvcc.is_none() {
+        if let WhereClause::Single(f) = where_clause {
+            if f.op == "=" {
+                let col = &table.columns[f.col_idx];
+                let kernel = kernel_table
+                    .select(Operator::ScanEqU64, MemoryTier::L3)
+                    .ok_or_else(|| Error::Unsupported("no ScanEqU64 kernel".into()))?;
+                let params =
+                    KernelParams { target_u64: f.value, cell_count: col.len(), ..Default::default() };
+                let mut output = [0u8; 64];
+                let result =
+                    unsafe { kernel.execute(col.as_ptr() as *const u8, output.as_mut_ptr(), &params) };
+                return Ok(QueryResult {
+                    columns: vec![ResultColumn {
+                        name: name.into(),
+                        values: vec![result.count],
+                        string_values: None,
+                        type_oid: 0,
+                        null_mask: None,
+                    }],
+                    row_count: 1,
+                    elapsed_us: 0,
+                });
+            }
         }
     }
 
     // Fallback: row-by-row filtering
-    let indices = filter_indices(where_clause, table);
+    let indices = filter_indices(where_clause, table, mvcc);
     let count = if arg == "*" {
         indices.len() as u64
     } else {
@@ -996,10 +1035,11 @@ fn execute_sum(
     name: &str,
     where_clause: &WhereClause,
     table: &Table,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
     // Check if arg is an arithmetic expression (Wave 44 fix).
     if crate::exec::expr_eval::is_arithmetic_expr(arg) {
-        let indices = filter_indices(where_clause, table);
+        let indices = filter_indices(where_clause, table, mvcc);
         let sum_f64: f64 = indices
             .iter()
             .map(|&i| {
@@ -1034,14 +1074,21 @@ fn execute_sum(
     let idx = table.column_idx(arg).ok_or_else(|| Error::NotFound(format!("column '{}'", arg)))?;
 
     // For large tables with no WHERE, use parallel execution (Wave 29).
+    //
+    // Task 2.4: when MVCC is active, skip the fast path (which iterates
+    // `table.columns[idx]` directly, ignoring `row_versions`) and fall
+    // through to `filter_indices`, which applies the visibility filter.
     let sum: u64 = if let WhereClause::None = where_clause {
-        if table.row_count > 10_000 {
+        if mvcc.is_some() {
+            let indices = filter_indices(where_clause, table, mvcc);
+            indices.iter().map(|&i| table.columns[idx][i]).sum()
+        } else if table.row_count > 10_000 {
             crate::exec::parallel::parallel_sum(&table.columns[idx])
         } else {
             table.columns[idx].iter().sum()
         }
     } else {
-        let indices = filter_indices(where_clause, table);
+        let indices = filter_indices(where_clause, table, mvcc);
         indices.iter().map(|&i| table.columns[idx][i]).sum()
     };
     // Return as f64 bits so scalar_f64() interprets correctly
@@ -1063,9 +1110,10 @@ fn execute_avg(
     name: &str,
     where_clause: &WhereClause,
     table: &Table,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
     let idx = table.column_idx(arg).ok_or_else(|| Error::NotFound(format!("column '{}'", arg)))?;
-    let indices = filter_indices(where_clause, table);
+    let indices = filter_indices(where_clause, table, mvcc);
     if indices.is_empty() {
         return Ok(QueryResult {
             columns: vec![ResultColumn {
@@ -1099,16 +1147,23 @@ fn execute_min(
     name: &str,
     where_clause: &WhereClause,
     table: &Table,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
     let idx = table.column_idx(arg).ok_or_else(|| Error::NotFound(format!("column '{}'", arg)))?;
+    // Task 2.4: when MVCC is active, skip the no-WHERE fast path (which
+    // iterates `table.columns[idx]` directly, ignoring `row_versions`)
+    // and fall through to `filter_indices`, which applies visibility.
     let min = if let WhereClause::None = where_clause {
-        if table.row_count > 10_000 {
+        if mvcc.is_some() {
+            let indices = filter_indices(where_clause, table, mvcc);
+            indices.iter().map(|&i| table.columns[idx][i]).min().unwrap_or(0)
+        } else if table.row_count > 10_000 {
             crate::exec::parallel::parallel_min(&table.columns[idx])
         } else {
             table.columns[idx].iter().min().copied().unwrap_or(0)
         }
     } else {
-        let indices = filter_indices(where_clause, table);
+        let indices = filter_indices(where_clause, table, mvcc);
         indices.iter().map(|&i| table.columns[idx][i]).min().unwrap_or(0)
     };
     Ok(QueryResult {
@@ -1129,16 +1184,23 @@ fn execute_max(
     name: &str,
     where_clause: &WhereClause,
     table: &Table,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
     let idx = table.column_idx(arg).ok_or_else(|| Error::NotFound(format!("column '{}'", arg)))?;
+    // Task 2.4: when MVCC is active, skip the no-WHERE fast path (which
+    // iterates `table.columns[idx]` directly, ignoring `row_versions`)
+    // and fall through to `filter_indices`, which applies visibility.
     let max = if let WhereClause::None = where_clause {
-        if table.row_count > 10_000 {
+        if mvcc.is_some() {
+            let indices = filter_indices(where_clause, table, mvcc);
+            indices.iter().map(|&i| table.columns[idx][i]).max().unwrap_or(0)
+        } else if table.row_count > 10_000 {
             crate::exec::parallel::parallel_max(&table.columns[idx])
         } else {
             table.columns[idx].iter().max().copied().unwrap_or(0)
         }
     } else {
-        let indices = filter_indices(where_clause, table);
+        let indices = filter_indices(where_clause, table, mvcc);
         indices.iter().map(|&i| table.columns[idx][i]).max().unwrap_or(0)
     };
     Ok(QueryResult {
@@ -1163,9 +1225,10 @@ fn execute_count_distinct(
     name: &str,
     where_clause: &WhereClause,
     table: &Table,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
     let idx = table.column_idx(arg).ok_or_else(|| Error::NotFound(format!("column '{}'", arg)))?;
-    let indices = filter_indices(where_clause, table);
+    let indices = filter_indices(where_clause, table, mvcc);
     let mut seen = std::collections::HashSet::new();
     for &i in &indices {
         seen.insert(table.columns[idx][i]);
@@ -1187,8 +1250,9 @@ fn execute_select_star(
     where_clause: &WhereClause,
     table: &Table,
     limit: Option<usize>,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
-    let indices = filter_indices(where_clause, table);
+    let indices = filter_indices(where_clause, table, mvcc);
     let limit = limit.unwrap_or(indices.len());
     let indices: Vec<usize> = indices.into_iter().take(limit).collect();
 
@@ -1216,10 +1280,11 @@ fn execute_select_column(
     where_clause: &WhereClause,
     table: &Table,
     limit: Option<usize>,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
     let idx =
         table.column_idx(name).ok_or_else(|| Error::NotFound(format!("column '{}'", name)))?;
-    let indices = filter_indices(where_clause, table);
+    let indices = filter_indices(where_clause, table, mvcc);
     let limit = limit.unwrap_or(indices.len());
     let indices: Vec<usize> = indices.into_iter().take(limit).collect();
 
@@ -1256,8 +1321,9 @@ fn execute_select_multi(
     table: &Table,
     _order_by: &[(String, bool, crate::sql::parser::NullsOrder)],
     limit: Option<usize>,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
 ) -> Result<QueryResult> {
-    let indices = filter_indices(where_clause, table);
+    let indices = filter_indices(where_clause, table, mvcc);
     let limit = limit.unwrap_or(indices.len());
     let indices: Vec<usize> = indices.into_iter().take(limit).collect();
 
@@ -1417,11 +1483,160 @@ fn where_clause_to_expr(wc: &WhereClause) -> crate::sql::parser::Expr {
 }
 
 /// New filter_indices: tries vectorized batch path first, falls back to per-row.
-fn filter_indices(where_clause: &WhereClause, table: &Table) -> Vec<usize> {
-    if let Some(indices) = filter_indices_batch(where_clause, table) {
-        return indices;
+///
+/// Task 2.4: when `mvcc` is `Some(&mgr)`, additionally filters out rows
+/// whose `row_versions[i]` is invisible to the active transaction (dirty
+/// inserts / committed deletes). This is the single chokepoint for MVCC
+/// visibility filtering in the SELECT execution path.
+///
+/// Task 5.3: when `mvcc` is `Some` AND `table.row_count > 1000`, bypass
+/// the serial batch+retain path and use [`crate::exec::parallel::parallel_scan`]
+/// to fan the row indices out across worker threads. Each worker applies
+/// both the WHERE filter and the MVCC visibility check to its morsel in
+/// one pass — avoiding the intermediate `Vec<usize>` that the serial
+/// path produces between `filter_indices_batch` and the `retain` call.
+/// For small tables or non-MVCC mode, the original serial path is used
+/// (the crossbeam::scope setup cost ~10µs dominates for sub-millisecond
+/// scans).
+fn filter_indices(
+    where_clause: &WhereClause,
+    table: &Table,
+    mvcc: Option<&crate::txn::MvccTxnManager>,
+) -> Vec<usize> {
+    // Task 5.3: parallel MORS scan for large tables under MVCC.
+    // Falls back to the serial path for small tables or when MVCC is off
+    // (the parallel path's benefit is the combined WHERE+visibility scan,
+    // which only matters when MVCC visibility filtering is active — the
+    // serial `filter_indices_batch` already uses SIMD-vectorised filter
+    // evaluation for the WHERE clause alone).
+    if let Some(mgr) = mvcc {
+        if table.row_count > 1000 {
+            return filter_indices_parallel(where_clause, table, mgr);
+        }
     }
-    filter_indices_old(where_clause, table)
+
+    let mut indices = if let Some(indices) = filter_indices_batch(where_clause, table) {
+        indices
+    } else {
+        filter_indices_old(where_clause, table)
+    };
+    if let Some(mgr) = mvcc {
+        // Retain only rows whose row_versions[i] is visible to the active
+        // txn. Rows without a row_versions entry (e.g. tables created
+        // before MVCC was enabled, or rows added by non-MVCC DDL) are kept
+        // — backward compatibility.
+        indices.retain(|&i| {
+            if i < table.row_versions.len() {
+                mgr.is_row_visible_to_active(&table.row_versions[i])
+            } else {
+                true
+            }
+        });
+    }
+    indices
+}
+
+/// Task 5.3 — parallel MORS scan path for `filter_indices`.
+///
+/// Splits the row-index range `0..table.row_count` into morsels of 256
+/// rows each, distributes them across `available_parallelism()` worker
+/// threads via `parallel_scan`, and has each worker apply BOTH the WHERE
+/// filter AND the MVCC visibility check to its morsel in a single pass.
+///
+/// # Why this is faster than the serial path for large MVCC tables
+///
+/// The serial path is two-pass:
+/// 1. `filter_indices_batch` evaluates the WHERE clause via the
+///    SIMD-vectorised `exec::vectorized::filter_rows`, producing a
+///    `Vec<usize>` of matching indices.
+/// 2. `indices.retain(...)` walks that Vec and applies
+///    `mgr.is_row_visible_to_active` per index.
+///
+/// For a 100k-row table with no WHERE clause, step 1 produces a 100k-entry
+/// Vec (every row matches), and step 2 walks all 100k entries — that's
+/// 200k iterations total, single-threaded.
+///
+/// The parallel path is single-pass per morsel: each worker walks its
+/// 256-row morsel ONCE, applying both the WHERE check and the visibility
+/// check, and emits only the surviving indices. With 8 worker threads,
+/// the wall-clock time is ~1/8th of the serial path (minus the crossbeam
+/// scope setup cost).
+///
+/// # Closure `Sync` requirement
+///
+/// `parallel_scan` requires `F: Fn(&[usize]) -> Vec<T> + Sync`. The
+/// closure here captures `&WhereClause`, `&Table`, and `&MvccTxnManager`
+/// by reference. All three are `Sync`:
+/// - `WhereClause`: contains only `String`, `u64`, `Box<WhereClause>` — all `Sync`.
+/// - `Table`: contains `Vec<Arc<Vec<u64>>>`, `Vec<String>`, etc. — all `Sync`.
+/// - `MvccTxnManager`: contains `HashMap`, `HashSet`, `Option` of plain
+///   data types — all `Sync`.
+///
+/// So the closure is `Sync` and `&Closure: Send`, satisfying the spawn
+/// requirement.
+fn filter_indices_parallel(
+    where_clause: &WhereClause,
+    table: &Table,
+    mgr: &crate::txn::MvccTxnManager,
+) -> Vec<usize> {
+    // Worker count: hardware concurrency. Fall back to 1 if unavailable
+    // (e.g. cgroups-restricted containers). When 1, parallel_scan takes
+    // its serial fast path (no spawn overhead).
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    // Morsel size: 256 rows. This is small enough to keep L1d cache-hot
+    // (256 rows × 8 bytes/col × ncols ≈ 4-32 KB per morsel) and large
+    // enough to amortise the per-morsel spawn dispatch cost (~1µs).
+    let morsel_size = 256;
+
+    // Build the row-index range. For very large tables this is a one-shot
+    // allocation of `row_count * 8` bytes (8 MB per million rows) —
+    // acceptable since `filter_indices` already returns an owned Vec.
+    let row_indices: Vec<usize> = (0..table.row_count).collect();
+
+    // The per-morsel worker. Each invocation receives a `&[usize]` slice
+    // of row indices and returns the subset that passes both the WHERE
+    // filter and the MVCC visibility check.
+    //
+    // The closure is `Fn` (called once per morsel) and `Sync` (captures
+    // only `&` references to `Sync` types — see the function doc comment).
+    let worker = |morsel: &[usize]| -> Vec<usize> {
+        let mut out = Vec::with_capacity(morsel.len());
+        for &i in morsel {
+            // MVCC visibility: rows without a row_versions entry (e.g.
+            // tables created before MVCC was enabled, or rows added by
+            // non-MVCC DDL) are kept — backward compatibility.
+            let visible = if i < table.row_versions.len() {
+                mgr.is_row_visible_to_active(&table.row_versions[i])
+            } else {
+                true
+            };
+            if !visible {
+                continue;
+            }
+
+            // WHERE clause: `WhereClause::None` is the common case
+            // (SELECT * with no filter) — skip the row build entirely.
+            let matches_where = match where_clause {
+                WhereClause::None => true,
+                _ => {
+                    // Build the row on demand. This is O(ncols) per row
+                    // — the same cost as `filter_indices_old`. A future
+                    // wave could push the WHERE eval into the SIMD
+                    // vectorised path (per-morsel, not per-row).
+                    let row: Vec<u64> = table.columns.iter().map(|c| c[i]).collect();
+                    row_matches(where_clause, &row, table)
+                }
+            };
+            if matches_where {
+                out.push(i);
+            }
+        }
+        out
+    };
+
+    crate::exec::parallel::parallel_scan(&row_indices, num_threads, morsel_size, worker)
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,11 +1709,17 @@ fn execute_with_join(
         return result;
     }
 
-    // Fallback to old executor path
+    // Fallback to old executor path.
+    //
+    // Task 2.4 note: the JOIN path is not yet MVCC-aware — `running` is a
+    // materialised clone whose `row_versions` is empty (Table::clone
+    // copies the vec but the JOIN materialisation logic doesn't preserve
+    // version chains). We pass `None` here; MVCC visibility filtering for
+    // JOINed tables is left to a future wave.
     let filter = parse_where(&modified.where_clause, &running)?;
     let tier = crate::memory::tier::MemoryTier::L3;
     if !modified.group_by.is_empty() {
-        execute_group_by(&modified, &filter, &running, tier, _kernel_table)
+        execute_group_by(&modified, &filter, &running, tier, _kernel_table, None)
     } else if modified.select.len() == 1 {
         match &modified.select[0] {
             crate::sql::parser::SelectItem::Aggregate { func, arg, alias } => execute_aggregate(
@@ -1509,12 +1730,13 @@ fn execute_with_join(
                 &running,
                 tier,
                 _kernel_table,
+                None,
             ),
             crate::sql::parser::SelectItem::Star => {
-                execute_select_star(&filter, &running, modified.limit)
+                execute_select_star(&filter, &running, modified.limit, None)
             }
             crate::sql::parser::SelectItem::Column(name) => {
-                execute_select_column(name, &filter, &running, modified.limit)
+                execute_select_column(name, &filter, &running, modified.limit, None)
             }
             // Bare literal in a join-context SELECT — emit single row.
             // Joins with literal SELECT items are not in the ClickBench /
@@ -1545,6 +1767,7 @@ fn execute_with_join(
             &running,
             &modified.order_by,
             modified.limit,
+            None,
         )
     }
 }
@@ -1622,3 +1845,19 @@ fn cross_join_into(
     };
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests — Task 5.2 + 5.3
+//
+// Moved to `src/engine/executor_tests.rs` in Task 8.2-fix to satisfy
+// the 2000-LOC file-size limit. The tests exercise the parallel_scan
+// integration in `filter_indices` directly (not via `execute()`).
+//
+// `#[path]` is needed because `mod foo;` declared in `executor.rs`
+// (a file module) would otherwise resolve to `src/engine/executor/foo.rs`,
+// and we don't want to convert `executor` into a directory module just
+// to host its tests.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+#[path = "executor_tests.rs"]
+mod executor_tests;
