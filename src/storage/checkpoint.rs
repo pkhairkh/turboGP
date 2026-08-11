@@ -30,7 +30,8 @@
 //!   preserved on round-trip; length/precision is not. CHECK constraints
 //!   (`Expr` trees) are NOT preserved — the legacy `checkpoint.sql` is
 //!   still written for full fidelity.
-//! - `row_versions`: `Vec<SerializedRowVersion>` — 4 primitive fields.
+//! - `row_versions`: `Vec<Vec<SerializedRowVersion>>` — one chain per
+//!   logical row, each chain a `Vec` of 4-field `SerializedRowVersion`.
 //!
 //! ## Atomicity
 //!
@@ -70,8 +71,12 @@ pub struct SerializedTable {
     pub null_bitmaps: Vec<Option<Vec<bool>>>,
     /// Optional table schema (column types + constraints).
     pub schema: Option<SerializedTableSchema>,
-    /// MVCC row versions (parallel to rows; empty when MVCC is not in use).
-    pub row_versions: Vec<SerializedRowVersion>,
+    /// MVCC row version chains (one `Vec<SerializedRowVersion>` per
+    /// logical row; empty outer vec when MVCC is not in use). Task 3.1
+    /// layout: the in-memory `Table.row_versions` is now
+    /// `Vec<Vec<RowVersion>>`, and this serialised form mirrors that
+    /// shape so the chain boundaries round-trip correctly.
+    pub row_versions: Vec<Vec<SerializedRowVersion>>,
 }
 
 /// A serializable row-version metadata entry (MVCC).
@@ -159,8 +164,8 @@ pub fn save(catalog: &crate::catalog::Catalog, path: &Path) -> std::io::Result<u
         .table_names()
         .into_iter()
         .filter(|n| *n != "__dummy__")
-        .filter_map(|name| catalog.get(name))
-        .map(serialize_table)
+        .filter_map(|name| catalog.get(&name))
+        .map(|t| serialize_table(&t))
         .collect();
 
     let tmp_path = path.with_extension("bin.tmp");
@@ -201,7 +206,7 @@ pub fn load(path: &Path) -> std::io::Result<crate::catalog::Catalog> {
     let reader = BufReader::new(file);
     let tables: Vec<SerializedTable> = bincode::deserialize_from(reader)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let mut catalog = crate::catalog::Catalog::new();
+    let catalog = crate::catalog::Catalog::new();
     for st in tables {
         let table = deserialize_table(st);
         catalog.register(table);
@@ -235,14 +240,19 @@ fn serialize_table(t: &Table) -> SerializedTable {
         t.null_bitmaps.iter().map(|opt| opt.as_ref().map(|bm| bm.bits().to_vec())).collect();
 
     let schema = t.schema.as_ref().map(serialize_schema);
-    let row_versions: Vec<SerializedRowVersion> = t
+    let row_versions: Vec<Vec<SerializedRowVersion>> = t
         .row_versions
         .iter()
-        .map(|v| SerializedRowVersion {
-            xmin: v.xmin,
-            xmax: v.xmax,
-            values: v.values.clone(),
-            deleted: v.deleted,
+        .map(|chain| {
+            chain
+                .iter()
+                .map(|v| SerializedRowVersion {
+                    xmin: v.xmin,
+                    xmax: v.xmax,
+                    values: v.values.clone(),
+                    deleted: v.deleted,
+                })
+                .collect()
         })
         .collect();
 
@@ -288,14 +298,19 @@ fn deserialize_table(st: SerializedTable) -> Table {
         .collect();
 
     let schema = st.schema.map(deserialize_schema);
-    let row_versions: Vec<RowVersion> = st
+    let row_versions: Vec<Vec<RowVersion>> = st
         .row_versions
         .into_iter()
-        .map(|v| RowVersion {
-            xmin: v.xmin,
-            xmax: v.xmax,
-            values: v.values,
-            deleted: v.deleted,
+        .map(|chain| {
+            chain
+                .into_iter()
+                .map(|v| RowVersion {
+                    xmin: v.xmin,
+                    xmax: v.xmax,
+                    values: v.values,
+                    deleted: v.deleted,
+                })
+                .collect()
         })
         .collect();
 
@@ -702,18 +717,22 @@ mod tests {
         assert!(!bm.is_null(4));
     }
 
-    /// A table with MVCC row versions round-trips the version metadata.
+    /// A table with MVCC row versions round-trips the version metadata
+    /// (Task 3.1: now using per-row `Vec<Vec<RowVersion>>` chains).
     #[test]
     fn test_row_versions_roundtrip() {
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("mvcc.bin");
 
         let mut table = make_int_table("t", vec![("x", vec![10, 20, 30])]);
-        table.append_row_version(RowVersion::new(1, vec![10]));
+        // Row 0: single live version.
+        table.append_row_version(0, RowVersion::new(1, vec![10]));
+        // Row 1: a version that was later deleted (xmax set).
         let mut v2 = RowVersion::new(2, vec![20]);
         v2.xmax = Some(5);
-        table.append_row_version(v2);
-        table.append_row_version(RowVersion::new_delete(3));
+        table.append_row_version(1, v2);
+        // Row 2: a delete-marker version.
+        table.append_row_version(2, RowVersion::new_delete(3));
 
         let mut catalog = crate::catalog::Catalog::new();
         catalog.register(table);
@@ -721,14 +740,53 @@ mod tests {
         save(&catalog, &path).expect("save");
         let loaded = load(&path).expect("load");
         let t = loaded.get("t").expect("table present");
+        // Three chains (one per row), each with one version.
         assert_eq!(t.row_versions.len(), 3);
-        assert_eq!(t.row_versions[0].xmin, 1);
-        assert_eq!(t.row_versions[0].xmax, None);
-        assert_eq!(t.row_versions[0].values, vec![10]);
-        assert!(!t.row_versions[0].deleted);
-        assert_eq!(t.row_versions[1].xmin, 2);
-        assert_eq!(t.row_versions[1].xmax, Some(5));
-        assert_eq!(t.row_versions[2].deleted, true);
+        assert_eq!(t.row_versions[0].len(), 1);
+        assert_eq!(t.row_versions[0][0].xmin, 1);
+        assert_eq!(t.row_versions[0][0].xmax, None);
+        assert_eq!(t.row_versions[0][0].values, vec![10]);
+        assert!(!t.row_versions[0][0].deleted);
+        assert_eq!(t.row_versions[1].len(), 1);
+        assert_eq!(t.row_versions[1][0].xmin, 2);
+        assert_eq!(t.row_versions[1][0].xmax, Some(5));
+        assert_eq!(t.row_versions[2].len(), 1);
+        assert_eq!(t.row_versions[2][0].deleted, true);
+    }
+
+    /// Task 3.1: a multi-version chain (UPDATE pattern) round-trips
+    /// correctly — both the old (tombstoned) and new (live) versions
+    /// survive save/load with their order and metadata intact.
+    #[test]
+    fn test_row_versions_chain_roundtrip() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("mvcc_chain.bin");
+
+        let mut table = make_int_table("t", vec![("x", vec![10])]);
+        // Row 0: INSERT v1 (committed, live), then UPDATE tombstones v1
+        // and appends v2.
+        table.append_row_version(0, RowVersion::new(1, vec![10]));
+        let mut v1_tombstone = RowVersion::new(1, vec![10]);
+        v1_tombstone.xmax = Some(2);
+        // Replace the chain with a two-version chain (old + new).
+        table.row_versions[0] = vec![v1_tombstone, RowVersion::new(2, vec![99])];
+
+        let mut catalog = crate::catalog::Catalog::new();
+        catalog.register(table);
+
+        save(&catalog, &path).expect("save");
+        let loaded = load(&path).expect("load");
+        let t = loaded.get("t").expect("table present");
+        assert_eq!(t.row_versions.len(), 1, "one chain");
+        assert_eq!(t.row_versions[0].len(), 2, "chain has two versions");
+        // Old version (chain[0]) is tombstoned.
+        assert_eq!(t.row_versions[0][0].xmin, 1);
+        assert_eq!(t.row_versions[0][0].xmax, Some(2));
+        assert_eq!(t.row_versions[0][0].values, vec![10]);
+        // New version (chain[1]) is live and carries the new value.
+        assert_eq!(t.row_versions[0][1].xmin, 2);
+        assert_eq!(t.row_versions[0][1].xmax, None);
+        assert_eq!(t.row_versions[0][1].values, vec![99]);
     }
 
     /// A table with foreign keys round-trips the FK constraints.

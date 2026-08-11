@@ -112,12 +112,12 @@ impl Date {
     /// Day of week using Zeller's congruence (branchless, SIMD-friendly).
     /// Returns 0=Sunday, 1=Monday, ..., 6=Saturday (PostgreSQL convention).
     pub fn dow(&self) -> i32 {
-        ((self.0 + 4).rem_euclid(7))
+        (self.0 + 4).rem_euclid(7)
     }
 
     /// ISO day of week: 1=Monday, 7=Sunday.
     pub fn isodow(&self) -> i32 {
-        ((self.0 + 3).rem_euclid(7) + 1)
+        (self.0 + 3).rem_euclid(7) + 1
     }
 
     pub fn doy(&self) -> u32 {

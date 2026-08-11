@@ -209,6 +209,7 @@ pub fn execute_select(
     let table = catalog
         .get(&query.from)
         .ok_or_else(|| Error::NotFound(format!("table '{}'", query.from)))?;
+    let table = &table;
 
     // 0. Consult the cost-based optimizer to choose an execution strategy.
     let row_count = table.row_count as u64;
@@ -1521,19 +1522,59 @@ fn filter_indices(
         filter_indices_old(where_clause, table)
     };
     if let Some(mgr) = mvcc {
-        // Retain only rows whose row_versions[i] is visible to the active
-        // txn. Rows without a row_versions entry (e.g. tables created
+        // Retain only rows whose row_versions[i] chain contains a visible
+        // version. Rows without a row_versions entry (e.g. tables created
         // before MVCC was enabled, or rows added by non-MVCC DDL) are kept
         // — backward compatibility.
-        indices.retain(|&i| {
-            if i < table.row_versions.len() {
-                mgr.is_row_visible_to_active(&table.row_versions[i])
-            } else {
-                true
-            }
-        });
+        //
+        // Task 3.1: `row_versions[i]` is now a `Vec<RowVersion>` (chain).
+        // We iterate the chain in reverse and accept the row if ANY version
+        // is visible (the latest visible version wins — the iterator
+        // short-circuits on the first visible version, which is the
+        // snapshot-isolation read rule).
+        indices.retain(|&i| row_visible_to_active(table, mgr, i));
     }
     indices
+}
+
+/// Check if row `i` is visible to the active transaction under MVCC.
+///
+/// Task 3.1: iterates the version chain at `row_versions[i]` in reverse
+/// and returns `true` if ANY version is visible to the active transaction
+/// (the latest visible version wins — short-circuits on first hit).
+///
+/// Rows without a `row_versions` entry (chain vec too short) or with an
+/// empty chain are treated as visible (backward compatibility with
+/// non-MVCC tables / pre-MVCC rows).
+///
+/// Task 3.2: the visibility check is now snapshot-aware — it uses
+/// [`MvccTxnManager::is_visible_with_snapshot`] with the active txn's
+/// `snapshot_id` (or `current_commit_id` in autocommit mode) and the
+/// active txn's `id` (or `0` in autocommit). This is the snapshot-
+/// isolation read rule: a transaction sees at most one version of each
+/// row, namely the newest version whose `xmin` committed at or before
+/// the txn's snapshot (or was created by the txn itself).
+fn row_visible_to_active(
+    table: &Table,
+    mgr: &crate::txn::MvccTxnManager,
+    i: usize,
+) -> bool {
+    if i >= table.row_versions.len() {
+        return true; // No chain — backward compat.
+    }
+    let chain = &table.row_versions[i];
+    if chain.is_empty() {
+        return true; // Empty chain — backward compat.
+    }
+    // Task 3.2: snapshot-isolation visibility check. In autocommit
+    // (no active txn), the reader is txn 0 with `snapshot_id =
+    // current_commit_id` (sees all committed data).
+    let active_txn_id = mgr.active_id().unwrap_or(0);
+    let snapshot_id = mgr.active_snapshot_id().unwrap_or_else(|| mgr.current_commit_id());
+    chain
+        .iter()
+        .rev()
+        .any(|v| mgr.is_visible_with_snapshot(v, snapshot_id, active_txn_id))
 }
 
 /// Task 5.3 — parallel MORS scan path for `filter_indices`.
@@ -1604,15 +1645,7 @@ fn filter_indices_parallel(
     let worker = |morsel: &[usize]| -> Vec<usize> {
         let mut out = Vec::with_capacity(morsel.len());
         for &i in morsel {
-            // MVCC visibility: rows without a row_versions entry (e.g.
-            // tables created before MVCC was enabled, or rows added by
-            // non-MVCC DDL) are kept — backward compatibility.
-            let visible = if i < table.row_versions.len() {
-                mgr.is_row_visible_to_active(&table.row_versions[i])
-            } else {
-                true
-            };
-            if !visible {
+            if !row_visible_to_active(table, mgr, i) {
                 continue;
             }
 
@@ -1661,6 +1694,7 @@ fn execute_with_join(
         let right = catalog
             .get(&join.table)
             .ok_or_else(|| Error::NotFound(format!("table '{}'", join.table)))?;
+        let right = &right;
 
         // Wave 49 fix: respect the parsed join type. Previously the executor
         // always dispatched `JoinType::Inner`, silently turning every LEFT /

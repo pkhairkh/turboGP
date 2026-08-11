@@ -11,6 +11,12 @@ pub mod page;
 pub mod recovery;
 pub mod replication;
 
+// Wave 5 (Task 5.1+): real Raft consensus via openraft. Compiled only
+// when the `raft` feature is enabled, so the default build does not pull
+// in openraft or its tokio dependency.
+#[cfg(feature = "raft")]
+pub mod raft;
+
 pub use buffer_pool::{BufferPool, PageId};
 pub use checkpoint::BinaryCheckpoint;
 pub use page::{Page, PageHeader, HEADER_SIZE, PAGE_CELLS, PAGE_SIZE};

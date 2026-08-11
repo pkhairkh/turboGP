@@ -13,15 +13,29 @@
 //! 3. The primary streams WAL records from the given position.
 //! 4. The replica applies each record to its own engine.
 //! 5. The connection stays open; new records are streamed as they're written.
+//!
+//! ## ACK wire protocol (Task 6.1)
+//!
+//! In `SyncMode::Synchronous`, the primary sends each record as
+//! `REPLICATE <lsn> <record_json>\n` and waits for the replica to respond
+//! with `ACK <lsn>\n` before considering the commit durable. The LSN in
+//! the ACK MUST match the LSN in the `REPLICATE` line; a mismatch (or a
+//! timeout) fails the commit. In `SyncMode::Asynchronous` the primary
+//! sends the same `REPLICATE` line but does NOT wait for the ACK
+//! (fire-and-forget); the replica still sends ACKs, which accumulate in
+//! the TCP receive buffer. The replica accepts both the new
+//! `REPLICATE <lsn> <json>` format and the legacy plain-`<json>` format
+//! (the latter produces no ACK, for backward compat with older senders).
 
 use crate::engine::QueryEngine;
 use crate::storage::recovery::{PhysicalChange, WalRecord};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // =========================================================================
 // WalStreamer (TCP)
@@ -34,8 +48,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// and sent over the TCP connection. The replica receives the records and
 /// applies them.
 pub struct WalStreamer {
-    /// The TCP stream to send records to (None if not connected).
-    stream: Option<TcpStream>,
+    /// The TCP write half (None if not connected). Task 6.1: the read
+    /// half is held separately in `reader` so `sync_wait` can read ACK
+    /// lines without interfering with `stream_record`'s writes.
+    writer: Option<TcpStream>,
+    /// The TCP read half, wrapped in a BufReader for line-oriented ACK
+    /// reads (Task 6.1). Cloned from the same underlying socket as
+    /// `writer` via `TcpStream::try_clone`.
+    reader: Option<BufReader<TcpStream>>,
+    /// LSN of the most recently sent record that's awaiting an ACK
+    /// (Task 6.1). Set by `stream_record`; consumed by `sync_wait`.
+    /// `None` means no pending ACK (either nothing was sent since the
+    /// last `sync_wait`, or the streamer isn't connected).
+    pending_ack_lsn: Option<u64>,
+    /// Kill switch (Task 6.4 test helper). When set, `stream_record` and
+    /// `sync_wait` return `Err` immediately, simulating a dead replica
+    /// for quorum tests without having to actually crash the receiver.
+    kill_switch: Arc<AtomicBool>,
     /// Bytes sent so far.
     pub bytes_sent: u64,
     /// Records sent so far.
@@ -45,53 +74,205 @@ pub struct WalStreamer {
 impl WalStreamer {
     /// Create a new WalStreamer (not yet connected).
     pub fn new() -> Self {
-        Self { stream: None, bytes_sent: 0, records_sent: 0 }
+        Self {
+            writer: None,
+            reader: None,
+            pending_ack_lsn: None,
+            kill_switch: Arc::new(AtomicBool::new(false)),
+            bytes_sent: 0,
+            records_sent: 0,
+        }
     }
 
     /// Connect to a replica at the given address.
     ///
-    /// Returns an error if the connection fails.
+    /// Returns an error if the connection fails. After connecting, the
+    /// streamer holds separate read and write halves (cloned from the
+    /// same underlying socket) so the ACK protocol can read ACK lines
+    /// while writes are unimpeded (Task 6.1).
     pub fn connect(&mut self, addr: &str) -> Result<(), String> {
         let stream = TcpStream::connect(addr)
             .map_err(|e| format!("connect to {}: {}", addr, e))?;
         stream.set_nodelay(true).ok();
-        self.stream = Some(stream);
+        let reader_stream = stream.try_clone()
+            .map_err(|e| format!("try_clone reader: {}", e))?;
+        self.writer = Some(stream);
+        self.reader = Some(BufReader::new(reader_stream));
         Ok(())
     }
 
-    /// Check if the streamer is connected to a replica.
+    /// Check if the streamer is connected to a replica AND not killed.
     pub fn is_connected(&self) -> bool {
-        self.stream.is_some()
+        self.writer.is_some() && !self.kill_switch.load(Ordering::SeqCst)
     }
 
-    /// Serialize and send a WAL record to the replica.
+    /// Serialize and send a WAL record to the replica (Task 6.1 ACK wire
+    /// protocol).
     ///
-    /// Returns the number of bytes sent. Returns an error if not connected
-    /// or if the send fails.
+    /// Sends `REPLICATE <lsn> <record_json>\n` over the TCP stream. The
+    /// record's `lsn` is recorded as `pending_ack_lsn` so a subsequent
+    /// `sync_wait` knows which ACK to expect. This method does NOT block
+    /// on the ACK — call `sync_wait` (or `stream_and_wait_ack`) for that.
+    ///
+    /// Returns the number of bytes sent. Returns an error if not
+    /// connected (and the kill switch is set), if the send fails, or if
+    /// serialization fails.
     pub fn stream_record(&mut self, record: &WalRecord) -> Result<usize, String> {
+        if self.kill_switch.load(Ordering::SeqCst) {
+            return Err("streamer killed (simulated replica down)".to_string());
+        }
         let serialized = serde_json::to_string(record)
             .map_err(|e| format!("serialize: {}", e))?;
-        let bytes = serialized.len() + 1; // +1 for newline delimiter
+        // Task 6.1 ACK wire protocol: "REPLICATE <lsn> <json>\n".
+        let line = format!("REPLICATE {} {}\n", record.lsn, serialized);
+        let bytes = line.len();
 
-        if let Some(stream) = &mut self.stream {
-            stream.write_all(serialized.as_bytes())
+        if let Some(stream) = &mut self.writer {
+            stream.write_all(line.as_bytes())
                 .map_err(|e| format!("write: {}", e))?;
-            stream.write_all(b"\n")
-                .map_err(|e| format!("write newline: {}", e))?;
             self.bytes_sent += bytes as u64;
             self.records_sent += 1;
+            self.pending_ack_lsn = Some(record.lsn);
             Ok(bytes)
         } else {
-            // Not connected — just count (for testing)
+            // Not connected — just count (for testing the wiring without
+            // a live replica). pending_ack_lsn is still set so sync_wait
+            // knows the "send" happened; sync_wait treats a missing
+            // reader as "local-only" and returns Ok without reading.
             self.bytes_sent += bytes as u64;
             self.records_sent += 1;
+            self.pending_ack_lsn = Some(record.lsn);
             Ok(bytes)
         }
     }
 
+    /// Send a record and synchronously wait for the matching ACK (Task 6.1).
+    ///
+    /// Convenience wrapper: calls `stream_record` (which sends
+    /// `REPLICATE <lsn> <json>\n` and sets `pending_ack_lsn`), then
+    /// reads `ACK <lsn>\n` within `timeout_ms`. Returns `Ok(bytes_sent)`
+    /// if the ACK LSN matches the record's LSN, `Err` on timeout,
+    /// mismatch, or send failure.
+    ///
+    /// On a successful ACK, `pending_ack_lsn` is cleared (so a
+    /// subsequent `sync_wait` is a no-op flush rather than a duplicate
+    /// ACK wait).
+    pub fn stream_and_wait_ack(
+        &mut self,
+        record: &WalRecord,
+        timeout_ms: u64,
+    ) -> Result<usize, String> {
+        let bytes = self.stream_record(record)?;
+        let expected_lsn = record.lsn;
+        // stream_record set pending_ack_lsn; consume it directly so
+        // wait_for_ack doesn't double-clear.
+        self.pending_ack_lsn = None;
+        // For the local-only (not-connected) case, there's no ACK to
+        // read — treat as success (matches sync_wait's local-only path).
+        if self.reader.is_none() {
+            return Ok(bytes);
+        }
+        self.read_and_verify_ack(expected_lsn, timeout_ms)?;
+        Ok(bytes)
+    }
+
+    /// Read one ACK line and verify its LSN matches `expected_lsn`
+    /// (Task 6.1). Uses `set_read_timeout` on the underlying socket so
+    /// the read can't block forever.
+    fn read_and_verify_ack(
+        &mut self,
+        expected_lsn: u64,
+        timeout_ms: u64,
+    ) -> Result<(), String> {
+        let reader = self.reader.as_mut().ok_or("not connected")?;
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(timeout_ms)))
+            .map_err(|e| format!("set_read_timeout: {}", e))?;
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut
+                || e.kind() == std::io::ErrorKind::WouldBlock
+            {
+                "ACK read timeout".to_string()
+            } else {
+                format!("read ACK: {}", e)
+            }
+        })?;
+        if n == 0 {
+            return Err("connection closed before ACK".to_string());
+        }
+        // Strip trailing newline / CR.
+        while line.ends_with('\n') || line.ends_with('\r') {
+            line.pop();
+        }
+        let ack_lsn = parse_ack_lsn(&line)?;
+        if ack_lsn != expected_lsn {
+            return Err(format!(
+                "ACK LSN mismatch: expected {}, got {}",
+                expected_lsn, ack_lsn
+            ));
+        }
+        Ok(())
+    }
+
+    /// Wait for the pending ACK (Task 6.1).
+    ///
+    /// If `stream_record` was called since the last `sync_wait`, reads
+    /// `ACK <lsn>\n` within `timeout_ms` and verifies the LSN matches
+    /// the most recently sent record. Returns `Ok(())` if ACK'd, `Err`
+    /// on timeout, mismatch, or if the kill switch is set.
+    ///
+    /// If no record is pending (no `stream_record` since the last
+    /// `sync_wait`), falls back to `flush()` for backward compat with
+    /// pre-6.1 callers. If the streamer isn't connected (local-only
+    /// testing), returns `Ok(())` without reading — there's no ACK to
+    /// wait for.
+    fn wait_for_ack(&mut self, timeout_ms: u64) -> Result<(), String> {
+        if self.kill_switch.load(Ordering::SeqCst) {
+            self.pending_ack_lsn = None;
+            return Err("streamer killed (simulated replica down)".to_string());
+        }
+        let expected_lsn = match self.pending_ack_lsn.take() {
+            Some(lsn) => lsn,
+            None => {
+                // No pending ACK: flush (backward compat).
+                return self.flush();
+            }
+        };
+        // Local-only (not connected): no ACK to wait for.
+        if self.reader.is_none() {
+            return Ok(());
+        }
+        self.read_and_verify_ack(expected_lsn, timeout_ms)
+    }
+
+    /// Kill the streamer (Task 6.4 test helper).
+    ///
+    /// Sets the kill switch and shuts down the underlying TCP connection
+    /// (so the receiver sees EOF). All subsequent `stream_record` and
+    /// `sync_wait` calls return `Err`. Used by quorum tests to simulate
+    /// a replica going down without having to crash the receiver
+    /// process.
+    pub fn kill(&mut self) {
+        self.kill_switch.store(true, Ordering::SeqCst);
+        if let Some(writer) = &mut self.writer {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+        }
+        self.writer = None;
+        self.reader = None;
+        self.pending_ack_lsn = None;
+    }
+
+    /// Whether the streamer is alive (not killed) (Task 6.4 test helper).
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        !self.kill_switch.load(Ordering::SeqCst)
+    }
+
     /// Flush the TCP stream.
     pub fn flush(&mut self) -> Result<(), String> {
-        if let Some(stream) = &mut self.stream {
+        if let Some(stream) = &mut self.writer {
             stream.flush().map_err(|e| format!("flush: {}", e))?;
         }
         Ok(())
@@ -143,28 +324,85 @@ impl crate::storage::recovery::WalStreamSink for WalStreamer {
     }
 
     /// Task 6.1: in `SyncMode::Synchronous`, `Wal::append_and_sync` calls
-    /// this after `stream()` to block until the record has left the
-    /// process. The simplified implementation calls `self.flush()`, which
-    /// flushes the underlying TCP stream (or no-ops if not connected).
-    /// Returns `Err` if the flush fails, which propagates as a commit
-    /// failure in synchronous mode.
+    /// this after `stream()` to block until the replica ACKs the record.
+    /// Blocks on `ACK <lsn>\n` for up to 5 seconds; returns `Err` on
+    /// timeout, LSN mismatch, or kill-switch. The commit then fails
+    /// (the replica did not ACK in time). In `SyncMode::Asynchronous`
+    /// this is never called by `Wal::append_and_sync`.
     fn sync_wait(&mut self) -> Result<(), String> {
-        self.flush()
+        self.wait_for_ack(5000)
+    }
+}
+
+/// Quorum policy for synchronous replication (Task 6.3).
+///
+/// Controls how many replica ACKs `MultiWalStreamSink::sync_wait` waits
+/// for before returning `Ok`. Used by `Wal::append_and_sync` in
+/// `SyncMode::Synchronous` to decide whether the commit is durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuorumPolicy {
+    /// Wait for `ceil(N/2) + 1` ACKs (majority). The default — tolerates
+    /// up to `floor(N/2)` replica failures.
+    Majority,
+    /// Wait for all `N` ACKs. Strongest consistency; tolerates zero
+    /// replica failures.
+    All,
+    /// Wait for 1 ACK (any). Weakest consistency; tolerates `N-1`
+    /// replica failures.
+    Any,
+}
+
+impl QuorumPolicy {
+    /// Number of ACKs required for a fan-out set of `n` streamers.
+    #[must_use]
+    pub fn required(&self, n: usize) -> usize {
+        match self {
+            QuorumPolicy::Majority => n / 2 + 1,
+            QuorumPolicy::All => n,
+            QuorumPolicy::Any => 1.min(n),
+        }
     }
 }
 
 /// A sink that fans out records to multiple `WalStreamer`s (Task 5.3).
 ///
 /// Used by `RaftNode::on_become_leader` to stream WAL records to all
-/// followers via a single sink attached to the `Wal`.
+/// followers via a single sink attached to the `Wal`. In
+/// `SyncMode::Synchronous`, `sync_wait` enforces a [`QuorumPolicy`]
+/// (default `Majority`): the commit succeeds only if at least
+/// `policy.required(N)` replicas ACK within the per-streamer timeout.
 pub struct MultiWalStreamSink {
     streamers: Vec<WalStreamer>,
+    quorum: QuorumPolicy,
 }
 
 impl MultiWalStreamSink {
-    /// Create an empty multi-sink.
+    /// Create an empty multi-sink with the default quorum policy
+    /// (`Majority`).
     pub fn new() -> Self {
-        Self { streamers: Vec::new() }
+        Self {
+            streamers: Vec::new(),
+            quorum: QuorumPolicy::Majority,
+        }
+    }
+
+    /// Create an empty multi-sink with the given quorum policy (Task 6.3).
+    pub fn with_quorum(quorum: QuorumPolicy) -> Self {
+        Self {
+            streamers: Vec::new(),
+            quorum,
+        }
+    }
+
+    /// Set the quorum policy (Task 6.3).
+    pub fn set_quorum(&mut self, quorum: QuorumPolicy) {
+        self.quorum = quorum;
+    }
+
+    /// Return the current quorum policy (Task 6.3).
+    #[must_use]
+    pub fn quorum(&self) -> QuorumPolicy {
+        self.quorum
     }
 
     /// Add a streamer to the fan-out set.
@@ -181,6 +419,20 @@ impl MultiWalStreamSink {
     pub fn is_empty(&self) -> bool {
         self.streamers.is_empty()
     }
+
+    /// Get a shared reference to the streamer at `index` (Task 6.4 test
+    /// helper — used to call `kill()` on a specific streamer to simulate
+    /// a replica going down).
+    pub fn streamer(&self, index: usize) -> Option<&WalStreamer> {
+        self.streamers.get(index)
+    }
+
+    /// Get a mutable reference to the streamer at `index` (Task 6.4 test
+    /// helper — used to call `kill()` on a specific streamer to simulate
+    /// a replica going down).
+    pub fn streamer_mut(&mut self, index: usize) -> Option<&mut WalStreamer> {
+        self.streamers.get_mut(index)
+    }
 }
 
 impl Default for MultiWalStreamSink {
@@ -193,7 +445,8 @@ impl crate::storage::recovery::WalStreamSink for MultiWalStreamSink {
     fn stream(&mut self, record: &WalRecord) -> Result<usize, String> {
         let mut total = 0;
         // Stream to all followers. A failure on one follower doesn't stop
-        // streaming to the others (best-effort replication).
+        // streaming to the others (best-effort fan-out). Per-follower
+        // ACK results are resolved later in `sync_wait` (quorum).
         for streamer in &mut self.streamers {
             match streamer.stream_record(record) {
                 Ok(n) => total += n,
@@ -205,18 +458,86 @@ impl crate::storage::recovery::WalStreamSink for MultiWalStreamSink {
         Ok(total)
     }
 
-    /// Task 6.1: flush every child streamer so all followers receive the
-    /// record before `append_and_sync` returns. A failure on one follower
-    /// is logged but does not fail the call (best-effort, matching the
-    /// `stream()` semantics). A future task may make this configurable
-    /// (e.g. require-quorum ACK).
+    /// Task 6.3: quorum-based sync_wait. Spawns a thread per streamer,
+    /// each calling `WalStreamer::sync_wait` (which blocks on the ACK
+    /// for up to 5 s). Counts ACKs; returns `Ok` once the quorum is
+    /// met, `Err` if the overall 6 s deadline passes without quorum.
+    ///
+    /// The streamers are moved into the worker threads and reclaimed
+    /// (via `join`) before returning, so the sink is reusable for the
+    /// next record.
     fn sync_wait(&mut self) -> Result<(), String> {
-        for streamer in &mut self.streamers {
-            if let Err(e) = streamer.flush() {
-                log::warn!("multi-sink: sync_wait flush failed: {e}");
+        let n = self.streamers.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let required = self.quorum.required(n);
+
+        // Spawn a thread per streamer. Each thread calls
+        // `WalStreamer::sync_wait` (the trait method, which blocks on the
+        // ACK for up to 5 s) and reports Ok/Err via a channel. The
+        // streamers are moved into the threads and reclaimed via `join`
+        // before returning, so the sink is reusable.
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let streamers = std::mem::take(&mut self.streamers);
+        let mut handles = Vec::with_capacity(streamers.len());
+        for mut streamer in streamers {
+            let tx = tx.clone();
+            let handle = std::thread::spawn(move || {
+                let result = streamer.sync_wait();
+                // Send the Ok/Err result; ignore send errors (the
+                // receiver may have already given up after quorum).
+                let _ = tx.send(result.is_ok());
+                streamer
+            });
+            handles.push(handle);
+        }
+        // Drop the last sender clone so `recv_timeout` returns
+        // `Disconnected` once all threads finish sending.
+        drop(tx);
+
+        // Wait for quorum or the overall 6 s deadline (1 s slack over
+        // the per-streamer 5 s ACK timeout so a slow-but-successful
+        // streamer still counts).
+        let deadline = Instant::now() + Duration::from_millis(6000);
+        let mut success_count = 0usize;
+        let mut total_count = 0usize;
+        while total_count < handles.len() {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(timeout) {
+                Ok(true) => {
+                    success_count += 1;
+                    total_count += 1;
+                    if success_count >= required {
+                        break;
+                    }
+                }
+                Ok(false) => {
+                    total_count += 1;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
             }
         }
-        Ok(())
+
+        // Reclaim the streamers (join all threads; best-effort — a
+        // panicked thread's streamer is lost, which is acceptable for
+        // a degraded sink).
+        self.streamers = handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .collect();
+
+        if success_count >= required {
+            Ok(())
+        } else {
+            Err(format!(
+                "quorum not met: {}/{} ACKs (required {}, policy {:?})",
+                success_count, n, required, self.quorum
+            ))
+        }
     }
 }
 
@@ -272,6 +593,10 @@ impl WalReceiver {
     ///
     /// Each received record is applied via the `apply` callback.
     /// Returns the number of records applied.
+    ///
+    /// Task 6.1: accepts both the new `REPLICATE <lsn> <json>` wire
+    /// format (sends `ACK <lsn>\n` back after applying) and the legacy
+    /// plain-`<json>` format (no ACK, for backward compat).
     pub fn accept_and_apply<F>(&mut self, mut apply: F) -> Result<u64, String>
     where
         F: FnMut(&WalRecord),
@@ -280,12 +605,16 @@ impl WalReceiver {
             .ok_or("receiver not bound")?;
         let (mut stream, addr) = listener.accept()
             .map_err(|e| format!("accept: {}", e))?;
+        stream.set_nodelay(true).ok();
         let mut buffer = String::new();
         let mut chunk = [0u8; 4096];
 
         loop {
-            let n = stream.read(&mut chunk)
-                .map_err(|e| format!("read: {}", e))?;
+            let n = match stream.read(&mut chunk) {
+                Ok(n) => n,
+                Err(e) if is_conn_closed(&e) => break,
+                Err(e) => return Err(format!("read: {}", e)),
+            };
             if n == 0 {
                 break; // connection closed
             }
@@ -296,14 +625,23 @@ impl WalReceiver {
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].to_string();
                 buffer = buffer[pos + 1..].to_string();
-                if let Ok(record) = serde_json::from_str::<WalRecord>(&line) {
-                    apply(&record);
-                    self.records_received += 1;
-                    // Task 6.4: track the highest applied LSN so the
-                    // replica can resume from last_applied_lsn + 1 on
-                    // reconnect.
-                    if record.lsn > self.last_applied_lsn {
-                        self.last_applied_lsn = record.lsn;
+                let (wire_lsn, record, is_new_format) = match parse_replicate_line(&line) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
+                apply(&record);
+                self.records_received += 1;
+                // Task 6.4: track the highest applied LSN so the
+                // replica can resume from last_applied_lsn + 1 on
+                // reconnect.
+                if record.lsn > self.last_applied_lsn {
+                    self.last_applied_lsn = record.lsn;
+                }
+                // Task 6.1: send ACK for the new wire format.
+                if is_new_format {
+                    let ack = format!("ACK {}\n", wire_lsn);
+                    if let Err(e) = stream.write_all(ack.as_bytes()) {
+                        log::warn!("receiver: failed to send ACK: {e}");
                     }
                 }
             }
@@ -326,6 +664,11 @@ impl WalReceiver {
     /// The loop runs until the connection closes or an unrecoverable error
     /// occurs (read failure, or apply failure when `continue_on_error` is
     /// false).
+    ///
+    /// Task 6.1: accepts both the new `REPLICATE <lsn> <json>` wire
+    /// format (sends `ACK <lsn>\n` back after applying, even on apply
+    /// error so the primary isn't blocked) and the legacy plain-`<json>`
+    /// format (no ACK, for backward compat).
     pub fn run_apply_loop<F>(&mut self, mut apply: F) -> Result<u64, String>
     where
         F: FnMut(&WalRecord) -> Result<(), String>,
@@ -334,13 +677,17 @@ impl WalReceiver {
             .ok_or("receiver not bound")?;
         let (mut stream, _addr) = listener.accept()
             .map_err(|e| format!("accept: {}", e))?;
+        stream.set_nodelay(true).ok();
         let mut buffer = String::new();
         let mut chunk = [0u8; 4096];
         let continue_on_error = self.continue_on_error;
 
         loop {
-            let n = stream.read(&mut chunk)
-                .map_err(|e| format!("read: {}", e))?;
+            let n = match stream.read(&mut chunk) {
+                Ok(n) => n,
+                Err(e) if is_conn_closed(&e) => break,
+                Err(e) => return Err(format!("read: {}", e)),
+            };
             if n == 0 {
                 break; // connection closed
             }
@@ -350,25 +697,41 @@ impl WalReceiver {
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].to_string();
                 buffer = buffer[pos + 1..].to_string();
-                if let Ok(record) = serde_json::from_str::<WalRecord>(&line) {
-                    match apply(&record) {
-                        Ok(()) => {
-                            self.records_received += 1;
-                            // Task 6.4: track the highest applied LSN so
-                            // the replica can resume from
-                            // `last_applied_lsn + 1` on reconnect.
-                            if record.lsn > self.last_applied_lsn {
-                                self.last_applied_lsn = record.lsn;
+                let (wire_lsn, record, is_new_format) = match parse_replicate_line(&line) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
+                match apply(&record) {
+                    Ok(()) => {
+                        self.records_received += 1;
+                        // Task 6.4: track the highest applied LSN so
+                        // the replica can resume from
+                        // `last_applied_lsn + 1` on reconnect.
+                        if record.lsn > self.last_applied_lsn {
+                            self.last_applied_lsn = record.lsn;
+                        }
+                        // Task 6.1: send ACK for the new wire format.
+                        if is_new_format {
+                            let ack = format!("ACK {}\n", wire_lsn);
+                            if let Err(e) = stream.write_all(ack.as_bytes()) {
+                                log::warn!("receiver: failed to send ACK: {e}");
                             }
                         }
-                        Err(e) => {
-                            log::warn!("replication apply error: {e}");
-                            if !continue_on_error {
-                                return Err(format!("apply error: {e}"));
-                            }
-                            // Continue — count the record as received but not applied.
-                            self.records_received += 1;
+                    }
+                    Err(e) => {
+                        log::warn!("replication apply error: {e}");
+                        // Still send the ACK so the primary isn't
+                        // blocked waiting for it (best-effort — the
+                        // apply failed, but the record was received).
+                        if is_new_format {
+                            let ack = format!("ACK {}\n", wire_lsn);
+                            let _ = stream.write_all(ack.as_bytes());
                         }
+                        if !continue_on_error {
+                            return Err(format!("apply error: {e}"));
+                        }
+                        // Continue — count the record as received but not applied.
+                        self.records_received += 1;
                     }
                 }
             }
@@ -410,8 +773,80 @@ impl WalReceiver {
 }
 
 // =========================================================================
-// Raft consensus (minimal implementation)
+// Wire-protocol parsers (Task 6.1)
 // =========================================================================
+
+/// Parse a wire-protocol line into `(wire_lsn, record, is_new_format)`
+/// (Task 6.1).
+///
+/// Accepts both:
+/// - The new ACK-protocol format: `REPLICATE <lsn> <json>` — the `lsn`
+///   is the wire-protocol LSN used for ACK correlation; the `<json>` is
+///   a serialized `WalRecord`. Returns `is_new_format = true` so the
+///   receiver knows to send `ACK <lsn>\n` back.
+/// - The legacy plain-JSON format: just `<json>` (a serialized
+///   `WalRecord` with no `REPLICATE` prefix). Returns `is_new_format =
+///   false` so the receiver does NOT send an ACK (backward compat with
+///   older senders that don't implement the ACK protocol).
+///
+/// Returns `None` if the line doesn't parse as either format (the
+/// caller should skip it).
+fn parse_replicate_line(line: &str) -> Option<(u64, WalRecord, bool)> {
+    if let Some(rest) = line.strip_prefix("REPLICATE ") {
+        // New format: "REPLICATE <lsn> <json>".
+        let mut parts = rest.splitn(2, ' ');
+        let lsn_str = parts.next()?;
+        let json = parts.next()?;
+        let wire_lsn: u64 = lsn_str.parse().ok()?;
+        let record: WalRecord = serde_json::from_str(json).ok()?;
+        Some((wire_lsn, record, true))
+    } else {
+        // Legacy format: plain JSON.
+        let record: WalRecord = serde_json::from_str(line).ok()?;
+        Some((record.lsn, record, false))
+    }
+}
+
+/// Parse an `ACK <lsn>` line (Task 6.1). Returns the LSN, or `Err` if
+/// the line isn't a well-formed ACK.
+fn parse_ack_lsn(line: &str) -> Result<u64, String> {
+    let rest = line
+        .strip_prefix("ACK ")
+        .ok_or_else(|| format!("expected 'ACK <lsn>', got: {}", line))?;
+    rest.parse::<u64>()
+        .map_err(|e| format!("parse ACK lsn '{}': {}", rest, e))
+}
+
+/// Whether an `io::Error` indicates the peer closed (or reset) the
+/// connection (Task 6.1). When the primary drops a `WalStreamer` while
+/// ACKs are still buffered in its receive window, the kernel sends a
+/// RST to the replica; the replica's `read` then returns
+/// `ConnectionReset` instead of a clean `Ok(0)` EOF. Treating these as
+/// "connection closed" keeps the replica's apply loop from erroring out
+/// on a primary-initiated disconnect.
+fn is_conn_closed(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+    )
+}
+
+// =========================================================================
+// Raft consensus (minimal hand-rolled stub — retained for backward compat)
+// =========================================================================
+//
+// Wave 5 (Task 5.1+) replaces this stub with a real openraft integration
+// in `crate::storage::raft` (compiled when the `raft` feature is enabled).
+// `QueryEngine::enable_raft` routes to `raft::RaftManager` when the feature
+// is on, and falls back to this `RaftNode` stub when the feature is off.
+// The stub is kept here so its existing unit tests continue to run in the
+// default build (without `--features raft`); it does NOT implement real
+// Raft consensus (no quorum, no failover, no log replication beyond the
+// WalStreamer TCP fan-out in `on_become_leader`).
 
 /// Raft node state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,7 +856,7 @@ pub enum RaftState {
     Leader,
 }
 
-/// A minimal Raft node.
+/// A minimal Raft node (stub).
 ///
 /// This implements the core Raft consensus algorithm:
 /// - Leader election via randomized timeouts

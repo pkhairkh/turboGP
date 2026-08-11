@@ -57,7 +57,7 @@ impl StoredCredential {
     /// - server_key      = HMAC-SHA-256(salted_password, "Server Key")
     pub fn from_password(password: &str, salt: &[u8], iterations: u32) -> Self {
         let mut salted = [0u8; 32];
-        pbkdf2::<HmacSha256>(password.as_bytes(), salt, iterations, &mut salted);
+        let _ = pbkdf2::<HmacSha256>(password.as_bytes(), salt, iterations, &mut salted);
         let mut client_key = [0u8; 32];
         let mut mac = <HmacSha256 as Mac>::new_from_slice(&salted).expect("hmac key len");
         mac.update(b"Client Key");

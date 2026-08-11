@@ -93,11 +93,10 @@ impl Default for TxnManager {
 /// `Vec<u64>`. The `Arc<Vec<u64>>` columns are cloned into new `Arc`s
 /// pointing at fresh `Vec`s.
 pub fn clone_catalog(catalog: &Catalog) -> Catalog {
-    let mut new_cat = Catalog::new();
+    let new_cat = Catalog::new();
     for name in catalog.table_names() {
-        if let Some(table) = catalog.get(name) {
-            let cloned = table.clone();
-            new_cat.register(cloned);
+        if let Some(table) = catalog.get(&name) {
+            new_cat.register(table);
         }
     }
     new_cat
@@ -110,7 +109,7 @@ mod tests {
     use crate::datasource::Table as DS;
 
     fn make_catalog() -> Catalog {
-        let mut c = Catalog::new();
+        let c = Catalog::new();
         let t = DS::from_loaded(LoadedTable {
             name: "t".into(),
             columns: vec![LoadedColumn {

@@ -153,7 +153,23 @@ pub struct QueryEngine {
     /// Optional Raft node for leader election (Task 4.5 — debt-5.4).
     /// When set via `enable_raft()`, the node participates in leader election.
     /// On becoming leader, it connects WalStreamers to all followers.
+    ///
+    /// When the `raft` feature is enabled, this stub is superseded by
+    /// `raft_manager` (real openraft consensus); the stub remains for
+    /// callers that compile without the feature.
     raft_node: Option<crate::storage::replication::RaftNode>,
+    /// Real openraft-based Raft consensus manager (Wave 5 — Task 5.4).
+    /// Set by `enable_raft` when the `raft` feature is enabled. The
+    /// manager holds the `Raft` handle, the dispatcher task, and the
+    /// in-memory store. WAL records are proposed through it via
+    /// `RaftManager::propose`.
+    #[cfg(feature = "raft")]
+    raft_manager: Option<crate::storage::raft::RaftManager>,
+    /// Dedicated tokio runtime keeping the openraft dispatcher (and the
+    /// Raft core task) alive for the engine's lifetime. Only present when
+    /// `raft` feature is enabled AND `enable_raft` has been called.
+    #[cfg(feature = "raft")]
+    raft_runtime: Option<tokio::runtime::Runtime>,
 }
 
 /// A handle to an active WAL streamer (Wave 5 Task 5.3 — Agent C).
@@ -454,7 +470,7 @@ impl QueryEngine {
     /// All data is in-memory and lost on process exit. Use this for
     /// tests and ephemeral workloads where durability is not required.
     pub fn in_memory() -> Self {
-        let mut catalog = Catalog::new();
+        let catalog = Catalog::new();
         // Register a dummy table that allows `SELECT 1` and `SELECT count(*)`
         // without a FROM clause. The table has one row and one column.
         let dummy = Table {
@@ -489,6 +505,10 @@ impl QueryEngine {
             mvcc_enabled: false,
             wal_streamer: None,
             raft_node: None,
+            #[cfg(feature = "raft")]
+            raft_manager: None,
+            #[cfg(feature = "raft")]
+            raft_runtime: None,
         }
     }
 
@@ -1040,47 +1060,72 @@ impl QueryEngine {
         0
     }
 
-    /// Enable Raft-based leader election (Wave 5 Task 5.4 — Agent C, STUB).
+    /// Enable Raft-based leader election (Wave 5 — Task 5.4).
     ///
-    /// **STUB:** `RaftNode::on_become_leader()` is not yet implemented by
-    /// Agent B. This method creates a `RaftNode` and stores it, but does
-    /// NOT start leader election or wire `Wal::set_streamer()` on becoming
-    /// leader. Documented as debt in `AGENT_C_API_REQUESTS.md`.
+    /// When the `raft` feature is enabled, this creates a real
+    /// [`crate::storage::raft::RaftManager`] backed by openraft and a
+    /// single-node cluster (the node is always leader). The manager
+    /// holds the `Raft` handle and a dedicated tokio runtime; WAL
+    /// records can then be proposed through Raft via
+    /// `RaftManager::propose` for quorum replication (multi-node
+    /// clustering is supported by the underlying `RaftManager::new`
+    /// API; this engine entry point wires the single-node case).
     ///
-    /// When Agent B completes the Raft API, this method should:
-    /// 1. Create a `RaftNode` with the given `node_id` and `peers`.
-    /// 2. Start leader election.
-    /// 3. On becoming leader, call `self.enable_replication(peer_addr)`
-    ///    for each peer.
+    /// When the `raft` feature is NOT enabled, this falls back to the
+    /// hand-rolled stub `RaftNode` (retained for backward compat with
+    /// its existing tests). The stub calls `on_become_leader` on the
+    /// WAL to attach `WalStreamer`s to the peer addresses; it does NOT
+    /// implement real Raft consensus.
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok(())` (stub). Will return an error if
-    /// Raft initialization fails once implemented.
+    /// Returns `Error::Other` if the openraft `Raft` instance cannot be
+    /// created or initialized (e.g. tokio runtime spawn failure).
     pub fn enable_raft(&mut self, node_id: u64, peers: Vec<(u64, String)>) -> Result<()> {
-        // Task 4.5 (debt-5.4): wire enable_raft to create a RaftNode and
-        // start election. On becoming leader, the RaftNode connects a
-        // WalStreamer to each follower via on_become_leader().
-        let mut raft_node = crate::storage::replication::RaftNode::new(node_id);
-        for (peer_id, addr) in &peers {
-            raft_node.add_peer(*peer_id, addr);
-        }
-        // Collect peer addresses for on_become_leader.
-        let peer_addrs: Vec<&str> = peers.iter().map(|(_, a)| a.as_str()).collect();
-        // Start election. In a single-node cluster, this immediately makes
-        // the node leader. In a multi-node cluster, on_become_leader is
-        // called when the node wins the election.
-        if let Some(ref mut wal) = self.wal {
-            let connected = raft_node.on_become_leader(wal, &peer_addrs);
+        #[cfg(feature = "raft")]
+        {
+            // Real openraft path: create a dedicated tokio runtime and
+            // block on building + initializing a single-node cluster.
+            // The runtime is stored in the engine to keep the Raft core
+            // and dispatcher task alive.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| Error::Other(format!("enable_raft: tokio runtime: {e}")))?;
+
+            let mgr = runtime
+                .block_on(crate::storage::raft::RaftManager::new_single_node(node_id))
+                .map_err(|e| Error::Other(format!("enable_raft: {e}")))?;
+
             log::info!(
-                "enable_raft: node {} became leader, connected to {} followers",
-                node_id, connected
+                "enable_raft: openraft node {} initialized as single-node leader ({} peers declared but unused by single-node init)",
+                node_id,
+                peers.len()
             );
-        } else {
-            log::warn!("enable_raft: no WAL attached — leader election skipped");
+            self.raft_manager = Some(mgr);
+            self.raft_runtime = Some(runtime);
+            return Ok(());
         }
-        self.raft_node = Some(raft_node);
-        Ok(())
+        #[cfg(not(feature = "raft"))]
+        {
+            // Stub path: hand-rolled RaftNode + WalStreamer fan-out.
+            let mut raft_node = crate::storage::replication::RaftNode::new(node_id);
+            for (peer_id, addr) in &peers {
+                raft_node.add_peer(*peer_id, addr);
+            }
+            let peer_addrs: Vec<&str> = peers.iter().map(|(_, a)| a.as_str()).collect();
+            if let Some(ref mut wal) = self.wal {
+                let connected = raft_node.on_become_leader(wal, &peer_addrs);
+                log::info!(
+                    "enable_raft: stub node {} became leader, connected to {} followers",
+                    node_id, connected
+                );
+            } else {
+                log::warn!("enable_raft: no WAL attached — leader election skipped");
+            }
+            self.raft_node = Some(raft_node);
+            Ok(())
+        }
     }
 
     /// Append a DML/DDL record to the WAL (if enabled).
@@ -1848,7 +1893,7 @@ impl QueryEngine {
                     // in the CTE table. For simplicity, we compare by row
                     // content (all columns must match).
                     let new_rows = compute_new_rows(
-                        &self.catalog.get(&temp_name).cloned().unwrap_or_else(|| Table {
+                        &self.catalog.get(&temp_name).unwrap_or_else(|| Table {
                             name: temp_name.clone(),
                             columns: vec![],
                             column_names: vec![],
@@ -1870,11 +1915,11 @@ impl QueryEngine {
                     // ones) because the recursive query should only produce
                     // new rows if written correctly. A proper set-difference
                     // would be more correct but expensive.
-                    let cte_table = self
-                        .catalog
-                        .get_mut(&temp_name)
+                    self.catalog
+                        .with_mut(&temp_name, |cte_table| {
+                            append_result_rows(cte_table, &rec_result);
+                        })
                         .ok_or_else(|| Error::NotFound(format!("CTE table \"{temp_name}\"")))?;
-                    append_result_rows(cte_table, &rec_result);
                 }
             }
         }

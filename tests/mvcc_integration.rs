@@ -212,7 +212,8 @@ fn test_execute_select_filters_uncommitted() {
 
     // T2 SELECT COUNT(*) → must be 0. T1's insert has `xmin = t1_id`,
     // `txn_state(t1_id) = InProgress`, and `t1_id != active_id (T2)`, so
-    // `is_row_visible_to_active` returns false → the row is filtered out.
+    // `is_visible_with_snapshot` returns false (xmin is neither the active
+    // txn nor Committed with cid <= snapshot) → the row is filtered out.
     let r = engine.execute("SELECT COUNT(*) FROM t").expect("T2 SELECT (pre-commit)");
     assert_eq!(
         r.columns[0].values[0], 0,
@@ -220,25 +221,43 @@ fn test_execute_select_filters_uncommitted() {
     );
 
     // T1 commits in the background. `txn_state(t1_id)` becomes
-    // `Committed(cid)`. `current_active` stays as T2 (the commit_background_txn
+    // `Committed(cid=1)`. `current_active` stays as T2 (the commit_background_txn
     // helper only clears current_active if it matches t1_id).
     engine.commit_background_txn(t1_id);
 
-    // T2 SELECT COUNT(*) → must be 1. T1's insert now has
-    // `txn_state(t1_id) = Committed`, so `is_row_visible_to_active` returns
-    // true (xmin is committed; xmax is None).
+    // T2 SELECT COUNT(*) → must STILL be 0 (snapshot isolation).
+    //
+    // Task 3.2 replaced the read-committed `is_row_visible_to_active`
+    // with the snapshot-aware `is_visible_with_snapshot`. T2's snapshot
+    // was fixed at BEGIN (snapshot_id=0, before any commits). T1
+    // committed at cid=1 > T2's snapshot, so T1's row is INVISIBLE to
+    // T2 even after T1 commits. This is the snapshot-isolation property
+    // (T2's snapshot is stable for the duration of the txn).
+    //
+    // Previously (pre-Task 3.2) this step asserted 1 — read-committed
+    // behaviour, where T2 would see T1's commit. That was a known
+    // limitation, now fixed.
     let r = engine.execute("SELECT COUNT(*) FROM t").expect("T2 SELECT (post-commit)");
     assert_eq!(
-        r.columns[0].values[0], 1,
-        "T2 must see T1's row after T1 commits (no dirty read, commit visible)"
+        r.columns[0].values[0], 0,
+        "T2 must NOT see T1's commit (snapshot isolation — T1 committed \
+         after T2's snapshot; T2's snapshot is fixed at BEGIN)"
     );
 
-    // Cleanup: commit T2.
+    // Cleanup: commit T2. A new txn T3 (begun after T1's commit) sees
+    // T1's row — its snapshot includes T1's commit.
     engine.execute("COMMIT").expect("T2 COMMIT");
     assert!(
         !engine.mvcc_txn_manager().is_active(),
         "no active txn after T2 COMMIT"
     );
+    engine.execute("BEGIN").expect("T3 BEGIN");
+    let r = engine.execute("SELECT COUNT(*) FROM t").expect("T3 SELECT");
+    assert_eq!(
+        r.columns[0].values[0], 1,
+        "T3 (begun after T1's commit) must see T1's row — its snapshot includes T1's commit"
+    );
+    engine.execute("COMMIT").expect("T3 COMMIT");
 }
 
 /// Task 2.5 — MVCC snapshot isolation (dirty-read elimination + read-
@@ -313,24 +332,24 @@ fn test_mvcc_snapshot_isolation_enforced() {
     // Committed(cid=2). T2 remains current_active.
     engine.commit_background_txn(t3_id);
 
-    // Step 6: T2 SELECT COUNT(*) → returns 2 (read-committed behaviour).
+    // Step 6: T2 SELECT COUNT(*) → returns 1 (snapshot isolation).
     //
-    // Full snapshot isolation would return 1 (T2's snapshot was fixed at
-    // BEGIN, before T3 committed). The current `is_row_visible_to_active`
-    // check uses `txn_state(xmin)` without snapshot_id comparison, so once
-    // T3 commits, its rows are visible to T2. This is read-committed, not
-    // snapshot isolation — documented as a known limitation (future work:
-    // thread a full MvccTransaction through execute_select and use the
-    // snapshot-aware `visible(version, txn)` method).
+    // Task 3.2 replaced `is_row_visible_to_active` (read-committed —
+    // accepted any committed `xmin`) with `is_visible_with_snapshot`
+    // (snapshot-isolation — requires `xmin`'s `commit_id <= snapshot_id`).
+    // T2's snapshot was fixed at BEGIN (cid=1, after T1's commit). T3
+    // committed at cid=2 > T2's snapshot, so T3's row is INVISIBLE to T2
+    // even after T3 commits. This is now correct snapshot isolation
+    // (previously this step asserted 2 — read-committed behaviour — and
+    // was fixed by Task 3.2).
     let r = engine
         .execute("SELECT COUNT(*) FROM t")
         .expect("T2 SELECT (post-T3-commit)");
     assert_eq!(
-        r.columns[0].values[0], 2,
-        "T2 sees T3's commit (read-committed behaviour, NOT full snapshot \
-         isolation — is_row_visible_to_active uses txn_state without \
-         snapshot_id comparison; full SI requires the visible(version, txn) \
-         path, future work)"
+        r.columns[0].values[0], 1,
+        "T2 must NOT see T3's commit (snapshot isolation — T3 committed \
+         after T2's snapshot; is_visible_with_snapshot compares commit_id \
+         to snapshot_id)"
     );
 
     // Step 7 (T4): begin a new background txn. T4 started after T3
@@ -478,21 +497,34 @@ fn test_write_write_conflict_aborts() {
 
     // Step 7 (T3): BEGIN, SELECT v FROM t WHERE id = 1.
     //
-    // Due to the flat row_versions design (Task 2.2/2.3 known limitation),
-    // T1's appended new version (v=99) is NOT found by filter_indices — it
-    // only checks row_versions[0] (the original version, which has
-    // xmax=t1_id committed → invisible to T3). So T3 sees 0 rows. The
-    // in-place column mutation set v=99 in the column, but the visibility
-    // filter hides row 0 entirely. Full MVCC visibility for updated rows
-    // requires the Vec<Vec<RowVersion>> refactor (future work).
+    // Task 3.1 refactored `row_versions` to `Vec<Vec<RowVersion>>` (one
+    // chain per row), so T1's UPDATE appended the new version (v=99) to
+    // the SAME chain at row 0. `filter_indices` iterates the chain in
+    // reverse and finds the new version: `xmin=t1_id` (Committed at
+    // cid=2 <= T3's snapshot=2) → visible, `xmax=None` → live. T3 sees
+    // T1's committed value (v=99).
+    //
+    // Previously (pre-Task 3.1) the flat `row_versions` design appended
+    // the new version to the END of the vec, breaking row-index alignment
+    // and hiding the new version from `filter_indices` — T3 saw 0 rows.
+    // That limitation is now fixed.
     engine.execute("BEGIN").expect("T3 BEGIN");
     let r = engine
         .execute("SELECT v FROM t WHERE id = 1")
         .expect("T3 SELECT");
     assert_eq!(
-        r.row_count, 0,
-        "T3 sees 0 rows — flat row_versions design hides updated rows \
-         (known limitation; full visibility requires Vec<Vec<RowVersion>>)"
+        r.row_count, 1,
+        "T3 must see T1's committed UPDATE (v=99) — the Vec<Vec<RowVersion>> \
+         chain makes the new version visible to readers whose snapshot \
+         includes T1's commit"
+    );
+    let v = r
+        .column("v")
+        .and_then(|c| c.first().copied())
+        .expect("expected a v value");
+    assert_eq!(
+        v, 99,
+        "T3 sees T1's committed value (v=99), not the original (v=10)"
     );
     engine.execute("COMMIT").expect("T3 COMMIT");
 }
@@ -584,5 +616,318 @@ fn test_mvcc_rollback_marks_inserts_invisible() {
     assert_eq!(
         r.columns[0].values[0], 2,
         "autocommit insert must be visible to autocommit reader"
+    );
+}
+
+// =================================================================
+// Task 3.4 + 3.5 + 3.6 — VACUUM compaction, Serializable conflict
+// detection, and snapshot isolation integration.
+// =================================================================
+
+/// Task 3.4 DoD — VACUUM compacts dead row versions from `Table`'s
+/// version chains.
+///
+/// Scenario:
+/// 1. `enable_mvcc`, `CREATE TABLE t (id INT, v INT)`.
+/// 2. `BEGIN; INSERT 100 rows; COMMIT` — each row's chain has 1 version
+///    (the INSERT, `xmin=t1, xmax=None`).
+/// 3. `BEGIN; UPDATE all 100 rows; COMMIT` — each row's chain now has 2
+///    versions: the old INSERT (`xmax=t2`, tombstoned) and the new
+///    UPDATE version (`xmin=t2, xmax=None`, live).
+/// 4. Before VACUUM: every chain has 2 versions.
+/// 5. `VACUUM` — `vacuum_table` removes the 100 dead old versions
+///    (`xmax=t2` committed at `cid=2 <= oldest_active_snapshot=2`).
+/// 6. After VACUUM: every chain has 1 version (the live UPDATE version).
+///
+/// This exercises the engine-level `execute_vacuum` →
+/// `MvccTxnManager::vacuum_table` wiring (Task 3.4), not the standalone
+/// `MvccTable` test type.
+#[test]
+fn test_vacuum_compacts_dead_versions() {
+    let mut engine = QueryEngine::in_memory();
+    engine.enable_mvcc().expect("enable_mvcc");
+    engine.execute("CREATE TABLE t (id INT, v INT)").expect("CREATE TABLE");
+
+    // Step 2: INSERT 100 rows in an explicit txn (so xmin is a real
+    // committed txn_id, not autocommit's 0 which defaults to Aborted).
+    engine.execute("BEGIN").expect("INSERT BEGIN");
+    for i in 0..100u64 {
+        engine
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+            .expect("INSERT");
+    }
+    engine.execute("COMMIT").expect("INSERT COMMIT"); // commit_id = 1
+
+    // Step 3: UPDATE all 100 rows in another explicit txn.
+    engine.execute("BEGIN").expect("UPDATE BEGIN");
+    for i in 0..100u64 {
+        engine
+            .execute(&format!("UPDATE t SET v = {} WHERE id = {}", i * 100, i))
+            .expect("UPDATE");
+    }
+    engine.execute("COMMIT").expect("UPDATE COMMIT"); // commit_id = 2
+
+    // Step 4: before VACUUM, every chain has 2 versions.
+    let table = engine
+        .catalog()
+        .get("t")
+        .expect("table t should exist");
+    assert_eq!(table.row_versions.len(), 100, "100 row chains");
+    for (i, chain) in table.row_versions.iter().enumerate() {
+        assert_eq!(
+            chain.len(),
+            2,
+            "chain {} should have 2 versions before VACUUM (old tombstoned + new live); got {}",
+            i,
+            chain.len()
+        );
+    }
+    drop(table);
+
+    // Step 5: VACUUM.
+    engine.execute("VACUUM").expect("VACUUM");
+
+    // Step 6: after VACUUM, every chain has 1 version (the live one).
+    let table = engine
+        .catalog()
+        .get("t")
+        .expect("table t should exist after VACUUM");
+    for (i, chain) in table.row_versions.iter().enumerate() {
+        assert_eq!(
+            chain.len(),
+            1,
+            "chain {} should have 1 version after VACUUM (dead old version removed); got {}",
+            i,
+            chain.len()
+        );
+        // The surviving version is live (xmax None).
+        assert!(
+            chain[0].xmax.is_none(),
+            "chain {}'s surviving version should be live (xmax None)",
+            i
+        );
+    }
+
+    // Sanity: the data is still readable after VACUUM.
+    let r = engine.execute("SELECT COUNT(*) FROM t").expect("post-VACUUM COUNT");
+    assert_eq!(
+        r.columns[0].values[0], 100,
+        "all 100 rows still visible after VACUUM"
+    );
+}
+
+/// Task 3.5 DoD — Serializable conflict detection aborts a transaction
+/// that updates a row modified by a concurrent committed transaction.
+///
+/// Scenario (adapted to the engine's single-active-txn model):
+/// 1. `enable_mvcc`, `CREATE TABLE t (id INT, v INT)`.
+/// 2. T0: `BEGIN; INSERT (1, 10); COMMIT` — commit_id = 1.
+/// 3. T1: `begin_background_txn_with_isolation(Serializable)` —
+///    snapshot_id = 1, current_active = T1.
+/// 4. T1: `UPDATE t SET v=99 WHERE id=1` — T1 tombstones the old version
+///    and appends a new one. (T1 is current_active, so the engine tags
+///    the row with t1_id.)
+/// 5. T2: `begin_background_txn_with_isolation(Serializable)` —
+///    snapshot_id = 1, current_active = T2. T1 remains InProgress.
+/// 6. T1: `commit_background_txn(t1_id)` — T1 → Committed(2). T2's
+///    snapshot (1) < T1's commit_id (2) → first-committer-wins condition.
+/// 7. T2: `UPDATE t SET v=100 WHERE id=1` → must fail with a
+///    write-write conflict error (T1 committed after T2's snapshot).
+/// 8. T2: `ROLLBACK`.
+///
+/// The conflict is detected by `execute_update`'s Serializable pre-check
+/// (Task 3.5), which calls `check_write_conflict_for_table` on each
+/// matched row before modifying it. The check finds the latest version
+/// visible to T2 (the original INSERT, since T1's new version has
+/// `xmin=t1_id` committed at cid=2 > T2's snapshot=1 → invisible to T2).
+/// That visible version's `xmax = t1_id` is `Committed(2 > 1)` → conflict.
+#[test]
+fn test_serializable_conflict_detection() {
+    let mut engine = QueryEngine::in_memory();
+    engine.enable_mvcc().expect("enable_mvcc");
+    engine.execute("CREATE TABLE t (id INT, v INT)").expect("CREATE TABLE");
+
+    // Step 2 (T0): insert (1, 10) in an explicit committed txn so the
+    // row's xmin is a real Committed txn_id (not autocommit's 0).
+    engine.execute("BEGIN").expect("T0 BEGIN");
+    engine.execute("INSERT INTO t VALUES (1, 10)").expect("T0 INSERT");
+    engine.execute("COMMIT").expect("T0 COMMIT"); // commit_id = 1
+
+    // Step 3 (T1): begin a Serializable background txn. snapshot_id = 1.
+    let t1_id = engine.begin_background_txn_with_isolation(IsolationLevel::Serializable);
+    assert_eq!(
+        engine.mvcc_txn_manager().active_snapshot_id(),
+        Some(1),
+        "T1's snapshot_id should be 1 (commit_id at BEGIN)"
+    );
+
+    // Step 4 (T1): UPDATE the row. T1 is current_active, so the engine
+    // tags the old version's xmax = t1_id and appends a new version with
+    // xmin = t1_id.
+    engine
+        .execute("UPDATE t SET v = 99 WHERE id = 1")
+        .expect("T1 UPDATE");
+
+    // Step 5 (T2): begin another Serializable background txn. T2 becomes
+    // current_active; T1 remains InProgress. T2's snapshot_id = 1 (no
+    // commits since T1 began).
+    let t2_id = engine.begin_background_txn_with_isolation(IsolationLevel::Serializable);
+    assert_eq!(
+        engine.mvcc_txn_manager().active_snapshot_id(),
+        Some(1),
+        "T2's snapshot_id should be 1 (no commits since T1 began)"
+    );
+
+    // Step 6 (T1): commit T1 in the background. T1 → Committed(2).
+    // current_active stays T2 (t1_id != t2_id).
+    engine.commit_background_txn(t1_id);
+    assert_eq!(
+        engine.mvcc_txn_manager().txn_state(t1_id),
+        TxnState::Committed(2),
+        "T1 should be Committed at cid=2"
+    );
+    assert_eq!(
+        engine.mvcc_txn_manager().active_id(),
+        Some(t2_id),
+        "T2 should still be current_active after T1's background commit"
+    );
+
+    // Step 7 (T2): UPDATE the same row → must fail with a write-write
+    // conflict. T1 committed at cid=2 > T2's snapshot=1, and T1 modified
+    // the row (set xmax on the version visible to T2).
+    let result = engine.execute("UPDATE t SET v = 100 WHERE id = 1");
+    assert!(
+        result.is_err(),
+        "T2's UPDATE must fail with a write-write conflict (T1 committed after T2's snapshot)"
+    );
+    let err_msg = format!("{}", result.expect_err("error verified above"));
+    assert!(
+        err_msg.contains("conflict"),
+        "error message should mention 'conflict'; got: {err_msg}"
+    );
+
+    // Step 8 (T2): ROLLBACK to clean up.
+    engine.execute("ROLLBACK").expect("T2 ROLLBACK");
+    assert!(
+        !engine.mvcc_txn_manager().is_active(),
+        "no active txn after T2 ROLLBACK"
+    );
+
+    // Sanity: the row still holds T1's committed value (v=99). T2's
+    // aborted UPDATE did not corrupt the data.
+    let r = engine.execute("SELECT v FROM t WHERE id = 1").expect("post-conflict SELECT");
+    assert_eq!(
+        r.column("v").and_then(|c| c.first().copied()),
+        Some(99),
+        "row should still hold T1's committed value (v=99) after T2's aborted UPDATE"
+    );
+}
+
+/// Task 3.6 DoD — snapshot isolation integration test.
+///
+/// Verifies that a transaction T2 does NOT see rows committed by T3
+/// AFTER T2's snapshot, but DOES see rows committed before. This is the
+/// defining property of snapshot isolation (as opposed to read-committed,
+/// where each statement gets a fresh snapshot).
+///
+/// Scenario (adapted to the engine's single-active-txn model — T3 begins
+/// and inserts BEFORE T2 so that T2 can be current_active for the scan):
+/// 1. T1: `BEGIN; INSERT (1); COMMIT` — row A. commit_id = 1.
+/// 2. T3: `begin_background_txn` — snapshot = 1. INSERT (2) [row B,
+///    uncommitted]. T3 is current_active.
+/// 3. T2: `begin_background_txn` — snapshot = 1. T2 is current_active;
+///    T3 remains InProgress.
+/// 4. T3: `commit_background_txn(t3_id)` — T3 → Committed(2).
+/// 5. T2: `SELECT COUNT(*) FROM t` → must return 1 (row A only; row B's
+///    xmin committed at cid=2 > T2's snapshot=1 → invisible to T2).
+/// 6. T2: `commit_background_txn(t2_id)` — commit_id = 3.
+/// 7. T4: `begin_background_txn` — snapshot = 3. `SELECT COUNT(*) FROM t`
+///    → must return 2 (both rows visible: T1's row Committed(1<=3), T3's
+///    row Committed(2<=3)).
+///
+/// This complements `test_mvcc_snapshot_isolation_enforced` (which tests
+/// the same property with a focus on dirty-read elimination) by following
+/// the Task 3.6 spec's exact step numbering and asserting the snapshot
+/// isolation boundary explicitly.
+#[test]
+fn test_snapshot_isolation_integration() {
+    let mut engine = QueryEngine::in_memory();
+    engine.enable_mvcc().expect("enable_mvcc");
+    engine.execute("CREATE TABLE t (id INT)").expect("CREATE TABLE");
+
+    // Step 1 (T1): insert row A (id=1) and commit. commit_id = 1.
+    engine.execute("BEGIN").expect("T1 BEGIN");
+    engine.execute("INSERT INTO t VALUES (1)").expect("T1 INSERT (row A)");
+    engine.execute("COMMIT").expect("T1 COMMIT");
+    let t1_commit_id = engine.mvcc_txn_manager().current_commit_id();
+    assert_eq!(t1_commit_id, 1, "T1's commit should advance commit_id to 1");
+
+    // Step 2 (T3): begin a background txn and insert row B (id=2),
+    // uncommitted. T3 is current_active; row B's xmin = t3_id (InProgress).
+    let t3_id = engine.begin_background_txn();
+    engine.execute("INSERT INTO t VALUES (2)").expect("T3 INSERT (row B, uncommitted)");
+
+    // Step 3 (T2): begin a background txn. T2 becomes current_active;
+    // T3 remains InProgress. T2's snapshot_id = current_commit_id = 1
+    // (no commits since T1).
+    let t2_id = engine.begin_background_txn();
+    let t2_snapshot = engine
+        .mvcc_txn_manager()
+        .active_snapshot_id()
+        .expect("T2 should be active");
+    assert_eq!(t2_snapshot, 1, "T2's snapshot_id should be 1 (commit_id at BEGIN)");
+
+    // Step 4 (T3): commit T3 in the background. T3 → Committed(cid=2).
+    // cid=2 > T2's snapshot (1) → T3's row must be invisible to T2.
+    engine.commit_background_txn(t3_id);
+    let t3_commit_id = match engine.mvcc_txn_manager().txn_state(t3_id) {
+        TxnState::Committed(cid) => cid,
+        ref s => panic!("T3 should be Committed; got {:?}", s),
+    };
+    assert_eq!(t3_commit_id, 2, "T3's commit_id should be 2");
+    assert!(
+        t3_commit_id > t2_snapshot,
+        "T3's commit_id ({}) must be > T2's snapshot ({}) for snapshot isolation to be observable",
+        t3_commit_id,
+        t2_snapshot
+    );
+
+    // Step 5 (T2): SELECT COUNT(*) → must be 1 (row A only; row B invisible).
+    let r = engine
+        .execute("SELECT COUNT(*) FROM t")
+        .expect("T2 SELECT (after T3 commit)");
+    assert_eq!(
+        r.columns[0].values[0], 1,
+        "T2 must see only row A (snapshot isolation — T3's row B committed \
+         at cid={} > T2's snapshot={})",
+        t3_commit_id,
+        t2_snapshot
+    );
+
+    // Step 6 (T2): commit. commit_id = 3.
+    engine.commit_background_txn(t2_id);
+
+    // Step 7 (T4): begin a fresh txn. snapshot = 3 (>= both commit_ids).
+    // T4 sees both rows.
+    let t4_id = engine.begin_background_txn();
+    let t4_snapshot = engine
+        .mvcc_txn_manager()
+        .active_snapshot_id()
+        .expect("T4 should be active");
+    assert_eq!(t4_snapshot, 3, "T4's snapshot_id should be 3 (after T2's commit)");
+    let r = engine
+        .execute("SELECT COUNT(*) FROM t")
+        .expect("T4 SELECT");
+    assert_eq!(
+        r.columns[0].values[0], 2,
+        "T4 (snapshot={}) must see both rows (T1's cid=1, T3's cid=2, both <= snapshot)",
+        t4_snapshot
+    );
+
+    // Cleanup.
+    engine.commit_background_txn(t4_id);
+    assert!(
+        !engine.mvcc_txn_manager().is_active(),
+        "no active txn after cleanup"
     );
 }

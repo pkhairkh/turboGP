@@ -410,13 +410,22 @@ impl Wal {
     pub fn append_and_sync(&mut self, record: &WalRecord) -> std::io::Result<()> {
         self.append(record)?;
         self.sync()?;
+        // Task 6.1: clone the record with the LSN the Wal just assigned
+        // (self.current_lsn()) so the wire-protocol ACK correlation
+        // works — `record.lsn` passed in by the caller is typically 0
+        // (constructed via `WalRecord::autocommit`), but the ACK
+        // protocol needs the real on-disk LSN so the receiver's
+        // `ACK <lsn>` matches what the sender expects.
+        let assigned_lsn = self.current_lsn();
+        let mut streamed = record.clone();
+        streamed.lsn = assigned_lsn;
         // Task 5.1: stream the record to replicas if a sink is attached.
         // Task 6.1: in `Synchronous` mode, additionally call `sync_wait()`
         // and propagate any failure as an `io::Error` so the caller's
         // transaction aborts (the commit is not durable on the replica).
         if let Some(ref sink) = self.stream_sink {
             if let Ok(mut sink) = sink.lock() {
-                match sink.stream(record) {
+                match sink.stream(&streamed) {
                     Ok(_) => {
                         if self.sync_mode == SyncMode::Synchronous {
                             // Wait for the sink to flush / ACK before
@@ -981,7 +990,7 @@ impl Checkpoint {
             if name == "__dummy__" {
                 continue;
             }
-            if let Some(table) = catalog.get(name) {
+            if let Some(table) = catalog.get(&name) {
                 // Resolve column types: prefer `table.schema`, fall back to INT.
                 let col_types: Vec<ColumnType> = if let Some(ref schema) = table.schema {
                     table
