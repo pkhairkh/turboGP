@@ -36,3 +36,30 @@ duplicate rows on every restart.
 
 **Test impact**: `tests/acid.rs::test_acid_durability_commit_survives_checkpoint`
 now asserts `count == 10` (was `count >= 10`).
+
+---
+
+## Wave 2 — WAL Durability Correctness
+
+### `Wal::append_and_sync(&mut self, record: &WalRecord) -> std::io::Result<()>` — Task 2.1
+
+**New method** in `src/storage/recovery.rs`. Appends a record AND fsyncs
+atomically. Returns `Err` if either the append or the fsync fails.
+
+**Engine wiring** (`src/engine/mod.rs`):
+- `wal_append_txn()` and `wal_append_record()` now return `Result<()>`
+  and call `wal.append_and_sync()` instead of `wal.append()` + `wal.sync()`
+  with errors logged and swallowed.
+- All call sites (BEGIN/COMMIT/ROLLBACK markers, DDL/DML execute paths)
+  now propagate the error with `?`. COMMIT no longer returns success when
+  fsync failed.
+
+### `WalRecord.lsn: u64` + `Wal::current_lsn()` + `Wal::advance_lsn_to()` — Task 2.2
+
+**Already implemented in Task 1.3** (LSN-based idempotent replay). Task 2.2
+formalises the API:
+- `WalRecord.lsn: u64` field with `#[serde(default)]`.
+- `Wal::current_lsn() -> u64` — returns the last assigned LSN.
+- `Wal::advance_lsn_to(lsn: u64)` — bumps `next_lsn` past `lsn`.
+- `Wal::open()` scans existing records to recover `next_lsn`.
+- `Wal::truncate()` preserves `next_lsn` (monotonic across checkpoints).

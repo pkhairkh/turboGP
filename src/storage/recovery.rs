@@ -248,6 +248,29 @@ impl Wal {
         Ok(())
     }
 
+    /// Append a record AND fsync atomically (Task 2.1).
+    ///
+    /// This is the durability-correct append path: if either the append
+    /// or the fsync fails, the error is returned to the caller. The
+    /// engine (Agent C) should call this instead of the legacy
+    /// `wal_append_txn` / `wal_append_record` helpers, which log errors
+    /// and swallow them — that lets COMMIT return success even when fsync
+    /// failed, violating durability.
+    ///
+    /// # Errors
+    /// - `io::Error` from `write_all` if the append fails (disk full,
+    ///   broken pipe, etc.).
+    /// - `io::Error` from `sync_all` if the fsync fails (disk error,
+    ///   I/O subsystem failure, etc.).
+    ///
+    /// When this returns `Err`, the transaction MUST be aborted — the
+    /// commit is not durable.
+    pub fn append_and_sync(&mut self, record: &WalRecord) -> std::io::Result<()> {
+        self.append(record)?;
+        self.sync()?;
+        Ok(())
+    }
+
     /// Read all records from the WAL (for replay on startup).
     ///
     /// Wave 51 fix: the SQL field is base64-decoded. Records that fail to
@@ -800,7 +823,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let mut wal = Wal::open(tmp.path()).unwrap();
         wal.append(&WalRecord {
-        lsn: 0,
+            lsn: 0,
             txn_id: 0,
             sql: "INSERT INTO t VALUES (1)".into(),
             is_commit: false,
@@ -813,6 +836,23 @@ mod tests {
 
         wal.truncate().unwrap();
         assert_eq!(wal.read_all().unwrap().len(), 0);
+    }
+
+    /// Task 2.1 DoD: append_and_sync appends AND fsyncs, returning any error.
+    #[test]
+    fn wal_append_and_sync_roundtrips() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (1)")).unwrap();
+        wal.append_and_sync(&WalRecord::autocommit("INSERT INTO t VALUES (2)")).unwrap();
+        // The records are durable (fsynced) and readable.
+        let records = wal.read_all().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sql, "INSERT INTO t VALUES (1)");
+        assert_eq!(records[1].sql, "INSERT INTO t VALUES (2)");
+        // LSNs are assigned.
+        assert_eq!(records[0].lsn, 1);
+        assert_eq!(records[1].lsn, 2);
     }
 
     #[test]
