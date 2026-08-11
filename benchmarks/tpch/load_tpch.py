@@ -83,21 +83,48 @@ def run(cmd, timeout=3600, check=True, capture=False, env=None):
 
 # ---------- turboGP ----------
 def tbl_to_csv(tbl, tbl_path, out_path):
-    """Convert a .tbl file (pipe-separated, trailing pipe) to proper CSV with header."""
+    """Convert a .tbl file (pipe-separated, trailing pipe) to a turboGP-friendly CSV.
+
+    turboGP's COPY FROM uses naive split(',') and doesn't handle quoted fields.
+    So we generate a "safe CSV" where:
+      - The delimiter is comma
+      - No field contains a comma (commas in text are replaced with ';')
+      - No quoting is used
+      - A header row is included
+      - Line endings are \\n (not \\r\\n)
+    """
     cols = COLS[tbl]
     with open(tbl_path, "r", encoding="utf-8", errors="replace") as fin, \
-         open(out_path, "w", encoding="utf-8", newline="") as fout:
-        w = csv.writer(fout, quoting=csv.QUOTE_MINIMAL)
-        w.writerow(cols)
+         open(out_path, "w", encoding="utf-8", newline="\n") as fout:
+        fout.write(",".join(cols) + "\n")
         for line in fin:
-            line = line.rstrip("\n")
+            line = line.rstrip("\r\n")
             if not line:
                 continue
             # Strip trailing pipe, then split on pipe
             if line.endswith("|"):
                 line = line[:-1]
             fields = line.split("|")
-            # Coerce numeric fields to avoid quotes (turboGP COPY FROM parses numbers vs strings)
+            # Replace any comma in any field with ';' to avoid breaking turboGP's split(',')
+            safe_fields = [f.replace(",", ";") for f in fields]
+            fout.write(",".join(safe_fields) + "\n")
+
+
+def tbl_to_csv_quoted(tbl, tbl_path, out_path):
+    """Convert a .tbl file to a proper RFC 4180 CSV (with quoting) for ClickHouse.
+
+    No header row (ClickHouse FORMAT CSV doesn't expect one by default).
+    """
+    with open(tbl_path, "r", encoding="utf-8", errors="replace") as fin, \
+         open(out_path, "w", encoding="utf-8", newline="") as fout:
+        w = csv.writer(fout, quoting=csv.QUOTE_MINIMAL)
+        for line in fin:
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            if line.endswith("|"):
+                line = line[:-1]
+            fields = line.split("|")
             w.writerow(fields)
 
 
@@ -170,6 +197,20 @@ def load_turbogp(sf):
 # ---------- ClickHouse ----------
 def load_clickhouse(sf):
     print("\n========== ClickHouse ==========")
+    # Pre-convert .tbl to proper CSV (with quoting, no header) for ClickHouse
+    ch_csv_dir = Path(f"/srv/clickhouse_csv/sf{sf}")
+    ch_csv_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Converting .tbl to quoted CSV in {ch_csv_dir}/ ...")
+    for tbl in TABLES:
+        tbl_path = DATA_DIR / f"sf{sf}" / f"{tbl}.tbl"
+        csv_path = ch_csv_dir / f"{tbl}.csv"
+        if not csv_path.exists() or csv_path.stat().st_size == 0:
+            t0 = time.time()
+            tbl_to_csv_quoted(tbl, tbl_path, csv_path)
+            print(f"  converted {tbl} -> {csv_path.name} ({csv_path.stat().st_size//1024} KB, {time.time()-t0:.1f}s)")
+        else:
+            print(f"  {tbl}.csv already exists, skipping")
+
     # Apply schema
     schema = (SCHEMA_DIR / "clickhouse.sql").read_text()
     tmpf = Path("/tmp/ch_schema.sql")
@@ -177,15 +218,13 @@ def load_clickhouse(sf):
     run(f"docker exec -i clickhouse clickhouse-client --multiquery < {tmpf}",
         timeout=120, check=False)
 
-    # Load each table via INSERT FORMAT CustomSeparated with field_delimiter='|'
+    # Load each table via INSERT FORMAT CSV (using the pre-converted CSV)
     for tbl in TABLES:
-        csv = DATA_DIR / f"sf{sf}" / f"{tbl}.tbl"
-        # Strip trailing pipe, then INSERT FORMAT CustomSeparated
+        csv_path = ch_csv_dir / f"{tbl}.csv"
+        # Stream the file into ClickHouse via docker exec -i
         cmd = (
-            f"sed 's/|$//' {csv} | docker exec -i clickhouse clickhouse-client "
-            f"--query \"INSERT INTO {tbl} FORMAT CustomSeparated\" "
-            f"--format_custom_field_delimiter=\"|\" "
-            f"--format_custom_row_after_delimiter=\"\\n\""
+            f"docker exec -i clickhouse clickhouse-client "
+            f"--query \"INSERT INTO {tbl} FORMAT CSV\" < {csv_path}"
         )
         t0 = time.time()
         run(cmd, timeout=3600, check=False)
