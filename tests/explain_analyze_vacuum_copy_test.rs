@@ -11,8 +11,12 @@ fn explain_basic() {
     let r = e.execute("EXPLAIN SELECT count(*) FROM t WHERE v > 15").unwrap();
     assert_eq!(r.row_count, 1);
     let plan = r.columns[0].string_values.as_ref().expect("plan text");
-    assert!(plan[0].contains("SELECT"), "plan must contain the query");
-    assert!(plan[0].contains("Table: t"), "plan must mention the table");
+    // Wave 1 (Agent C): EXPLAIN now prints the planner's plan tree, not a
+    // string-based description. The tree contains a Scan(table=t) leaf and
+    // a Filter node (for the WHERE v > 15 predicate) and an Aggregate node
+    // (for COUNT(*)).
+    assert!(plan[0].contains("Scan"), "plan tree must contain Scan (got: {})", plan[0]);
+    assert!(plan[0].contains("table=t"), "plan tree must reference table t (got: {})", plan[0]);
 }
 
 #[test]
