@@ -385,6 +385,19 @@ pub fn is_readonly_sql(sql: &str) -> bool {
 ///
 /// This maximizes read concurrency: 10 concurrent SELECTs run in parallel
 /// (sharing the read lock), while DML/DDL is serialized via the write lock.
+///
+/// # Wave 5 Task 5.4 — verification
+///
+/// The function itself was introduced in Wave 2 Task 2.2 (this exact
+/// signature); Wave 5 Task 5.4 re-confirms it as the production entry
+/// point and adds concurrent-stress verification in
+/// `tests/concurrency_test.rs`:
+/// - `test_route_and_execute_select_takes_read_lock`: 10 concurrent
+///   SELECTs via this function complete in <2× a single SELECT's time
+///   (proving read locks are shared, not exclusive).
+/// - `test_concurrent_readers_writer`: 10 readers + 1 writer for 2 s,
+///   no deadlocks, no panics, final COUNT == initial + writer_ops
+///   (data consistency under mixed read/write load).
 pub fn route_and_execute(
     engine: &std::sync::Arc<std::sync::RwLock<QueryEngine>>,
     sql: &str,
