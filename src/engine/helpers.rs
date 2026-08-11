@@ -1408,7 +1408,7 @@ pub(crate) fn default_cell_for_type(col_def: &crate::sql::ColumnDef, _row_count:
 pub(crate) fn extract_eq_predicate(expr: &crate::sql::parser::Expr) -> Option<(String, u64)> {
     use crate::sql::parser::{Expr, Value};
     match expr {
-        Expr::Binary { left, op, right } if op == "=" => {
+        Expr::Binary { left, op, right } if *op == crate::sql::parser::BinOp::Eq => {
             // Try left=column, right=literal.
             if let (Expr::Column(name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
                 return Some((name.clone(), literal_to_cell(val)?));
@@ -1443,5 +1443,7 @@ pub(crate) fn literal_to_cell(val: &crate::sql::parser::Value) -> Option<u64> {
                 bytes.iter().enumerate().fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (8 * i)));
             Some(v)
         }
+        Value::Date(d) => Some(*d as u64),
+        Value::Null => None,
     }
 }
