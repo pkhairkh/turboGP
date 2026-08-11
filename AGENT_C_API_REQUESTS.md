@@ -76,23 +76,111 @@ and `feat/engine-planner` into `main`.
 
 ### Wave 3 — Parser-based dispatch
 
-**Status:** Not yet started (Wave 3 hasn't begun).
+**Status:** Task 3.1 COMPLETE. Tasks 3.2, 3.3, 3.4 are DOCUMENTED AS DEBT.
 
-Agent C will need:
-- A unified AST that distinguishes SELECT / INSERT / UPDATE / DELETE /
-  CREATE / DROP / ALTER / BEGIN / COMMIT / ROLLBACK / COPY / VACUUM /
-  EXPLAIN / BACKUP / RESTORE / MERGE / PIVOT as top-level variants.
-- A `parse(sql: &str) -> Result<Statement>` function that returns the
-  top-level statement type, so `execute()` can dispatch on the parsed
-  variant instead of `starts_with()`.
-- `SetQuery` parsing (UNION ALL) so the string-based `split_union_all()`
-  hack in `helpers.rs` can be removed.
-- MERGE and PIVOT/UNPIVOT in the formal parser so the string-based
-  `parse_merge()` and `parse_pivot_clause()` hacks can be removed.
+#### Task 3.1 — Complete
 
-**Until Agent A completes these:** Agent C will keep the existing
-`starts_with()` dispatch (documented as known debt) and the string-based
-hacks for UNION ALL / MERGE / PIVOT.
+`execute()` now dispatches via `classify_statement()` (in
+`src/engine/dispatch.rs`), which tokenizes the SQL via
+`crate::sql::lexer::tokenize` and inspects the first keyword. All
+`starts_with()` calls have been removed from `src/engine/mod.rs`:
+
+```
+$ rg -n 'starts_with("' src/engine/mod.rs
+# (zero matches)
+```
+
+`StatementKind` enum covers: Select, With, Insert, Update, Delete, Create,
+Drop, Alter, Begin, Commit, Rollback, RollbackTo, Savepoint, Release, Copy,
+Vacuum, Checkpoint, Explain, Analyze, Merge, Backup, Restore, Show, Exec,
+Truncate, Other.
+
+`is_readonly_sql()` and `execute_readonly()` also use `classify_statement`
+instead of `starts_with()`.
+
+#### Task 3.2 — UNION ALL (DEBT)
+
+The string-based `split_union_all()` hack in `src/engine/helpers.rs` is
+**still in use**. It detects `UNION ALL` by string-scanning the SQL and
+splitting on the keyword, then executes both halves and concatenates.
+
+**Why kept:** Agent A's unified AST (Wave 2) is not yet available. Once
+Agent A adds `SetQuery::Union(left, right)` to the formal parser, the hack
+in `execute_inner()` can be removed and `execute_select()` can handle
+`SetQuery::Union` directly.
+
+**Where it's used:** `src/engine/mod.rs::execute_inner()`:
+
+```rust
+if let Some((left_sql, right_sql)) = split_union_all(sql) {
+    let left_result = self.execute_inner(&left_sql, start, txn_id)?;
+    let right_result = self.execute_inner(&right_sql, start, txn_id)?;
+    return Ok(concatenate_results(left_result, right_result, start));
+}
+```
+
+**Regression test:** `tests/string_hacks_dispatch.rs::test_union_all_works`
+verifies `SELECT * FROM t UNION ALL SELECT * FROM t2` returns the
+concatenated rows.
+
+#### Task 3.3 — MERGE (DEBT)
+
+The string-based `parse_merge()` hack in `src/engine/helpers.rs` is **still
+in use**. It parses `MERGE INTO target USING source ON ... WHEN MATCHED
+THEN ... WHEN NOT MATCHED THEN ...` by string-scanning.
+
+**Why kept:** Agent A hasn't added MERGE to the formal parser. Once they
+do, `execute_inner()` can dispatch via `StatementKind::Merge` to a formal
+MERGE AST handler.
+
+**Where it's used:** `src/engine/mod.rs::execute_inner()`:
+
+```rust
+if let Some(merge) = parse_merge(sql) {
+    return self.execute_merge_stmt(merge, start);
+}
+```
+
+`classify_statement()` already returns `StatementKind::Merge` for MERGE
+statements — the formal-parser path is ready to plug in.
+
+**Regression test:** `tests/string_hacks_dispatch.rs::test_merge_works`
+verifies a basic MERGE statement executes.
+
+#### Task 3.4 — PIVOT / UNPIVOT (DEBT)
+
+The string-based `parse_pivot_clause()` and `strip_pivot_clause()` hacks in
+`src/engine/helpers.rs` are **still in use**. They detect `PIVOT (...)`
+by string-scanning.
+
+**Why kept:** Agent A hasn't added PIVOT/UNPIVOT to the formal parser. Once
+they do, `execute_inner()` can handle the parsed PivotSpec directly.
+
+**Where it's used:** `src/engine/mod.rs::execute_inner()`:
+
+```rust
+if let Some(pivot_spec) = parse_pivot_clause(sql) {
+    let stripped = strip_pivot_clause(sql);
+    let input = self.execute_inner(&stripped, start, txn_id)?;
+    // ... apply pivot transformation
+}
+```
+
+**Regression test:** `tests/string_hacks_dispatch.rs::test_pivot_works`
+verifies a basic PIVOT query executes.
+
+---
+
+## Summary of stubs / debt
+
+| Wave | Task | Status | Action needed |
+|------|------|--------|---------------|
+| 3 | 3.2 UNION ALL | DEBT | Agent A: add `SetQuery::Union` to parser |
+| 3 | 3.3 MERGE | DEBT | Agent A: add MERGE to parser |
+| 3 | 3.4 PIVOT | DEBT | Agent A: add PIVOT/UNPIVOT to parser |
+
+All three hacks are tagged with comments referencing this file in
+`src/engine/mod.rs::execute_inner()`.
 
 ---
 
