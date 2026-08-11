@@ -12,7 +12,7 @@
 use tempfile::TempDir;
 use turbogp::engine::QueryEngine;
 use turbogp::storage::recovery::{SyncMode, Wal, WalRecord, WalStreamSink};
-use turbogp::storage::replication::{WalReceiver, WalStreamer};
+use turbogp::storage::replication::{MultiWalStreamSink, QuorumPolicy, WalReceiver, WalStreamer};
 
 #[test]
 fn test_wal_append_returns_result() {
@@ -423,4 +423,162 @@ fn test_replica_last_applied_lsn_after_apply_loop() {
         "reconnect stream_from_lsn(lsn={resume_lsn}) must send 5 catch-up records"
     );
     assert_eq!(catchup_streamer.records_sent, 5);
+}
+
+// =========================================================================
+// Wave 6 — Task 6.4: quorum-based synchronous replication integration test
+// =========================================================================
+
+/// Task 6.4 DoD: 3 replicas, `QuorumPolicy::Majority` (quorum = 2 of 3).
+///
+/// Verifies the full sync-replication flow end-to-end:
+/// 1. Three `WalStreamer`s connected to three `WalReceiver`s over TCP on
+///    localhost, wrapped in a `MultiWalStreamSink` with `Majority` quorum.
+/// 2. In `SyncMode::Synchronous`, `append_and_sync` a record → all 3
+///    receivers apply + ACK → quorum 2/3 met → `Ok`.
+/// 3. Kill 1 streamer (simulates 1 replica going down) → `append_and_sync`
+///    still succeeds (2/3 quorum met).
+/// 4. Kill a 2nd streamer → only 1 ACK → quorum 2/3 NOT met →
+///    `append_and_sync` returns `Err`.
+///
+/// "Killing" a streamer uses the `WalStreamer::kill()` test helper, which
+/// sets a kill switch (all future `stream_record` / `sync_wait` calls
+/// return `Err`) and shuts down the underlying TCP connection (so the
+/// receiver sees EOF). This simulates a replica crash without having to
+/// actually kill the receiver thread — the spec's note explicitly allows
+/// this simulation: "If TCP-based testing is flaky, use the local-only
+/// streamer (no real TCP) and simulate ACKs. The key is that the quorum
+/// logic works."
+#[test]
+fn test_sync_replication_quorum() {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    // 1. Bind 3 receivers on random localhost ports.
+    let receivers: Vec<WalReceiver> = (0..3)
+        .map(|_| WalReceiver::bind("127.0.0.1:0").expect("bind receiver"))
+        .collect();
+    let addrs: Vec<String> = receivers
+        .iter()
+        .map(|r| r.local_addr().expect("local_addr").to_string())
+        .collect();
+
+    // Shared per-receiver "applied LSN" lists so the test can verify each
+    // receiver got the records. The receiver's apply callback pushes the
+    // record's LSN onto its list.
+    let applied_lists: Vec<Arc<Mutex<Vec<u64>>>> =
+        (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+
+    // 2. Spawn 3 receiver threads.
+    let mut handles = Vec::new();
+    let mut receivers_iter = receivers.into_iter();
+    let mut applied_iter = applied_lists.iter().cloned();
+    for _ in 0..3 {
+        let mut receiver = receivers_iter.next().expect("receiver");
+        let applied = applied_iter.next().expect("applied list");
+        let handle = thread::spawn(move || {
+            receiver
+                .run_apply_loop(move |record| {
+                    applied.lock().expect("lock applied").push(record.lsn);
+                    Ok(())
+                })
+                .expect("run_apply_loop");
+        });
+        handles.push(handle);
+    }
+
+    // Give the receivers a moment to start listening.
+    thread::sleep(std::time::Duration::from_millis(50));
+
+    // 3. Create 3 WalStreamers, connect each to a receiver, wrap in a
+    //    MultiWalStreamSink with Majority quorum.
+    let mut multi_sink = MultiWalStreamSink::with_quorum(QuorumPolicy::Majority);
+    for addr in &addrs {
+        let mut streamer = WalStreamer::new();
+        streamer.connect(addr).expect("connect streamer");
+        multi_sink.add(streamer);
+    }
+    assert_eq!(multi_sink.len(), 3, "multi-sink must have 3 streamers");
+    assert_eq!(multi_sink.quorum(), QuorumPolicy::Majority);
+
+    // Wrap in Arc<Mutex<...>> and attach to the Wal. Keep a typed clone
+    // so the test can access `streamer_mut` to kill individual streamers.
+    let sink: Arc<Mutex<MultiWalStreamSink>> = Arc::new(Mutex::new(multi_sink));
+    let sink_trait: Arc<Mutex<dyn WalStreamSink>> = sink.clone();
+
+    let tmp = TempDir::new().expect("temp dir");
+    let mut wal = Wal::open(tmp.path()).expect("open wal");
+    wal.set_stream_sink(sink_trait);
+    wal.set_sync_mode(SyncMode::Synchronous);
+
+    // 4. append_and_sync a record → all 3 receivers apply + ACK → quorum met.
+    let record1 = WalRecord::autocommit("INSERT INTO t VALUES (1)");
+    let result = wal.append_and_sync(&record1);
+    assert!(
+        result.is_ok(),
+        "append_and_sync with 3 alive replicas (quorum 2/3) must succeed, got: {:?}",
+        result.err()
+    );
+
+    // 5. Verify all 3 receivers got the record. By the time sync_wait
+    //    returned Ok, at least 2 receivers had applied (and sent ACKs);
+    //    the 3rd applies BEFORE sending its ACK, so all 3 have applied
+    //    by now. A short sleep covers any thread-scheduling jitter.
+    thread::sleep(std::time::Duration::from_millis(50));
+    for (i, applied) in applied_lists.iter().enumerate() {
+        let list = applied.lock().expect("lock applied");
+        assert!(
+            !list.is_empty(),
+            "receiver {} should have applied at least 1 record, got {}",
+            i,
+            list.len()
+        );
+    }
+
+    // 6. Kill 1 streamer (simulates 1 replica going down). Quorum is
+    //    still 2/3 (Majority of 3 = 2), so append_and_sync must still
+    //    succeed.
+    {
+        let mut sink_guard = sink.lock().expect("lock sink");
+        sink_guard.streamer_mut(0).expect("streamer 0").kill();
+        assert!(!sink_guard.streamer(0).expect("streamer 0").is_alive());
+    }
+    let record2 = WalRecord::autocommit("INSERT INTO t VALUES (2)");
+    let result = wal.append_and_sync(&record2);
+    assert!(
+        result.is_ok(),
+        "append_and_sync with 2 alive replicas (quorum 2/3 met) must succeed, got: {:?}",
+        result.err()
+    );
+
+    // 7. Kill a 2nd streamer. Only 1 alive → quorum 2/3 NOT met →
+    //    append_and_sync must fail.
+    {
+        let mut sink_guard = sink.lock().expect("lock sink");
+        sink_guard.streamer_mut(1).expect("streamer 1").kill();
+        assert!(!sink_guard.streamer(1).expect("streamer 1").is_alive());
+    }
+    let record3 = WalRecord::autocommit("INSERT INTO t VALUES (3)");
+    let result = wal.append_and_sync(&record3);
+    assert!(
+        result.is_err(),
+        "append_and_sync with 1 alive replica (quorum 2/3 NOT met) must fail"
+    );
+    let err_msg = format!("{}", result.err().expect("error"));
+    assert!(
+        err_msg.contains("quorum")
+            || err_msg.contains("sync_wait")
+            || err_msg.contains("ACK"),
+        "error message should mention quorum / sync_wait / ACK, got: {err_msg}"
+    );
+
+    // 8. Cleanup: drop the Wal first (detaches the sink), then drop the
+    //    sink (drops the remaining streamer → receiver 2 sees EOF and
+    //    exits). The killed streamers' receivers already saw EOF when
+    //    `kill()` shut down their connections. Join all receiver threads.
+    drop(wal);
+    drop(sink);
+    for handle in handles {
+        let _ = handle.join();
+    }
 }
