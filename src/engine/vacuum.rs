@@ -785,4 +785,96 @@ mod vacuum_tests {
         // case future tests in this module need `Arc`-wrapped columns).
         let _: Option<Arc<Vec<u64>>> = None;
     }
+
+    /// Wave 6 Task 6.3 DoD: full VACUUM integration test using the
+    /// engine's `execute()` method end-to-end (no direct API calls).
+    ///
+    /// Scenario:
+    /// 1. `CREATE TABLE t (id INT, v INT)` + `enable_mvcc`.
+    /// 2. Insert 1000 rows in a single BEGIN/COMMIT block.
+    /// 3. Update 500 rows (`id < 500`) — appends a new version per row,
+    ///    tombstones the old version.
+    /// 4. Delete 200 rows (`id < 200`) — tombstones the latest version.
+    /// 5. `VACUUM` — reclaims column space + compacts version chains.
+    ///
+    /// Assertions after VACUUM:
+    /// - `table.row_count == 800` (1000 − 200 deleted).
+    /// - Every column vector has exactly 800 entries.
+    /// - `row_versions.len() == 800` with each chain containing only
+    ///   live versions (latest version `xmax == None`).
+    /// - `SELECT COUNT(*) FROM t` returns 800 (the engine scans the
+    ///   compacted column vectors under MVCC visibility).
+    #[test]
+    fn vacuum_integration_test() {
+        use crate::engine::QueryEngine;
+
+        let mut engine = QueryEngine::in_memory();
+        engine.enable_mvcc().expect("enable_mvcc");
+        engine.execute("CREATE TABLE t (id INT, v INT)").expect("CREATE TABLE");
+
+        // 1. Insert 1000 rows in one transaction (xmin = t1, committed).
+        engine.execute("BEGIN").expect("BEGIN");
+        for i in 0..1000u64 {
+            let sql = format!("INSERT INTO t VALUES ({}, {})", i, i * 10);
+            engine.execute(&sql).expect("INSERT");
+        }
+        engine.execute("COMMIT").expect("COMMIT");
+
+        // 2. Update 500 rows (id < 500) — appends new versions.
+        engine.execute("BEGIN").expect("BEGIN");
+        engine
+            .execute("UPDATE t SET v = 999 WHERE id < 500")
+            .expect("UPDATE");
+        engine.execute("COMMIT").expect("COMMIT");
+
+        // 3. Delete 200 rows (id < 200) — tombstones their latest version.
+        engine.execute("BEGIN").expect("BEGIN");
+        engine.execute("DELETE FROM t WHERE id < 200").expect("DELETE");
+        engine.execute("COMMIT").expect("COMMIT");
+
+        // 4. VACUUM.
+        engine.execute("VACUUM").expect("VACUUM");
+
+        // 5. Verify row_count == 800, all columns have 800 entries.
+        let table = engine.catalog.get("t").expect("table \"t\" exists");
+        assert_eq!(
+            table.row_count, 800,
+            "row_count must be 800 after VACUUM (1000 − 200 deleted)"
+        );
+        for (i, col) in table.columns.iter().enumerate() {
+            assert_eq!(
+                col.len(),
+                800,
+                "columns[{}].len() must be 800 after VACUUM",
+                i
+            );
+        }
+
+        // 6. Verify row_versions has 800 chains, each with only live
+        //    versions (latest version's xmax == None).
+        assert_eq!(
+            table.row_versions.len(),
+            800,
+            "row_versions.len() must be 800 (one chain per surviving row)"
+        );
+        for (i, chain) in table.row_versions.iter().enumerate() {
+            assert!(!chain.is_empty(), "chain {} must not be empty", i);
+            let last = chain.last().expect("non-empty chain has a last version");
+            assert!(
+                last.xmax.is_none(),
+                "chain {} latest version must be live (xmax=None)",
+                i
+            );
+        }
+        drop(table);
+
+        // 7. Verify SELECT COUNT(*) FROM t returns 800 (end-to-end).
+        let r = engine
+            .execute("SELECT COUNT(*) FROM t")
+            .expect("SELECT COUNT(*)");
+        assert_eq!(
+            r.columns[0].values[0], 800,
+            "SELECT COUNT(*) must return 800 after VACUUM"
+        );
+    }
 }
