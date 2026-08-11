@@ -15,7 +15,7 @@
 //! O(1) per row visibility check.
 
 pub mod mvcc;
-pub use mvcc::{MvccTransaction, MvccTxnManager, RowVersion, TxnState};
+pub use mvcc::{ConflictError, IsolationLevel, MvccTable, MvccTransaction, MvccTxnManager, RowVersion, TxnState};
 
 use crate::catalog::Catalog;
 use std::collections::HashMap;

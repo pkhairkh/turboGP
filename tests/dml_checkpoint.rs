@@ -198,11 +198,11 @@ fn checkpoint_preserves_float_type() {
     });
     cat.register(t);
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let count = Checkpoint::save(&cat, tmp.path()).unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let count = Checkpoint::save(&cat, tmp.path().join("checkpoint.sql")).unwrap();
     assert_eq!(count, 1);
 
-    let content = std::fs::read_to_string(tmp.path()).unwrap();
+    let content = std::fs::read_to_string(tmp.path().join("checkpoint.sql")).unwrap();
     assert!(
         content.contains("CREATE TABLE metrics (price FLOAT)"),
         "checkpoint must declare FLOAT, got: {content}"
@@ -247,10 +247,10 @@ fn checkpoint_preserves_varchar_type() {
     });
     cat.register(t);
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    Checkpoint::save(&cat, tmp.path()).unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    Checkpoint::save(&cat, tmp.path().join("checkpoint.sql")).unwrap();
 
-    let content = std::fs::read_to_string(tmp.path()).unwrap();
+    let content = std::fs::read_to_string(tmp.path().join("checkpoint.sql")).unwrap();
     assert!(
         content.contains("CREATE TABLE users (name VARCHAR(50))"),
         "checkpoint must declare VARCHAR(50), got: {content}"
@@ -283,10 +283,10 @@ fn checkpoint_emits_null_for_null_cells() {
     });
     cat.register(t);
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    Checkpoint::save(&cat, tmp.path()).unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    Checkpoint::save(&cat, tmp.path().join("checkpoint.sql")).unwrap();
 
-    let content = std::fs::read_to_string(tmp.path()).unwrap();
+    let content = std::fs::read_to_string(tmp.path().join("checkpoint.sql")).unwrap();
     assert!(content.contains("INSERT INTO t VALUES (10)"));
     assert!(
         content.contains("INSERT INTO t VALUES (NULL)"),
@@ -355,9 +355,9 @@ fn checkpoint_roundtrip_floats_and_varchars() {
     });
     cat.register(t);
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    Checkpoint::save(&cat, tmp.path()).unwrap();
-    let sql = std::fs::read_to_string(tmp.path()).unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    Checkpoint::save(&cat, tmp.path().join("checkpoint.sql")).unwrap();
+    let sql = std::fs::read_to_string(tmp.path().join("checkpoint.sql")).unwrap();
 
     // Verify the SQL output preserves types correctly.
     assert!(
@@ -394,10 +394,11 @@ fn checkpoint_roundtrip_floats_and_varchars() {
 
 #[test]
 fn wal_replays_after_wave50_changes() {
-    use tempfile::NamedTempFile;
-    let tmp = NamedTempFile::new().unwrap();
+    use tempfile::TempDir;
+    let tmp = TempDir::new().unwrap();
     let mut wal = Wal::open(tmp.path()).unwrap();
     wal.append(&WalRecord {
+        lsn: 0,
         txn_id: 0,
         sql: "CREATE TABLE t (id INT)".into(),
         is_commit: false,
@@ -406,6 +407,7 @@ fn wal_replays_after_wave50_changes() {
     })
     .unwrap();
     wal.append(&WalRecord {
+        lsn: 0,
         txn_id: 0,
         sql: "INSERT INTO t VALUES (1)".into(),
         is_commit: false,
@@ -414,6 +416,7 @@ fn wal_replays_after_wave50_changes() {
     })
     .unwrap();
     wal.append(&WalRecord {
+        lsn: 0,
         txn_id: 0,
         sql: "INSERT INTO t VALUES (2)".into(),
         is_commit: false,

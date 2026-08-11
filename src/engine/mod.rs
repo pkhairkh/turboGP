@@ -80,7 +80,9 @@ use std::time::Instant;
 /// See the module docs for the pipeline and usage examples.
 pub struct QueryEngine {
     /// The table catalog (name → [`Table`]).
-    catalog: Catalog,
+    /// Public so the storage layer (`storage::replication::backup`) can
+    /// list tables for backup (Task 5.4). See AGENT_B_API_REQUESTS.md.
+    pub catalog: Catalog,
     /// The kernel table: maps `(Operator, CpuTarget, MemoryTier)` to the
     /// best kernel for that combination on the running CPU.
     kernel_table: Arc<KernelTable>,
@@ -92,7 +94,11 @@ pub struct QueryEngine {
     /// Transaction manager for BEGIN/COMMIT/ROLLBACK (Wave 5).
     txn_manager: crate::txn::TxnManager,
     /// Write-ahead log for durability (Wave 37). None when not configured.
-    wal: Option<crate::storage::recovery::Wal>,
+    /// Public so the storage layer (`Checkpoint::load`) can temporarily
+    /// detach the WAL during checkpoint load — preventing the checkpoint
+    /// statements from being re-written to the WAL (Task 1.1 fix for the
+    /// duplicate-row data-corruption bug). See `AGENT_B_API_REQUESTS.md`.
+    pub wal: Option<crate::storage::recovery::Wal>,
     /// Index manager for secondary indexes (Wave 31).
     pub index_manager: crate::index::manager::IndexManager,
     /// Hash column registry for materialized string hashes.
@@ -528,8 +534,10 @@ impl QueryEngine {
         let bp = crate::storage::buffer_pool::BufferPool::new(data_dir, 256)?;
         engine.buffer_pool = Some(bp);
         // Also open a WAL in the same data directory.
-        let wal_path = data_dir.join("wal.log");
-        let wal = crate::storage::recovery::Wal::open(&wal_path)?;
+        // Task 2.3: the WAL is now segmented — it manages `wal-<N>.log`
+        // files inside a dedicated `wal/` subdirectory of the data dir.
+        let wal_dir = data_dir.join("wal");
+        let wal = crate::storage::recovery::Wal::open(&wal_dir)?;
         engine.wal = Some(wal);
         // Wave 5 (A4 fix): Load checkpoint BEFORE replaying WAL.
         // The checkpoint contains the catalog state at the last VACUUM;
@@ -538,8 +546,22 @@ impl QueryEngine {
         if let Err(e) = crate::storage::recovery::Checkpoint::load(&mut engine, &checkpoint_path) {
             log::warn!("checkpoint load failed: {e}");
         }
+        // Task 1.3: read the checkpoint's last_lsn (if the sidecar exists)
+        // and use it to skip already-checkpointed records on replay. Also
+        // bump the WAL's next_lsn past it so new records get LSNs strictly
+        // greater than the checkpoint's last_lsn.
+        let checkpoint_last_lsn =
+            crate::storage::recovery::Checkpoint::read_last_lsn(&checkpoint_path);
+        if let Some(lsn) = checkpoint_last_lsn {
+            if let Some(ref mut wal) = engine.wal {
+                wal.advance_lsn_to(lsn);
+            }
+        }
         // Replay the WAL to restore committed state after the checkpoint.
-        engine.replay_wal()?;
+        // Task 3.2: try physical replay first (fast path — applies
+        // PhysicalChange records directly to the buffer pool). Then fall
+        // back to SQL replay for records without physical changes.
+        engine.replay_wal_with_lsn_filter(checkpoint_last_lsn)?;
         Ok(engine)
     }
 
@@ -547,7 +569,19 @@ impl QueryEngine {
     /// This re-executes SQL records and applies physical page changes.
     /// Only committed transactions are replayed; uncommitted (no COMMIT
     /// marker after the DML) are discarded.
+    #[allow(dead_code)]
     fn replay_wal(&mut self) -> Result<()> {
+        self.replay_wal_with_lsn_filter(None)
+    }
+
+    /// Replay the WAL with an optional LSN filter (Task 1.3).
+    ///
+    /// If `checkpoint_last_lsn` is `Some(lsn)`, records with `lsn <= lsn`
+    /// are skipped — they are already included in the checkpoint. This
+    /// makes replay idempotent: even if the WAL wasn't truncated (e.g.
+    /// crash between checkpoint rename and WAL truncate), replay won't
+    /// duplicate rows.
+    fn replay_wal_with_lsn_filter(&mut self, checkpoint_last_lsn: Option<u64>) -> Result<()> {
         let wal = match &self.wal {
             Some(w) => w,
             None => return Ok(()),
@@ -566,6 +600,12 @@ impl QueryEngine {
 
         // Re-execute SQL records for committed transactions.
         for record in &records {
+            // Task 1.3: skip records already included in the checkpoint.
+            if let Some(last_lsn) = checkpoint_last_lsn {
+                if record.lsn <= last_lsn && record.lsn > 0 {
+                    continue;
+                }
+            }
             // Skip rollback records and their transactions.
             if record.is_rollback {
                 continue;
@@ -610,6 +650,16 @@ impl QueryEngine {
         &mut self,
         change: &crate::storage::recovery::PhysicalChange,
     ) -> Result<()> {
+        self.apply_physical_change_public(change)
+    }
+
+    /// Public wrapper for `apply_physical_change` (Task 3.2).
+    /// Exposed so `replay_wal_physical()` in src/storage/recovery.rs can
+    /// call it without going through the private method.
+    pub fn apply_physical_change_public(
+        &mut self,
+        change: &crate::storage::recovery::PhysicalChange,
+    ) -> Result<()> {
         use crate::storage::recovery::PhysicalChange;
         if self.buffer_pool.is_none() {
             return Ok(());
@@ -630,7 +680,7 @@ impl QueryEngine {
                 }
                 bp.unpin_page(page_id, true);
             }
-            PhysicalChange::RowInsert { table_id, page_num, row_offset, values } => {
+            PhysicalChange::RowInsert { table_id, page_num, slot, values } => {
                 let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
                 let bp = self.buffer_pool.as_mut().unwrap();
                 let idx =
@@ -638,17 +688,48 @@ impl QueryEngine {
                 {
                     let page = bp.get_page_mut(idx);
                     for (i, &val) in values.iter().enumerate() {
-                        let cell_idx = *row_offset + i;
+                        let cell_idx = *slot + i;
                         if cell_idx < crate::storage::page::PAGE_CELLS {
                             page.set_cell(cell_idx, val);
                         }
                     }
+                    page.header.row_count = page.header.row_count.max((*slot + values.len()) as u64);
+                    page.update_checksum();
+                }
+                bp.unpin_page(page_id, true);
+            }
+            PhysicalChange::RowUpdate { table_id, page_num, slot, new_values, .. } => {
+                // Task 3.1: redo-only — apply new_values at the slot.
+                let page_id = crate::storage::buffer_pool::PageId::new(*table_id, *page_num);
+                let bp = self.buffer_pool.as_mut().unwrap();
+                let idx =
+                    bp.fetch_page(page_id).map_err(|e| Error::Other(format!("page fetch: {e}")))?;
+                {
+                    let page = bp.get_page_mut(idx);
+                    for (i, &val) in new_values.iter().enumerate() {
+                        let cell_idx = *slot + i;
+                        if cell_idx < crate::storage::page::PAGE_CELLS {
+                            page.set_cell(cell_idx, val);
+                        }
+                    }
+                    page.update_checksum();
                 }
                 bp.unpin_page(page_id, true);
             }
             PhysicalChange::RowDelete { .. } => {
                 // Row deletion is handled by the catalog (row_count decrement).
                 // Physical deletion (compaction) happens during VACUUM.
+            }
+            PhysicalChange::PageSplit { table_id, old_page, new_page, .. } => {
+                // Task 3.1: ensure both pages are fetched (allocated) in the
+                // buffer pool. The actual row redistribution is handled by
+                // the executor when it performs the split; this redo path
+                // just makes sure both pages exist.
+                let old_page_id = crate::storage::buffer_pool::PageId::new(*table_id, *old_page);
+                let new_page_id = crate::storage::buffer_pool::PageId::new(*table_id, *new_page);
+                let bp = self.buffer_pool.as_mut().unwrap();
+                let _ = bp.fetch_page(old_page_id);
+                let _ = bp.fetch_page(new_page_id);
             }
         }
         Ok(())
@@ -676,19 +757,31 @@ impl QueryEngine {
     pub fn flush_with_checkpoint(&mut self) -> Result<()> {
         // 1. Flush dirty pages to disk.
         self.flush()?;
-        // 2. Write a checkpoint file (if we have a data directory).
-        if let Some(ref bp) = self.buffer_pool {
-            let checkpoint_path = bp.data_dir().join("checkpoint.sql");
-            match crate::storage::recovery::Checkpoint::save(&self.catalog, &checkpoint_path) {
-                Ok(n) => {
-                    log::debug!("checkpoint: wrote {n} tables to {}", checkpoint_path.display())
-                }
-                Err(e) => {
-                    return Err(Error::Other(format!(
-                        "checkpoint save to {}: {e}",
-                        checkpoint_path.display()
-                    )))
-                }
+        // 2. Write a checkpoint file (if we have a data directory) AND
+        //    truncate the WAL (Task 1.1 fix: prevents duplicate rows on
+        //    restart). The substantive logic lives in
+        //    Checkpoint::save_and_truncate() in src/storage/recovery.rs.
+        let checkpoint_path = match &self.buffer_pool {
+            Some(bp) => bp.data_dir().join("checkpoint.sql"),
+            None => return Ok(()),
+        };
+        let wal = match self.wal.as_mut() {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        match crate::storage::recovery::Checkpoint::save_and_truncate(
+            &self.catalog,
+            &checkpoint_path,
+            wal,
+        ) {
+            Ok(n) => {
+                log::debug!("checkpoint: wrote {n} tables to {}", checkpoint_path.display())
+            }
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "checkpoint save to {}: {e}",
+                    checkpoint_path.display()
+                )))
             }
         }
         Ok(())
@@ -712,6 +805,7 @@ impl QueryEngine {
     }
 
     /// Enable WAL on an existing engine.
+    /// Task 2.3: `wal_path` is now a directory (segmented WAL).
     pub fn enable_wal<P: AsRef<std::path::Path>>(&mut self, wal_path: P) -> Result<()> {
         let wal = crate::storage::recovery::Wal::open(&wal_path)?;
         self.wal = Some(wal);
@@ -804,38 +898,18 @@ impl QueryEngine {
     /// explicit transaction, or `None` for autocommit. The record carries
     /// the txn_id so replay can group statements by transaction.
     ///
-    /// **Wave 5 Task 5.1 (Agent C):** WAL errors are now **raised**, not
-    /// logged-and-swallowed. If `wal.append()` or `wal.sync()` fails, the
-    /// error is propagated to the caller (`execute()`), which aborts the
-    /// transaction and returns the error to the user. Previously, a WAL
-    /// sync failure was silently logged and the transaction appeared to
-    /// succeed — risking data loss on crash.
-    ///
-    /// Returns `Ok(())` if the WAL is not enabled (no-op).
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Other`] wrapping the underlying I/O error if `wal.append()`
-    ///   or `wal.sync()` fails.
+    /// **Integration:** uses `Wal::append_and_sync()` (Agent B's atomic
+    /// append+fsync). If a `WalStreamSink` is attached to the Wal, the
+    /// record is automatically streamed to replicas after fsync. Errors
+    /// are propagated — COMMIT fails if fsync fails.
     fn wal_append_txn(&mut self, sql: &str, txn_id: Option<u64>) -> Result<()> {
         if let Some(ref mut wal) = self.wal {
             let record = match txn_id {
                 Some(id) => crate::storage::recovery::WalRecord::txn_dml(id, sql),
                 None => crate::storage::recovery::WalRecord::autocommit(sql),
             };
-            wal.append(&record)
-                .map_err(|e| Error::Other(format!("WAL append failed: {e}")))?;
-            wal.sync()
-                .map_err(|e| Error::Other(format!("WAL sync failed: {e}")))?;
-            // Wave 5 Task 5.3 (Agent C): if a WalStreamer is attached, stream
-            // the record to the replica after fsync.
-            if let Some(ref streamer_handle) = self.wal_streamer {
-                if let Ok(mut streamer) = streamer_handle.streamer.lock() {
-                    if let Err(e) = streamer.stream_record(&record) {
-                        log::warn!("WAL stream to replica failed (non-fatal): {e}");
-                    }
-                }
-            }
+            wal.append_and_sync(&record)
+                .map_err(|e| Error::Other(format!("WAL append_and_sync failed: {e}")))?;
         }
         Ok(())
     }
@@ -844,26 +918,12 @@ impl QueryEngine {
     /// markers, or any other special record). Used by `execute()` to
     /// write transaction boundary markers (Wave 51 fix).
     ///
-    /// **Wave 5 Task 5.1 (Agent C):** WAL errors are raised, not swallowed.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Other`] wrapping the underlying I/O error if `wal.append()`
-    ///   or `wal.sync()` fails.
+    /// **Integration:** uses `Wal::append_and_sync()` (Agent B's atomic
+    /// append+fsync). Errors are propagated.
     fn wal_append_record(&mut self, record: crate::storage::recovery::WalRecord) -> Result<()> {
         if let Some(ref mut wal) = self.wal {
-            wal.append(&record)
-                .map_err(|e| Error::Other(format!("WAL append failed: {e}")))?;
-            wal.sync()
-                .map_err(|e| Error::Other(format!("WAL sync failed: {e}")))?;
-            // Wave 5 Task 5.3 (Agent C): stream to replica after fsync.
-            if let Some(ref streamer_handle) = self.wal_streamer {
-                if let Ok(mut streamer) = streamer_handle.streamer.lock() {
-                    if let Err(e) = streamer.stream_record(&record) {
-                        log::warn!("WAL stream to replica failed (non-fatal): {e}");
-                    }
-                }
-            }
+            wal.append_and_sync(&record)
+                .map_err(|e| Error::Other(format!("WAL append_and_sync failed: {e}")))?;
         }
         Ok(())
     }
@@ -1040,6 +1100,7 @@ impl QueryEngine {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let trimmed = sql.trim();
+        let lower = trimmed.to_lowercase();
 
         // Wave 3 (Agent C): top-level dispatch via the formal tokenizer
         // (classify_statement), NOT string-prefix matching. The classifier
@@ -1096,7 +1157,7 @@ impl QueryEngine {
                 // Wave 4 (Agent C): route to MVCC or snapshot-isolation
                 // manager based on mvcc_enabled.
                 if self.mvcc_enabled {
-                    let id = self.mvcc_txn_manager.begin().map_err(Error::Other)?;
+                    let id = self.mvcc_txn_manager.begin_compat().map_err(Error::Other)?;
                     self.wal_append_record(crate::storage::recovery::WalRecord::begin(id))?;
                 } else {
                     let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
@@ -1107,7 +1168,7 @@ impl QueryEngine {
             crate::engine::dispatch::StatementKind::Commit => {
                 // Wave 4 (Agent C): route to the active transaction manager.
                 let txn_id = if self.mvcc_enabled {
-                    let id = self.mvcc_txn_manager.commit().map_err(Error::Other)?;
+                    let id = self.mvcc_txn_manager.commit_compat().map_err(Error::Other)?;
                     id
                 } else {
                     // Capture the txn_id before we drain the transaction.
@@ -1124,7 +1185,7 @@ impl QueryEngine {
                 // Full ROLLBACK (no `TO` savepoint). RollbackTo is handled
                 // in execute_inner below so it operates on the txn snapshot.
                 let txn_id = if self.mvcc_enabled {
-                    self.mvcc_txn_manager.rollback().map_err(Error::Other)?
+                    self.mvcc_txn_manager.rollback_compat().map_err(Error::Other)?
                 } else {
                     let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
                     self.txn_manager.rollback().map_err(Error::Other)?;
@@ -1142,6 +1203,16 @@ impl QueryEngine {
                 // the inner dispatch.
             }
         }
+        // Task 5.4: BACKUP TO '<directory>' — dump all tables to CSV + manifest.
+        // Task 5.5: RESTORE FROM '<directory>' [AS OF TIMESTAMP '<iso8601>'] —
+        //   load tables from CSV; with AS OF TIMESTAMP, replay the WAL up to
+        //   the given timestamp (PITR).
+        if lower.starts_with("backup to ") {
+            return self.execute_backup(trimmed, &start);
+        }
+        if lower.starts_with("restore from ") {
+            return self.execute_restore(trimmed, &start);
+        }
 
         // Wave 4 (Agent C): in MVCC mode, there's no catalog snapshot swap.
         // DML/SELECT execute against the main catalog directly; visibility
@@ -1156,6 +1227,32 @@ impl QueryEngine {
             }
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
+        }
+
+        // SAVEPOINT, ROLLBACK TO, RELEASE are handled inside execute_inner
+        // (after the txn snapshot is swapped in) so they operate on the
+        // transaction's catalog, not the main catalog.
+
+        if lower.starts_with("begin") || lower.starts_with("start transaction") {
+            let id = self.txn_manager.begin(&self.catalog).map_err(Error::Other)?;
+            self.wal_append_record(crate::storage::recovery::WalRecord::begin(id))?;
+            return Ok(QueryResult::empty());
+        }
+        if lower.starts_with("commit") {
+            // Capture the txn_id before we drain the transaction.
+            let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
+            let committed = self.txn_manager.commit().map_err(Error::Other)?;
+            self.catalog = committed;
+            self.savepoints.clear(); // Wave 69: clear savepoints on commit.
+            self.wal_append_record(crate::storage::recovery::WalRecord::commit(txn_id))?;
+            return Ok(QueryResult::empty());
+        }
+        if lower.starts_with("rollback") && !lower.starts_with("rollback to ") {
+            let txn_id = self.txn_manager.active.as_ref().map(|t| t.id).unwrap_or(0);
+            self.txn_manager.rollback().map_err(Error::Other)?;
+            self.savepoints.clear(); // Wave 69: clear savepoints on rollback.
+            self.wal_append_record(crate::storage::recovery::WalRecord::rollback(txn_id))?;
+            return Ok(QueryResult::empty());
         }
 
         // If a snapshot-isolation transaction is active, route all DML/DDL/
