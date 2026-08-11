@@ -530,12 +530,12 @@ fn compute_aggregate(func: &str, arg: &str, indices: &[usize], table: &Table) ->
     }
 }
 
-fn order_group_result(result: QueryResult, order_by: &[(String, bool)]) -> Result<QueryResult> {
+fn order_group_result(result: QueryResult, order_by: &[(String, bool, crate::sql::parser::NullsOrder)]) -> Result<QueryResult> {
     if order_by.is_empty() || result.columns.is_empty() {
         return Ok(result);
     }
 
-    let (col_name, ascending) = &order_by[0];
+    let (col_name, ascending, _nulls) = &order_by[0];
     let col_idx = result
         .columns
         .iter()
@@ -1115,7 +1115,7 @@ fn execute_select_multi(
     select: &[SelectItem],
     where_clause: &WhereClause,
     table: &Table,
-    _order_by: &[(String, bool)],
+    _order_by: &[(String, bool, crate::sql::parser::NullsOrder)],
     limit: Option<usize>,
 ) -> Result<QueryResult> {
     let indices = filter_indices(where_clause, table);
@@ -1160,14 +1160,14 @@ fn execute_select_multi(
 
 fn apply_order_by(
     result: QueryResult,
-    order_by: &[(String, bool)],
+    order_by: &[(String, bool, crate::sql::parser::NullsOrder)],
     _table: &Table,
 ) -> Result<QueryResult> {
     if order_by.is_empty() || result.columns.is_empty() || result.row_count <= 1 {
         return Ok(result);
     }
 
-    let (col_name, ascending) = &order_by[0];
+    let (col_name, ascending, _nulls) = &order_by[0];
     let col_idx = result
         .columns
         .iter()
