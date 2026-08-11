@@ -1288,3 +1288,38 @@ Stage Summary:
   deferred (documented) — metrics are accessible via `pool.metrics()`
   from Rust. 870 lib tests + 6 concurrency integration tests pass
   (0 failures). Ready for Wave 8.
+
+---
+
+# turboGP Competitive Benchmarking Programme — Worklog (Benchmarking Branch)
+
+**Branch:** `feat/benchmarking`
+**Sandbox:** `root@192.248.158.130` (`hopf-decoherence`)
+**Programme:** TPC-H (SF=1, SF=10) + ClickBench (100M rows) vs ClickHouse, DuckDB, Exasol
+
+## Sandbox Specifications
+
+| Dimension | Value |
+|---|---|
+| OS | Rocky Linux 10.2 (Red Quartz), kernel 6.12.0-211.34.1.el10_2.x86_64 |
+| CPU | AMD EPYC-Turin, 1 socket × 8 cores × 2 threads = **16 vCPU** |
+| RAM | 125 GiB total, 8 GiB swap |
+| Disk | 960 GB virtio (`vda`), 687 GB free on `/` |
+| Rust | rustc 1.97.1 (8bab26f4f 2026-07-14), cargo 1.97.1 |
+| Python | Python 3.12.13 |
+| Git | git 2.52.0 |
+| Docker | Docker CE 29.7.2 (overlay2, systemd cgroup v2). Network: host-only (iptables disabled — kernel lacks xt_addrtype module on this virtualized host; documented in FAIRNESS_AUDIT.md in Wave 8). |
+
+## Wave 1 — Sandbox Setup & Database Installation
+
+### Task 1.1 — Sandbox provisioning and verification
+- **System packages installed:** `dnf-plugins-core wget unzip curl tar git` (already present, confirmed).
+- **Docker CE installed** via `download.docker.com/linux/centos/docker-ce.repo`:
+  - `docker-ce-3:29.7.2-1.el10.x86_64`, `docker-ce-cli`, `containerd.io-2.3.3`, `docker-buildx-plugin`, `docker-compose-plugin-5.4.0`.
+- **Docker networking fix applied:** kernel on this host lacks the `xt_addrtype` iptables module, causing `failed to register "bridge" driver: failed to add jump rules to ipv4 NAT table`. Resolution: `/etc/docker/daemon.json` with `{"iptables": false, "ip6tables": false, "bridge": "none"}`. All benchmark containers will run with `--network host`. This is a host-only single-tenant benchmark box, so container isolation is not required.
+- **Python deps installed:** `pandas matplotlib seaborn paramiko` (via pip).
+- **turboGP cloned** to `/root/turboGP`; branch `feat/benchmarking` created from `main` (HEAD: `8e7d013` — `feat(9): final: merge feat/ha-concurrency into main`).
+- **Build verification:** `cargo check --jobs 1` — pending; will be re-run as part of Task 1.5.
+- **`worklog.md` initialized** (this section).
+
+DoD satisfied: sandbox accessible; Rust, Python, Docker installed; turboGP cloned and on `feat/benchmarking`; worklog initialized.
