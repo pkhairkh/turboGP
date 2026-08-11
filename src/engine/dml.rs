@@ -649,13 +649,21 @@ impl QueryEngine {
         }
         table.row_count += n_new_rows;
 
-        // Task 3.2 (debt-4.2): populate Table.row_versions when MVCC mode
+        // Task 3.1 (debt-4.2): populate Table.row_versions when MVCC mode
         // is enabled. Each inserted row gets a RowVersion with xmin = txn_id
-        // (or 0 for autocommit) and xmax = None (still live).
+        // (or 0 for autocommit) and xmax = None (still live). The new rows
+        // live at indices [old_row_count, old_row_count + n_new_rows); since
+        // `row_count` was already incremented above, that range is
+        // [row_count - n_new_rows, row_count).
         if self.mvcc_enabled {
             let xmin = txn_id.unwrap_or(0);
-            for _ in 0..n_new_rows {
-                table.row_versions.push(crate::txn::mvcc::RowVersion::new(xmin, Vec::new()));
+            let first_new_row = table.row_count - n_new_rows;
+            for i in 0..n_new_rows {
+                let row_idx = first_new_row + i;
+                table.append_row_version(
+                    row_idx,
+                    crate::txn::mvcc::RowVersion::new(xmin, Vec::new()),
+                );
             }
         }
 
@@ -1049,11 +1057,14 @@ impl QueryEngine {
             updated += 1;
         }
 
-        // Task 2.2 (debt-4.2): populate Table.row_versions when MVCC mode
+        // Task 3.1 (debt-4.2): populate Table.row_versions when MVCC mode
         // is enabled. For each matched row, the old version is tombstoned
         // (xmax = txn_id) via `mark_deleted`, and a new RowVersion carrying
-        // the post-update column values is appended. This must run BEFORE
-        // the temporal-sync block below, which drops the `table` borrow.
+        // the post-update column values is APPENDED TO THE SAME CHAIN at
+        // `row_idx`. This is the key Task 3.1 fix: previously UPDATE
+        // appended to the END of the flat `row_versions` vec, which broke
+        // the row-index alignment and made the new version invisible to
+        // the updating transaction.
         //
         // The new version's `values` are read from the already-mutated
         // `columns` (the in-place update loop above wrote the new cells),
@@ -1070,14 +1081,18 @@ impl QueryEngine {
                 for ci in 0..ncols {
                     new_values.push(table.columns[ci].get(row_idx).copied().unwrap_or(0));
                 }
-                // Tombstone the old version (sets xmax). If the row had no
+                // Tombstone the old version (sets xmax on the latest
+                // version in the chain at `row_idx`). If the row had no
                 // version yet (e.g. table loaded without MVCC tracking),
                 // `mark_deleted` returns false and we skip the append — the
                 // absence of a prior version means there is nothing to
                 // supersede.
                 let marked = table.mark_deleted(row_idx, xmin);
                 if marked {
-                    table.append_row_version(crate::txn::mvcc::RowVersion::new(xmin, new_values));
+                    table.append_row_version(
+                        row_idx,
+                        crate::txn::mvcc::RowVersion::new(xmin, new_values),
+                    );
                 }
             }
         }
@@ -1178,8 +1193,13 @@ impl QueryEngine {
         // versions (xmax = txn_id) and leave the column data in place for
         // VACUUM to reclaim later. We do NOT rebuild the columns or
         // decrement `row_count` here — that's the VACUUM path's job. The
-        // `row_versions` vec stays aligned with `columns` (both reflect
-        // the original row indices, with tombstones marking deleted rows).
+        // `row_versions` chain vec stays aligned with `columns` (both
+        // reflect the original row indices, with tombstones marking
+        // deleted rows).
+        //
+        // Task 3.1: `mark_deleted` now sets xmax on the LAST version in
+        // the chain at `row_idx` (rather than on `row_versions[row_idx]`
+        // directly). The semantics for DELETE are unchanged.
         //
         // The temporal sidecar (if any) still receives a logical delete
         // so FOR SYSTEM_TIME queries see the row's end-time, but its
@@ -1355,12 +1375,16 @@ mod tests {
     /// appends a new `RowVersion` with the post-update column values when
     /// MVCC mode is enabled.
     ///
+    /// Task 3.1: the new version is appended to the SAME chain at `row_idx`
+    /// (not to the end of the flat `row_versions` vec), so the row-index
+    /// alignment is preserved.
+    ///
     /// Sequence: `BEGIN; INSERT (1,10); UPDATE SET v=99 WHERE id=1; COMMIT;`
     /// Expected:
-    /// - `row_versions[0].xmax == Some(txn_id)` (old version tombstoned).
-    /// - `row_versions.len() == 2` (a new version was appended).
-    /// - The new version (`row_versions[1]`) has `xmin == txn_id`,
-    ///   `xmax == None`, and its `values` contain `99` (the updated `v`).
+    /// - `row_versions[0]` is a chain of length 2 (old + new version).
+    /// - `row_versions[0][0].xmax == Some(txn_id)` (old version tombstoned).
+    /// - `row_versions[0][1].xmin == txn_id`, `xmax == None`, and its
+    ///   `values` contain `99` (the updated `v`).
     #[test]
     fn test_update_sets_xmax() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut engine = QueryEngine::in_memory();
@@ -1379,21 +1403,24 @@ mod tests {
         let table = engine.catalog().get("t").ok_or_else(|| "table t should exist".to_string())?;
         assert!(!table.row_versions.is_empty(), "row_versions should be populated by INSERT");
 
-        // The original version (at index 0) should have been tombstoned.
+        // Row 0's chain should have 2 versions after INSERT + UPDATE.
+        let chain = &table.row_versions[0];
         assert_eq!(
-            table.row_versions[0].xmax,
+            chain.len(),
+            2,
+            "row 0 should have 2 versions after INSERT+UPDATE; got {}",
+            chain.len()
+        );
+
+        // The old version (chain[0]) is tombstoned.
+        assert_eq!(
+            chain[0].xmax,
             Some(txn_id),
             "UPDATE should set xmax on the old version"
         );
 
-        // A new version should have been appended for the updated row.
-        assert!(
-            table.row_versions.len() >= 2,
-            "UPDATE should append a new version; got len={}",
-            table.row_versions.len()
-        );
-
-        let new_version = &table.row_versions[1];
+        // The new version (chain[1]) is live and carries the updated value.
+        let new_version = &chain[1];
         assert_eq!(new_version.xmin, txn_id, "new version's xmin is the updating txn");
         assert_eq!(new_version.xmax, None, "new version is live (xmax == None)");
         assert!(
@@ -1407,8 +1434,11 @@ mod tests {
     /// Task 2.3 — `execute_delete` sets `xmax` on the old version when
     /// MVCC mode is enabled, without removing the row from `columns`.
     ///
+    /// Task 3.1: `mark_deleted` now sets xmax on the LAST version in the
+    /// chain at `row_idx`.
+    ///
     /// Sequence: `BEGIN; INSERT (1); DELETE WHERE id=1; COMMIT;`
-    /// Expected: `row_versions[0].xmax == Some(txn_id)`.
+    /// Expected: `row_versions[0].last().xmax == Some(txn_id)`.
     #[test]
     fn test_delete_sets_xmax() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut engine = QueryEngine::in_memory();
@@ -1426,10 +1456,12 @@ mod tests {
 
         let table = engine.catalog().get("t").ok_or_else(|| "table t should exist".to_string())?;
         assert!(!table.row_versions.is_empty(), "row_versions should be populated by INSERT");
+        let chain = &table.row_versions[0];
+        assert!(!chain.is_empty(), "row 0 should have at least one version");
         assert_eq!(
-            table.row_versions[0].xmax,
+            chain.last().unwrap().xmax,
             Some(txn_id),
-            "DELETE should set xmax on the old version"
+            "DELETE should set xmax on the latest version in the chain"
         );
         Ok(())
     }
