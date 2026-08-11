@@ -1264,3 +1264,174 @@ Stage Summary:
   AST/DDL types so CHECK constraints round-trip, add a
   `Catalog::drain` method for zero-copy load, add a binary
   checkpoint benchmark).
+
+---
+Task ID: 4.3 + 4.4 + 4.5
+Agent: general-purpose
+Task: Binary checkpoint PITR support, migration path verification,
+and binary-vs-SQL performance benchmark.
+
+Work Log:
+- Read `worklog.md` (Waves 1-4 done; Tasks 4.1, 4.2 complete — 837
+  lib tests), `src/engine/vacuum.rs` (existing `execute_restore`
+  with CSV-manifest + fake-timestamp PITR), `src/storage/recovery.rs`
+  (`WalRecord.timestamp_us` already set by `Wal::append` to epoch
+  microseconds, read by `Wal::read_all` in the 7-field format),
+  `src/storage/replication.rs` (`replay_wal_to_timestamp` +
+  `TimestampedWalRecord`), `src/storage/checkpoint.rs`
+  (`BinaryCheckpoint::save` / `load` wrapper), and `src/engine/mod.rs`
+  (`with_data_dir` binary-first / SQL-fallback, `flush_with_checkpoint`
+  writes both formats).
+- **Task 4.3 — `src/engine/vacuum.rs` (`execute_restore` rewrite,
+  ~+185 LOC net):**
+  - New load order in `execute_restore`:
+    1. **Binary checkpoint** (`checkpoint.bin`) — fast path. Calls
+       `BinaryCheckpoint::load`, registers each loaded `Table` clone
+       into `engine.catalog` (no SQL re-execution). Skips
+       `__dummy__`. Counts rows for the result.
+    2. **SQL checkpoint** (`checkpoint.sql`) — legacy fallback when
+       `checkpoint.bin` is missing or fails to load (corrupt file).
+       Calls `Checkpoint::load(&mut engine, &checkpoint_sql_path)`,
+       which re-executes CREATE TABLE / INSERT lines via
+       `engine.execute(...)`. The WAL is temporarily taken out
+       (`engine.wal.take()`) during load so the replay statements
+       aren't appended to the WAL (would pollute PITR replay and
+       break idempotency).
+    3. **CSV manifest** (`manifest.json` + `*.csv`) — original Wave
+       6 BACKUP TO format, used when neither checkpoint exists. Moved
+       the existing CSV-loop body into a helper `restore_from_manifest`
+       to keep `execute_restore` readable.
+  - If none of the three sources exist, returns an `Error::Other` with
+    a descriptive message (preserves the pre-existing
+    `test_restore_nonexistent_directory_returns_error` contract).
+  - **PITR WAL replay (Task 4.3 fix):** the old code assigned fake
+    timestamps (`i as u64` — record-index) to WAL records and called
+    `replay_wal_to_timestamp`. The new code uses the real
+    `WalRecord.timestamp_us` field (set by `Wal::append` to epoch
+    microseconds). For legacy WAL files written before the timestamp
+    field existed (all records have `timestamp_us == 0`), it falls
+    back to record-index ordering so the original PITR semantics
+    still work.
+  - **WAL location:** the PITR path now looks for the segmented WAL
+    in `<backup_dir>/wal/` first (the canonical location written by
+    `with_data_dir`'s `Wal::open`), then falls back to the legacy
+    flat `<backup_dir>/wal.log`. The old code only checked the flat
+    file.
+  - Refactored the result-building into a small `finish_restore`
+    helper so both the no-WAL early return and the normal path share
+    the same result-shape code.
+- **Task 4.4 — migration path test (in `tests/backup_restore_pitr.rs`):**
+  - `test_migration_sql_to_binary`:
+    1. `with_data_dir`, CREATE TABLE mig_t, INSERT 3 rows.
+    2. Call `Checkpoint::save_and_truncate(&engine.catalog, &sql_path,
+       wal)` directly (NOT `flush_with_checkpoint`, which would write
+       both formats) to simulate a pre-binary-checkpoint data dir.
+       This writes `checkpoint.sql` + LSN sidecar + truncates the WAL,
+       but does NOT write `checkpoint.bin`.
+    3. Assert `checkpoint.bin` does NOT exist (legacy data dir).
+    4. Drop engine, `with_data_dir` → loads from SQL (no `checkpoint.bin`).
+       Verify 3 rows present + `id=2, v=20`.
+    5. `CHECKPOINT` → `checkpoint.bin` now exists (migration).
+    6. Drop engine, `with_data_dir` → loads from binary.
+       Verify 3 rows present + `id=3, v=30`.
+  - The disjoint-borrow pattern (`engine.wal.as_mut()` + `&engine.catalog`
+    in the same call) works because Rust 2018+ borrow checker
+    recognizes disjoint struct fields.
+- **Task 4.5 — benchmark test (`test_checkpoint_binary_faster_than_sql`):**
+  - `QueryEngine::in_memory()`, CREATE TABLE bench_t (id INT, v INT),
+    insert 10,000 rows in 10 chunks of 1,000-row multi-row INSERTs
+    (avoids WAL fsync overhead and parser limits on a single 10k-row
+    INSERT).
+  - `std::time::Instant::now()` + `elapsed()` around:
+    - `Checkpoint::save(&engine.catalog, &sql_path)` — legacy SQL-text
+      path (emits CREATE TABLE + 10,000 INSERT statements).
+    - `BinaryCheckpoint::save(&engine.catalog, &bin_path)` — bincode
+      serialization of the catalog.
+  - Assert `bin_elapsed * 3 < sql_elapsed` (binary is ≥3x faster).
+  - Prints the speedup factor via `eprintln!` (visible with
+    `--nocapture`).
+  - **Measured speedup: 20.82x** (sql=26,652μs, bin=1,280μs on the
+    test machine). Well above the 3x threshold.
+- **Additional test: `test_binary_checkpoint_restore_no_timestamp`** —
+  RESTORE without `AS OF TIMESTAMP` loads the full checkpoint state
+  when the WAL is empty (post-CHECKPOINT). Verifies the no-PITR path
+  still works after the rewrite.
+
+- **Constraints honoured:**
+  - No `unwrap()`/`expect()` in production code (`vacuum.rs`). Tests
+    use `expect()` with descriptive messages.
+  - Max 3 files touched: only 2 modified (`src/engine/vacuum.rs`,
+    `tests/backup_restore_pitr.rs`). `src/storage/recovery.rs` was
+    NOT modified — the `WalRecord.timestamp_us` field and
+    `Wal::append` / `Wal::read_all` handling were already correct
+    from Task 4.1+4.2.
+  - Context budget: ~452 LOC added across the two files (well under
+    the 1,500 LOC cap).
+
+- **Verification:**
+  - `cargo check --jobs 1 --lib` → 466 pre-existing warnings, 0
+    errors, no new warnings introduced.
+  - `cargo check --jobs 1 --test backup_restore_pitr` → 0 errors.
+  - `cargo test --jobs 1 --lib` → **837 passed, 0 failed** (no
+    regressions; same count as the Task 4.1+4.2 baseline).
+  - `cargo test --jobs 1 --test backup_restore_pitr` → **10 passed,
+    0 failed** (4 pre-existing + 4 new: `test_binary_checkpoint_pitr`,
+    `test_binary_checkpoint_restore_no_timestamp`,
+    `test_migration_sql_to_binary`,
+    `test_checkpoint_binary_faster_than_sql`).
+  - `cargo test --jobs 1 --test dml_checkpoint --test on_disk_storage
+    --test wal --test acid` → all pass (no regressions in
+    checkpoint, on-disk, WAL, or ACID test suites).
+  - Pre-existing failure (NOT caused by this task; verified by
+    `git stash` + re-run on the base commit `23a8e68`):
+    - `tests/explain_analyze_vacuum_copy_test.rs::copy_to_and_from`
+      fails with `COPY path '...' not in allowed_copy_dirs
+      (SQLSTATE 42501)` — a COPY-permissions setup issue unrelated
+      to RESTORE / checkpoint / PITR.
+  - Pre-existing failure (Wave 3 debt, noted in Task 4.1+4.2 worklog):
+    - `tests/integration.rs`: `unresolved imports turbogp::executor,
+      turbogp::memory::region`.
+- Committed on `feat/prod-hardening` as `8b2ba75` with the task
+  commit-message template.
+
+Stage Summary:
+- 2 files modified (within the 3-file limit):
+  - `src/engine/vacuum.rs`: +185 LOC net (`execute_restore` rewrite
+    with binary-checkpoint-first load order, real-timestamp PITR,
+    WAL-dir-or-flat-file lookup, `restore_from_manifest` helper,
+    `finish_restore` helper).
+  - `tests/backup_restore_pitr.rs`: +267 LOC (4 new tests covering
+    PITR, no-timestamp restore, SQL→binary migration, and the
+    binary-vs-SQL benchmark).
+- DoD met:
+  - **Task 4.3 (PITR):** `execute_restore` loads `checkpoint.bin`
+    first, falls back to `checkpoint.sql`, then to CSV manifest. PITR
+    uses the real `WalRecord.timestamp_us` field. Test
+    `test_binary_checkpoint_pitr` verifies 5 checkpoint rows survive
+    + 3 post-checkpoint WAL records (with `timestamp_us > target`)
+    are skipped.
+  - **Task 4.4 (Migration):** `test_migration_sql_to_binary` proves
+    a legacy SQL-only data dir loads via SQL fallback on the first
+    `with_data_dir`, then upgrades to binary after a CHECKPOINT, and
+    the second `with_data_dir` loads from binary. Data matches
+    across both paths.
+  - **Task 4.5 (Benchmark):** `test_checkpoint_binary_faster_than_sql`
+    inserts 10,000 rows and asserts `bin_elapsed * 3 < sql_elapsed`.
+    Measured 20.82x speedup (sql=26.7ms, bin=1.3ms).
+- Known limitations (out of scope for this task):
+  - The benchmark uses wall-clock `Instant::elapsed()` rather than
+    `criterion`. Sufficient for a ≥3x assertion, but a future wave
+    could add a `criterion` benchmark for statistical rigor (median,
+    p99, warm-up).
+  - PITR replay re-executes WAL record SQL via `engine.execute()`
+    (logical replay). Physical replay (`PhysicalChange` records) is
+    not yet wired into the PITR path — it's only used by
+    `replay_wal_with_lsn_filter` on the normal `with_data_dir` restart
+    path. A future wave could unify the two replay paths.
+  - The `with_data_dir` SQL-fallback path and the `execute_restore`
+    SQL-fallback path both clone `Table`s out of the loaded `Catalog`
+    (no `Catalog::drain` API). Same limitation as Task 4.1+4.2.
+- Ready for downstream Wave 4 tasks (e.g. unify physical + logical
+  WAL replay, add `criterion` benchmark, add `Catalog::drain` for
+  zero-copy load).
+
