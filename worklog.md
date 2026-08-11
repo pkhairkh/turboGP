@@ -1461,3 +1461,27 @@ Stage Summary:
 - RaftManager::new_multi_node uses TcpRaftNetwork for multi-node clusters.
 - 3-node TCP cluster replication verified.
 - Wave 3 complete.
+
+---
+Task ID: 4.1 + 4.2 + 4.3
+Agent: prod-wiring-orchestrator
+Task: Wire Raft into the write path; fallback to local-only when Raft not enabled.
+
+Work Log:
+- Added `raft_handle: Option<(RaftType, tokio::runtime::Handle)>` field to Wal (cfg-gated on the raft feature).
+- Added Wal::set_raft_handle(raft, handle) and Wal::clear_raft_handle() methods.
+- Modified Wal::append_and_sync:
+  - If raft_handle is set, serialize the WalRecord with bincode, block_on raft.client_write(bytes) BEFORE the local append + fsync.
+  - If Raft fails (quorum unreachable, not leader, etc.), return an io::Error so the caller's transaction aborts; the local WAL is NOT written.
+  - If raft_handle is None, the existing local-only path is used (backward compat).
+- Modified engine::QueryEngine::enable_raft (when --features raft):
+  - After creating the RaftManager and runtime, calls wal.set_raft_handle(mgr.raft.clone(), runtime.handle().clone()).
+  - This wires the leader's Raft consensus into every subsequent append_and_sync call.
+- Tests:
+  - wal_append_and_sync_routes_through_raft: single-node persistent RaftManager + Wal with raft_handle. Append a record, verify it lands in both the Raft store's applied_records AND the local WAL. Decode the bincode payload to confirm the SQL.
+  - wal_append_and_sync_local_only_when_no_raft: no raft_handle attached, append_and_sync works as before.
+
+Stage Summary:
+- Raft wired into the write path: append_and_sync → RaftManager::propose (via raft.client_write).
+- Backward compatibility preserved when Raft is not enabled.
+- Wave 4 complete.

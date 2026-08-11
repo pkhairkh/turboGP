@@ -22,7 +22,7 @@ Branch: `feat/prod-wiring`.
   append happens only after the Raft commit returns. When Raft is not
   enabled, the original local-only path is used (backward compatible).
 - **Resolved by:** Wave 4 (Task 4.1 + 4.2).
-- **Resolved:** ☐
+- **Resolved:** ☑ (commit bab42a7)
 
 ---
 
@@ -169,7 +169,7 @@ Branch: `feat/prod-wiring`.
 
 | Gap | Wave | Target | Resolved |
 |-----|------|--------|----------|
-| 1 — Raft write path | 4 | `append_and_sync` → `RaftManager::propose()` | ☐ |
+| 1 — Raft write path | 4 | `append_and_sync` → `RaftManager::propose()` | ☑ |
 | 2 — Persistent Raft storage | 2 | `SledRaftStore` (disk-backed) | ☑ |
 | 3 — TCP Raft network | 3 | `TcpRaftNetwork` over tokio TCP | ☑ |
 | 4 — Production pgwire server | 5 | Full PostgreSQL wire protocol over tokio | ☐ |
