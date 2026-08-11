@@ -385,7 +385,7 @@ fn _assert_logflushed_bounds(_: LogFlushed<TypeConfig>) {}
 // Snapshot encoding / decoding (length-prefixed Vec<Vec<u8>>)
 // =========================================================================
 
-fn encode_snapshot(records: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn encode_snapshot(records: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     for rec in records {
         out.extend_from_slice(&(rec.len() as u64).to_le_bytes());
@@ -394,7 +394,7 @@ fn encode_snapshot(records: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-fn decode_snapshot(data: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn decode_snapshot(data: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos + 8 <= data.len() {
