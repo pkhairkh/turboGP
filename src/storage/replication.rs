@@ -410,8 +410,17 @@ impl WalReceiver {
 }
 
 // =========================================================================
-// Raft consensus (minimal implementation)
+// Raft consensus (minimal hand-rolled stub — retained for backward compat)
 // =========================================================================
+//
+// Wave 5 (Task 5.1+) replaces this stub with a real openraft integration
+// in `crate::storage::raft` (compiled when the `raft` feature is enabled).
+// `QueryEngine::enable_raft` routes to `raft::RaftManager` when the feature
+// is on, and falls back to this `RaftNode` stub when the feature is off.
+// The stub is kept here so its existing unit tests continue to run in the
+// default build (without `--features raft`); it does NOT implement real
+// Raft consensus (no quorum, no failover, no log replication beyond the
+// WalStreamer TCP fan-out in `on_become_leader`).
 
 /// Raft node state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,7 +430,7 @@ pub enum RaftState {
     Leader,
 }
 
-/// A minimal Raft node.
+/// A minimal Raft node (stub).
 ///
 /// This implements the core Raft consensus algorithm:
 /// - Leader election via randomized timeouts
