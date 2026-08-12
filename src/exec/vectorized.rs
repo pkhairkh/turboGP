@@ -228,6 +228,17 @@ pub fn sum_masked(col: &[u64], mask: &[bool]) -> u64 {
     (sum as f64).to_bits()
 }
 
+/// Sum for float/DECIMAL columns. Each cell is f64::to_bits; decode, sum, re-encode.
+pub fn sum_masked_f64(col: &[u64], mask: &[bool]) -> u64 {
+    let mut sum: f64 = 0.0;
+    for (i, &v) in col.iter().enumerate() {
+        if mask[i] {
+            sum += f64::from_bits(v);
+        }
+    }
+    sum.to_bits()
+}
+
 /// Compute count where mask is true.
 pub fn count_masked(mask: &[bool]) -> u64 {
     mask.iter().filter(|&&b| b).count() as u64
@@ -273,6 +284,23 @@ pub fn avg_masked(col: &[u64], mask: &[bool]) -> u64 {
         0
     } else {
         (sum as f64 / count as f64).to_bits()
+    }
+}
+
+/// Average for float/DECIMAL columns.
+pub fn avg_masked_f64(col: &[u64], mask: &[bool]) -> u64 {
+    let mut sum: f64 = 0.0;
+    let mut count: u64 = 0;
+    for (i, &v) in col.iter().enumerate() {
+        if mask[i] {
+            sum += f64::from_bits(v);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0
+    } else {
+        (sum / count as f64).to_bits()
     }
 }
 

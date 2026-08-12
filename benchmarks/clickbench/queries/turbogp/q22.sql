@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM hits WHERE URL LIKE '%page_10%';

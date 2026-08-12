@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM hits WHERE CounterID IN (SELECT CounterID FROM hits WHERE UserID = 12345);

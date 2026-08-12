@@ -1,0 +1,1 @@
+SELECT AVG(WatchID) FROM hits;

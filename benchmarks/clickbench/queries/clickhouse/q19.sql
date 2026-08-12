@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM hits WHERE WatchID % 2 = 0;

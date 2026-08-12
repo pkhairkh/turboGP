@@ -1,0 +1,1 @@
+SELECT CounterID, AVG(WatchID) FROM hits GROUP BY CounterID;

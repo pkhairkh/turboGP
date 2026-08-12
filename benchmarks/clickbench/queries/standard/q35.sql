@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM hits WHERE EventDate IN ('2020-01-01', '2020-01-02', '2020-01-03');

@@ -1,0 +1,1 @@
+SELECT EventDate, SUM(WatchID) AS s FROM hits GROUP BY EventDate ORDER BY EventDate;

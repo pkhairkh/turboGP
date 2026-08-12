@@ -52,13 +52,17 @@ def drop_caches():
 def run_query_turbogp(sql, sf, port=55432):
     """Run a query on turboGP (pgwire)."""
     db_name = f"tpch_sf{sf}"  # Not used — turboGP loads tables directly
-    cmd = f"psql -h 127.0.0.1 -p {port} -U postgres -tAc \"{sql.replace(chr(34), chr(39)).replace(chr(10), ' ')}\""
+    cmd = f"psql -h 127.0.0.1 -p {port} -U postgres -tAc \"{sql_lines = [line for line in sql.split(chr(10)) if not line.strip().startswith('--')]
+            sql_clean = chr(10).join(sql_lines)
+            sql_escaped = sql_clean.replace(chr(34), chr(39)).replace(chr(10), ' ')}\""
     return run_cmd(cmd)
 
 
 def run_query_clickhouse(sql, sf):
     """Run a query on ClickHouse."""
-    cmd = f"docker exec clickhouse clickhouse-client --query \"{sql.replace(chr(34), chr(39)).replace(chr(10), ' ')}\""
+    cmd = f"docker exec clickhouse clickhouse-client --query \"{sql_lines = [line for line in sql.split(chr(10)) if not line.strip().startswith('--')]
+            sql_clean = chr(10).join(sql_lines)
+            sql_escaped = sql_clean.replace(chr(34), chr(39)).replace(chr(10), ' ')}\""
     return run_cmd(cmd)
 
 

@@ -1,0 +1,1 @@
+SELECT SUM(WatchID) FROM hits WHERE CounterID = 500;

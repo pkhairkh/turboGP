@@ -97,7 +97,10 @@ def stop_turbogp(proc):
         except: proc.kill()
 
 def run_query(db, sql, sf):
-    sql_escaped = sql.replace('"', "'").replace('\n', ' ').strip()
+    # Strip comment-only lines to avoid lexer issues when newlines are collapsed.
+    sql_lines = [line for line in sql.split('\n') if not line.strip().startswith('--')]
+    sql_clean = '\n'.join(sql_lines)
+    sql_escaped = sql_clean.replace('"', "'").replace('\n', ' ').strip()
     if db == "turbogp":
         cmd = f"psql -h 127.0.0.1 -p 55432 -U postgres -tAc \"{sql_escaped}\""
     elif db == "clickhouse":

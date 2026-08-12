@@ -1,0 +1,1 @@
+SELECT CounterID, SUM(WatchID) AS s FROM hits GROUP BY CounterID ORDER BY s DESC LIMIT 10;

@@ -1,0 +1,1 @@
+SELECT CounterID, MIN(WatchID), MAX(WatchID) FROM hits GROUP BY CounterID;

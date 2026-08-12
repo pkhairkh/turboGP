@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM (SELECT CounterID FROM hits GROUP BY CounterID) AS sub;

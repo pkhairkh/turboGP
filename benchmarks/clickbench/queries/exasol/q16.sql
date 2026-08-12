@@ -1,0 +1,1 @@
+SELECT CounterID, COUNT(*) AS c FROM hits WHERE EventDate = '2020-01-15' GROUP BY CounterID ORDER BY c DESC LIMIT 10;

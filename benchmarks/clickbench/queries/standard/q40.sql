@@ -1,0 +1,1 @@
+SELECT MIN(WatchID) FROM hits WHERE CounterID = 500;
