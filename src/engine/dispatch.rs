@@ -393,29 +393,66 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
         }
         QueryShape::SumCol => {
             let mask = build_filter_mask(query, table)?;
-            let col_idx = resolve_agg_col(&query.select[0], table)?;
-            // Exclude NULLs (Wave 33).
-            let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
-            let is_float = table.schema.as_ref().map(|s| s.is_float(col_idx)).unwrap_or(false);
-            let sum = if is_float {
-                vectorized::sum_masked_f64(&table.columns[col_idx], &null_adjusted_mask)
-            } else {
-                vectorized::sum_masked(&table.columns[col_idx], &null_adjusted_mask)
-            };
-            Ok(single_value("sum", sum))
+            // Try simple column path first
+            match resolve_agg_col(&query.select[0], table) {
+                Ok(col_idx) => {
+                    let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
+                    let is_float = table.schema.as_ref().map(|s| s.is_float(col_idx)).unwrap_or(false);
+                    let sum = if is_float {
+                        vectorized::sum_masked_f64(&table.columns[col_idx], &null_adjusted_mask)
+                    } else {
+                        vectorized::sum_masked(&table.columns[col_idx], &null_adjusted_mask)
+                    };
+                    Ok(single_value("sum", sum))
+                }
+                Err(_) => {
+                    // W2: Arithmetic expression in SUM — use compiled expr evaluator
+                    if let SelectItem::Aggregate { arg, .. } = &query.select[0] {
+                        if let Some(compiled) = crate::exec::expr_eval::compile_expr(arg, table) {
+                            let indices: Vec<usize> = mask.iter().enumerate()
+                                .filter(|(_, &m)| m)
+                                .map(|(i, _)| i)
+                                .collect();
+                            let sum = crate::exec::expr_eval::sum_compiled_f64(&compiled, table, &indices);
+                            return Ok(single_value("sum", sum.to_bits()));
+                        }
+                    }
+                    Err(Error::Other("cannot resolve SUM argument".into()))
+                }
+            }
         }
         QueryShape::AvgCol => {
             let mask = build_filter_mask(query, table)?;
-            let col_idx = resolve_agg_col(&query.select[0], table)?;
-            // Exclude NULLs (Wave 33).
-            let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
-            let is_float = table.schema.as_ref().map(|s| s.is_float(col_idx)).unwrap_or(false);
-            let avg = if is_float {
-                vectorized::avg_masked_f64(&table.columns[col_idx], &null_adjusted_mask)
-            } else {
-                vectorized::avg_masked(&table.columns[col_idx], &null_adjusted_mask)
-            };
-            Ok(single_value("avg", avg))
+            match resolve_agg_col(&query.select[0], table) {
+                Ok(col_idx) => {
+                    let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
+                    let is_float = table.schema.as_ref().map(|s| s.is_float(col_idx)).unwrap_or(false);
+                    let avg = if is_float {
+                        vectorized::avg_masked_f64(&table.columns[col_idx], &null_adjusted_mask)
+                    } else {
+                        vectorized::avg_masked(&table.columns[col_idx], &null_adjusted_mask)
+                    };
+                    Ok(single_value("avg", avg))
+                }
+                Err(_) => {
+                    // W2: Arithmetic expression in AVG — use compiled expr evaluator
+                    if let SelectItem::Aggregate { arg, .. } = &query.select[0] {
+                        if let Some(compiled) = crate::exec::expr_eval::compile_expr(arg, table) {
+                            let indices: Vec<usize> = mask.iter().enumerate()
+                                .filter(|(_, &m)| m)
+                                .map(|(i, _)| i)
+                                .collect();
+                            let sum = crate::exec::expr_eval::sum_compiled_f64(&compiled, table, &indices);
+                            let count = indices.len() as u64;
+                            let avg = if count > 0 {
+                                sum / count as f64
+                            } else { 0.0 };
+                            return Ok(single_value("avg", avg.to_bits()));
+                        }
+                    }
+                    Err(Error::Other("cannot resolve AVG argument".into()))
+                }
+            }
         }
         QueryShape::MinMax => {
             let mask = build_filter_mask(query, table)?;
