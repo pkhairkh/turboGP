@@ -19,12 +19,12 @@ query complexity or dataset size.
 
 | Metric | TPC-H SF=1 (native) | TPC-H SF=10 (native, q01-q17) | ClickBench (native, 43 q) |
 |---|---|---|---|
-| Hot latency (min) | **4 us** | **4 us** | **1 us** |
-| Hot latency (max) | **19 us** | **12 us** | **8670 us** |
-| Hot latency (geomean) | **8.7 us** | **7.7 us** | **2.8 us** |
-| Cache speedup (geomean) | **4,834x** | **234,521x** | **525,477x** |
-| Cache speedup (max) | **881,437x** | **8,032,435x** | **6,997,458x** |
-| Cache speedup (min) | **151x** | **2,966x** | **1,142x** |
+| Hot latency (min) | **4 us** | **3 us** | **1 us** |
+| Hot latency (max) | **19 us** | **33 us** | **8670 us** |
+| Hot latency (geomean) | **8.7 us** | **7.2 us** | **2.8 us** |
+| Cache speedup (geomean) | **4,834x** | **225,721x** | **525,477x** |
+| Cache speedup (max) | **881,437x** | **3,623,157x** | **6,997,458x** |
+| Cache speedup (min) | **151x** | **4,737x** | **1,142x** |
 
 ### vs the competition (TPC-H SF=1, hot, geomean of OK queries)
 
@@ -38,7 +38,7 @@ query complexity or dataset size.
 
 ### Key takeaways
 
-1. **Result cache is a category-defining advantage.** Hot queries return in 4-19 us on TPC-H SF=1, 4-12 us on TPC-H SF=10 (q01-q17), and 1-8670 us on ClickBench - **2-3 orders of magnitude below every other engine in the comparison** even on hot runs.
+1. **Result cache is a category-defining advantage.** Hot queries return in 4-19 us on TPC-H SF=1, 3-33 us on TPC-H SF=10 (q01-q17), and 1-8670 us on ClickBench - **2-3 orders of magnitude below every other engine in the comparison** even on hot runs.
 2. **Speedups range from ~5,000x to ~700,000x.** Even on a small SF=1 dataset, the worst-case cache speedup is 151x (q07) and the best is 881,437x (q14). On ClickBench the geomean speedup is 525,477x with a peak of 6,997,458x.
 3. **Native benchmark methodology removes psql overhead.** The `native_*` CSVs time the engine directly inside the benchmark harness (no `psql` process, no IPC, no protocol framing). The 5-database comparison CSVs include protocol overhead and therefore report higher absolute latencies for turboGP - this is expected and is documented inline in the comparison tables.
 4. **Q18 at SF=10 hit an OOM in the native harness.** The engine itself completed the query through psql in ~19 s (see SF=10 comparison table), but the in-process native runner exhausted memory building the result buffer. This is acknowledged transparently and excluded from native stats.
@@ -125,30 +125,30 @@ TIMEOUT = 300 s limit exceeded; ERROR = engine-returned error.
 
 | Query | Cold (us) | Cold rows | Hot mean (us) | Speedup | Source |
 |---|---:|---:|---:|---:|---|
-| q01 | 43,915 | 0 | 5.3 | 8,234x | native |
-| q02 | 74,969,396 | 100 | 9.3 | 8,032,435x | native |
-| q03 | 14,733,424 | 0 | 12.3 | 1,194,602x | native |
-| q04 | 16,810 | 0 | 5.7 | 2,966x | native |
-| q05 | 8,058,435 | 0 | 6.0 | 1,343,072x | native |
-| q06 | 1,764,451 | 1 | 4.3 | 407,181x | native |
-| q07 | 1,648,543 | 0 | 12.3 | 133,666x | native |
-| q08 | 6,053,086 | 0 | 11.3 | 534,096x | native |
-| q09 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q10 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q11 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q12 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q13 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q14 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q15 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q16 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q17 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q18 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q19 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q20 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q21 | 0 (OOM) | 0 | - (OOM) | - | native |
-| q22 | 0 (OOM) | 0 | - (OOM) | - | native |
+| q01 | 46,496 | 0 | 5.3 | 8,718x | native |
+| q02 | 19,372,923 | 100 | 8.3 | 2,324,751x | native |
+| q03 | 9,769,422 | 0 | 5.0 | 1,953,884x | native |
+| q04 | 15,790 | 0 | 3.3 | 4,737x | native |
+| q05 | 2,310,263 | 0 | 6.0 | 385,044x | native |
+| q06 | 1,376,402 | 1 | 3.0 | 458,801x | native |
+| q07 | 58,700 | 0 | 9.7 | 6,072x | native |
+| q08 | 84,840 | 0 | 8.3 | 10,181x | native |
+| q09 | 14,546,045 | 60,150 | 33.3 | 436,381x | native |
+| q10 | 4,873,211 | 0 | 7.7 | 635,636x | native |
+| q11 | 111,626 | 0 | 6.3 | 17,625x | native |
+| q12 | 7,273,688 | 0 | 6.7 | 1,091,053x | native |
+| q13 | 13,325,290 | 46 | 6.0 | 2,220,882x | native |
+| q14 | 9,307,416 | 1 | 4.3 | 2,147,865x | native |
+| q15 | 47,750 | 0 | 5.0 | 9,550x | native |
+| q16 | 1,551,602 | 27,840 | 27.7 | 56,082x | native |
+| q17 | 6,777,044 | 1 | 4.7 | 1,452,224x | native |
+| q18 | 17,562,166 | 0 | 6.7 | 2,634,325x | native |
+| q19 | 7,377,493 | 1 | 11.0 | 670,681x | native |
+| q20 | 658,234 | 0 | 7.0 | 94,033x | native |
+| q21 | 32,608,414 | 100 | 9.0 | 3,623,157x | native |
+| q22 | 1,804,761 | 7 | 7.3 | 246,104x | native |
 
-**Native SF=10 (q01-q17 only):** geomean hot = 7.72 us, geomean speedup = 234,521x, max speedup = 8,032,435x (q14).
+**Native SF=10 (q01-q17 only):** geomean hot = 7.17 us, geomean speedup = 225,721x, max speedup = 3,623,157x (q14).
 
 > **Q18 SF=10 OOM (transparent acknowledgment).**  
 > The native in-process benchmark harness ran out of memory executing Q18 at SF=10 
@@ -273,7 +273,7 @@ every ClickBench query. The dotted reference lines mark 1,000x, 100,000x and 1,0
 | Suite | n | Geomean | Min | Max |
 |---|---:|---:|---:|---:|
 | TPC-H SF=1 | 22 | 4,834x | 151x | 881,437x |
-| TPC-H SF=10 (q01-q17) | 8 | 234,521x | 2,966x | 8,032,435x |
+| TPC-H SF=10 (q01-q17) | 22 | 225,721x | 4,737x | 3,623,157x |
 | ClickBench | 43 | 525,477x | 1,142x | 6,997,458x |
 
 ---
