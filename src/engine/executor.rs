@@ -626,31 +626,28 @@ fn compute_aggregate(func: &str, arg: &str, indices: &[usize], table: &Table) ->
         "SUM" => {
             // Check if arg is a simple column or an arithmetic expression (Wave 40).
             if crate::exec::expr_eval::is_arithmetic_expr(arg) {
-                // Evaluate the expression per row and sum.
-                // If any operand is a float, the result should be a float sum.
-                let sum_f64: f64 = indices
-                    .iter()
-                    .map(|&i| {
-                        let val = crate::exec::expr_eval::eval_expr(arg, table, i);
-                        // Convert to f64 — eval_expr returns u64 which may be
-                        // int or f64 bits. We sum as f64 to handle both.
-                        // Check if it looks like an f64 bit pattern.
-                        if val > (1u64 << 62) && f64::from_bits(val).is_finite() {
-                            f64::from_bits(val)
-                        } else if val > (1u64 << 60) {
-                            // Could be a large int or a float — try float first.
-                            let f = f64::from_bits(val);
-                            if f.is_finite() && f.abs() < 1e15 {
-                                f
+                // W1 fix: compile the expression ONCE, then evaluate vectorized.
+                if let Some(compiled) = crate::exec::expr_eval::compile_expr(arg, table) {
+                    let sum_f64 = crate::exec::expr_eval::sum_compiled_f64(&compiled, table, &indices);
+                    sum_f64.to_bits()
+                } else {
+                    // Fallback to old path if compilation fails
+                    let sum_f64: f64 = indices
+                        .iter()
+                        .map(|&i| {
+                            let val = crate::exec::expr_eval::eval_expr(arg, table, i);
+                            if val > (1u64 << 62) && f64::from_bits(val).is_finite() {
+                                f64::from_bits(val)
+                            } else if val > (1u64 << 60) {
+                                let f = f64::from_bits(val);
+                                if f.is_finite() && f.abs() < 1e15 { f } else { val as f64 }
                             } else {
                                 val as f64
                             }
-                        } else {
-                            val as f64
-                        }
-                    })
-                    .sum();
-                sum_f64.to_bits()
+                        })
+                        .sum();
+                    sum_f64.to_bits()
+                }
             } else {
                 let idx = table.column_idx(arg).unwrap_or(0);
                 // Check if this is a float/DECIMAL column
@@ -1059,6 +1056,22 @@ fn execute_sum(
     // Check if arg is an arithmetic expression (Wave 44 fix).
     if crate::exec::expr_eval::is_arithmetic_expr(arg) {
         let indices = filter_indices(where_clause, table, mvcc);
+        // W1 fix: compile expression once, evaluate vectorized
+        if let Some(compiled) = crate::exec::expr_eval::compile_expr(arg, table) {
+            let sum_f64 = crate::exec::expr_eval::sum_compiled_f64(&compiled, table, &indices);
+            return Ok(QueryResult {
+                columns: vec![ResultColumn {
+                    name: name.into(),
+                    values: vec![sum_f64.to_bits()],
+                    string_values: None,
+                    type_oid: 0,
+                    null_mask: None,
+                }],
+                row_count: 1,
+                elapsed_us: 0,
+            });
+        }
+        // Fallback to old path
         let sum_f64: f64 = indices
             .iter()
             .map(|&i| {
@@ -1067,11 +1080,7 @@ fn execute_sum(
                     f64::from_bits(val)
                 } else if val > (1u64 << 60) {
                     let f = f64::from_bits(val);
-                    if f.is_finite() && f.abs() < 1e15 {
-                        f
-                    } else {
-                        val as f64
-                    }
+                    if f.is_finite() && f.abs() < 1e15 { f } else { val as f64 }
                 } else {
                     val as f64
                 }

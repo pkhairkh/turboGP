@@ -225,6 +225,176 @@ impl<'a> ExprParser<'a> {
 // Tests
 // -----------------------------------------------------------------------
 
+
+
+// === Pre-compiled expression for fast vectorized evaluation ===
+
+/// A compiled arithmetic expression. Parse once, evaluate many times.
+/// This avoids re-tokenizing and re-parsing the expression string per row.
+#[derive(Debug, Clone)]
+pub enum CompiledNode {
+    /// A column reference (resolved to column index at compile time).
+    Column(usize),
+    /// An integer literal.
+    IntLit(u64),
+    /// A float literal (stored as f64::to_bits).
+    FloatLit(u64),
+    /// A binary operation: op(left, right).
+    BinOp {
+        op: char,
+        left: Box<CompiledNode>,
+        right: Box<CompiledNode>,
+    },
+}
+
+/// Compile an arithmetic expression string into a CompiledNode tree.
+/// Column names are resolved to indices at compile time.
+pub fn compile_expr(expr: &str, table: &Table) -> Option<CompiledNode> {
+    let tokens: Vec<&str> = expr.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut compiler = ExprCompiler { tokens: &tokens, pos: 0, table };
+    let result = compiler.compile_additive();
+    if compiler.pos == tokens.len() {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+struct ExprCompiler<'a> {
+    tokens: &'a [&'a str],
+    pos: usize,
+    table: &'a Table,
+}
+
+impl<'a> ExprCompiler<'a> {
+    fn compile_additive(&mut self) -> CompiledNode {
+        let mut left = self.compile_multiplicative();
+        loop {
+            if self.pos >= self.tokens.len() { break; }
+            let op = self.tokens[self.pos];
+            if op != "+" && op != "-" { break; }
+            self.pos += 1;
+            let right = self.compile_multiplicative();
+            left = CompiledNode::BinOp { op: op.chars().next().unwrap(), left: Box::new(left), right: Box::new(right) };
+        }
+        left
+    }
+
+    fn compile_multiplicative(&mut self) -> CompiledNode {
+        let mut left = self.compile_primary();
+        loop {
+            if self.pos >= self.tokens.len() { break; }
+            let op = self.tokens[self.pos];
+            if op != "*" && op != "/" { break; }
+            self.pos += 1;
+            let right = self.compile_primary();
+            left = CompiledNode::BinOp { op: op.chars().next().unwrap(), left: Box::new(left), right: Box::new(right) };
+        }
+        left
+    }
+
+    fn compile_primary(&mut self) -> CompiledNode {
+        if self.pos >= self.tokens.len() {
+            return CompiledNode::IntLit(0);
+        }
+        let token = self.tokens[self.pos];
+        if token == "(" {
+            self.pos += 1;
+            let val = self.compile_additive();
+            if self.pos < self.tokens.len() && self.tokens[self.pos] == ")" {
+                self.pos += 1;
+            }
+            return val;
+        }
+        self.pos += 1;
+        // Try integer literal
+        if let Ok(n) = token.parse::<i64>() {
+            return CompiledNode::IntLit(n as u64);
+        }
+        if let Ok(n) = token.parse::<u64>() {
+            return CompiledNode::IntLit(n);
+        }
+        // Try float literal
+        if let Ok(f) = token.parse::<f64>() {
+            return CompiledNode::FloatLit(f.to_bits());
+        }
+        // Column reference — resolve to index NOW
+        if let Some(idx) = self.table.column_idx(token) {
+            return CompiledNode::Column(idx);
+        }
+        CompiledNode::IntLit(0)
+    }
+}
+
+/// Evaluate a compiled expression for a single row. Much faster than eval_expr
+/// because no string parsing occurs.
+#[inline]
+pub fn eval_compiled(node: &CompiledNode, table: &Table, row_idx: usize) -> u64 {
+    match node {
+        CompiledNode::Column(idx) => table.columns[*idx].get(row_idx).copied().unwrap_or(0),
+        CompiledNode::IntLit(v) => *v,
+        CompiledNode::FloatLit(bits) => *bits,
+        CompiledNode::BinOp { op, left, right } => {
+            let l = eval_compiled(left, table, row_idx);
+            let r = eval_compiled(right, table, row_idx);
+            eval_binop_u64(*op, l, r)
+        }
+    }
+}
+
+/// Evaluate a compiled expression as f64 for a single row.
+#[inline]
+pub fn eval_compiled_f64(node: &CompiledNode, table: &Table, row_idx: usize) -> f64 {
+    match node {
+        CompiledNode::Column(idx) => {
+            let v = table.columns[*idx].get(row_idx).copied().unwrap_or(0);
+            // Check if float-encoded
+            if v > (1u64 << 60) {
+                f64::from_bits(v)
+            } else {
+                v as f64
+            }
+        }
+        CompiledNode::IntLit(v) => *v as f64,
+        CompiledNode::FloatLit(bits) => f64::from_bits(*bits),
+        CompiledNode::BinOp { op, left, right } => {
+            let l = eval_compiled_f64(left, table, row_idx);
+            let r = eval_compiled_f64(right, table, row_idx);
+            match op {
+                '+' => l + r,
+                '-' => l - r,
+                '*' => l * r,
+                '/' => l / r,
+                _ => 0.0,
+            }
+        }
+    }
+}
+
+/// Vectorized sum of a compiled expression over a set of row indices.
+/// This is the fast path for SUM(arithmetic_expr) queries.
+pub fn sum_compiled_f64(node: &CompiledNode, table: &Table, indices: &[usize]) -> f64 {
+    let mut sum = 0.0f64;
+    for &i in indices {
+        sum += eval_compiled_f64(node, table, i);
+    }
+    sum
+}
+
+#[inline]
+fn eval_binop_u64(op: char, l: u64, r: u64) -> u64 {
+    match op {
+        '+' => l.wrapping_add(r),
+        '-' => l.wrapping_sub(r),
+        '*' => l.wrapping_mul(r),
+        '/' => if r == 0 { 0 } else { l / r },
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
