@@ -65,6 +65,11 @@ struct Args {
     /// Server name reported in ParameterStatus (default: turboGP).
     #[arg(long, default_value = "turboGP")]
     server_name: String,
+
+    /// Directory to allowlist for COPY FROM (benchmarking convenience).
+    /// May be specified multiple times.
+    #[arg(long = "allow-copy-dir")]
+    allow_copy_dir: Vec<String>,
 }
 
 #[tokio::main]
@@ -97,6 +102,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::warn!("No --data-dir specified: running in-memory (data will be lost on exit)");
         Arc::new(RwLock::new(QueryEngine::in_memory()))
     };
+
+    // Allowlist any COPY FROM directories specified on the CLI (benchmarking).
+    {
+        let mut eg = engine.write();
+        for dir in &args.allow_copy_dir {
+            let abs = std::path::Path::new(dir)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::Path::new(dir).to_path_buf());
+            log::info!("Allowlisting COPY FROM dir: {}", abs.display());
+            eg.allowed_copy_dirs.push(abs);
+        }
+    }
 
     // Build the server config.
     let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port)

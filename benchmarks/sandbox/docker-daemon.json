@@ -1,0 +1,9 @@
+{
+  "iptables": false,
+  "ip6tables": false,
+  "bridge": "none",
+  "userland-proxy": false,
+  "log-driver": "journald",
+  "log-level": "warn",
+  "storage-driver": "overlay2"
+}
