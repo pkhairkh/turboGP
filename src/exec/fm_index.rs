@@ -371,8 +371,14 @@ impl StringSearchColumn {
     /// applies to remapped columns (filter_table output).
     pub fn get(&self, i: usize) -> &str {
         if let (Some(src), Some(idx)) = (&self.source, &self.indices) {
-            let src_idx = idx.get(i).copied().unwrap_or(0) as usize;
-            return src.get(src_idx);
+            // Out-of-bounds on the remap view returns "" (matching the owned-column
+            // behavior of `self.strings.get(i).map(...).unwrap_or("")`). Previously
+            // this fell back to source index 0, which silently returned the wrong
+            // row instead of an empty string.
+            let Some(&src_idx_u32) = idx.get(i) else {
+                return "";
+            };
+            return src.get(src_idx_u32 as usize);
         }
         self.strings.get(i).map(|s| s.as_str()).unwrap_or("")
     }

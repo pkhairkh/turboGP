@@ -259,6 +259,91 @@ fn eval_where(
                 // represents LIKE as a distinct variant, not as Binary op).
             }
         }
+        crate::sql::parser::Expr::InList { expr, list, negated } => {
+            // col IN (a, b, c, ...) == (col == a) OR (col == b) OR ...
+            // col NOT IN (...)    == NOT (col IN (...))
+            // We decompose into per-literal `filter_eq` calls and OR the masks
+            // together. Only the `Column IN (Literal, ...)` shape is handled;
+            // anything else falls back to the no-op arm.
+            use crate::sql::parser::{Expr, Value};
+            let col_name = match expr.as_ref() {
+                Expr::Column(n) => n,
+                _ => return,
+            };
+            let Some(col_idx) = resolve_name(col_name, column_names) else {
+                return;
+            };
+            let col = &columns[col_idx];
+            // Build the OR-of-equalities mask.
+            let mut member_mask = vec![false; row_count];
+            for item in list {
+                let val_opt: Option<u64> = match item {
+                    Expr::Literal(v) => value_to_u64(v),
+                    _ => None,
+                };
+                let Some(val) = val_opt else {
+                    continue;
+                };
+                let mut eq_mask = vec![true; row_count];
+                filter_eq(col, val, &mut eq_mask);
+                for i in 0..row_count {
+                    if eq_mask[i] {
+                        member_mask[i] = true;
+                    }
+                }
+            }
+            if *negated {
+                for i in 0..row_count {
+                    mask[i] = mask[i] && !member_mask[i];
+                }
+            } else {
+                for i in 0..row_count {
+                    mask[i] = mask[i] && member_mask[i];
+                }
+            }
+        }
+        crate::sql::parser::Expr::Between { expr, low, high, negated } => {
+            // BETWEEN lo AND hi  ==  (col >= lo) AND (col <= hi)
+            // NOT BETWEEN        ==  (col < lo) OR (col > hi)
+            // Decompose into two leaf comparisons using the existing filter_*
+            // helpers, then combine the masks. We only handle the
+            // `Column OP Literal` shape here — non-leaf `expr` falls back to
+            // the no-op arm (mask unchanged), which is the pre-existing
+            // behaviour for unsupported shapes.
+            use crate::sql::parser::{Expr, Value};
+            let col_name = match expr.as_ref() {
+                Expr::Column(n) => n,
+                _ => return,
+            };
+            let lo_val = match low.as_ref() {
+                Expr::Literal(v) => value_to_u64(v),
+                _ => None,
+            };
+            let hi_val = match high.as_ref() {
+                Expr::Literal(v) => value_to_u64(v),
+                _ => None,
+            };
+            let (Some(col_idx), Some(lo), Some(hi)) =
+                (resolve_name(col_name, column_names), lo_val, hi_val)
+            else {
+                return;
+            };
+            let col = &columns[col_idx];
+            if *negated {
+                let mut lt_mask = vec![true; row_count];
+                filter_lt(col, lo, &mut lt_mask);
+                let mut gt_mask = vec![true; row_count];
+                filter_gt(col, hi, &mut gt_mask);
+                or_mask(&lt_mask, &gt_mask, mask);
+            } else {
+                let mut ge_mask = vec![true; row_count];
+                filter_ge(col, lo, &mut ge_mask);
+                let mut le_mask = vec![true; row_count];
+                filter_le(col, hi, &mut le_mask);
+                let ge = ge_mask.clone();
+                and_mask(&ge, &le_mask, mask);
+            }
+        }
         crate::sql::parser::Expr::Like { expr, pattern, negated } => {
             // LIKE: compile pattern, match against u64 values as if they were string hashes
             if let (Some(col_idx), Some(pattern_str)) =

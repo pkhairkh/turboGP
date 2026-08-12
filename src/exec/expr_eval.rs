@@ -374,6 +374,31 @@ pub fn eval_compiled_f64(node: &CompiledNode, table: &Table, row_idx: usize) -> 
     }
 }
 
+/// W2-T2 regression fix: simd_agg kernels treat `Vec<u64>` cells as
+/// `f64::to_bits` patterns. This is only correct when the column is
+/// actually stored as f64 bits (Float/Real/Decimal/Numeric). For INT
+/// columns the u64 cell holds the integer value directly (e.g. `100u64`),
+/// and `f64::from_bits(100u64)` ≈ 4.9e-322 ≈ 0 — silently producing 0
+/// for `SUM(price * discount)` on INT columns.
+///
+/// We gate simd_agg on the column's `ColumnType` (from `table.schema`).
+/// If the schema is `None` (defensive — should not happen for tables
+/// loaded via `engine.load_csv` or DDL), we conservatively refuse to
+/// fire simd_agg and fall back to the scalar loop.
+fn column_is_f64_encoded(table: &crate::datasource::Table, col_idx: usize) -> bool {
+    use crate::sql::ddl::ColumnType;
+    let Some(schema) = table.schema.as_ref() else {
+        return false;
+    };
+    let Some(col_schema) = schema.columns.get(col_idx) else {
+        return false;
+    };
+    matches!(
+        col_schema.col_type,
+        ColumnType::Float | ColumnType::Real | ColumnType::Decimal(_, _) | ColumnType::Numeric(_, _)
+    )
+}
+
 /// Try to pattern-match the compiled expression against one of the
 /// AVX-512 FMA kernels in `simd_agg.rs`. Returns `Some(result)` if a
 /// kernel matches, `None` to fall back to the scalar per-row loop.
@@ -423,11 +448,16 @@ fn try_simd_agg(node: &CompiledNode, table: &Table, indices: &[usize]) -> Option
 
     // Pattern 1: a * b
     // Tree: BinOp { op: '*', left: Col(a), right: Col(b) }
+    // Guard: both columns must be f64-encoded (Float/Real/Decimal/Numeric).
+    // INT columns store `value as u64` (not `f64::to_bits`), so the AVX-512
+    // kernel would misinterpret them and return ~0.
     if let CompiledNode::BinOp { op: '*', left, right } = node {
         if let (Some(a_idx), Some(b_idx)) = (as_col(left), as_col(right)) {
-            let a = &table.columns[a_idx];
-            let b = &table.columns[b_idx];
-            return Some(simd_agg::sum_a_mul_b_by_idx(a, b, indices));
+            if column_is_f64_encoded(table, a_idx) && column_is_f64_encoded(table, b_idx) {
+                let a = &table.columns[a_idx];
+                let b = &table.columns[b_idx];
+                return Some(simd_agg::sum_a_mul_b_by_idx(a, b, indices));
+            }
         }
     }
 
@@ -436,17 +466,21 @@ fn try_simd_agg(node: &CompiledNode, table: &Table, indices: &[usize]) -> Option
     if let CompiledNode::BinOp { op: '*', left, right } = node {
         if let Some(a_idx) = as_col(left) {
             if let Some(b_idx) = as_one_minus_col(right) {
-                let a = &table.columns[a_idx];
-                let b = &table.columns[b_idx];
-                return Some(simd_agg::sum_a_mul_one_minus_b_by_idx(a, b, indices));
+                if column_is_f64_encoded(table, a_idx) && column_is_f64_encoded(table, b_idx) {
+                    let a = &table.columns[a_idx];
+                    let b = &table.columns[b_idx];
+                    return Some(simd_agg::sum_a_mul_one_minus_b_by_idx(a, b, indices));
+                }
             }
         }
         // Also handle commutative: (1 - b) * a
         if let Some(a_idx) = as_col(right) {
             if let Some(b_idx) = as_one_minus_col(left) {
-                let a = &table.columns[a_idx];
-                let b = &table.columns[b_idx];
-                return Some(simd_agg::sum_a_mul_one_minus_b_by_idx(a, b, indices));
+                if column_is_f64_encoded(table, a_idx) && column_is_f64_encoded(table, b_idx) {
+                    let a = &table.columns[a_idx];
+                    let b = &table.columns[b_idx];
+                    return Some(simd_agg::sum_a_mul_one_minus_b_by_idx(a, b, indices));
+                }
             }
         }
     }
@@ -459,19 +493,29 @@ fn try_simd_agg(node: &CompiledNode, table: &Table, indices: &[usize]) -> Option
             if let CompiledNode::BinOp { op: '*', left: l2, right: r2 } = left.as_ref() {
                 if let Some(a_idx) = as_col(l2) {
                     if let Some(b_idx) = as_one_minus_col(r2) {
-                        let a = &table.columns[a_idx];
-                        let b = &table.columns[b_idx];
-                        let c = &table.columns[c_idx];
-                        return Some(simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(a, b, c, indices));
+                        if column_is_f64_encoded(table, a_idx)
+                            && column_is_f64_encoded(table, b_idx)
+                            && column_is_f64_encoded(table, c_idx)
+                        {
+                            let a = &table.columns[a_idx];
+                            let b = &table.columns[b_idx];
+                            let c = &table.columns[c_idx];
+                            return Some(simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(a, b, c, indices));
+                        }
                     }
                 }
                 // Also handle commutative: (1 - b) * a
                 if let Some(a_idx) = as_col(r2) {
                     if let Some(b_idx) = as_one_minus_col(l2) {
-                        let a = &table.columns[a_idx];
-                        let b = &table.columns[b_idx];
-                        let c = &table.columns[c_idx];
-                        return Some(simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(a, b, c, indices));
+                        if column_is_f64_encoded(table, a_idx)
+                            && column_is_f64_encoded(table, b_idx)
+                            && column_is_f64_encoded(table, c_idx)
+                        {
+                            let a = &table.columns[a_idx];
+                            let b = &table.columns[b_idx];
+                            let c = &table.columns[c_idx];
+                            return Some(simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(a, b, c, indices));
+                        }
                     }
                 }
             }
@@ -481,10 +525,15 @@ fn try_simd_agg(node: &CompiledNode, table: &Table, indices: &[usize]) -> Option
             if let CompiledNode::BinOp { op: '*', left: l2, right: r2 } = right.as_ref() {
                 if let Some(a_idx) = as_col(l2) {
                     if let Some(b_idx) = as_one_minus_col(r2) {
-                        let a = &table.columns[a_idx];
-                        let b = &table.columns[b_idx];
-                        let c = &table.columns[c_idx];
-                        return Some(simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(a, b, c, indices));
+                        if column_is_f64_encoded(table, a_idx)
+                            && column_is_f64_encoded(table, b_idx)
+                            && column_is_f64_encoded(table, c_idx)
+                        {
+                            let a = &table.columns[a_idx];
+                            let b = &table.columns[b_idx];
+                            let c = &table.columns[c_idx];
+                            return Some(simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(a, b, c, indices));
+                        }
                     }
                 }
             }

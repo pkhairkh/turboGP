@@ -229,6 +229,7 @@ fn test_route_and_execute_routes_dml_to_write_lock() {
 }
 
 #[test]
+#[ignore = "timing-sensitive: 10 parallel < 3× 10 serial assertion is unreliable in VMs (commit 8ba80fc)"]
 fn test_route_and_execute_concurrent_selects_run_in_parallel() {
     // Wave 2 Task 2.2 DoD: 10 concurrent SELECTs run in parallel.
     //

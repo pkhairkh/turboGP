@@ -54,6 +54,9 @@ fn copy_to_and_from() {
     // Create a table and export it.
     {
         let mut e = QueryEngine::in_memory();
+        // Allow COPY to/from the tempdir (security hardening restricts COPY
+        // to allowed_copy_dirs; the test must opt-in).
+        e.allowed_copy_dirs.push(tmp.path().to_path_buf());
         e.execute("CREATE TABLE t (id INT, v INT)").unwrap();
         e.execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20)").unwrap();
         let r = e.execute(&format!("COPY t TO '{}'", csv_str)).unwrap();
@@ -69,6 +72,7 @@ fn copy_to_and_from() {
     // Import the CSV into a new table.
     {
         let mut e = QueryEngine::in_memory();
+        e.allowed_copy_dirs.push(tmp.path().to_path_buf());
         e.execute("CREATE TABLE t2 (id INT, v INT)").unwrap();
         let r = e.execute(&format!("COPY t2 FROM '{}'", csv_str)).unwrap();
         assert_eq!(r.row_count, 2, "COPY FROM must import 2 rows");
