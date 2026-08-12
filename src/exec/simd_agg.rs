@@ -405,6 +405,89 @@ unsafe fn sum_a_mul_one_minus_b_mul_one_plus_c_by_idx_avx512(
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// vec_fxhash_multi_key: vectorized multi-key FxHash for join hashing
+// ---------------------------------------------------------------------------
+
+/// FxHash multiply constant. Same as used by the rustc hash map.
+const FXHASH_MULT: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+/// Scalar multi-key FxHash: hash N key columns of a single row into one u64.
+///
+/// `hash = (hash + col[0]) * MULT; hash = (hash + col[1]) * MULT; ...`
+#[inline]
+pub fn fxhash_multi_key_scalar(cols: &[&[u64]], row: usize) -> u64 {
+    let mut hash = 0u64;
+    for col in cols {
+        let val = col[row];
+        hash = (hash.wrapping_add(val)).wrapping_mul(FXHASH_MULT);
+    }
+    hash
+}
+
+/// Vectorized multi-key FxHash: hash N key columns for 8 rows simultaneously.
+///
+/// Uses AVX-512F + AVX-512DQ (`_mm512_mullo_epi64` requires DQ).
+/// Processes 8 rows × N key columns in N iterations, producing 8 hash values.
+///
+/// Returns an array of 8 u64 hashes (one per row).
+#[inline]
+pub fn vec_fxhash_multi_key_8(cols: &[&[u64]], row_offset: usize) -> [u64; 8] {
+    if !has_avx512f() {
+        // Scalar fallback: compute 8 rows one at a time.
+        let mut result = [0u64; 8];
+        for i in 0..8 {
+            result[i] = fxhash_multi_key_scalar(cols, row_offset + i);
+        }
+        return result;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe { vec_fxhash_multi_key_8_avx512(cols, row_offset) }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut result = [0u64; 8];
+        for i in 0..8 {
+            result[i] = fxhash_multi_key_scalar(cols, row_offset + i);
+        }
+        result
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq")]
+unsafe fn vec_fxhash_multi_key_8_avx512(cols: &[&[u64]], row_offset: usize) -> [u64; 8] {
+    let mult = _mm512_set1_epi64(FXHASH_MULT as i64);
+    let mut hash = _mm512_setzero_si512();
+    for col in cols {
+        // Load 8 u64 values from this column starting at row_offset.
+        let vals = _mm512_loadu_epi64(col.as_ptr().add(row_offset) as *const i64);
+        // hash = (hash + val) * MULT
+        hash = _mm512_add_epi64(hash, vals);
+        hash = _mm512_mullo_epi64(hash, mult);
+    }
+    let mut result = [0u64; 8];
+    _mm512_storeu_epi64(result.as_mut_ptr() as *mut i64, hash);
+    result
+}
+
+/// Compute FxHash for all rows in `row_range`, returning a Vec<u64>.
+///
+/// Uses the vectorized 8-row kernel for the bulk, scalar for the tail.
+pub fn fxhash_multi_key_batch(cols: &[&[u64]], row_count: usize) -> Vec<u64> {
+    let mut hashes = Vec::with_capacity(row_count);
+    let mut r = 0;
+    while r + 8 <= row_count {
+        let h = vec_fxhash_multi_key_8(cols, r);
+        hashes.extend_from_slice(&h);
+        r += 8;
+    }
+    while r < row_count {
+        hashes.push(fxhash_multi_key_scalar(cols, r));
+        r += 1;
+    }
+    hashes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

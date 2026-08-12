@@ -1,5 +1,6 @@
 //! Expression evaluation methods for QueryInterpreter.
 
+use rayon::prelude::*;
 use crate::catalog::Catalog;
 use crate::datasource::table::Table;
 use crate::engine::result::{QueryResult, ResultColumn};
@@ -89,7 +90,15 @@ fn topn_indices(sort_keys: &[Vec<(f64, bool)>], row_count: usize, limit: Option<
         kept
     } else {
         let mut order: Vec<usize> = (0..row_count).collect();
-        order.sort_by(|&a, &b| cmp_keys(sort_keys, a, b));
+        // W4-T2: parallel sort with rayon for large result sets.
+        // par_sort_unstable_by uses work-stealing parallelism across N threads.
+        // For small result sets (≤10000 rows), the parallel overhead exceeds
+        // the benefit, so we use the serial sort.
+        if row_count > 100_000 {
+            order.par_sort_unstable_by(|&a, &b| cmp_keys(sort_keys, a, b));
+        } else {
+            order.sort_by(|&a, &b| cmp_keys(sort_keys, a, b));
+        }
         order
     }
 }

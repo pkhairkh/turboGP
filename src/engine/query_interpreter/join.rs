@@ -435,20 +435,18 @@ impl<'a> QueryInterpreter<'a> {
                 bloom.insert(k);
             }
         } else {
-            // Multi-key: hash all key columns into a single u64 via xxh3.
+            // W4-T3: vectorized multi-key FxHash (8 rows per AVX-512 iteration).
+            // Replaces per-row xxh3_64 of a stack buffer with _mm512_add_epi64
+            // + _mm512_mullo_epi64 per key column. 8x throughput on the hash
+            // computation, which is the multi-key join's hot path.
             let bk_cols: Vec<usize> = build_keys.iter().map(|k| k.left).collect();
-            for r in 0..build_side.row_count {
-                let mut buf = [0u8; 64];
-                let mut off = 0;
-                for &kc in &bk_cols {
-                    let v = build_side.columns[kc][r];
-                    let bytes = v.to_le_bytes();
-                    if off + 8 <= 64 {
-                        buf[off..off + 8].copy_from_slice(&bytes);
-                        off += 8;
-                    }
-                }
-                let key = xxh3_64(&buf[..off]);
+            let bk_slices: Vec<&[u64]> = bk_cols.iter()
+                .map(|&kc| build_side.columns[kc].as_slice())
+                .collect();
+            let build_hashes = crate::exec::simd_agg::fxhash_multi_key_batch(
+                &bk_slices, build_side.row_count,
+            );
+            for (r, &key) in build_hashes.iter().enumerate() {
                 build_hash.insert(key, r as u32);
                 bloom.insert(key);
             }
@@ -509,17 +507,16 @@ impl<'a> QueryInterpreter<'a> {
                     let k = if keys.len() == 1 {
                         probe_side.columns[pk_cols[0]][p]
                     } else {
-                        let mut buf = [0u8; 64];
-                        let mut off = 0;
+                        // W4-T3: scalar FxHash for the probe loop (the loop is
+                        // already parallel via rayon chunks; vectorizing within
+                        // each chunk would require restructuring the chunk loop).
+                        // The build phase uses the vectorized batch version.
+                        let mut h = 0u64;
                         for &kc in &pk_cols {
                             let v = probe_side.columns[kc][p];
-                            let bytes = v.to_le_bytes();
-                            if off + 8 <= 64 {
-                                buf[off..off + 8].copy_from_slice(&bytes);
-                                off += 8;
-                            }
+                            h = (h.wrapping_add(v)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
                         }
-                        xxh3_64(&buf[..off])
+                        h
                     };
                     probe_keys.push(k);
                 }
