@@ -1,5 +1,6 @@
 [build]
 incremental = false
+rustflags = ["-C", "target-cpu=native"]
 
 [profile.dev]
 incremental = false
