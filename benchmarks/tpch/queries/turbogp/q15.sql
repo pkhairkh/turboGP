@@ -1,7 +1,7 @@
--- TPC-H Q15: Top Supplier
+-- TPC-H Q15: Top Supplier (rewritten for turboGP — no CTE column alias)
 WITH revenue AS (
     SELECT
-        l_suppkey AS supplier_no,
+        l_suppkey,
         SUM(l_extendedprice * (1 - l_discount)) AS total_revenue
     FROM
         lineitem
@@ -21,7 +21,7 @@ FROM
     supplier,
     revenue
 WHERE
-    s_suppkey = supplier_no
+    s_suppkey = l_suppkey
     AND total_revenue = (SELECT MAX(total_revenue) FROM revenue)
 ORDER BY
     s_suppkey;
