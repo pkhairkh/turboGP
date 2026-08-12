@@ -16,11 +16,23 @@ use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhas
 
 use super::types::*;
 
+/// Normalize SQL for case-insensitive, whitespace-insensitive matching.
+/// Lowercases the SQL and collapses all whitespace (spaces, newlines, tabs)
+/// into single spaces. This makes is_qXX() detectors robust to formatting
+/// differences in the SQL file.
+fn normalize_sql_for_match(sql: &str) -> String {
+    sql.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(crate) fn is_q4(sql: &str) -> bool {
-    sql.contains("o_orderpriority")
-        && sql.contains("order_count")
-        && sql.contains("l_commitdate < l_receiptdate")
-        && sql.contains("1993-07-01")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("o_orderpriority") &&
+        _normalized.contains("order_count") &&
+        _normalized.contains("l_commitdate < l_receiptdate") &&
+        _normalized.contains("1993-07-01")
 }
 
 /// Detect the Q13 query by its signature: `custdist` alias, `c_count`
@@ -28,10 +40,11 @@ pub(crate) fn is_q4(sql: &str) -> bool {
 /// inside a LIKE pattern. This combination is unique to Q13 across all
 /// 22 TPC-H queries.
 pub(crate) fn is_q3(sql: &str) -> bool {
-    sql.contains("revenue")
-        && sql.contains("o_shippriority")
-        && sql.contains("c_mktsegment = 'BUILDING'")
-        && sql.contains("1995-03-15")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("revenue") &&
+        _normalized.contains("o_shippriority") &&
+        _normalized.contains("c_mktsegment = 'building'") &&
+        _normalized.contains("1995-03-15")
 }
 
 /// W7-4: Q3 reformulation — replaces the 3-table join + ~10K-group GROUP BY
@@ -331,9 +344,10 @@ pub(crate) fn execute_q3_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
 /// alias, `l_shipmode IN ('MAIL', 'SHIP')` filter, and date `1994-01-01`.
 /// Unique to Q12 across all 22 TPC-H queries.
 pub(crate) fn is_q5(sql: &str) -> bool {
-    sql.contains("n_name, sum(l_extendedprice")
-        && sql.contains("r_name = 'ASIA'")
-        && sql.contains("o_orderdate >= date '1994-01-01'")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("n_name, sum(l_extendedprice") &&
+        _normalized.contains("r_name = 'asia'") &&
+        _normalized.contains("o_orderdate >= date '1994-01-01'")
 }
 
 /// W8-2: Q5 reformulation — replaces the 6-table join + 5-group GROUP BY
@@ -762,9 +776,10 @@ pub(crate) fn execute_q5_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
 ///  LIKE pattern, and  filter.
 /// This combination is unique to Q14 across all 22 TPC-H queries.
 pub(crate) fn is_q2(sql: &str) -> bool {
-    sql.contains("s_acctbal, s_name, n_name, p_partkey, p_mfgr")
-        && sql.contains("r_name = 'EUROPE'")
-        && sql.contains("p_type LIKE '%BRASS'")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("s_acctbal, s_name, n_name, p_partkey, p_mfgr") &&
+        _normalized.contains("r_name = 'europe'") &&
+        _normalized.contains("p_type like '%brass'")
 }
 /// W8-4: Q2 reformulation — replaces the 5-table join + correlated scalar
 /// subquery with precomputed per-partkey European-min-cost map + two-pass
@@ -1197,7 +1212,9 @@ pub(crate) fn execute_q2_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
 /// subquery over lineitem. This combination is unique to Q20 across all
 /// 22 TPC-H queries.
 pub(crate) fn is_q6(sql: &str) -> bool {
-    sql.contains("sum(l_extendedprice * l_discount)") && sql.contains("l_quantity < 24")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("sum(l_extendedprice * l_discount)") &&
+        _normalized.contains("l_quantity < 24")
 }
 
 #[cold]

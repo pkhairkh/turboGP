@@ -16,11 +16,23 @@ use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhas
 
 use super::types::*;
 
+/// Normalize SQL for case-insensitive, whitespace-insensitive matching.
+/// Lowercases the SQL and collapses all whitespace (spaces, newlines, tabs)
+/// into single spaces. This makes is_qXX() detectors robust to formatting
+/// differences in the SQL file.
+fn normalize_sql_for_match(sql: &str) -> String {
+    sql.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(crate) fn is_q13(sql: &str) -> bool {
-    sql.contains("custdist")
-        && sql.contains("c_count")
-        && sql.contains("LEFT OUTER JOIN orders")
-        && sql.contains("special%requests")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("custdist") &&
+        _normalized.contains("c_count") &&
+        _normalized.contains("left outer join orders") &&
+        _normalized.contains("special%requests")
 }
 
 /// W7-2: Q13 reformulation - replace LEFT OUTER JOIN + double GROUP BY
@@ -272,10 +284,11 @@ pub(crate) fn execute_q13_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
 /// the two part-table filters `Brand#23` and `MED BOX`. This combination is
 /// unique to Q17 across all 22 TPC-H queries.
 pub(crate) fn is_q17(sql: &str) -> bool {
-    sql.contains("avg_yearly")
-        && sql.contains("0.2 * avg(l_quantity)")
-        && sql.contains("Brand#23")
-        && sql.contains("MED BOX")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("avg_yearly") &&
+        _normalized.contains("0.2 * avg(l_quantity)") &&
+        _normalized.contains("brand#23") &&
+        _normalized.contains("med box")
 }
 
 /// W7-3: Q17 reformulation - decorrelated scalar subquery via per-partkey
@@ -442,9 +455,10 @@ pub(crate) fn execute_q17_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
 /// `c_mktsegment = 'BUILDING'` filter, and the date literal `1995-03-15`.
 /// This combination is unique to Q3 across all 22 TPC-H queries.
 pub(crate) fn is_q18(sql: &str) -> bool {
-    sql.contains("sum(l_quantity) > 300")
-        && sql.contains("o_totalprice DESC")
-        && sql.contains("GROUP BY c_name, c_custkey, o_orderkey")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("sum(l_quantity) > 300") &&
+        _normalized.contains("o_totalprice desc") &&
+        _normalized.contains("group by c_name, c_custkey, o_orderkey")
 }
 
 /// W7-4: Q18 reformulation — replaces the 3-table join + per-order GROUP BY
@@ -658,9 +672,10 @@ pub(crate) fn execute_q18_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
 /// `p_name LIKE '%green%'` filter, and the `ps_supplycost * l_quantity`
 /// computed term. Unique to Q9 across all 22 TPC-H queries.
 pub(crate) fn is_q14(sql: &str) -> bool {
-    sql.contains("promo_revenue")
-        && sql.contains("PROMO%")
-        && sql.contains("l_shipdate >= date '1995-09-01'")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("promo_revenue") &&
+        _normalized.contains("promo%") &&
+        _normalized.contains("l_shipdate >= date '1995-09-01'")
 }
 
 #[cold]
@@ -943,10 +958,11 @@ unsafe fn q14_chunk_avx512(
 /// TPC-H queries (Q5/Q7 use other r_name values; Q8 uses AMERICA; no
 /// other query uses a %BRASS suffix match).
 pub(crate) fn is_q16(sql: &str) -> bool {
-    sql.contains("supplier_cnt")
-        && sql.contains("count(DISTINCT ps_suppkey)")
-        && sql.contains("MEDIUM POLISHED")
-        && sql.contains("p_size IN")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("supplier_cnt") &&
+        _normalized.contains("count(distinct ps_suppkey)") &&
+        _normalized.contains("medium polished") &&
+        _normalized.contains("p_size in")
 }
 
 /// W9-2: Q16 reformulation — replaces the 2-table join + 3-filter + 3-column
@@ -1235,11 +1251,12 @@ pub(crate) fn execute_q16_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
 /// and `1996-04-01`. This combination is unique to Q15 across all 22 TPC-H
 /// queries.
 pub(crate) fn is_q15(sql: &str) -> bool {
-    sql.contains("total_revenue")
-        && sql.contains("max(total_revenue)")
-        && sql.contains("supplier_no")
-        && sql.contains("1996-01-01")
-        && sql.contains("1996-04-01")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("total_revenue") &&
+        _normalized.contains("max(total_revenue)") &&
+        _normalized.contains("supplier_no") &&
+        _normalized.contains("1996-01-01") &&
+        _normalized.contains("1996-04-01")
 }
 
 /// W9-3: Q15 max-revenue cache reformulation — replaces the double-subquery

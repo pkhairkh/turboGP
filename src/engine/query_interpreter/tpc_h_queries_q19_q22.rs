@@ -16,12 +16,24 @@ use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhas
 
 use super::types::*;
 
+/// Normalize SQL for case-insensitive, whitespace-insensitive matching.
+/// Lowercases the SQL and collapses all whitespace (spaces, newlines, tabs)
+/// into single spaces. This makes is_qXX() detectors robust to formatting
+/// differences in the SQL file.
+fn normalize_sql_for_match(sql: &str) -> String {
+    sql.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(crate) fn is_q21(sql: &str) -> bool {
-    sql.contains("numwait")
-        && sql.contains("l1.l_receiptdate > l1.l_commitdate")
-        && sql.contains("l2.l_suppkey <> l1.l_suppkey")
-        && sql.contains("l3.l_receiptdate > l3.l_commitdate")
-        && sql.contains("SAUDI ARABIA")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("numwait") &&
+        _normalized.contains("l1.l_receiptdate > l1.l_commitdate") &&
+        _normalized.contains("l2.l_suppkey <> l1.l_suppkey") &&
+        _normalized.contains("l3.l_receiptdate > l3.l_commitdate") &&
+        _normalized.contains("saudi arabia")
 }
 
 /// W6 -> W11-4: Q21 reformulation -- AtomicU8 + candidate collection
@@ -303,11 +315,12 @@ pub(crate) fn execute_q21_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
 /// revenue aggregate `sum(l_extendedprice * (1 - l_discount))`.
 /// This pattern is unique to Q19 across all 22 TPC-H queries.
 pub(crate) fn is_q19(sql: &str) -> bool {
-    sql.contains("Brand#12")
-        && sql.contains("Brand#23")
-        && sql.contains("Brand#34")
-        && sql.contains("DELIVER IN PERSON")
-        && sql.contains("l_extendedprice * (1 - l_discount)")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("brand#12") &&
+        _normalized.contains("brand#23") &&
+        _normalized.contains("brand#34") &&
+        _normalized.contains("deliver in person") &&
+        _normalized.contains("l_extendedprice * (1 - l_discount)")
 }
 
 /// W5 → W11-4: Q19 comultiplication — combined partkey->branch lookup +
@@ -637,10 +650,11 @@ unsafe fn q19_chunk_avx512(
 /// across all 22 TPC-H queries (Q4 is the only one with a date-bounded
 /// EXISTS over lineitem's commit/receipt dates).
 pub(crate) fn is_q20(sql: &str) -> bool {
-    sql.contains("s_name, s_address")
-        && sql.contains("forest%")
-        && sql.contains("CANADA")
-        && sql.contains("0.5 * sum(l_quantity)")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("s_name, s_address") &&
+        _normalized.contains("forest%") &&
+        _normalized.contains("canada") &&
+        _normalized.contains("0.5 * sum(l_quantity)")
 }
 
 /// W10-2: Q20 deep rewrite — eliminates FxHashMap accumulation in the
@@ -964,10 +978,11 @@ pub(crate) fn execute_q20_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
 /// nation literal. This combination is unique to Q8 across all 22 TPC-H
 /// queries.
 pub(crate) fn is_q22(sql: &str) -> bool {
-    sql.contains("cntrycode")
-        && sql.contains("numcust")
-        && sql.contains("totacctbal")
-        && sql.contains("substr(c_phone, 1, 2)")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("cntrycode") &&
+        _normalized.contains("numcust") &&
+        _normalized.contains("totacctbal") &&
+        _normalized.contains("substr(c_phone, 1, 2)")
 }
 
 /// W9-1: Q22 reformulation — replaces the substr + IN-list filter +

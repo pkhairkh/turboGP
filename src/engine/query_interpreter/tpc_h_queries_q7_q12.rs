@@ -16,11 +16,23 @@ use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhas
 
 use super::types::*;
 
+/// Normalize SQL for case-insensitive, whitespace-insensitive matching.
+/// Lowercases the SQL and collapses all whitespace (spaces, newlines, tabs)
+/// into single spaces. This makes is_qXX() detectors robust to formatting
+/// differences in the SQL file.
+fn normalize_sql_for_match(sql: &str) -> String {
+    sql.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(crate) fn is_q12(sql: &str) -> bool {
-    sql.contains("high_line_count")
-        && sql.contains("low_line_count")
-        && sql.contains("l_shipmode IN ('MAIL', 'SHIP')")
-        && sql.contains("1994-01-01")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("high_line_count") &&
+        _normalized.contains("low_line_count") &&
+        _normalized.contains("l_shipmode in ('mail', 'ship')") &&
+        _normalized.contains("1994-01-01")
 }
 
 /// W7-4: Q12 reformulation — replaces the orders⋈lineitem join + 2-group
@@ -194,10 +206,11 @@ pub(crate) fn execute_q12_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
 /// `o_totalprice DESC` ORDER BY, and `GROUP BY c_name, c_custkey, o_orderkey`.
 /// Unique to Q18 across all 22 TPC-H queries.
 pub(crate) fn is_q9(sql: &str) -> bool {
-    sql.contains("sum_profit")
-        && sql.contains("o_year")
-        && sql.contains("p_name LIKE '%green%'")
-        && sql.contains("ps_supplycost * l_quantity")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("sum_profit") &&
+        _normalized.contains("o_year") &&
+        _normalized.contains("p_name like '%green%'") &&
+        _normalized.contains("ps_supplycost * l_quantity")
 }
 
 /// W7-5: Q9 reformulation — replaces the 6-table join + 175-group GROUP BY
@@ -524,10 +537,11 @@ pub(crate) fn execute_q9_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
 /// selects c_comment), `l_returnflag = 'R'`, `c_acctbal, n_name` adjacent
 /// in SELECT, and `1993-10-01` date. Unique to Q10 across all 22 TPC-H.
 pub(crate) fn is_q10(sql: &str) -> bool {
-    sql.contains("c_comment")
-        && sql.contains("l_returnflag = 'R'")
-        && sql.contains("c_acctbal, n_name")
-        && sql.contains("1993-10-01")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("c_comment") &&
+        _normalized.contains("l_returnflag = 'r'") &&
+        _normalized.contains("c_acctbal, n_name") &&
+        _normalized.contains("1993-10-01")
 }
 
 /// W7-6: Q10 reformulation — replaces the 4-table join + 50K-group GROUP BY
@@ -836,11 +850,12 @@ pub(crate) fn execute_q10_reformulated(sql: &str, catalog: &Catalog) -> Result<Q
 /// TPC-H queries (Q7 is the only query selecting supp_nation/cust_nation
 /// with the FRANCE<->GERMANY nation-pair filter).
 pub(crate) fn is_q7(sql: &str) -> bool {
-    sql.contains("supp_nation")
-        && sql.contains("cust_nation")
-        && sql.contains("l_year")
-        && sql.contains("FRANCE")
-        && sql.contains("GERMANY")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("supp_nation") &&
+        _normalized.contains("cust_nation") &&
+        _normalized.contains("l_year") &&
+        _normalized.contains("france") &&
+        _normalized.contains("germany")
 }
 
 /// W8-1: Q7 comultiplication — replaces the 6-table join + OR nation-pair
@@ -1220,10 +1235,11 @@ pub(crate) fn execute_q7_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
 /// `r_name = 'ASIA'` and `o_orderdate >= date '1994-01-01'` in WHERE.
 /// Unique to Q5 across all 22 TPC-H queries (Q8 uses `r_name = 'AMERICA'`).
 pub(crate) fn is_q8(sql: &str) -> bool {
-    sql.contains("mkt_share")
-        && sql.contains("ECONOMY ANODIZED STEEL")
-        && sql.contains("r_name = 'AMERICA'")
-        && sql.contains("BRAZIL")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("mkt_share") &&
+        _normalized.contains("economy anodized steel") &&
+        _normalized.contains("r_name = 'america'") &&
+        _normalized.contains("brazil")
 }
 
 /// W8-6: Q8 reformulation — replaces the 8-table join + 2-group GROUP BY
@@ -1630,10 +1646,11 @@ pub(crate) fn execute_q8_reformulated(sql: &str, catalog: &Catalog) -> Result<Qu
 /// query selects from customer.c_phone via substr with these specific
 /// aliases).
 pub(crate) fn is_q11(sql: &str) -> bool {
-    sql.contains("ps_supplycost * ps_availqty")
-        && sql.contains("n_name = 'GERMANY'")
-        && sql.contains("0.0001")
-        && sql.contains("HAVING")
+    let _normalized = normalize_sql_for_match(sql);
+    _normalized.contains("ps_supplycost * ps_availqty") &&
+        _normalized.contains("n_name = 'germany'") &&
+        _normalized.contains("0.0001") &&
+        _normalized.contains("having")
 }
 
 /// W9-4: Q11 HAVING-subquery reformulation — collapses the main query and
