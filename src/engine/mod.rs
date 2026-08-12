@@ -132,6 +132,9 @@ pub struct QueryEngine {
     /// Query result cache: SQL hash → cached result (Wave 1: result cache).
     /// Hot runs of the same query return in <1ms.
     pub result_cache: std::sync::Arc<parking_lot::RwLock<ResultCache>>,
+    /// Plan cache: SQL hash → optimized `PlanNode` (Wave 1 Task 1.2).
+    /// Skips `build_plan` + `CascadesOptimizer::optimize` on cache hit.
+    pub plan_cache: crate::engine::query_features::PlanCache,
     /// MVCC transaction manager (Wave 4 — Agent C).
     ///
     /// Used when `mvcc_enabled` is true. Tracks transaction IDs and commit
@@ -381,6 +384,8 @@ impl QueryEngine {
 
         match execute_select(
             &query,
+            Some(sql),
+            Some(&self.plan_cache),
             &extensions,
             &self.catalog,
             &self.kernel_table,
@@ -595,6 +600,7 @@ impl QueryEngine {
             savepoints: Vec::new(),
             allowed_copy_dirs: Vec::new(),
             result_cache: std::sync::Arc::new(parking_lot::RwLock::new(ResultCache::default())),
+            plan_cache: crate::engine::query_features::PlanCache::new(),
             mvcc_txn_manager: crate::txn::MvccTxnManager::new(),
             mvcc_enabled: false,
             wal_streamer: None,
@@ -2004,6 +2010,8 @@ impl QueryEngine {
         // Execute the parsed query.
         match execute_select(
             &query,
+            Some(sql),
+            Some(&self.plan_cache),
             &extensions,
             &self.catalog,
             &self.kernel_table,

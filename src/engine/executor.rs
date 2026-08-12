@@ -83,6 +83,8 @@ pub fn reset_planner_pipeline_counter() {
 /// tests assert on to prove the planner is wired from `execute()`.
 fn try_planner_pipeline(
     query: &SelectQuery,
+    sql: Option<&str>,
+    plan_cache: Option<&crate::engine::query_features::PlanCache>,
     catalog: &Catalog,
     kernel_table: &KernelTable,
     cost_model: &crate::planner::CostModel,
@@ -103,12 +105,17 @@ fn try_planner_pipeline(
         query.limit,
     );
 
-    // Build the logical plan from the parsed SELECT.
-    let plan = build_plan(query)?;
-
-    // Optimize via Cascades (predicate pushdown, projection pruning, constant folding).
-    let optimizer = CascadesOptimizer::new();
-    let optimized = optimizer.optimize(plan);
+    // Build + optimize the logical plan, consulting the plan cache when
+    // both the SQL text and a PlanCache are available. On a cache hit we
+    // skip `build_plan` + `CascadesOptimizer::optimize` entirely.
+    let optimized = match (sql, plan_cache) {
+        (Some(sql), Some(cache)) => cache.get_or_build_with(sql, query)?,
+        _ => {
+            let plan = build_plan(query)?;
+            let optimizer = CascadesOptimizer::new();
+            optimizer.optimize(plan)
+        }
+    };
 
     // Lower + execute via the Scheduler, which dispatches to KernelTable::select.
     let scheduler = Scheduler::new(kernel_table, cost_model);
@@ -164,6 +171,8 @@ fn try_planner_pipeline(
 /// non-MVCC path (no filtering). Task 2.4.
 pub fn execute_select(
     query: &SelectQuery,
+    sql: Option<&str>,
+    plan_cache: Option<&crate::engine::query_features::PlanCache>,
     extensions: &QueryExtensions,
     catalog: &Catalog,
     kernel_table: &KernelTable,
@@ -198,7 +207,7 @@ pub fn execute_select(
         // planner result directly. For everything else, we let the planner run
         // (incrementing the reachability counter) and then fall through to the
         // existing direct-scan path so results stay correct.
-        if let Some(planner_result) = try_planner_pipeline(query, catalog, kernel_table, cost_model)? {
+        if let Some(planner_result) = try_planner_pipeline(query, sql, plan_cache, catalog, kernel_table, cost_model)? {
             let mut result = planner_result;
             result.elapsed_us = 0; // caller sets elapsed_us
             return Ok(result);

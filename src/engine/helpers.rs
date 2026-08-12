@@ -1460,6 +1460,8 @@ impl QueryEngine {
         };
         let mut result = execute_select(
             query,
+            None,
+            Some(&self.plan_cache),
             extensions,
             &self.catalog,
             &self.kernel_table,

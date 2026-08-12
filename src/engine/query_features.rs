@@ -13,7 +13,7 @@ use crate::engine::result::{QueryResult, ResultColumn};
 use crate::error::{Error, Result};
 use crate::planner::{build_plan, CascadesOptimizer, PlanNode};
 use crate::sql::lexer::tokenize;
-use crate::sql::parser;
+use crate::sql::parser::{self, SelectQuery};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -219,6 +219,34 @@ impl PlanCache {
         let tokens = tokenize(sql).map_err(Error::Parse)?;
         let query = parser::parse(tokens).map_err(Error::Parse)?;
         let plan = build_plan(&query)?;
+        let optimizer = CascadesOptimizer::new();
+        let optimized = optimizer.optimize(plan);
+
+        // Cache it
+        if let Ok(mut plans) = self.plans.lock() {
+            plans.insert(hash, optimized.clone());
+        }
+
+        Ok(optimized)
+    }
+
+    /// Get or build a plan using a pre-parsed `SelectQuery`.
+    ///
+    /// This avoids the redundant tokenize/parse step that `get_or_build`
+    /// would otherwise do internally. Use this when the caller has already
+    /// parsed the SQL.
+    pub fn get_or_build_with(&self, sql: &str, query: &SelectQuery) -> Result<PlanNode> {
+        let hash = xxhash_rust::xxh3::xxh3_64(sql.as_bytes());
+
+        // Check cache
+        if let Ok(plans) = self.plans.lock() {
+            if let Some(plan) = plans.get(&hash) {
+                return Ok(plan.clone());
+            }
+        }
+
+        // Build plan from pre-parsed query (skip tokenize/parse)
+        let plan = build_plan(query)?;
         let optimizer = CascadesOptimizer::new();
         let optimized = optimizer.optimize(plan);
 
