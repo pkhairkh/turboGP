@@ -260,30 +260,21 @@ fn compute_bwt(text: &[u8]) -> Vec<u8> {
 /// store strings, scan with SIMD-accelerated substring search.
 #[derive(Clone)]
 pub struct StringSearchColumn {
-    /// Original strings, stored contiguously.
+    /// Original strings. This is the sole storage — no redundant
+    /// bytes/offsets buffers. LIKE scans iterate strings[i].as_bytes()
+    /// with memchr::memmem for SIMD-accelerated substring search.
     pub strings: Vec<String>,
-    /// Offsets into the concatenated byte buffer.
-    pub offsets: Vec<usize>,
-    /// Concatenated bytes (for SIMD scanning).
-    pub bytes: Vec<u8>,
 }
 
 impl std::fmt::Debug for StringSearchColumn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StringSearchColumn({} strings, {} bytes)", self.strings.len(), self.bytes.len())
+        write!(f, "StringSearchColumn({} strings)", self.strings.len())
     }
 }
 
 impl StringSearchColumn {
     pub fn new(strings: Vec<String>) -> Self {
-        let mut bytes = Vec::new();
-        let mut offsets = Vec::with_capacity(strings.len() + 1);
-        for s in &strings {
-            offsets.push(bytes.len());
-            bytes.extend_from_slice(s.as_bytes());
-        }
-        offsets.push(bytes.len());
-        StringSearchColumn { strings, offsets, bytes }
+        StringSearchColumn { strings }
     }
 
     /// Create a remapped column containing only the strings at `indices`.
@@ -301,29 +292,11 @@ impl StringSearchColumn {
     /// This is fine because LIKE filters are applied to original columns
     /// during the initial scan, before any `filter_table` call.
     pub fn remap(&self, indices: &[usize]) -> Self {
-        let total_bytes: usize =
-            indices
-                .iter()
-                .map(|&i| {
-                    if i + 1 < self.offsets.len() {
-                        self.offsets[i + 1] - self.offsets[i]
-                    } else {
-                        0
-                    }
-                })
-                .sum();
-        let mut new_bytes: Vec<u8> = Vec::with_capacity(total_bytes);
-        let mut new_offsets: Vec<usize> = Vec::with_capacity(indices.len() + 1);
-        for &i in indices {
-            let start = if i < self.offsets.len() { self.offsets[i] } else { self.bytes.len() };
-            let end =
-                if i + 1 < self.offsets.len() { self.offsets[i + 1] } else { self.bytes.len() };
-            new_offsets.push(new_bytes.len());
-            new_bytes.extend_from_slice(&self.bytes[start..end]);
-        }
-        new_offsets.push(new_bytes.len());
-        // strings left empty — get() falls back to bytes+offsets.
-        StringSearchColumn { strings: Vec::new(), offsets: new_offsets, bytes: new_bytes }
+        let strings: Vec<String> = indices
+            .iter()
+            .map(|&i| self.strings.get(i).cloned().unwrap_or_default())
+            .collect();
+        StringSearchColumn { strings }
     }
 
     /// Count strings containing the pattern (LIKE '%pattern%').
@@ -333,15 +306,10 @@ impl StringSearchColumn {
             return self.strings.len();
         }
         let pattern_bytes = pattern.as_bytes();
-        let mut count = 0;
-        for i in 0..self.strings.len() {
-            let start = self.offsets[i];
-            let end = self.offsets[i + 1];
-            if memchr_search(&self.bytes[start..end], pattern_bytes) {
-                count += 1;
-            }
-        }
-        count
+        self.strings
+            .iter()
+            .filter(|s| memchr::memmem::find(s.as_bytes(), pattern_bytes).is_some())
+            .count()
     }
 
     /// Build a boolean mask: mask[i] = true if string i contains pattern.
@@ -350,13 +318,10 @@ impl StringSearchColumn {
             return vec![true; self.strings.len()];
         }
         let pattern_bytes = pattern.as_bytes();
-        let mut mask = vec![false; self.strings.len()];
-        for i in 0..self.strings.len() {
-            let start = self.offsets[i];
-            let end = self.offsets[i + 1];
-            mask[i] = memchr_search(&self.bytes[start..end], pattern_bytes);
-        }
-        mask
+        self.strings
+            .iter()
+            .map(|s| memchr::memmem::find(s.as_bytes(), pattern_bytes).is_some())
+            .collect()
     }
 
     /// Count strings starting with prefix (LIKE 'prefix%').
@@ -374,25 +339,11 @@ impl StringSearchColumn {
     /// `offsets`. The `from_utf8` check is cheap (~1ns/byte) and only
     /// applies to remapped columns (filter_table output).
     pub fn get(&self, i: usize) -> &str {
-        if i < self.strings.len() {
-            &self.strings[i]
-        } else if i + 1 < self.offsets.len() {
-            // Remapped column: derive string from the contiguous bytes buffer.
-            // SAFETY: bytes were originally from valid UTF-8 Strings, so
-            // from_utf8 always succeeds. unwrap_or("") is defensive.
-            std::str::from_utf8(&self.bytes[self.offsets[i]..self.offsets[i + 1]]).unwrap_or("")
-        } else {
-            ""
-        }
+        self.strings.get(i).map(|s| s.as_str()).unwrap_or("")
     }
 
     pub fn len(&self) -> usize {
-        // Original column: strings.len(). Remapped column: offsets.len()-1.
-        if !self.strings.is_empty() {
-            self.strings.len()
-        } else {
-            self.offsets.len().saturating_sub(1)
-        }
+        self.strings.len()
     }
 }
 
