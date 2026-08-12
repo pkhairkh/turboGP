@@ -4,16 +4,18 @@
 
 | Database | Geomean (ms) | Queries OK |
 |---|---|---|
-| turbogp | 9.1 | 10/22 |
-| clickhouse | 59.1 | 22/22 |
-| duckdb | 34.4 | 22/22 |
-| postgres | 44.2 | 22/22 |
+| turbogp | 9.0 | 10/22 |
+| clickhouse | 61.4 | 22/22 |
+| duckdb | 34.3 | 22/22 |
+| postgres | 44.7 | 22/22 |
+| exasol | 15.8 | 21/22 |
 
 ## SF=10
 
 | Database | Geomean (ms) | Queries OK |
 |---|---|---|
-| turbogp | 72.3 | 10/22 |
-| clickhouse | 59.6 | 22/22 |
-| duckdb | 153.0 | 22/22 |
-| postgres | 44.4 | 22/22 |
+| turbogp | 0.0 | 0/22 |
+| clickhouse | 63.8 | 22/22 |
+| duckdb | 155.5 | 22/22 |
+| postgres | 44.8 | 22/22 |
+| exasol | 7.0 | 21/22 |
