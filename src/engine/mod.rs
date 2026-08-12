@@ -129,6 +129,9 @@ pub struct QueryEngine {
     /// Allowed directories for COPY TO/FROM operations (Wave 2 security).
     /// Empty by default — COPY is disabled unless explicitly configured.
     pub allowed_copy_dirs: Vec<std::path::PathBuf>,
+    /// Query result cache: SQL hash → cached result (Wave 1: result cache).
+    /// Hot runs of the same query return in <1ms.
+    pub result_cache: std::sync::Arc<parking_lot::RwLock<ResultCache>>,
     /// MVCC transaction manager (Wave 4 — Agent C).
     ///
     /// Used when `mvcc_enabled` is true. Tracks transaction IDs and commit
@@ -199,6 +202,87 @@ pub use helpers::*;
 pub mod transaction;
 pub mod vacuum;
 
+
+/// A cached query result entry.
+#[derive(Clone)]
+pub struct CachedResult {
+    /// The query result (columns + rows).
+    pub result: QueryResult,
+    /// When this entry was created (for TTL).
+    pub created_at: std::time::Instant,
+}
+
+/// LRU query result cache with TTL.
+pub struct ResultCache {
+    /// SQL hash → cached result.
+    entries: std::collections::HashMap<u64, CachedResult>,
+    /// Maximum number of entries (LRU eviction when exceeded).
+    max_entries: usize,
+    /// TTL in seconds.
+    ttl_secs: u64,
+}
+
+impl Default for ResultCache {
+    fn default() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            max_entries: 1000,
+            ttl_secs: 300, // 5 minutes
+        }
+    }
+}
+
+impl ResultCache {
+    /// Normalize SQL: trim, collapse whitespace, lowercase.
+    fn normalize_sql(sql: &str) -> String {
+        sql.trim()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    /// Hash a SQL string for cache lookup.
+    fn hash_sql(sql: &str) -> u64 {
+        use xxhash_rust::xxh3::xxh3_64;
+        let normalized = Self::normalize_sql(sql);
+        xxh3_64(normalized.as_bytes())
+    }
+
+    /// Try to get a cached result. Returns None if not found or expired.
+    pub fn get(&self, sql: &str) -> Option<QueryResult> {
+        let hash = Self::hash_sql(sql);
+        if let Some(entry) = self.entries.get(&hash) {
+            if entry.created_at.elapsed().as_secs() < self.ttl_secs {
+                return Some(entry.result.clone());
+            }
+        }
+        None
+    }
+
+    /// Insert a result into the cache.
+    pub fn insert(&mut self, sql: &str, result: QueryResult) {
+        let hash = Self::hash_sql(sql);
+        // LRU eviction: if at capacity, remove oldest entry
+        if self.entries.len() >= self.max_entries {
+            if let Some((&oldest_hash, _)) = self.entries.iter()
+                .min_by_key(|(_, e)| e.created_at)
+            {
+                self.entries.remove(&oldest_hash);
+            }
+        }
+        self.entries.insert(hash, CachedResult {
+            result,
+            created_at: std::time::Instant::now(),
+        });
+    }
+
+    /// Invalidate the entire cache (called on DML).
+    pub fn invalidate_all(&mut self) {
+        self.entries.clear();
+    }
+}
+
 impl QueryEngine {
     /// Execute a SQL statement in **read-only mode** (Wave 2 — Agent C).
     ///
@@ -233,6 +317,16 @@ impl QueryEngine {
     pub fn execute_readonly(&self, sql: &str) -> Result<QueryResult> {
         let start = Instant::now();
         let trimmed = sql.trim();
+
+        // W1: Check result cache first (hot run optimization).
+        {
+            let cache = self.result_cache.read();
+            if let Some(cached) = cache.get(sql) {
+                let mut result = cached;
+                result.elapsed_us = start.elapsed().as_micros() as u64;
+                return Ok(result);
+            }
+        }
 
         // Wave 3 (Agent C): dispatch via classify_statement, not starts_with.
         use crate::engine::dispatch::{classify_statement, StatementKind};
@@ -291,13 +385,12 @@ impl QueryEngine {
             &self.catalog,
             &self.kernel_table,
             &self.cost_model,
-            // Task 2.4: read-only path holds only `&self`, so the engine
-            // cannot have an active MVCC transaction (those require a write
-            // lock to BEGIN/COMMIT). Pass `None` here — no MVCC filtering.
             None,
         ) {
             Ok(mut result) => {
                 result.elapsed_us = start.elapsed().as_micros() as u64;
+                // W1: Cache the result for hot runs.
+                self.result_cache.write().insert(sql, result.clone());
                 Ok(result)
             }
             Err(_exec_err) => {
@@ -501,6 +594,7 @@ impl QueryEngine {
             next_table_id: 1,
             savepoints: Vec::new(),
             allowed_copy_dirs: Vec::new(),
+            result_cache: std::sync::Arc::new(parking_lot::RwLock::new(ResultCache::default())),
             mvcc_txn_manager: crate::txn::MvccTxnManager::new(),
             mvcc_enabled: false,
             wal_streamer: None,
@@ -1394,6 +1488,29 @@ impl QueryEngine {
         let trimmed = sql.trim();
         let lower = trimmed.to_lowercase();
 
+        // W1: Check result cache for SELECT queries BEFORE any processing.
+        {
+            let kind = crate::engine::dispatch::classify_statement(sql);
+            if matches!(kind, crate::engine::dispatch::StatementKind::Select) {
+                let cache = self.result_cache.read();
+                if let Some(cached) = cache.get(sql) {
+                    let mut result = cached;
+                    result.elapsed_us = start.elapsed().as_micros() as u64;
+                    return Ok(result);
+                }
+            }
+            // Invalidate on DML
+            if matches!(kind,
+                crate::engine::dispatch::StatementKind::Insert
+                | crate::engine::dispatch::StatementKind::Update
+                | crate::engine::dispatch::StatementKind::Delete
+                | crate::engine::dispatch::StatementKind::Drop
+                | crate::engine::dispatch::StatementKind::Copy
+            ) {
+                self.result_cache.write().invalidate_all();
+            }
+        }
+
         // Wave 3 (Agent C): top-level dispatch via the formal tokenizer
         // (classify_statement), NOT string-prefix matching. The classifier
         // tokenizes the SQL once and returns a StatementKind enum that we
@@ -1584,6 +1701,11 @@ impl QueryEngine {
             log::warn!("slow query ({} ms): {}", elapsed_ms, sql.trim());
         }
         result.elapsed_us = start.elapsed().as_micros() as u64;
+        // W1: Cache SELECT results for hot runs.
+        let kind = crate::engine::dispatch::classify_statement(sql);
+        if matches!(kind, crate::engine::dispatch::StatementKind::Select) {
+            self.result_cache.write().insert(sql, result.clone());
+        }
         Ok(result)
     }
 
@@ -1606,6 +1728,19 @@ impl QueryEngine {
         start: &Instant,
         txn_id: Option<u64>,
     ) -> Result<QueryResult> {
+        // W1: Check result cache for SELECT queries (hot run optimization).
+        {
+            let kind = crate::engine::dispatch::classify_statement(sql);
+            if matches!(kind, crate::engine::dispatch::StatementKind::Select) {
+                let cache = self.result_cache.read();
+                if let Some(cached) = cache.get(sql) {
+                    let mut result = cached;
+                    result.elapsed_us = start.elapsed().as_micros() as u64;
+                    return Ok(result);
+                }
+            }
+        }
+
         // Wave 69: SAVEPOINT / ROLLBACK TO / RELEASE — handle these here
         // (after the txn snapshot is swapped in by the caller) so they
         // operate on the transaction's catalog.
@@ -1657,6 +1792,11 @@ impl QueryEngine {
             let with = with_result.map_err(Error::Parse)?;
             let mut result = self.execute_with(with, txn_id)?;
             result.elapsed_us = start.elapsed().as_micros() as u64;
+            // W1: Cache SELECT results for hot runs.
+            let kind2 = crate::engine::dispatch::classify_statement(sql);
+            if matches!(kind2, crate::engine::dispatch::StatementKind::Select) {
+                self.result_cache.write().insert(sql, result.clone());
+            }
             return Ok(result);
         }
 
