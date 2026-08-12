@@ -463,7 +463,7 @@ impl<'a> QueryInterpreter<'a> {
         let est_output = std::cmp::max(probe_side.row_count, build_side.row_count).min(4_000_000);
         let mut out_types = left.col_types.clone();
         out_types.extend(right.col_types.iter().copied());
-        let out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> =
+        let mut out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> =
             (0..ncol).map(|_| None).collect();
         let mut out_names = left.column_names.clone();
         out_names.extend(right.column_names.clone());
@@ -624,6 +624,47 @@ impl<'a> QueryInterpreter<'a> {
         for (k, v) in &right.col_map {
             col_map.insert(k.clone(), *v + off);
         }
+        // W3: Rebuild string columns from source tables using value lookup.
+        // For each string column in left/right, create a u64→String map from
+        // the source table, then populate the output string column by looking
+        // up each output row's cell value.
+        let left_ncol = left.columns.len();
+        for (c, sc) in left.string_columns.iter().enumerate() {
+            if let Some(ref scol) = sc {
+                // Build u64 → String lookup from left table
+                let mut val_to_str: ahash::AHashMap<u64, String> = ahash::AHashMap::new();
+                for r in 0..left.row_count {
+                    let val = left.columns[c][r];
+                    val_to_str.entry(val).or_insert_with(|| scol.get(r).to_string());
+                }
+                // Rebuild string column for output rows
+                let strings: Vec<String> = (0..row_count)
+                    .map(|r| {
+                        let val = out_cols[c][r];
+                        val_to_str.get(&val).cloned().unwrap_or_default()
+                    })
+                    .collect();
+                out_strings[c] = Some(std::sync::Arc::new(StringSearchColumn::new(strings)));
+            }
+        }
+        for (c, sc) in right.string_columns.iter().enumerate() {
+            if let Some(ref scol) = sc {
+                let out_idx = left_ncol + c;
+                let mut val_to_str: ahash::AHashMap<u64, String> = ahash::AHashMap::new();
+                for r in 0..right.row_count {
+                    let val = right.columns[c][r];
+                    val_to_str.entry(val).or_insert_with(|| scol.get(r).to_string());
+                }
+                let strings: Vec<String> = (0..row_count)
+                    .map(|r| {
+                        let val = out_cols[out_idx][r];
+                        val_to_str.get(&val).cloned().unwrap_or_default()
+                    })
+                    .collect();
+                out_strings[out_idx] = Some(std::sync::Arc::new(StringSearchColumn::new(strings)));
+            }
+        }
+
         Ok(ExecTable {
             columns: out_cols.into_iter().map(std::sync::Arc::new).collect(),
             column_names: out_names,
@@ -816,7 +857,7 @@ impl<'a> QueryInterpreter<'a> {
         let mut out_types = left.col_types.clone();
         out_types.extend(right.col_types.iter().copied());
         // String columns are NOT rebuilt after join — see hash_join_with_keys.
-        let out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> =
+        let mut out_strings: Vec<Option<std::sync::Arc<StringSearchColumn>>> =
             (0..ncol).map(|_| None).collect();
         let mut out_names = left.column_names.clone();
         out_names.extend(right.column_names.clone());
