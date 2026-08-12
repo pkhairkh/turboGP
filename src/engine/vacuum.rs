@@ -676,3 +676,205 @@ fn parse_iso8601_to_micros(s: &str) -> Option<u64> {
 fn is_leap_year(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
+
+#[cfg(test)]
+mod vacuum_tests {
+    //! Tests for the Production Wiring Wave 6 Task 6.2 DoD: VACUUM
+    //! removes dead rows from `Table::columns` (not just version chains).
+
+    use crate::datasource::parquet::{LoadedColumn, LoadedTable};
+    use crate::datasource::Table;
+    use crate::txn::mvcc::{MvccTxnManager, RowVersion, TxnState};
+    use std::sync::Arc;
+
+    /// Build a 1-column `Table` of `n` rows with `id = 0..n` and an
+    /// empty `row_versions` (caller fills in version chains after).
+    fn build_table_with_rows(n: usize) -> Table {
+        let cells: Vec<u64> = (0..n).map(|i| i as u64).collect();
+        let loaded = LoadedTable {
+            name: "t".into(),
+            columns: vec![LoadedColumn {
+                name: "id".into(),
+                cells: cells.clone(),
+                row_count: n,
+                string_search: None,
+                null_bitmap: None,
+            }],
+            row_count: n,
+        };
+        let mut table = Table::from_loaded(loaded);
+        // Initialize a fresh single-version chain for each row (xmin = 0,
+        // xmax = None — "live, created by T0").
+        table.row_versions = (0..n)
+            .map(|i| vec![RowVersion::new(0, vec![i as u64])])
+            .collect();
+        table
+    }
+
+    /// Wave 6 Task 6.2 DoD: insert 100 rows, delete 50 (committed),
+    /// VACUUM, verify `row_count == 50` and `columns[0].len() == 50`.
+    ///
+    /// The 50 deleted rows (rows 0..50) have their latest version's
+    /// `xmax` set to a committed transaction whose commit_id is at or
+    /// below `oldest_active_snapshot_or_current` — they are dead and
+    /// must be reclaimed from `columns` (not just version chains).
+    #[test]
+    fn vacuum_removes_dead_rows_from_columns() {
+        let mut mgr = MvccTxnManager::new();
+        // T1 inserts all 100 rows. We model this by registering T1 in
+        // `txn_states` as Committed with commit_id = 1.
+        let t1 = 1u64;
+        mgr.commit(t1); // commit_id advances to 1, txn_states[t1] = Committed(1)
+                        // Rewrite each row's xmin to t1 so the existing
+                        // retain logic keeps them (xmin is committed).
+        // T2 deletes rows 0..50 (marks their xmax = t2). Register T2 as
+        // committed with commit_id = 2.
+        let t2 = 2u64;
+        mgr.commit(t2); // commit_id = 2, txn_states[t2] = Committed(2)
+
+        // Build the table and rewrite the version chains: rows 0..50
+        // have xmax = t2 (deleted, committed), rows 50..100 are live.
+        let n = 100usize;
+        let mut table = build_table_with_rows(n);
+        for (i, chain) in table.row_versions.iter_mut().enumerate() {
+            let v = &mut chain[0];
+            v.xmin = t1;
+            if i < 50 {
+                v.xmax = Some(t2);
+            }
+        }
+        // Sanity before vacuum: 100 rows, columns have 100 cells, 50
+        // chains have a deleted version and 50 have a live version.
+        assert_eq!(table.row_count, 100);
+        assert_eq!(table.columns[0].len(), 100);
+        assert_eq!(table.row_versions.len(), 100);
+
+        // VACUUM.
+        let removed = mgr.vacuum_table(&mut table);
+
+        // The 50 dead versions are removed (one per dead row).
+        assert_eq!(removed, 50, "vacuum_table must remove 50 dead versions");
+
+        // row_count and columns[0].len() must drop to 50.
+        assert_eq!(table.row_count, 50, "row_count must be 50 after VACUUM");
+        assert_eq!(
+            table.columns[0].len(),
+            50,
+            "columns[0].len() must be 50 after VACUUM"
+        );
+
+        // row_versions must have 50 chains (one per surviving row), each
+        // containing exactly one live version with xmax = None.
+        assert_eq!(table.row_versions.len(), 50);
+        for chain in &table.row_versions {
+            assert_eq!(chain.len(), 1, "each surviving chain must have 1 version");
+            assert!(chain[0].xmax.is_none(), "surviving version must be live");
+        }
+
+        // The surviving cells must be the original rows 50..100, in
+        // order (no shuffling, no duplicates).
+        let surviving: Vec<u64> = table.columns[0].as_ref().clone();
+        let expected: Vec<u64> = (50..100u64).collect();
+        assert_eq!(surviving, expected, "surviving cells must be rows 50..100");
+
+        // Txn state sanity: t1 and t2 must be committed.
+        assert!(matches!(mgr.txn_state(t1), TxnState::Committed(_)));
+        assert!(matches!(mgr.txn_state(t2), TxnState::Committed(_)));
+
+        // Suppress unused-import warning for `Arc` (kept for clarity in
+        // case future tests in this module need `Arc`-wrapped columns).
+        let _: Option<Arc<Vec<u64>>> = None;
+    }
+
+    /// Wave 6 Task 6.3 DoD: full VACUUM integration test using the
+    /// engine's `execute()` method end-to-end (no direct API calls).
+    ///
+    /// Scenario:
+    /// 1. `CREATE TABLE t (id INT, v INT)` + `enable_mvcc`.
+    /// 2. Insert 1000 rows in a single BEGIN/COMMIT block.
+    /// 3. Update 500 rows (`id < 500`) — appends a new version per row,
+    ///    tombstones the old version.
+    /// 4. Delete 200 rows (`id < 200`) — tombstones the latest version.
+    /// 5. `VACUUM` — reclaims column space + compacts version chains.
+    ///
+    /// Assertions after VACUUM:
+    /// - `table.row_count == 800` (1000 − 200 deleted).
+    /// - Every column vector has exactly 800 entries.
+    /// - `row_versions.len() == 800` with each chain containing only
+    ///   live versions (latest version `xmax == None`).
+    /// - `SELECT COUNT(*) FROM t` returns 800 (the engine scans the
+    ///   compacted column vectors under MVCC visibility).
+    #[test]
+    fn vacuum_integration_test() {
+        use crate::engine::QueryEngine;
+
+        let mut engine = QueryEngine::in_memory();
+        engine.enable_mvcc().expect("enable_mvcc");
+        engine.execute("CREATE TABLE t (id INT, v INT)").expect("CREATE TABLE");
+
+        // 1. Insert 1000 rows in one transaction (xmin = t1, committed).
+        engine.execute("BEGIN").expect("BEGIN");
+        for i in 0..1000u64 {
+            let sql = format!("INSERT INTO t VALUES ({}, {})", i, i * 10);
+            engine.execute(&sql).expect("INSERT");
+        }
+        engine.execute("COMMIT").expect("COMMIT");
+
+        // 2. Update 500 rows (id < 500) — appends new versions.
+        engine.execute("BEGIN").expect("BEGIN");
+        engine
+            .execute("UPDATE t SET v = 999 WHERE id < 500")
+            .expect("UPDATE");
+        engine.execute("COMMIT").expect("COMMIT");
+
+        // 3. Delete 200 rows (id < 200) — tombstones their latest version.
+        engine.execute("BEGIN").expect("BEGIN");
+        engine.execute("DELETE FROM t WHERE id < 200").expect("DELETE");
+        engine.execute("COMMIT").expect("COMMIT");
+
+        // 4. VACUUM.
+        engine.execute("VACUUM").expect("VACUUM");
+
+        // 5. Verify row_count == 800, all columns have 800 entries.
+        let table = engine.catalog.get("t").expect("table \"t\" exists");
+        assert_eq!(
+            table.row_count, 800,
+            "row_count must be 800 after VACUUM (1000 − 200 deleted)"
+        );
+        for (i, col) in table.columns.iter().enumerate() {
+            assert_eq!(
+                col.len(),
+                800,
+                "columns[{}].len() must be 800 after VACUUM",
+                i
+            );
+        }
+
+        // 6. Verify row_versions has 800 chains, each with only live
+        //    versions (latest version's xmax == None).
+        assert_eq!(
+            table.row_versions.len(),
+            800,
+            "row_versions.len() must be 800 (one chain per surviving row)"
+        );
+        for (i, chain) in table.row_versions.iter().enumerate() {
+            assert!(!chain.is_empty(), "chain {} must not be empty", i);
+            let last = chain.last().expect("non-empty chain has a last version");
+            assert!(
+                last.xmax.is_none(),
+                "chain {} latest version must be live (xmax=None)",
+                i
+            );
+        }
+        drop(table);
+
+        // 7. Verify SELECT COUNT(*) FROM t returns 800 (end-to-end).
+        let r = engine
+            .execute("SELECT COUNT(*) FROM t")
+            .expect("SELECT COUNT(*)");
+        assert_eq!(
+            r.columns[0].values[0], 800,
+            "SELECT COUNT(*) must return 800 after VACUUM"
+        );
+    }
+}

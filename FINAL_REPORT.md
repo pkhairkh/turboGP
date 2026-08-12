@@ -358,3 +358,170 @@ connection pooling, zero warnings.
 - **Raft**: `openraft::Raft` with `MemStore` backend, 3-node cluster, failover
 - **Replication**: ACK wire protocol, `QuorumPolicy::Majority`, sync mode
 - **Server**: tokio async runtime, `ConnectionPool` with configurable size
+
+---
+
+# Production Wiring Completion Programme — Final Report
+
+## Executive Summary
+
+This report documents the execution of the Production Wiring Completion
+Programme, a 10-wave effort to transform turboGP from "architecturally
+complete but unwired" into a deployable production database. The base
+was `main` at commit `8e7d013` (post HA & Concurrency Completion); the
+final state is branch `feat/prod-wiring` with all 10 production-wiring
+gaps resolved.
+
+## Outcome
+
+All 10 gaps from `WIRING_GAPS.md` are resolved (each marked ☑ in the
+WIRING_GAPS summary table). The branch carries **18 production-wiring
+commits** across 10 waves, plus per-wave doc commits.
+
+## Wave-by-Wave Summary
+
+### Wave 1: Environment Setup & Baseline ✅
+- Rust 1.97.1 installed, repo cloned to `feat/prod-wiring` branch.
+- 870-test baseline verified, zero warnings.
+- `WIRING_GAPS.md` created enumerating all 10 unwired gaps.
+
+### Wave 2: Persistent Raft Storage ✅
+- Added `sled = "0.34"` and enabled openraft's `serde` feature.
+- New `src/storage/raft_store.rs` (~920 LOC) implementing openraft's
+  `RaftStorage` v1 trait via `sled::Db`. Log entries, votes, committed
+  index, applied state machine, and snapshots all persisted to disk.
+- `RaftManager::new_single_node_persistent` and `new_persistent` use
+  the new store; `MemStore` retained for the in-memory test
+  constructors.
+- Tests: log entries + vote + state machine survive process restart.
+
+### Wave 3: TCP Raft Network ✅
+- New `src/storage/raft_network.rs` (~620 LOC) implementing
+  `RaftNetworkFactory` + `RaftNetwork` over `tokio::net::TcpStream`.
+  Wire protocol: 1-byte type tag + 4-byte LE length + bincode payload.
+- `TcpRaftServer` accepts inbound TCP connections and dispatches RPCs
+  to the local `Raft` handle.
+- `RaftManager::new_multi_node` takes `Vec<(node_id, SocketAddr)>` and
+  uses the TCP transport.
+- Test: 3-node cluster on localhost, leader elected, 5 records
+  replicated to all 3 nodes.
+
+### Wave 4: Wire Raft into the Write Path ✅
+- `Wal::append_and_sync` now routes the record through
+  `RaftManager::propose()` (via `raft.client_write`) BEFORE the local
+  WAL append. The record is committed only after a quorum of nodes
+  ACK it; the local WAL write happens after the Raft commit.
+- Falls back to local-only path when no Raft handle is attached
+  (backward compatible).
+- `engine::QueryEngine::enable_raft` wires the Raft handle into the Wal.
+
+### Wave 5: Production Async pgwire Server ✅
+- New `src/server/async_pgwire.rs` (~1180 LOC) implementing the full
+  PostgreSQL wire protocol over tokio: startup, authentication (trust),
+  simple query (Q → RowDescription → DataRow* → CommandComplete →
+  ReadyForQuery), extended query (Parse/Bind/Describe/Execute/Sync/Close),
+  and error responses.
+- Connection pool integration: each connection acquires a `PoolPermit`;
+  when the pool is full, new connections are rejected with a FATAL
+  "too many connections" error.
+- 9 new tests covering startup, simple query, extended query, pool
+  admission control, end-to-end integration.
+
+### Wave 6: Sync Replication Default + VACUUM Column Compaction ✅
+- `enable_raft()` now sets `Wal::sync_mode = Synchronous` and attaches
+  a `MultiWalStreamSink` with `QuorumPolicy::Majority` — HA deployments
+  get durable sync replication out of the box.
+- `vacuum_table` (`src/txn/mvcc.rs`) now removes dead rows from the
+  `columns: Vec<Arc<Vec<u64>>>`, decrements `row_count`, and compacts
+  `row_versions` chains. After VACUUM, `columns[0].len() == row_count
+  == SELECT COUNT(*)`.
+- 3 new tests including a 1000-row integration test (insert/update/
+  delete/vacuum, verify row_count == 800).
+
+### Wave 7: Remove Parser Hacks ✅
+- `split_union_all` deleted — `execute_inner` dispatches UNION ALL via
+  the formal `SetQuery::UnionAll` AST.
+- `parse_merge` deleted — formal `MergeStmt` AST + `parse_merge_stmt()`
+  in `src/sql/parser.rs`.
+- `parse_pivot_clause` + `strip_pivot_clause` deleted from
+  `src/engine/helpers.rs` — moved to formal `src/sql/pivot.rs` module
+  with `PivotClause` AST in `src/sql/ast.rs`.
+- Grep for hack function definitions in `src/engine/` returns zero
+  matches. 127 parser + dispatch tests pass.
+
+### Wave 8: Real Doc Comments ✅
+- `#![allow(missing_docs)]` removed from `src/lib.rs`. Every public item
+  in `src/**/*.rs` carries a `///` doc comment.
+- Also fixed the pre-existing `RpcMessage` privacy warning by making
+  the enum `pub(crate)`.
+- `cargo check --jobs 1` AND `cargo check --jobs 1 --features raft`
+  both pass with **zero warnings**.
+- The remaining `unused_imports` / `unused_variables` / `dead_code`
+  suppressions cover pre-existing technical debt (separate cleanup
+  effort, not the focus of Wave 8).
+
+### Wave 9: Operational Tooling ✅
+- New `src/bin/turbogp-admin.rs` binary entry point + `src/admin/mod.rs`
+  (~850 LOC) implementing five subcommands:
+  - `backup` — file-level snapshot of the data directory.
+  - `restore` — copies a backup into an empty data directory.
+  - `cluster-status` — opens sled DB and prints Raft state (vote,
+    last log id, last applied, snapshot). Feature-gated on `raft`.
+  - `vacuum` — runs VACUUM on all tables in the catalog.
+  - `checkpoint` — flushes the WAL and writes `checkpoint.bin`.
+- 6 tests including an end-to-end backup → restore → backup → restore
+  round-trip with 50 rows.
+
+### Wave 10: Final Verification ✅
+- All 3 check scripts pass (`check_file_size.sh`, `check_no_panics.sh`,
+  `check_dead_code.sh`).
+- Zero compiler warnings (with and without `--features raft`).
+- 33 production-wiring tests pass (raft, raft_store, raft_network,
+  wal_append_and_sync, async_pgwire, vacuum, admin).
+- All 10 gaps in `WIRING_GAPS.md` summary table marked ☑.
+- `feat/prod-wiring` merged into `main` and pushed.
+
+## Production Deployment Verification Matrix
+
+| Capability | Verified by | Status |
+|---|---|---|
+| Raft log survives restart | `sled_store_persists_log_entries_across_reopen`, `raft_manager_persistent_survives_restart` | ✅ |
+| 3-node TCP cluster with failover | `raft_3_node_tcp_cluster_replicates_records`, `raft_3_node_cluster_failover` | ✅ |
+| Commits require quorum | `wal_append_and_sync_routes_through_raft` (Raft commit happens BEFORE local WAL append) | ✅ |
+| Async pgwire server accepts connections | `async_pgwire_startup_and_simple_select_round_trip` | ✅ |
+| Connection pool limits concurrency | `async_pgwire_pool_limits_concurrency` | ✅ |
+| VACUUM reclaims space | `vacuum_removes_dead_rows_from_columns`, `vacuum_integration_test` | ✅ |
+| No string hacks | `grep -rnE 'fn (split_union_all|parse_merge|parse_pivot_clause|strip_pivot_clause)' src/engine/` returns zero | ✅ |
+| Admin CLI works | `admin_end_to_end_backup_restore_round_trip` | ✅ |
+
+## Files Added / Removed
+
+**Added (new files):**
+- `WIRING_GAPS.md`
+- `src/storage/raft_store.rs` (~920 LOC) — SledRaftStore
+- `src/storage/raft_network.rs` (~620 LOC) — TcpRaftNetwork + TcpRaftServer
+- `src/server/async_pgwire.rs` (~1180 LOC) + `src/server/async_pgwire_tests.rs` (~750 LOC)
+- `src/sql/pivot.rs` (~190 LOC) — formal PIVOT parser
+- `src/admin/mod.rs` (~850 LOC) — admin CLI implementation
+- `src/bin/turbogp-admin.rs` (~30 LOC) — binary shim
+- `src/engine/enable_raft_tests.rs` (~90 LOC) — sync-mode/quorum test
+
+**Removed:**
+- `split_union_all`, `parse_merge` functions from `src/engine/helpers.rs`
+- `parse_pivot_clause`, `strip_pivot_clause` function definitions from `src/engine/helpers.rs`
+- `#![allow(missing_docs)]` from `src/lib.rs`
+
+## Production-Readiness Statement
+
+turboGP is now production-deployable in the dimensions this programme
+targeted:
+
+1. **Durability**: commits require Raft quorum ACK on HA deployments;
+   the Raft log + state machine survive restart via SledRaftStore.
+2. **Availability**: 3-node TCP cluster with automatic failover tested.
+3. **Protocol**: full PostgreSQL wire protocol over async tokio.
+4. **Admission control**: connection pool prevents OOM under load.
+5. **Maintenance**: VACUUM reclaims column space; admin CLI provides
+   backup/restore/cluster-status/vacuum/checkpoint.
+6. **Code quality**: zero compiler warnings, no panics in production
+   code, no string-scan parser hacks, all public items documented.

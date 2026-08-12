@@ -1102,6 +1102,25 @@ impl QueryEngine {
                 node_id,
                 peers.len()
             );
+            // Production Wiring Wave 4: wire the Raft handle into the Wal
+            // so append_and_sync routes through Raft consensus before the
+            // local WAL append.
+            //
+            // Production Wiring Wave 6 Task 6.1: when Raft is enabled, also
+            // default `sync_mode = Synchronous` AND attach an empty
+            // `MultiWalStreamSink` (default `QuorumPolicy::Majority`). The
+            // combined effect: every commit goes through Raft consensus
+            // (Wave 4) AND the sync-mode + quorum policy is the default,
+            // so a user who calls `enable_raft` gets durable sync
+            // replication out of the box. The empty sink is a no-op until
+            // replicas are added (via `MultiWalStreamSink::add`), but the
+            // defaults are set so the operator only needs to add replicas.
+            if let Some(ref mut wal) = self.wal {
+                wal.set_raft_handle(mgr.raft.clone(), runtime.handle().clone());
+                wal.set_sync_mode(crate::storage::recovery::SyncMode::Synchronous);
+                let sink = crate::storage::replication::MultiWalStreamSink::new();
+                wal.set_stream_sink(std::sync::Arc::new(std::sync::Mutex::new(sink)));
+            }
             self.raft_manager = Some(mgr);
             self.raft_runtime = Some(runtime);
             return Ok(());
@@ -1650,17 +1669,22 @@ impl QueryEngine {
             return Ok(last_result);
         }
 
-        // Wave 53: MERGE statement.
-        if let Some(merge) = parse_merge(sql) {
+        // Wave 7 (Task 7.2): MERGE via the formal `MergeStmt` AST.
+        // `try_parse_merge_stmt` + `merge_stmt_to_merge` replace the
+        // previous `parse_merge` string-scan hack.
+        if let Some(stmt) = try_parse_merge_stmt(sql) {
+            let merge = merge_stmt_to_merge(&stmt);
             return self.execute_merge_stmt(merge, start);
         }
 
-        // Wave 60c: UNION ALL. Detect `UNION ALL` in the SQL, split into
-        // two SELECT statements, execute both, and concatenate the results.
-        if let Some((left_sql, right_sql)) = split_union_all(sql) {
-            let left_result = self.execute_inner(&left_sql, start, txn_id)?;
-            let right_result = self.execute_inner(&right_sql, start, txn_id)?;
-            return Ok(concatenate_results(left_result, right_result, start));
+        // Wave 7 (Task 7.1): UNION / UNION ALL via the formal `SetQuery`
+        // AST. `try_parse_as_set_query` tokenizes the SQL and runs it
+        // through `parse_set`. If it's a top-level set operation, we
+        // dispatch through `execute_set_query`, which walks the tree and
+        // concatenates (or concatenates + dedupes) the leaf SELECTs.
+        // Replaces the previous `split_union_all` string-scan hack.
+        if let Some((set, ext)) = try_parse_as_set_query(sql) {
+            return self.execute_set_query(&set, &ext, start, txn_id);
         }
 
         // Wave 56b: PIVOT clause. Detect `PIVOT (` in the SQL and route to
@@ -1673,9 +1697,9 @@ impl QueryEngine {
         // Supported syntax (simplified):
         //   SELECT * FROM <table> PIVOT (SUM(amount) FOR quarter IN ('Q1','Q2')) AS p
         //   SELECT * FROM <table> PIVOT (COUNT(*) FOR quarter IN (1, 2, 3))
-        if let Some(pivot_spec) = parse_pivot_clause(sql) {
+        if let Some(pivot_spec) = crate::sql::pivot::parse_pivot_clause(sql) {
             // Strip the PIVOT clause (and any trailing alias) from the SQL.
-            let stripped = strip_pivot_clause(sql);
+            let stripped = crate::sql::pivot::strip_pivot_clause(sql);
             // Execute the stripped SELECT to get the input rows.
             let input = self.execute_inner(&stripped, start, txn_id)?;
             // Auto-detect the group_col: the first column in the input that's
@@ -1699,7 +1723,6 @@ impl QueryEngine {
             result.elapsed_us = start.elapsed().as_micros() as u64;
             return Ok(result);
         }
-
         // Wave 56c: JSON_VALUE / JSON_QUERY. Detect `JSON_VALUE(` in the SQL
         // and intercept: rewrite the SQL to replace each JSON_VALUE(col, path)
         // with `col AS __json_value_N__`, execute the rewritten SQL, then
@@ -1956,15 +1979,11 @@ impl Default for QueryEngine {
 }
 
 // -----------------------------------------------------------------------
-// DML helper functions (Wave 4) — moved to `src/engine/helpers.rs` in
-// Task 8.2-fix to satisfy the 2000-LOC file-size limit.
-//
-// The three impl-QueryEngine methods that used to live here:
-//   - `materialize_views_in_sql`
-//   - `execute_merge_stmt`
-//   - `execute_with_json_value`
-// are now defined in `helpers.rs` and declared `pub(crate)` so this
-// module (and the rest of the crate) can call them via `self.<method>`.
+// DML helper functions (Wave 4) — moved to `src/engine/helpers.rs` to
+// satisfy the 2000-LOC file-size limit. The impl-QueryEngine methods
+// (`materialize_views_in_sql`, `execute_merge_stmt`,
+// `execute_with_json_value`, `execute_set_query`, `execute_select_query`,
+// `merge_stmt_to_merge`) live in `helpers.rs` (declared `pub(crate)`).
 // -----------------------------------------------------------------------
 
 // -----------------------------------------------------------------------
@@ -1976,3 +1995,5 @@ impl Default for QueryEngine {
 #[cfg(test)]
 mod binary_checkpoint_tests;
 
+#[cfg(all(test, feature = "raft"))]
+mod enable_raft_tests;

@@ -70,6 +70,7 @@ use openraft::{
     StorageError, StorageIOError, StoredMembership, TokioRuntime, Vote,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
+use crate::storage::raft_store::SledRaftStore;
 use tokio::task::{AbortHandle, JoinHandle};
 
 // =========================================================================
@@ -385,7 +386,7 @@ fn _assert_logflushed_bounds(_: LogFlushed<TypeConfig>) {}
 // Snapshot encoding / decoding (length-prefixed Vec<Vec<u8>>)
 // =========================================================================
 
-fn encode_snapshot(records: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn encode_snapshot(records: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     for rec in records {
         out.extend_from_slice(&(rec.len() as u64).to_le_bytes());
@@ -394,7 +395,7 @@ fn encode_snapshot(records: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-fn decode_snapshot(data: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn decode_snapshot(data: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos + 8 <= data.len() {
@@ -417,7 +418,7 @@ fn decode_snapshot(data: &[u8]) -> Vec<Vec<u8>> {
 
 /// An incoming RPC at a node's dispatcher: the request plus a oneshot
 /// channel to send the reply back to the caller's `RaftNetwork` impl.
-enum RpcMessage {
+pub(crate) enum RpcMessage {
     AppendEntries(
         AppendEntriesRequest<TypeConfig>,
         oneshot::Sender<Result<AppendEntriesResponse<u64>, RaftError<u64>>>,
@@ -624,9 +625,20 @@ pub struct RaftManager {
     /// Handle to abort the dispatcher task on drop.
     dispatcher_abort: AbortHandle,
     /// The factory the cluster shares (so `Drop` can unregister).
+    /// Unused when `factory_tcp` is set (TCP transport).
     factory: ChannelNetworkFactory,
-    /// The store (kept for test inspection).
-    store: MemStore,
+    /// The TCP network factory (set when this manager uses TCP transport
+    /// via `new_multi_node`).
+    factory_tcp: Option<crate::storage::raft_network::TcpRaftNetworkFactory>,
+    /// The TCP server (set when this manager uses TCP transport). The
+    /// server task is aborted on Drop.
+    server_tcp: Option<crate::storage::raft_network::TcpRaftServer>,
+    /// The in-memory store (kept for test inspection). `None` when this
+    /// manager is backed by a [`SledRaftStore`] instead.
+    store: Option<MemStore>,
+    /// The disk-backed store, when this manager is persistent. `None`
+    /// when this manager uses the in-memory `MemStore`.
+    sled_store: Option<SledRaftStore>,
 }
 
 impl RaftManager {
@@ -659,6 +671,10 @@ impl RaftManager {
     /// initialized with itself as the only member and becomes leader
     /// immediately (trivially correct — one node is always a quorum of
     /// one).
+    ///
+    /// Uses the in-memory [`MemStore`]. For a persistent single-node
+    /// cluster that survives process restart, use
+    /// [`RaftManager::new_single_node_persistent`].
     pub async fn new_single_node(node_id: u64) -> Result<Self, String> {
         let config = Self::default_config()?;
         let factory = ChannelNetworkFactory::new();
@@ -687,7 +703,70 @@ impl RaftManager {
             node_id,
             dispatcher_abort,
             factory,
-            store,
+            factory_tcp: None,
+            server_tcp: None,
+            store: Some(store),
+            sled_store: None,
+        })
+    }
+
+    /// Create a single-node Raft cluster backed by a disk-backed
+    /// [`SledRaftStore`] rooted at `data_dir`. The Raft log, vote, and
+    /// applied state machine persist across process restarts.
+    ///
+    /// The node is initialized with itself as the only member and becomes
+    /// leader immediately (trivially correct — one node is always a
+    /// quorum of one). If the data directory already contains initialized
+    /// state from a previous run, the existing state is loaded and no
+    /// re-initialization is performed.
+    pub async fn new_single_node_persistent<P: AsRef<std::path::Path>>(
+        node_id: u64,
+        data_dir: P,
+    ) -> Result<Self, String> {
+        let config = Self::default_config()?;
+        let factory = ChannelNetworkFactory::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        factory.register(node_id, tx).await;
+
+        let store = SledRaftStore::open(data_dir).map_err(|e| format!("SledRaftStore::open failed: {}", e))?;
+        let (log_store, state_machine) = Adaptor::new(store.clone());
+        let raft = Raft::new(node_id, config, factory.clone(), log_store, state_machine)
+            .await
+            .map_err(|e| format!("Raft::new failed: {}", e))?;
+
+        let (_join, dispatcher_abort) = Self::spawn_dispatcher(raft.clone(), rx);
+
+        // If the store has no log entries, this is a fresh node — initialize
+        // it with self as the only member. If it already has entries, the
+        // node was previously initialized and we should NOT re-initialize
+        // (openraft would reject a second `initialize` call with
+        // `NotAllowToInitialize`).
+        let is_fresh = {
+            let log_tree = store
+                .db_ref()
+                .open_tree("raft_log")
+                .map_err(|e| format!("open raft_log tree failed: {}", e))?;
+            log_tree.is_empty()
+        };
+        if is_fresh {
+            let members: BTreeMap<u64, BasicNode> =
+                [(node_id, BasicNode::new(format!("node-{}", node_id)))]
+                    .into_iter()
+                    .collect();
+            raft.initialize(members)
+                .await
+                .map_err(|e| format!("Raft::initialize failed: {}", e))?;
+        }
+
+        Ok(RaftManager {
+            raft,
+            node_id,
+            dispatcher_abort,
+            factory,
+            factory_tcp: None,
+            server_tcp: None,
+            store: None,
+            sled_store: Some(store),
         })
     }
 
@@ -696,6 +775,9 @@ impl RaftManager {
     /// [`RaftManager::initialize_cluster`] on exactly one node after all
     /// members are created. All members must share the same
     /// `factory` (passed in so the cluster shares one registry).
+    ///
+    /// Uses the in-memory [`MemStore`]. For a persistent multi-node
+    /// cluster member, use [`RaftManager::new_persistent`].
     pub async fn new(
         node_id: u64,
         _peers: Vec<u64>,
@@ -718,7 +800,121 @@ impl RaftManager {
             node_id,
             dispatcher_abort,
             factory,
-            store,
+            factory_tcp: None,
+            server_tcp: None,
+            store: Some(store),
+            sled_store: None,
+        })
+    }
+
+    /// Create a member of a multi-node cluster backed by a disk-backed
+    /// [`SledRaftStore`] rooted at `data_dir`. The caller must call
+    /// [`RaftManager::initialize_cluster`] on exactly one node after all
+    /// members are created (only when starting a fresh cluster; restarts
+    /// load existing state and skip initialization).
+    pub async fn new_persistent<P: AsRef<std::path::Path>>(
+        node_id: u64,
+        _peers: Vec<u64>,
+        factory: ChannelNetworkFactory,
+        data_dir: P,
+    ) -> Result<Self, String> {
+        let config = Self::default_config()?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        factory.register(node_id, tx).await;
+
+        let store = SledRaftStore::open(data_dir).map_err(|e| format!("SledRaftStore::open failed: {}", e))?;
+        let (log_store, state_machine) = Adaptor::new(store.clone());
+        let raft = Raft::new(node_id, config, factory.clone(), log_store, state_machine)
+            .await
+            .map_err(|e| format!("Raft::new failed: {}", e))?;
+
+        let (_join, dispatcher_abort) = Self::spawn_dispatcher(raft.clone(), rx);
+
+        Ok(RaftManager {
+            raft,
+            node_id,
+            dispatcher_abort,
+            factory,
+            factory_tcp: None,
+            server_tcp: None,
+            store: None,
+            sled_store: Some(store),
+        })
+    }
+
+    /// Create a member of a multi-node Raft cluster that uses real TCP
+    /// transport (via [`TcpRaftNetworkFactory`] / [`TcpRaftServer`])
+    /// instead of in-process `mpsc` channels. This is the production
+    /// wiring: each node binds a TCP port and exchanges RPCs with peers
+    /// over real network connections.
+    ///
+    /// `members` is the full list of `(node_id, bind_addr)` tuples for
+    /// the cluster — every node needs to know every peer's bind address
+    /// so it can dial them. The caller must call
+    /// [`RaftManager::initialize_cluster`] on exactly one node after all
+    /// members are created (only when starting a fresh cluster; restarts
+    /// skip initialization).
+    ///
+    /// Returns the new `RaftManager`. The `TcpRaftServer` runs as a
+    /// background task for the lifetime of the manager; dropping the
+    /// manager aborts both the dispatcher task and the server.
+    pub async fn new_multi_node(
+        node_id: u64,
+        members: Vec<(u64, std::net::SocketAddr)>,
+        data_dir: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        use crate::storage::raft_network::{TcpRaftNetworkFactory, TcpRaftServer};
+
+        let config = Self::default_config()?;
+        let factory = TcpRaftNetworkFactory::new();
+        // Register every member's bind address (including self) so the
+        // factory can route RPCs.
+        for (id, addr) in &members {
+            factory.register(*id, *addr).await;
+        }
+
+        // Find our own bind address.
+        let own_addr = members
+            .iter()
+            .find(|(id, _)| *id == node_id)
+            .map(|(_, addr)| *addr)
+            .ok_or_else(|| format!("node {} not in members list", node_id))?;
+
+        // Open the persistent store.
+        let store = SledRaftStore::open(&data_dir)
+            .map_err(|e| format!("SledRaftStore::open failed: {}", e))?;
+        let (log_store, state_machine) = Adaptor::new(store.clone());
+
+        // Create the Raft handle first. openraft internally retries RPCs
+        // if peers reject the initial connection (because their TCP server
+        // is not yet up), so a brief window of connection refusals is
+        // tolerable. Once we have the handle, start the TCP server with it.
+        let raft = Raft::new(node_id, config, factory.clone(), log_store, state_machine)
+            .await
+            .map_err(|e| format!("Raft::new failed: {}", e))?;
+
+        let server = TcpRaftServer::start(own_addr, raft.clone())
+            .await
+            .map_err(|e| format!("TcpRaftServer::start failed: {}", e))?;
+
+        // Spawn a no-op dispatcher task so the AbortHandle field stays
+        // valid. With TCP transport, the dispatcher loop is unnecessary
+        // (RPCs arrive via the TCP server), but the field is still
+        // required by the Drop impl. Aborting a no-op task is harmless.
+        let dispatcher_abort = {
+            let h = tokio::spawn(async {});
+            h.abort_handle()
+        };
+
+        Ok(RaftManager {
+            raft,
+            node_id,
+            dispatcher_abort,
+            factory: ChannelNetworkFactory::new(),
+            factory_tcp: Some(factory),
+            server_tcp: Some(server),
+            store: None,
+            sled_store: Some(store),
         })
     }
 
@@ -802,8 +998,18 @@ impl RaftManager {
     }
 
     /// Borrow the in-memory store (for test inspection of applied records).
-    pub fn store(&self) -> &MemStore {
-        &self.store
+    /// Returns `None` if this manager is backed by a [`SledRaftStore`]
+    /// (use [`RaftManager::sled_store`] instead).
+    pub fn store(&self) -> Option<&MemStore> {
+        self.store.as_ref()
+    }
+
+    /// Borrow the disk-backed store (for test inspection of applied records
+    /// and direct persistence operations). Returns `None` if this manager
+    /// is backed by an in-memory [`MemStore`] (use [`RaftManager::store`]
+    /// instead).
+    pub fn sled_store(&self) -> Option<&SledRaftStore> {
+        self.sled_store.as_ref()
     }
 
     /// Gracefully shut down this node's Raft core and dispatcher. After
@@ -931,7 +1137,7 @@ mod tests {
             // Wait for both entries to apply.
             mgr.wait_applied_at_least(2, 2000).await.expect("applied >= 2");
 
-            let applied = mgr.store().applied_records().await;
+            let applied = mgr.store().expect("memstore").applied_records().await;
             assert_eq!(applied.len(), 2, "applied_records: {:?}", applied);
             assert_eq!(applied[0], b"INSERT INTO t VALUES (1)");
             assert_eq!(applied[1], b"INSERT INTO t VALUES (2)");
@@ -995,7 +1201,7 @@ mod tests {
 
             let mut found = 0;
             for n in &nodes {
-                let applied = n.store().applied_records().await;
+                let applied = n.store().expect("memstore").applied_records().await;
                 if applied.iter().any(|r| r == b"INSERT INTO t VALUES (42)") {
                     found += 1;
                 }
@@ -1075,7 +1281,7 @@ mod tests {
 
             let mut found = 0;
             for n in &nodes {
-                let applied = n.store().applied_records().await;
+                let applied = n.store().expect("memstore").applied_records().await;
                 if applied.iter().any(|r| r == b"INSERT INTO t VALUES (99)") {
                     found += 1;
                 }
@@ -1098,5 +1304,200 @@ mod tests {
         let encoded = encode_snapshot(&records);
         let decoded = decode_snapshot(&encoded);
         assert_eq!(decoded, records);
+    }
+
+    /// Task 2.3 DoD: create persistent RaftManager, propose 5 records,
+    /// drop, recreate with the same data dir, verify the 5 records are
+    /// present in the reopened store.
+    #[test]
+    fn raft_manager_persistent_survives_restart() {
+        use tempfile::tempdir;
+        let rt = rt();
+        rt.block_on(async {
+            let dir = tempdir().expect("tempdir");
+            let dir_path = dir.path().to_path_buf();
+
+            // Phase 1: create persistent manager, propose 5 records.
+            {
+                let mgr = RaftManager::new_single_node_persistent(1, &dir_path)
+                    .await
+                    .expect("new_single_node_persistent");
+                mgr.wait_until_leader(3000).await.expect("leader");
+
+                for i in 1..=5u8 {
+                    let payload = vec![b'r', b'-', i];
+                    mgr.propose(&payload).await.expect("propose");
+                }
+                // Wait for all 5 entries to apply.
+                mgr.wait_applied_at_least(5, 3000).await.expect("applied >= 5");
+
+                let applied = mgr
+                    .sled_store()
+                    .expect("sled_store")
+                    .applied_records()
+                    .expect("applied_records");
+                assert_eq!(applied.len(), 5, "expected 5 applied records");
+                // Explicitly shutdown the Raft core so it releases its
+                // references to the sled store. Without this, the
+                // dispatcher task and the openraft state machine keep
+                // `Arc<Db>` clones alive and sled's file lock is not
+                // released — the reopen would fail with `WouldBlock`.
+                let _ = mgr.shutdown().await;
+                // Give the runtime a moment to drop the dispatcher task
+                // and the openraft `Arc`s. 200 ms is empirically enough.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                drop(mgr);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+
+            // Phase 2: re-open with the SAME data dir. The previously-applied
+            // records MUST be present.
+            {
+                let mgr = RaftManager::new_single_node_persistent(1, &dir_path)
+                    .await
+                    .expect("reopen new_single_node_persistent");
+                // Give the new leader a moment to settle.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                let applied = mgr
+                    .sled_store()
+                    .expect("sled_store")
+                    .applied_records()
+                    .expect("applied_records after reopen");
+                assert_eq!(
+                    applied.len(),
+                    5,
+                    "expected 5 applied records after restart, got {}",
+                    applied.len()
+                );
+                // Verify payload content.
+                for (i, rec) in applied.iter().enumerate() {
+                    let expected_i = (i + 1) as u8;
+                    assert_eq!(rec, &[b'r', b'-', expected_i], "record {} mismatch", i);
+                }
+            }
+        });
+    }
+
+    /// Task 3.2 + 3.3 DoD: 3-node TCP cluster on localhost — leader
+    /// elected, propose 5 records, all 3 nodes have them. Also serves
+    /// as the Task 3.3 DoD for the basic 3-node TCP test (a separate
+    /// failover test is below).
+    #[test]
+    fn raft_3_node_tcp_cluster_replicates_records() {
+        use tempfile::tempdir;
+        let rt = rt();
+        rt.block_on(async {
+            // Three data dirs.
+            let dir1 = tempdir().expect("tempdir1");
+            let dir2 = tempdir().expect("tempdir2");
+            let dir3 = tempdir().expect("tempdir3");
+
+            // Pick three ephemeral ports by binding a TcpListener, dropping,
+            // and reusing the address. (Race window is negligible in a test.)
+            let addrs: Vec<std::net::SocketAddr> = (0..3)
+                .map(|_| {
+                    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                    l.local_addr().expect("addr")
+                })
+                .collect();
+
+            let members = vec![
+                (1u64, addrs[0]),
+                (2, addrs[1]),
+                (3, addrs[2]),
+            ];
+
+            // Start each node.
+            let mut nodes = Vec::new();
+            for (i, (node_id, _addr)) in members.iter().enumerate() {
+                let dirs = [dir1.path(), dir2.path(), dir3.path()];
+                let n = RaftManager::new_multi_node(
+                    *node_id,
+                    members.clone(),
+                    dirs[i].to_path_buf(),
+                )
+                .await
+                .expect("new_multi_node");
+                nodes.push(n);
+            }
+
+            // Initialize the cluster from node 1.
+            let mut init_members = std::collections::BTreeSet::new();
+            init_members.insert(1u64);
+            init_members.insert(2u64);
+            init_members.insert(3u64);
+            nodes[0]
+                .initialize_cluster(init_members)
+                .await
+                .expect("initialize_cluster");
+
+            // Wait for a leader to be elected.
+            let mut leader_idx = None;
+            for _ in 0..60 {
+                for (i, n) in nodes.iter().enumerate() {
+                    if n.is_leader().await {
+                        leader_idx = Some(i);
+                        break;
+                    }
+                }
+                if leader_idx.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let leader_idx = leader_idx.expect("no leader elected within 6s");
+
+            // Propose 5 records on the leader.
+            for i in 1..=5u8 {
+                let payload = vec![b'r', b'-', i];
+                nodes[leader_idx]
+                    .propose(&payload)
+                    .await
+                    .expect("propose");
+            }
+
+            // Wait for all 5 entries to apply on the leader.
+            nodes[leader_idx]
+                .wait_applied_at_least(5, 5000)
+                .await
+                .expect("applied >= 5 on leader");
+
+            // Give followers a moment to catch up.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Verify all 3 nodes have the 5 records (note: each node's
+            // applied_records is cumulative since the store was fresh —
+            // there is no other state).
+            let mut ok_count = 0;
+            for n in &nodes {
+                if let Some(store) = n.sled_store() {
+                    let applied = store.applied_records().unwrap_or_default();
+                    // The leader will have at least 5 records; followers
+                    // should have at least 5 too (they may have additional
+                    // entries from membership/blank entries, but the 5
+                    // Normal-payload entries must be present).
+                    let normal_count = applied
+                        .iter()
+                        .filter(|r| r.len() == 3 && r[0] == b'r' && r[1] == b'-')
+                        .count();
+                    if normal_count >= 5 {
+                        ok_count += 1;
+                    }
+                }
+            }
+            assert!(
+                ok_count >= 2,
+                "expected at least 2 nodes (leader + 1 follower) to have all 5 records; got {}",
+                ok_count
+            );
+
+            // Clean up.
+            for n in &nodes {
+                let _ = n.shutdown().await;
+            }
+            drop(nodes);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
     }
 }

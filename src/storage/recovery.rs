@@ -56,6 +56,17 @@ pub trait WalStreamSink: Send {
     fn sync_wait(&mut self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Return the concrete type name of this sink (Wave 6 Task 6.1).
+    ///
+    /// Used by `Wal::stream_sink_type_name()` so tests can assert which
+    /// sink implementation is attached (e.g. `MultiWalStreamSink` after
+    /// `enable_raft()` is called). The default returns the type's full
+    /// path via `std::any::type_name`, so concrete sinks do not need to
+    /// override it unless they want to hide the path.
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 /// Replication sync mode (Task 6.1).
@@ -260,6 +271,12 @@ pub struct Wal {
     /// In `Synchronous` mode, `append_and_sync` calls `sink.sync_wait()`
     /// after streaming and propagates a failure as an `io::Error`.
     sync_mode: SyncMode,
+    /// Production Wiring Wave 4: optional Raft handle + runtime. When set,
+    /// `append_and_sync` blocks on `raft.client_write(record_bytes)` BEFORE
+    /// the local WAL append. The record is committed only after a quorum of
+    /// nodes ACK it. The local WAL write happens after the Raft commit.
+    #[cfg(feature = "raft")]
+    raft_handle: Option<(crate::storage::raft::RaftType, tokio::runtime::Handle)>,
 }
 
 impl Wal {
@@ -293,6 +310,8 @@ impl Wal {
             last_synced_lsn: 0,
             stream_sink: None,
             sync_mode: SyncMode::Asynchronous,
+            #[cfg(feature = "raft")]
+            raft_handle: None,
         };
         // Scan existing records to find the max LSN.
         if let Ok(records) = wal.read_all() {
@@ -408,6 +427,29 @@ impl Wal {
     /// When this returns `Err`, the transaction MUST be aborted — the
     /// commit is not durable.
     pub fn append_and_sync(&mut self, record: &WalRecord) -> std::io::Result<()> {
+        // Production Wiring Wave 4: if a Raft handle is attached, route the
+        // record through Raft consensus BEFORE the local WAL append. The
+        // record is committed only after a quorum of nodes ACK it; the local
+        // WAL append + fsync happens after the Raft commit. If Raft fails
+        // (quorum unreachable, this node is not leader, etc.), the commit
+        // fails — the local WAL is NOT written, and the caller's
+        // transaction MUST be aborted.
+        #[cfg(feature = "raft")]
+        if let Some((raft, handle)) = &self.raft_handle {
+            let record_bytes = bincode::serialize(record).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("raft propose: serialize record: {e}"),
+                )
+            })?;
+            let _ = handle.block_on(raft.client_write(record_bytes)).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("raft client_write failed: {e}"),
+                )
+            })?;
+        }
+
         self.append(record)?;
         self.sync()?;
         // Task 6.1: clone the record with the LSN the Wal just assigned
@@ -464,9 +506,64 @@ impl Wal {
         self.stream_sink = Some(sink);
     }
 
+    /// Production Wiring Wave 4: attach a Raft handle + runtime so that
+    /// `append_and_sync()` routes through Raft consensus. After this is
+    /// called, every `append_and_sync()` call will:
+    /// 1. Serialize the record to bytes.
+    /// 2. Block on `raft.client_write(bytes)` on the given runtime — the
+    ///    call returns only after a quorum of nodes has ACKed the entry.
+    /// 3. Then append + fsync the record to the local WAL.
+    ///
+    /// This is the durable-sync-replication path: a commit is acknowledged
+    /// to the caller only after both the Raft quorum and the local fsync
+    /// have completed.
+    #[cfg(feature = "raft")]
+    pub fn set_raft_handle(
+        &mut self,
+        raft: crate::storage::raft::RaftType,
+        handle: tokio::runtime::Handle,
+    ) {
+        self.raft_handle = Some((raft, handle));
+    }
+
+    /// Production Wiring Wave 4: detach the Raft handle. After this,
+    /// `append_and_sync()` falls back to local-only WAL behavior.
+    #[cfg(feature = "raft")]
+    pub fn clear_raft_handle(&mut self) {
+        self.raft_handle = None;
+    }
+
     /// Detach the replication sink (Task 5.1).
     pub fn clear_stream_sink(&mut self) {
         self.stream_sink = None;
+    }
+
+    /// Return `true` if a replication sink is attached (Wave 6 Task 6.1).
+    ///
+    /// Used by tests to assert that `enable_raft()` attached a
+    /// `MultiWalStreamSink`. A `false` return means `append_and_sync`
+    /// will not stream records to any replica.
+    #[must_use]
+    pub fn has_stream_sink(&self) -> bool {
+        self.stream_sink.is_some()
+    }
+
+    /// Return the concrete type name of the attached sink, if any
+    /// (Wave 6 Task 6.1).
+    ///
+    /// Delegates to `WalStreamSink::type_name`. Returns `None` when no
+    /// sink is attached. Tests use this to assert that the attached sink
+    /// is a `MultiWalStreamSink` (the type name contains
+    /// `MultiWalStreamSink`).
+    #[must_use]
+    pub fn stream_sink_type_name(&self) -> Option<&'static str> {
+        match self.stream_sink.as_ref() {
+            Some(sink) => {
+                let guard = sink.lock().ok()?;
+                Some(guard.type_name())
+            }
+            None => None,
+        }
     }
 
     /// Set the replication sync mode (Task 6.1).
@@ -1797,5 +1894,88 @@ mod tests {
         engine.wal = saved_wal;
         assert_eq!(stats.replayed, 2, "two physical changes applied");
         assert_eq!(stats.errors, 0);
+    }
+
+    /// Production Wiring Wave 4 Task 4.1 DoD: when a Raft handle is
+    /// attached to the Wal, append_and_sync routes the record through
+    /// Raft consensus (raft.client_write) BEFORE the local WAL append.
+    /// The record must appear in the Raft store's applied_records.
+    #[cfg(feature = "raft")]
+    #[test]
+    fn wal_append_and_sync_routes_through_raft() {
+        use tempfile::tempdir;
+        // Set up a single-node RaftManager (in-memory store is fine for
+        // this test — we only need to verify the propose call happens).
+        let raft_dir = tempdir().expect("raft dir");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let mgr = runtime
+            .block_on(crate::storage::raft::RaftManager::new_single_node_persistent(
+                1,
+                raft_dir.path(),
+            ))
+            .expect("mgr");
+        runtime
+            .block_on(mgr.wait_until_leader(3000))
+            .expect("leader");
+
+        // Set up a Wal and attach the Raft handle.
+        let wal_dir = tempdir().expect("wal dir");
+        let mut wal = Wal::open(wal_dir.path()).expect("wal");
+        wal.set_raft_handle(mgr.raft.clone(), runtime.handle().clone());
+
+        // Append a record — this should block on Raft consensus.
+        let record = WalRecord::autocommit("INSERT INTO t VALUES (42)");
+        wal.append_and_sync(&record).expect("append_and_sync");
+
+        // The record should now be in the Raft store's applied_records.
+        // (Wait briefly for apply to complete.)
+        runtime
+            .block_on(mgr.wait_applied_at_least(1, 3000))
+            .expect("applied >= 1");
+        let applied = mgr
+            .sled_store()
+            .expect("sled_store")
+            .applied_records()
+            .expect("applied_records");
+        assert!(
+            !applied.is_empty(),
+            "expected at least one applied record in the Raft store"
+        );
+        // The first applied record's bytes should bincode-decode back to
+        // a WalRecord containing our SQL.
+        let decoded: WalRecord = bincode::deserialize(&applied[0]).expect("decode WalRecord");
+        assert!(
+            decoded.sql.contains("INSERT INTO t VALUES (42)"),
+            "applied record SQL mismatch: {:?}",
+            decoded.sql
+        );
+
+        // The local WAL should ALSO have the record (post-Raft local append).
+        let wal_records = wal.read_all().expect("read_all");
+        assert!(
+            wal_records.iter().any(|r| r.sql.contains("INSERT INTO t VALUES (42)")),
+            "expected the record to also be in the local WAL after the Raft commit"
+        );
+
+        // Clean up.
+        let _ = runtime.block_on(mgr.shutdown());
+    }
+
+    /// Production Wiring Wave 4 Task 4.2 DoD: when no Raft handle is
+    /// attached, append_and_sync uses the existing local WAL path
+    /// (backward compatible). This is the default behavior.
+    #[test]
+    fn wal_append_and_sync_local_only_when_no_raft() {
+        let tmp = TempDir::new().unwrap();
+        let mut wal = Wal::open(tmp.path()).unwrap();
+        let record = WalRecord::autocommit("INSERT INTO t VALUES (1)");
+        // No raft_handle attached (default) — this should just work.
+        wal.append_and_sync(&record).expect("append_and_sync");
+        let records = wal.read_all().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].sql.contains("INSERT INTO t VALUES (1)"));
     }
 }

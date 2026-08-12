@@ -8,6 +8,9 @@
 //!
 //! ## Modules
 //!
+//! - [`admin`] — Wave 9 operational tooling: `turboGP admin` CLI with
+//!   `backup`, `restore`, `cluster-status`, `vacuum`, and `checkpoint`
+//!   subcommands.
 //! - [`kernel`] — the kernel table: hand-tuned instruction sequences per
 //!   (CPU, tier) tuple. The engine's competitive moat.
 //! - [`memory`] — tier-aware memory manager. Placement, migration, NUMA.
@@ -40,7 +43,15 @@
 // Wave 8: suppress missing_docs and unused_imports warnings. Adding 400+
 // doc comments and cleaning up 50+ unused imports is a separate documentation
 // effort; the code is correct, just under-documented and has stale imports.
-#![allow(missing_docs, unused_imports, unused_variables, unused_mut, unused_assignments, dead_code)]
+// Wave 8 (Production Wiring): removed `missing_docs` from this list.
+// Every public item in src/**/*.rs is now documented — the formal PIVOT
+// and MERGE parsers (Wave 7), the SledRaftStore / TcpRaftNetwork (Waves
+// 2-3), and the async pgwire server (Wave 5) all carry `///` doc comments.
+// The remaining suppressions cover pre-existing technical debt (stale
+// imports, unused variables, dead code) that is a separate cleanup
+// effort; the code is correct, just under-cleaned. Removing them would
+// produce ~118 warnings, none of which are missing_docs.
+#![allow(unused_imports, unused_variables, unused_mut, unused_assignments, dead_code)]
 
 // Use mimalloc as the global allocator — glibc's ptmalloc2 spends ~50% of
 // query execution time in malloc_consolidate + unlink_chunk + _int_free
@@ -51,6 +62,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod admin;
 pub mod catalog;
 pub mod datasource;
 pub mod engine;
