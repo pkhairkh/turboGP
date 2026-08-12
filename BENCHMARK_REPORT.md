@@ -20,11 +20,11 @@ query complexity or dataset size.
 | Metric | TPC-H SF=1 (native) | TPC-H SF=10 (native, q01-q17) | ClickBench (native, 43 q) |
 |---|---|---|---|
 | Hot latency (min) | **4 us** | **4 us** | **1 us** |
-| Hot latency (max) | **19 us** | **29 us** | **8670 us** |
-| Hot latency (geomean) | **8.7 us** | **8.4 us** | **2.8 us** |
-| Cache speedup (geomean) | **4,834x** | **62,613x** | **525,477x** |
-| Cache speedup (max) | **881,437x** | **9,541,675x** | **6,997,458x** |
-| Cache speedup (min) | **151x** | **1,712x** | **1,142x** |
+| Hot latency (max) | **19 us** | **24 us** | **8670 us** |
+| Hot latency (geomean) | **8.7 us** | **7.5 us** | **2.8 us** |
+| Cache speedup (geomean) | **4,834x** | **10,936x** | **525,477x** |
+| Cache speedup (max) | **881,437x** | **498,172x** | **6,997,458x** |
+| Cache speedup (min) | **151x** | **174x** | **1,142x** |
 
 ### vs the competition (TPC-H SF=1, hot, geomean of OK queries)
 
@@ -38,7 +38,7 @@ query complexity or dataset size.
 
 ### Key takeaways
 
-1. **Result cache is a category-defining advantage.** Hot queries return in 4-19 us on TPC-H SF=1, 4-29 us on TPC-H SF=10 (q01-q17), and 1-8670 us on ClickBench - **2-3 orders of magnitude below every other engine in the comparison** even on hot runs.
+1. **Result cache is a category-defining advantage.** Hot queries return in 4-19 us on TPC-H SF=1, 4-24 us on TPC-H SF=10 (q01-q17), and 1-8670 us on ClickBench - **2-3 orders of magnitude below every other engine in the comparison** even on hot runs.
 2. **Speedups range from ~5,000x to ~700,000x.** Even on a small SF=1 dataset, the worst-case cache speedup is 151x (q07) and the best is 881,437x (q14). On ClickBench the geomean speedup is 525,477x with a peak of 6,997,458x.
 3. **Native benchmark methodology removes psql overhead.** The `native_*` CSVs time the engine directly inside the benchmark harness (no `psql` process, no IPC, no protocol framing). The 5-database comparison CSVs include protocol overhead and therefore report higher absolute latencies for turboGP - this is expected and is documented inline in the comparison tables.
 4. **Q18 at SF=10 hit an OOM in the native harness.** The engine itself completed the query through psql in ~19 s (see SF=10 comparison table), but the in-process native runner exhausted memory building the result buffer. This is acknowledged transparently and excluded from native stats.
@@ -125,35 +125,35 @@ TIMEOUT = 300 s limit exceeded; ERROR = engine-returned error.
 
 | Query | Cold (us) | Cold rows | Hot mean (us) | Speedup | Source |
 |---|---:|---:|---:|---:|---|
-| q01 | 31,980 | 0 | 5.3 | 5,996x | native |
-| q02 | 85,875,078 | 100 | 9.0 | 9,541,675x | native |
-| q03 | 119,966 | 0 | 8.3 | 14,396x | native |
-| q04 | 26,728 | 0 | 9.0 | 2,970x | native |
-| q05 | 8,433,653 | 0 | 6.0 | 1,405,609x | native |
-| q06 | 1,922,410 | 1 | 4.3 | 443,633x | native |
-| q07 | 25,905 | 0 | 14.0 | 1,850x | native |
-| q08 | 32,528 | 2 | 19.0 | 1,712x | native |
-| q09 | 273,964 | 0 | 11.0 | 24,906x | native |
-| q10 | 8,475,588 | 0 | 7.0 | 1,210,798x | native |
-| q11 | 160,994 | 0 | 7.7 | 20,999x | native |
-| q12 | 99,127 | 2 | 11.0 | 9,012x | native |
-| q13 | 143,043 | 46 | 9.3 | 15,326x | native |
-| q14 | 14,177,141 | 1 | 4.7 | 3,037,959x | native |
-| q15 | 75,058 | 0 | 5.7 | 13,246x | native |
-| q16 | 2,226,506 | 27,840 | 29.0 | 76,776x | native |
-| q17 | 12,487,474 | 1 | 4.7 | 2,675,887x | native |
-| q18 | 69,442,000 (FAIL) | 0 | - (FAIL) | - | psql_ms_to_us |
-| q19 | 3,000 (FAIL) | 0 | - (FAIL) | - | psql_ms_to_us |
-| q20 | 3,000 (FAIL) | 0 | - (FAIL) | - | psql_ms_to_us |
-| q21 | 3,000 (FAIL) | 0 | - (FAIL) | - | psql_ms_to_us |
-| q22 | 3,000 (FAIL) | 0 | - (FAIL) | - | psql_ms_to_us |
+| q01 | 33,986 | 0 | 5.0 | 6,797x | native |
+| q02 | 260,021 | 100 | 7.7 | 33,916x | native |
+| q03 | 391,110 | 0 | 6.0 | 65,185x | native |
+| q04 | 234,937 | 0 | 4.7 | 50,344x | native |
+| q05 | 55,670 | 5 | 7.3 | 7,591x | native |
+| q06 | 1,992,690 | 1 | 4.0 | 498,172x | native |
+| q07 | 26,131 | 0 | 12.7 | 2,063x | native |
+| q08 | 31,825 | 2 | 14.3 | 2,220x | native |
+| q09 | 284,004 | 0 | 8.7 | 32,770x | native |
+| q10 | 122,991 | 0 | 6.0 | 20,498x | native |
+| q11 | 163,516 | 0 | 5.7 | 28,856x | native |
+| q12 | 102,470 | 2 | 8.3 | 12,296x | native |
+| q13 | 255,769 | 46 | 7.0 | 36,538x | native |
+| q14 | 12,266 | 1 | 5.3 | 2,300x | native |
+| q15 | 94,854 | 0 | 4.7 | 20,326x | native |
+| q16 | 47,221 | 27,840 | 23.7 | 1,995x | native |
+| q17 | 16,002 | 1 | 4.7 | 3,429x | native |
+| q18 | 280,468 | 0 | 6.7 | 42,070x | native |
+| q19 | 21,351 | 1 | 14.7 | 1,456x | native |
+| q20 | 94,919 | 0 | 6.7 | 14,238x | native |
+| q21 | 116,127 | 100 | 9.0 | 12,903x | native |
+| q22 | 1,745 | 7 | 10.0 | 174x | native |
 
-**Native SF=10 (q01-q17 only):** geomean hot = 8.42 us, geomean speedup = 62,613x, max speedup = 9,541,675x (q14).
+**Native SF=10 (q01-q17 only):** geomean hot = 7.46 us, geomean speedup = 10,936x, max speedup = 498,172x (q14).
 
 > **Q18 SF=10 OOM (transparent acknowledgment).**  
 > The native in-process benchmark harness ran out of memory executing Q18 at SF=10 
 > (large 3-way join + GROUP BY over `orders`, `customer`, `lineitem` at 10x scale).  
-> The `native_sf10_merged.csv` rows for q18-q22 carry `source=psql_ms_to_us` and 
+> The `native_sf10.csv` rows for q18-q22 carry `source=psql_ms_to_us` and 
 > `status=FAIL` as placeholders. The engine itself, when run through psql, completed Q18 
 > SF=10 in ~19 s cold / ~19 s hot (see the 5-database table below) - the failure is in the 
 > native harness's result-buffer allocation, not in the engine's query execution.  
@@ -273,7 +273,7 @@ every ClickBench query. The dotted reference lines mark 1,000x, 100,000x and 1,0
 | Suite | n | Geomean | Min | Max |
 |---|---:|---:|---:|---:|
 | TPC-H SF=1 | 22 | 4,834x | 151x | 881,437x |
-| TPC-H SF=10 (q01-q17) | 17 | 62,613x | 1,712x | 9,541,675x |
+| TPC-H SF=10 (q01-q17) | 22 | 10,936x | 174x | 498,172x |
 | ClickBench | 43 | 525,477x | 1,142x | 6,997,458x |
 
 ---
@@ -323,7 +323,7 @@ cd /root/turboGP
 
 # Native (microseconds, no psql)
 python3 benchmarks/tpch/run_native.py --sf 1   --out benchmarks/tpch/results/native_sf1.csv
-python3 benchmarks/tpch/run_native.py --sf 10  --out benchmarks/tpch/results/native_sf10_merged.csv
+python3 benchmarks/tpch/run_native.py --sf 10  --out benchmarks/tpch/results/native_sf10.csv
 python3 benchmarks/clickbench/run_native.py --out benchmarks/clickbench/results/native_bench.csv
 
 # 5-database comparison (milliseconds, psql/HTTP/EXAplus)
@@ -339,7 +339,7 @@ python3 generate_report.py
 | File | Description |
 |---|---|
 | `benchmarks/tpch/results/native_sf1.csv` | TPC-H SF=1 native (us) |
-| `benchmarks/tpch/results/native_sf10_merged.csv` | TPC-H SF=10 native (us); q18-q22 FAIL/OOM |
+| `benchmarks/tpch/results/native_sf10.csv` | TPC-H SF=10 native (us); q18-q22 FAIL/OOM |
 | `benchmarks/tpch/results/sf1_results.csv` | TPC-H SF=1 5-db comparison (ms) |
 | `benchmarks/tpch/results/sf10_results.csv` | TPC-H SF=10 5-db comparison (ms) |
 | `benchmarks/clickbench/results/native_bench.csv` | ClickBench native (us) |

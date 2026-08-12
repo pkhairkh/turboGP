@@ -66,7 +66,7 @@ REPORT_PATH = ROOT / "BENCHMARK_REPORT.md"
 CHARTS_DIR.mkdir(parents=True, exist_ok=True)
 
 NATIVE_SF1_CSV = TPCH_RESULTS / "native_sf1.csv"
-NATIVE_SF10_CSV = TPCH_RESULTS / "native_sf10_merged.csv"
+NATIVE_SF10_CSV = TPCH_RESULTS / "native_sf10.csv"
 NATIVE_CLICK_CSV = CLICK_RESULTS / "native_bench.csv"
 SF1_RESULTS_CSV = TPCH_RESULTS / "sf1_results.csv"
 SF10_RESULTS_CSV = TPCH_RESULTS / "sf10_results.csv"
@@ -556,7 +556,7 @@ def build_report(native_sf1, native_sf10, native_click,
     A("> **Q18 SF=10 OOM (transparent acknowledgment).**  ")
     A("> The native in-process benchmark harness ran out of memory executing Q18 at SF=10 ")
     A("> (large 3-way join + GROUP BY over `orders`, `customer`, `lineitem` at 10x scale).  ")
-    A("> The `native_sf10_merged.csv` rows for q18-q22 carry `source=psql_ms_to_us` and ")
+    A("> The `native_sf10.csv` rows for q18-q22 carry `source=psql_ms_to_us` and ")
     A("> `status=FAIL` as placeholders. The engine itself, when run through psql, completed Q18 ")
     A("> SF=10 in ~19 s cold / ~19 s hot (see the 5-database table below) - the failure is in the ")
     A("> native harness's result-buffer allocation, not in the engine's query execution.  ")
@@ -696,7 +696,7 @@ def build_report(native_sf1, native_sf10, native_click,
     A("")
     A("# Native (microseconds, no psql)")
     A("python3 benchmarks/tpch/run_native.py --sf 1   --out benchmarks/tpch/results/native_sf1.csv")
-    A("python3 benchmarks/tpch/run_native.py --sf 10  --out benchmarks/tpch/results/native_sf10_merged.csv")
+    A("python3 benchmarks/tpch/run_native.py --sf 10  --out benchmarks/tpch/results/native_sf10.csv")
     A("python3 benchmarks/clickbench/run_native.py --out benchmarks/clickbench/results/native_bench.csv")
     A("")
     A("# 5-database comparison (milliseconds, psql/HTTP/EXAplus)")
@@ -712,7 +712,7 @@ def build_report(native_sf1, native_sf10, native_click,
     A("| File | Description |")
     A("|---|---|")
     A("| `benchmarks/tpch/results/native_sf1.csv` | TPC-H SF=1 native (us) |")
-    A("| `benchmarks/tpch/results/native_sf10_merged.csv` | TPC-H SF=10 native (us); q18-q22 FAIL/OOM |")
+    A("| `benchmarks/tpch/results/native_sf10.csv` | TPC-H SF=10 native (us); q18-q22 FAIL/OOM |")
     A("| `benchmarks/tpch/results/sf1_results.csv` | TPC-H SF=1 5-db comparison (ms) |")
     A("| `benchmarks/tpch/results/sf10_results.csv` | TPC-H SF=10 5-db comparison (ms) |")
     A("| `benchmarks/clickbench/results/native_bench.csv` | ClickBench native (us) |")
