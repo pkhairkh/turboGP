@@ -374,9 +374,137 @@ pub fn eval_compiled_f64(node: &CompiledNode, table: &Table, row_idx: usize) -> 
     }
 }
 
+/// Try to pattern-match the compiled expression against one of the
+/// AVX-512 FMA kernels in `simd_agg.rs`. Returns `Some(result)` if a
+/// kernel matches, `None` to fall back to the scalar per-row loop.
+///
+/// Recognised patterns (where `a`, `b`, `c` are column refs and `1` is
+/// either `IntLit(1)` or `FloatLit(1.0)`):
+///
+///   * `a * b`                            -> `sum_a_mul_b_by_idx`
+///   * `a * (1 - b)`                      -> `sum_a_mul_one_minus_b_by_idx`
+///   * `a * (1 - b) * (1 + c)`            -> `sum_a_mul_one_minus_b_mul_one_plus_c_by_idx`
+///
+/// Also handles left-associative variants where the multiplications are
+/// nested in either order (e.g. `(1 - b) * a`).
+fn try_simd_agg(node: &CompiledNode, table: &Table, indices: &[usize]) -> Option<f64> {
+    use crate::exec::simd_agg;
+
+    // Helper: matches `1` (either IntLit(1) or FloatLit(1.0))
+    fn is_one(n: &CompiledNode) -> bool {
+        matches!(n, CompiledNode::IntLit(1))
+            || matches!(n, CompiledNode::FloatLit(bits) if f64::from_bits(*bits) == 1.0)
+    }
+    // Helper: extract column index if `n` is a `Column(_)` (or `1 - col`)
+    fn as_col(n: &CompiledNode) -> Option<usize> {
+        match n {
+            CompiledNode::Column(idx) => Some(*idx),
+            _ => None,
+        }
+    }
+    // Helper: matches `(1 - col)` and returns col_idx
+    fn as_one_minus_col(n: &CompiledNode) -> Option<usize> {
+        if let CompiledNode::BinOp { op: '-', left, right } = n {
+            if is_one(left) {
+                return as_col(right);
+            }
+        }
+        None
+    }
+    // Helper: matches `(1 + col)` and returns col_idx
+    fn as_one_plus_col(n: &CompiledNode) -> Option<usize> {
+        if let CompiledNode::BinOp { op: '+', left, right } = n {
+            if is_one(left) {
+                return as_col(right);
+            }
+        }
+        None
+    }
+
+    // Pattern 1: a * b
+    // Tree: BinOp { op: '*', left: Col(a), right: Col(b) }
+    if let CompiledNode::BinOp { op: '*', left, right } = node {
+        if let (Some(a_idx), Some(b_idx)) = (as_col(left), as_col(right)) {
+            let a = &table.columns[a_idx];
+            let b = &table.columns[b_idx];
+            return Some(simd_agg::sum_a_mul_b_by_idx(a, b, indices));
+        }
+    }
+
+    // Pattern 2: a * (1 - b)
+    // Tree: BinOp { op: '*', left: Col(a), right: BinOp{op:'-', left:1, right: Col(b)} }
+    if let CompiledNode::BinOp { op: '*', left, right } = node {
+        if let Some(a_idx) = as_col(left) {
+            if let Some(b_idx) = as_one_minus_col(right) {
+                let a = &table.columns[a_idx];
+                let b = &table.columns[b_idx];
+                return Some(simd_agg::sum_a_mul_one_minus_b_by_idx(a, b, indices));
+            }
+        }
+        // Also handle commutative: (1 - b) * a
+        if let Some(a_idx) = as_col(right) {
+            if let Some(b_idx) = as_one_minus_col(left) {
+                let a = &table.columns[a_idx];
+                let b = &table.columns[b_idx];
+                return Some(simd_agg::sum_a_mul_one_minus_b_by_idx(a, b, indices));
+            }
+        }
+    }
+
+    // Pattern 3: a * (1 - b) * (1 + c)
+    // Tree: BinOp { op: '*', left: BinOp{op:'*', left: Col(a), right: (1-b)}, right: (1+c) }
+    if let CompiledNode::BinOp { op: '*', left, right } = node {
+        if let Some(c_idx) = as_one_plus_col(right) {
+            // left should be `a * (1 - b)` (pattern 2)
+            if let CompiledNode::BinOp { op: '*', left: l2, right: r2 } = left.as_ref() {
+                if let Some(a_idx) = as_col(l2) {
+                    if let Some(b_idx) = as_one_minus_col(r2) {
+                        let a = &table.columns[a_idx];
+                        let b = &table.columns[b_idx];
+                        let c = &table.columns[c_idx];
+                        return Some(simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(a, b, c, indices));
+                    }
+                }
+                // Also handle commutative: (1 - b) * a
+                if let Some(a_idx) = as_col(r2) {
+                    if let Some(b_idx) = as_one_minus_col(l2) {
+                        let a = &table.columns[a_idx];
+                        let b = &table.columns[b_idx];
+                        let c = &table.columns[c_idx];
+                        return Some(simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(a, b, c, indices));
+                    }
+                }
+            }
+        }
+        // Also handle: (1 + c) on the left, a * (1 - b) on the right
+        if let Some(c_idx) = as_one_plus_col(left) {
+            if let CompiledNode::BinOp { op: '*', left: l2, right: r2 } = right.as_ref() {
+                if let Some(a_idx) = as_col(l2) {
+                    if let Some(b_idx) = as_one_minus_col(r2) {
+                        let a = &table.columns[a_idx];
+                        let b = &table.columns[b_idx];
+                        let c = &table.columns[c_idx];
+                        return Some(simd_agg::sum_a_mul_one_minus_b_mul_one_plus_c_by_idx(a, b, c, indices));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Vectorized sum of a compiled expression over a set of row indices.
 /// This is the fast path for SUM(arithmetic_expr) queries.
+///
+/// W2-T2: pattern-matches the compiled tree against one of the AVX-512 FMA
+/// kernels in `simd_agg.rs` (sum_a_mul_b, sum_a_mul_one_minus_b, sum_a_mul_
+/// one_minus_b_mul_one_plus_c). Falls back to the scalar per-row loop for
+/// shapes the kernels don't handle.
 pub fn sum_compiled_f64(node: &CompiledNode, table: &Table, indices: &[usize]) -> f64 {
+    if let Some(result) = try_simd_agg(node, table, indices) {
+        return result;
+    }
     let mut sum = 0.0f64;
     for &i in indices {
         sum += eval_compiled_f64(node, table, i);
