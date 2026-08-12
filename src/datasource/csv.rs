@@ -51,21 +51,61 @@ use xxhash_rust::xxh3;
 /// Returns an error if the file cannot be read or if the rows have
 /// inconsistent column counts.
 pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Error>> {
-    let contents = fs::read_to_string(path)?;
+    // Streaming CSV reader: reads line by line via BufReader (64KB buffer)
+    // and accumulates cells into column-major Vec<String> buffers.
+    //
+    // This replaces the previous fs::read_to_string approach which slurped
+    // the entire file into memory (7.7GB for lineitem SF=10) plus built
+    // Vec<Vec<&str>> (16GB transient). Peak transient memory is now just
+    // the column-major string buffers (which become StringSearchColumn).
 
-    // Split into trimmed lines. We accept both `\n` and `\r\n` line
-    // endings (trim_end_matches handles the latter). Empty lines are
-    // skipped — they would otherwise create phantom zero-column rows.
-    let mut lines: Vec<&str> = Vec::new();
-    for line in contents.lines() {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let mut column_names: Vec<String> = Vec::new();
+    let mut column_data: Vec<Vec<String>> = Vec::new(); // column-major strings
+    let mut row_count: usize = 0;
+    let mut header_seen = false;
+
+    for line_result in reader.lines() {
+        let line = line_result?;
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
             continue;
         }
-        lines.push(line);
+
+        if has_header && !header_seen {
+            column_names = line.split(',').map(|s| s.to_string()).collect();
+            column_data = vec![Vec::new(); column_names.len()];
+            header_seen = true;
+            continue;
+        }
+
+        let cells: Vec<&str> = line.split(',').collect();
+
+        if column_names.is_empty() {
+            // No header mode: infer column count from first data row
+            column_names = (0..cells.len()).map(|i| format!("col_{i}")).collect();
+            column_data = vec![Vec::new(); column_names.len()];
+        }
+
+        if cells.len() != column_names.len() {
+            return Err(format!(
+                "CSV row {} has {} fields, expected {}",
+                row_count + if has_header { 1 } else { 0 },
+                cells.len(),
+                column_names.len()
+            )
+            .into());
+        }
+
+        for (col_idx, cell) in cells.iter().enumerate() {
+            column_data[col_idx].push(cell.to_string());
+        }
+        row_count += 1;
     }
 
-    if lines.is_empty() {
+    if column_names.is_empty() {
         return Ok(LoadedTable {
             name: LoadedTable::name_from_path(path),
             columns: Vec::new(),
@@ -73,49 +113,17 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
         });
     }
 
-    // Header (optional) + data rows.
-    let (column_names, data_rows) = if has_header {
-        let header = lines[0].split(',').map(|s| s.to_string()).collect::<Vec<_>>();
-        (header, &lines[1..])
-    } else {
-        let ncols = lines[0].split(',').count();
-        let names = (0..ncols).map(|i| format!("col_{i}")).collect::<Vec<_>>();
-        (names, &lines[..])
-    };
-
-    if column_names.is_empty() {
-        return Err("CSV has zero columns".into());
-    }
-
     let ncols = column_names.len();
-
-    // Parse rows into a Vec<Vec<&str>> (column-major would require
-    // two passes; row-major is fine for our sizes).
-    let mut parsed_rows: Vec<Vec<&str>> = Vec::with_capacity(data_rows.len());
-    for (row_idx, line) in data_rows.iter().enumerate() {
-        let row: Vec<&str> = line.split(',').collect();
-        if row.len() != ncols {
-            return Err(format!(
-                "CSV row {} has {} fields, expected {}",
-                row_idx + if has_header { 1 } else { 0 },
-                row.len(),
-                ncols
-            )
-            .into());
-        }
-        parsed_rows.push(row);
-    }
-
-    let row_count = parsed_rows.len();
     let mut columns: Vec<LoadedColumn> = Vec::with_capacity(ncols);
 
     for (col_idx, name) in column_names.iter().enumerate() {
-        // First pass: try to parse every value in this column as i64.
+        let strings = &column_data[col_idx];
+
+        // Try i64 first
         let mut as_i64: Vec<i64> = Vec::with_capacity(row_count);
         let mut all_numeric = true;
-        for row in &parsed_rows {
-            let v = row[col_idx];
-            match v.parse::<i64>() {
+        for s in strings {
+            match s.parse::<i64>() {
                 Ok(n) => as_i64.push(n),
                 Err(_) => {
                     all_numeric = false;
@@ -125,16 +133,13 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
         }
 
         let cells: Vec<u64> = if all_numeric {
-            // Integer column: cast i64 → u64 (bit-reinterpret).
             as_i64.into_iter().map(|v| v as u64).collect()
         } else {
-            // Try f64 parse (DECIMAL/FLOAT columns like 5755.94).
-            // If all values parse as f64, store f64::to_bits so SUM/AVG work.
+            // Try f64
             let mut as_f64: Vec<f64> = Vec::with_capacity(row_count);
             let mut all_float = true;
-            for row in &parsed_rows {
-                let v = row[col_idx];
-                match v.parse::<f64>() {
+            for s in strings {
+                match s.parse::<f64>() {
                     Ok(f) => as_f64.push(f),
                     Err(_) => {
                         all_float = false;
@@ -143,33 +148,31 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
                 }
             }
             if all_float {
-                // DECIMAL/FLOAT column: encode as f64::to_bits for correct arithmetic.
                 as_f64.into_iter().map(|v| v.to_bits()).collect()
             } else {
-                // True string column: hash every value with xxh3_64.
-                parsed_rows.iter().map(|row| xxh3::xxh3_64(row[col_idx].as_bytes())).collect()
+                // String column: hash with xxh3_64
+                strings.iter().map(|s| xxh3::xxh3_64(s.as_bytes())).collect()
             }
         };
 
-        // For string columns, build a StringSearchColumn sidecar.
-        // A column is "string" only if it's neither i64 nor f64.
+        // String sidecar: only for columns that are neither i64 nor f64
         let is_string = !all_numeric && {
             let mut all_float = true;
-            for row in &parsed_rows {
-                if row[col_idx].parse::<f64>().is_err() {
+            for s in strings {
+                if s.parse::<f64>().is_err() {
                     all_float = false;
                     break;
                 }
             }
             !all_float
         };
+
         let string_search = if is_string {
-            let strings: Vec<String> =
-                parsed_rows.iter().map(|row| row[col_idx].to_string()).collect();
-            Some(crate::exec::fm_index::StringSearchColumn::new(strings))
+            Some(crate::exec::fm_index::StringSearchColumn::new(strings.clone()))
         } else {
             None
         };
+
         columns.push(LoadedColumn {
             name: name.clone(),
             cells,
