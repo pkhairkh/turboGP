@@ -113,11 +113,14 @@ impl<'a> QueryInterpreter<'a> {
         let indices: Vec<usize> = (0..base.row_count).filter(|&i| mask[i]).collect();
         let result = self.project(&query.select, &base, &indices)?;
         let mut result = if !query.order_by.is_empty() {
-            self.apply_order_by(result, &query.order_by, &base, &indices)?
+            self.apply_order_by(result, &query.order_by, &base, &indices, query.limit)?
         } else {
             result
         };
 
+        // W1 Task 1.3: apply_order_by already truncates to `limit` when the
+        // limit is small (< 10_000) via the top-N heap path. For the non-heap
+        // path (limit >= 10_000 or no ORDER BY), apply the truncate here.
         if let Some(limit) = query.limit {
             if result.row_count > limit {
                 for col in &mut result.columns {

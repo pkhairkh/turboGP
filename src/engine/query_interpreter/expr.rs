@@ -12,6 +12,88 @@ use rayon::prelude::*;
 use super::types::*;
 use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset, take_mask_buf, return_mask_buf};
 
+// =========================================================================
+// Top-N heap (W1 Task 1.3) — O(N log K) replacement for full sort + truncate
+// =========================================================================
+
+/// Entry in the top-N BinaryHeap. Owns a small Vec of sort keys (typically
+/// 1-3 f64 values) so the heap can compare entries without borrowing from
+/// the parent `sort_keys` Vec.
+struct TopNEntry {
+    keys: Vec<(f64, bool)>,
+    idx: usize,
+}
+impl PartialEq for TopNEntry {
+    fn eq(&self, other: &Self) -> bool { self.cmp(other) == std::cmp::Ordering::Equal }
+}
+impl Eq for TopNEntry {}
+impl PartialOrd for TopNEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for TopNEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (i, (va, asc)) in self.keys.iter().enumerate() {
+            let vb = other.keys[i].0;
+            let cmp = va.total_cmp(&vb);
+            let cmp = if *asc { cmp } else { cmp.reverse() };
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+/// Choose row indices using a max-heap of size K, then sort the K survivors.
+///
+/// Returns `Vec<usize>` of row indices sorted ascending per the multi-key
+/// comparator. When `limit` is `None`, `0`, `>= row_count`, or `>= 10_000`,
+/// falls back to a full sort of all row indices (the previous behaviour).
+///
+/// Complexity: O(N log K) on the heap path vs O(N log N) on the full-sort path.
+fn topn_indices(sort_keys: &[Vec<(f64, bool)>], row_count: usize, limit: Option<usize>) -> Vec<usize> {
+    #[inline]
+    fn cmp_keys(a: &[Vec<(f64, bool)>], i: usize, j: usize) -> std::cmp::Ordering {
+        for (k, (va, asc)) in a[i].iter().enumerate() {
+            let vb = a[j][k].0;
+            let cmp = va.total_cmp(&vb);
+            let cmp = if *asc { cmp } else { cmp.reverse() };
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    let use_heap = matches!(limit, Some(l) if l > 0 && l < 10_000 && l < row_count);
+
+    if use_heap {
+        let k = limit.unwrap();
+        let mut heap: std::collections::BinaryHeap<TopNEntry> =
+            std::collections::BinaryHeap::with_capacity(k + 1);
+        for row_idx in 0..row_count {
+            let entry = TopNEntry { keys: sort_keys[row_idx].clone(), idx: row_idx };
+            if heap.len() < k {
+                heap.push(entry);
+            } else if let Some(top) = heap.peek() {
+                // Max-heap: peek() returns the LARGEST of the K smallest kept so far.
+                // Replace it when the new entry is smaller.
+                if entry.cmp(top) == std::cmp::Ordering::Less {
+                    heap.pop();
+                    heap.push(entry);
+                }
+            }
+        }
+        let mut kept: Vec<usize> = heap.into_iter().map(|e| e.idx).collect();
+        kept.sort_by(|&a, &b| cmp_keys(sort_keys, a, b));
+        kept
+    } else {
+        let mut order: Vec<usize> = (0..row_count).collect();
+        order.sort_by(|&a, &b| cmp_keys(sort_keys, a, b));
+        order
+    }
+}
+
 impl<'a> QueryInterpreter<'a> {
     pub(crate) fn filter_table(&self, table: &ExecTable, indices: &[usize]) -> ExecTable {
         let mut new_cols = Vec::with_capacity(table.columns.len());
@@ -1768,6 +1850,7 @@ impl<'a> QueryInterpreter<'a> {
         order_by: &[(Expr2, bool)],
         t: &ExecTable,
         indices: &[usize],
+        limit: Option<usize>,
     ) -> Result<QueryResult, Error> {
         if order_by.is_empty() || result.row_count <= 1 {
             return Ok(result);
@@ -1791,18 +1874,10 @@ impl<'a> QueryInterpreter<'a> {
             }
             sort_keys.push(keys);
         }
-        let mut order: Vec<usize> = (0..result.row_count).collect();
-        order.sort_by(|&a, &b| {
-            for (i, (va, asc)) in sort_keys[a].iter().enumerate() {
-                let vb = sort_keys[b][i].0;
-                let cmp = va.total_cmp(&vb);
-                let cmp = if *asc { cmp } else { cmp.reverse() };
-                if cmp != std::cmp::Ordering::Equal {
-                    return cmp;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
+        // W1 Task 1.3: top-N heap when limit is small. Returns either the
+        // K smallest indices (heap path) or all row_count indices (full sort).
+        let order = topn_indices(&sort_keys, result.row_count, limit);
+        let new_row_count = order.len();
         let new_cols: Vec<ResultColumn> = result
             .columns
             .iter()
@@ -1817,13 +1892,14 @@ impl<'a> QueryInterpreter<'a> {
                 }
             })
             .collect();
-        Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: 0 })
+        Ok(QueryResult { columns: new_cols, row_count: new_row_count, elapsed_us: 0 })
     }
 
     pub(crate) fn apply_order_by_grouped(
         &self,
         result: QueryResult,
         order_by: &[(Expr2, bool)],
+        limit: Option<usize>,
     ) -> Result<QueryResult, Error> {
         if order_by.is_empty() || result.row_count <= 1 {
             return Ok(result);
@@ -1843,18 +1919,9 @@ impl<'a> QueryInterpreter<'a> {
             }
             sort_keys.push(keys);
         }
-        let mut order: Vec<usize> = (0..result.row_count).collect();
-        order.sort_by(|&a, &b| {
-            for (i, (va, asc)) in sort_keys[a].iter().enumerate() {
-                let vb = sort_keys[b][i].0;
-                let cmp = va.total_cmp(&vb);
-                let cmp = if *asc { cmp } else { cmp.reverse() };
-                if cmp != std::cmp::Ordering::Equal {
-                    return cmp;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
+        // W1 Task 1.3: top-N heap when limit is small.
+        let order = topn_indices(&sort_keys, result.row_count, limit);
+        let new_row_count = order.len();
         let new_cols: Vec<ResultColumn> = result
             .columns
             .iter()
@@ -1869,7 +1936,7 @@ impl<'a> QueryInterpreter<'a> {
                 }
             })
             .collect();
-        Ok(QueryResult { columns: new_cols, row_count: result.row_count, elapsed_us: 0 })
+        Ok(QueryResult { columns: new_cols, row_count: new_row_count, elapsed_us: 0 })
     }
 
     /// Check if an expression contains any column references.

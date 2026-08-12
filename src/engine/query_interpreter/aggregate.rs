@@ -486,8 +486,11 @@ impl<'a> QueryInterpreter<'a> {
         let mut result = QueryResult { columns: cols, row_count: finalized.len(), elapsed_us: 0 };
 
         if !query.order_by.is_empty() {
-            result = self.apply_order_by_grouped(result, &query.order_by)?;
+            result = self.apply_order_by_grouped(result, &query.order_by, query.limit)?;
         }
+        // W1 Task 1.3: apply_order_by_grouped already truncates to `limit`
+        // when small (< 10_000) via the top-N heap path. For the non-heap
+        // path (limit >= 10_000 or no ORDER BY), apply the truncate here.
         if let Some(limit) = query.limit {
             if result.row_count > limit {
                 for col in &mut result.columns {
@@ -651,8 +654,11 @@ impl<'a> QueryInterpreter<'a> {
         let mut result = QueryResult { columns: cols, row_count: filtered.len(), elapsed_us: 0 };
 
         if !query.order_by.is_empty() {
-            result = self.apply_order_by_grouped(result, &query.order_by)?;
+            result = self.apply_order_by_grouped(result, &query.order_by, query.limit)?;
         }
+        // W1 Task 1.3: apply_order_by_grouped already truncates to `limit`
+        // when small (< 10_000) via the top-N heap path. For the non-heap
+        // path (limit >= 10_000 or no ORDER BY), apply the truncate here.
         if let Some(limit) = query.limit {
             if result.row_count > limit {
                 for col in &mut result.columns {
