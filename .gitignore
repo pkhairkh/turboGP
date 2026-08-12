@@ -34,3 +34,12 @@ Cargo.lock
 *.log
 checkpoint.sql
 benchmarks/tpch/dbgen-src/
+
+# Large benchmark data files (kept in /srv/, not in git)
+benchmarks/clickbench/data/*.csv
+benchmarks/clickbench/data/*.tbl
+benchmarks/tpch/data/sf1/*.tbl
+benchmarks/tpch/data/sf10/*.tbl
+benchmarks/tpch/data/clickbench/*.tbl
+*.duckdb
+*.duckdb.wal
