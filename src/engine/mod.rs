@@ -1409,17 +1409,11 @@ impl QueryEngine {
         let loaded = read_csv(path, has_header).map_err(|e| Error::Other(e.to_string()))?;
         let row_count = loaded.row_count;
 
-        // Materialize hash columns for string columns (Wave 31).
-        // This pre-computes xxh3 hashes so GROUP BY doesn't re-hash per query.
-        for col in &loaded.columns {
-            if col.string_search.is_some() {
-                // The cells are already xxh3 hashes (computed by the CSV reader).
-                // Register them as a HashColumn so GROUP BY can use the pre-computed
-                // hashes instead of re-hashing per query.
-                let hash_col = crate::exec::hash_column::HashColumn { hashes: col.cells.clone() };
-                self.hash_registry.register(table_name, &col.name, hash_col);
-            }
-        }
+        // Note: The hash_registry was previously populated here by cloning
+        // every string column's Vec<u64> hashes (4.5GB at SF=10). However,
+        // the registry was never read during query execution — no query
+        // ever called hash_registry.get(). This was pure dead weight.
+        // The registry struct is kept for potential future use but remains empty.
 
         let mut table = Table::from_loaded(loaded);
         table.name = table_name.to_string();
