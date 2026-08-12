@@ -75,15 +75,25 @@ def load_sf(sf):
         conn.execute(stmt)
     print(f"Created {len(TABLES)} tables")
 
-    # Load each table
+    # Load each table in batches to avoid OOM on large tables
+    BATCH_SIZE = 100_000
     for tbl in TABLES:
         tbl_path = DATA_DIR / f"sf{sf}" / f"{tbl}.tbl"
         print(f"  loading {tbl}...", end=" ", flush=True)
         t0 = time.time()
-        rows = list(read_tbl(tbl_path))
-        conn.import_from_iterable(rows, (schema_name, tbl))
+        total = 0
+        batch = []
+        for row in read_tbl(tbl_path):
+            batch.append(row)
+            if len(batch) >= BATCH_SIZE:
+                conn.import_from_iterable(batch, (schema_name, tbl))
+                total += len(batch)
+                batch = []
+        if batch:
+            conn.import_from_iterable(batch, (schema_name, tbl))
+            total += len(batch)
         elapsed = time.time() - t0
-        print(f"{len(rows)} rows in {elapsed:.1f}s ({len(rows)/max(elapsed,0.01):.0f} rows/sec)")
+        print(f"{total} rows in {elapsed:.1f}s ({total/max(elapsed,0.01):.0f} rows/sec)")
 
     # Verify row counts
     print("\n  Row counts:")
