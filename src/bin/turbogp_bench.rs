@@ -46,6 +46,12 @@ enum BenchCommand {
         /// Number of hot iterations (after 1 cold warmup)
         #[arg(long, default_value = "3")]
         hot_iters: u32,
+        /// Start query number (1-22, default 1)
+        #[arg(long, default_value = "1")]
+        start_query: u32,
+        /// End query number (1-22, default 22)
+        #[arg(long, default_value = "22")]
+        end_query: u32,
     },
     /// ClickBench benchmark (43 queries)
     Clickbench {
@@ -232,8 +238,9 @@ fn geometric_mean_us(values: &[u64]) -> u64 {
     (sum_log / values.len() as f64).exp() as u64
 }
 
-fn tpch_query_files() -> Vec<(String, String)> {
-    (1..=22)
+fn tpch_query_files(start: u32, end: u32) -> Vec<(String, String)> {
+    (start..=end)
+        .filter(|n| *n >= 1 && *n <= 22)
         .map(|n| (format!("q{n:02}"), format!("q{n:02}.sql")))
         .collect()
 }
@@ -344,7 +351,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repo_dir = PathBuf::from(&cli.repo_dir);
 
     match cli.command {
-        BenchCommand::Tpch { sf, csv_dir, output, hot_iters } => {
+        BenchCommand::Tpch { sf, csv_dir, output, hot_iters, start_query, end_query } => {
             eprintln!("=== TPC-H SF={sf} Native Benchmark ===");
             eprintln!("CSV dir: {csv_dir}");
             eprintln!("Repo dir: {}", repo_dir.display());
@@ -361,8 +368,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tables = ["region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem"];
             load_csv_data(&mut engine, &csv_path, &tables)?;
 
-            eprintln!("Running 22 TPC-H queries...");
-            let queries = tpch_query_files();
+            eprintln!("Running TPC-H queries Q{:02}-Q{:02}...", start_query, end_query);
+            let queries = tpch_query_files(start_query, end_query);
             run_benchmark(&mut engine, &queries_dir, &queries, &output, hot_iters, "TPC-H")?;
         }
         BenchCommand::Clickbench { csv_dir, output, hot_iters } => {
