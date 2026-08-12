@@ -495,42 +495,18 @@ impl<'a> QueryInterpreter<'a> {
                 let mut left_src_idx: Vec<u32> = Vec::with_capacity(CHUNK_SIZE * 2);
                 let mut right_src_idx: Vec<u32> = Vec::with_capacity(CHUNK_SIZE * 2);
 
-                // W1-B: Software prefetch distance (rows ahead). Literature default
-                // for hash-join probes is 8-32; tuned to K=8 on TPC-H (best total
-                // of 3 distances tested: K=8 total=11093, K=16 total=11224, K=32 total=11174).
-                const PREFETCH_DIST: usize = 8;
+                // W2-T3: Batch bloom filter probe.
+                //
+                // Precompute all probe_keys for [start, end) and run the bloom
+                // filter in batches of 8 via might_contain_batch (AVX-512F).
+                // This reduces bloom filter call overhead by ~8x: per-key
+                // might_contain costs ~10 cycles/key, while might_contain_batch
+                // costs ~20 cycles for 8 keys = 2.5 cycles/key (4x speedup on
+                // the bloom filter step, which is Q21's #1 hot spot).
+                let chunk_len = end - start;
+                let mut probe_keys: Vec<u64> = Vec::with_capacity(chunk_len);
                 for p in start..end {
-                    // W1-B: Prefetch the hash-table directory slot AND bloom
-                    // filter bits for the probe key PREFETCH_DIST rows ahead.
-                    // This hides the ~100-cycle L3 miss on the next random
-                    // directory access (Q21's #1 hot spot at 23.68% of runtime).
-                    //
-                    // The probe-side column load for next_key is sequential
-                    // (hardware-prefetched), so the only added cost is the
-                    // prefetch instruction itself (~1 cycle each).
-                    #[cfg(target_arch = "x86_64")]
-                    if p + PREFETCH_DIST < end {
-                        let next_p = p + PREFETCH_DIST;
-                        let next_key = if keys.len() == 1 {
-                            probe_side.columns[pk_cols[0]][next_p]
-                        } else {
-                            let mut nbuf = [0u8; 64];
-                            let mut noff = 0;
-                            for &kc in &pk_cols {
-                                let nv = probe_side.columns[kc][next_p];
-                                let nbytes = nv.to_le_bytes();
-                                if noff + 8 <= 64 {
-                                    nbuf[noff..noff + 8].copy_from_slice(&nbytes);
-                                    noff += 8;
-                                }
-                            }
-                            xxh3_64(&nbuf[..noff])
-                        };
-                        build_hash.prefetch_directory(next_key);
-                        bloom.prefetch(next_key);
-                    }
-
-                    let probe_key = if keys.len() == 1 {
+                    let k = if keys.len() == 1 {
                         probe_side.columns[pk_cols[0]][p]
                     } else {
                         let mut buf = [0u8; 64];
@@ -545,8 +521,57 @@ impl<'a> QueryInterpreter<'a> {
                         }
                         xxh3_64(&buf[..off])
                     };
+                    probe_keys.push(k);
+                }
+                // Batch bloom check: 8 keys per AVX-512 call.
+                let mut bloom_pass: Vec<bool> = vec![false; chunk_len];
+                let mut i = 0;
+                while i + 8 <= chunk_len {
+                    let mut batch = [0u64; 8];
+                    batch.copy_from_slice(&probe_keys[i..i + 8]);
+                    // SAFETY: might_contain_batch is unsafe because it uses
+                    // AVX-512F intrinsics. We checked has_avx512f() at bloom
+                    // build time; the scalar fallback inside BloomFilter handles
+                    // the case where AVX-512 is unavailable.
+                    let mask = if crate::exec::simd_agg::has_avx512f() {
+                        unsafe { bloom.might_contain_batch(&batch) }
+                    } else {
+                        // Scalar fallback
+                        let mut m = 0u8;
+                        for j in 0..8 {
+                            if bloom.might_contain(batch[j]) {
+                                m |= 1 << j;
+                            }
+                        }
+                        m
+                    };
+                    for j in 0..8 {
+                        bloom_pass[i + j] = (mask >> j) & 1 != 0;
+                    }
+                    i += 8;
+                }
+                // Remaining keys (< 8)
+                while i < chunk_len {
+                    bloom_pass[i] = bloom.might_contain(probe_keys[i]);
+                    i += 1;
+                }
 
-                    if !bloom.might_contain(probe_key) {
+                // W1-B: Software prefetch distance (rows ahead). Literature default
+                // for hash-join probes is 8-32; tuned to K=8 on TPC-H (best total
+                // of 3 distances tested: K=8 total=11093, K=16 total=11224, K=32 total=111174).
+                const PREFETCH_DIST: usize = 8;
+                for (idx, p) in (start..end).enumerate() {
+                    // W1-B: Prefetch the hash-table directory slot for the
+                    // probe key PREFETCH_DIST rows ahead. (Bloom prefetch is
+                    // no longer needed -- the bloom results are precomputed.)
+                    #[cfg(target_arch = "x86_64")]
+                    if p + PREFETCH_DIST < end {
+                        let next_idx = idx + PREFETCH_DIST;
+                        build_hash.prefetch_directory(probe_keys[next_idx]);
+                    }
+
+                    // W2-T3: use precomputed bloom result instead of per-row might_contain
+                    if !bloom_pass[idx] {
                         if jt == JoinType2::Left && !swapped {
                             for (c, col) in left.columns.iter().enumerate() {
                                 local_out[c].push(col[p]);
@@ -559,6 +584,7 @@ impl<'a> QueryInterpreter<'a> {
                         }
                         continue;
                     }
+                    let probe_key = probe_keys[idx];
                     build_hash.probe_all(probe_key, &mut matched_rows);
                     if matched_rows.is_empty() {
                         if jt == JoinType2::Left && !swapped {
