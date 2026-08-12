@@ -248,6 +248,13 @@ impl EGraph {
                     (l, r)
                 }
             };
+            // Skip cyclic nodes: if either child has u64::MAX cost, the
+            // node is self-referential (e.g., Mul(E, 1) where E contains
+            // Mul(E, 1)). Picking it would cause infinite recursion in
+            // extract_from_egraph. u64::MAX + anything = overflow, so guard.
+            if lc == u64::MAX || rc == u64::MAX {
+                continue;
+            }
             let total = cost_fn(node, lc, rc);
             if total < best_cost {
                 best_cost = total;
@@ -272,11 +279,16 @@ impl EGraph {
             return cost;
         }
         let _ = self.extract_inner(id, cost_fn, visiting);
+        // If extract_inner didn't cache a best (e.g., due to a cycle),
+        // return u64::MAX so the cost function never picks a cyclic form.
+        // Previously this returned 0, making cyclic nodes look "free" —
+        // which caused the extractor to pick self-referential forms like
+        // Mul(E, Lit(1)) where E contains Mul(E, Lit(1)) itself.
         self.classes
             .get(&id)
             .and_then(|c| c.best.clone())
             .map(|(c, _)| c)
-            .unwrap_or(0)
+            .unwrap_or(u64::MAX)
     }
 
     /// Helper: check if an e-class contains a `Lit(0)` (i.e. f64::to_bits(0.0) = 0).
@@ -442,8 +454,21 @@ pub fn apply_standard_rules(node: &ENode, eg: &mut EGraph) -> Option<EClassId> {
             return Some(lit);
         }
         // Distributivity: a * (b + c) -> a*b + a*c
-        // Look at the right child's e-class for a BinOp{Add, ...}
-        if *op == BinOpKind::Mul {
+        //
+        // DISABLED: distributivity creates cycles through the identity rule
+        // (x*1 → x). When `a * (1 + c)` is expanded to `a*1 + a*c`, identity
+        // rewrites `a*1 → a`, merging the Mul e-class into a's e-class. If
+        // `a` is the left child of the Mul, this creates a self-referential
+        // e-class (a contains Mul(a, 1) which references a). The extractor's
+        // cycle-break doesn't handle this correctly — it returns Lit(0) as
+        // a fallback, causing the entire expression to collapse to 0.
+        //
+        // TODO (W3-T3): implement proper cyclic e-class extraction (Tarjan's
+        // SCC + topological cost computation) and re-enable distributivity.
+        // For now, the other rules (identity, zero, strength reduction,
+        // constant folding) provide real optimization value without cycles.
+        // #[cfg(any())]  // compile-time disable
+        if false {
             if let Some(right_class) = eg.classes.get(&right) {
                 for right_node in right_class.nodes.clone() {
                     if let ENode::BinOp { op: BinOpKind::Add, left: b, right: c } = right_node {
