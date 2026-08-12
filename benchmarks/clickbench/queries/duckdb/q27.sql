@@ -1,0 +1,1 @@
+SELECT CounterID, UserID, COUNT(*) AS c FROM hits GROUP BY CounterID, UserID ORDER BY c DESC LIMIT 100;

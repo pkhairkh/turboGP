@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM hits WHERE NOT (CounterID = 500);

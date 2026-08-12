@@ -1,0 +1,1 @@
+SELECT CounterID, RegionID, COUNT(*) AS c FROM hits GROUP BY CounterID, RegionID;

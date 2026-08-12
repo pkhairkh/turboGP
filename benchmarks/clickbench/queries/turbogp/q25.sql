@@ -1,0 +1,1 @@
+SELECT EventDate, COUNT(*) AS c FROM hits GROUP BY EventDate ORDER BY EventDate;

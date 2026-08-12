@@ -1,0 +1,1 @@
+SELECT MIN(WatchID), MAX(WatchID) FROM hits;

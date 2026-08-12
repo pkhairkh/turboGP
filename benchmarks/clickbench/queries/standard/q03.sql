@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM hits WHERE CounterID = 500 AND EventDate = '2020-01-15';

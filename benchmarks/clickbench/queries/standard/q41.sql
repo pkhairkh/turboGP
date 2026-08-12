@@ -1,0 +1,1 @@
+SELECT MAX(WatchID) FROM hits WHERE CounterID = 500;

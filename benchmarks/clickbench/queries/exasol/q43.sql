@@ -1,0 +1,1 @@
+SELECT SUM(WatchID), COUNT(*), AVG(WatchID), MIN(WatchID), MAX(WatchID) FROM hits;
