@@ -77,6 +77,17 @@ pub enum ENode {
         left: EClassId,
         right: EClassId,
     },
+    /// Fused multiply-add: `a * b + c`.
+    ///
+    /// Semantically equivalent to `Add(Mul(a, b), c)` but cheaper on hardware
+    /// with FMA support (1 FMA instruction vs 1 MUL + 1 ADD). The e-graph's
+    /// rewrite rule `Add(Mul(a, b), c) -> Fma(a, b, c)` adds this form, and
+    /// the cost function (Fma=4 vs Mul+Add=8) picks it.
+    Fma {
+        a: EClassId,
+        b: EClassId,
+        c: EClassId,
+    },
 }
 
 impl ENode {
@@ -85,6 +96,7 @@ impl ENode {
         match self {
             ENode::Lit(_) | ENode::Col(_) => Vec::new(),
             ENode::BinOp { left, right, .. } => vec![*left, *right],
+            ENode::Fma { a, b, c } => vec![*a, *b, *c],
         }
     }
 }
@@ -240,6 +252,8 @@ impl EGraph {
         let mut best_cost = u64::MAX;
         let mut best_node: Option<ENode> = None;
         for node in &nodes {
+            // Compute child costs. For Fma, we pack a+b into left_cost and
+            // c into right_cost (the cost function adds left+right+self).
             let (lc, rc) = match node {
                 ENode::Lit(_) | ENode::Col(_) => (0u64, 0u64),
                 ENode::BinOp { left, right, .. } => {
@@ -247,11 +261,17 @@ impl EGraph {
                     let r = self.node_cost(*right, cost_fn, visiting);
                     (l, r)
                 }
+                ENode::Fma { a, b, c } => {
+                    let ca = self.node_cost(*a, cost_fn, visiting);
+                    let cb = self.node_cost(*b, cost_fn, visiting);
+                    let cc = self.node_cost(*c, cost_fn, visiting);
+                    // Pack a+b into left, c into right.
+                    (ca.saturating_add(cb), cc)
+                }
             };
             // Skip cyclic nodes: if either child has u64::MAX cost, the
-            // node is self-referential (e.g., Mul(E, 1) where E contains
-            // Mul(E, 1)). Picking it would cause infinite recursion in
-            // extract_from_egraph. u64::MAX + anything = overflow, so guard.
+            // node is self-referential. Picking it would cause infinite
+            // recursion in extract_from_egraph.
             if lc == u64::MAX || rc == u64::MAX {
                 continue;
             }
@@ -453,6 +473,31 @@ pub fn apply_standard_rules(node: &ENode, eg: &mut EGraph) -> Option<EClassId> {
             let lit = eg.add(ENode::Lit(result.to_bits()));
             return Some(lit);
         }
+        // FMA pattern: a*b + c -> Fma(a, b, c)
+        // Fused multiply-add is 1 instruction on hardware with FMA support
+        // (Zen 5: 4-cycle latency, 2/cycle throughput). Cheaper than separate
+        // MUL (5 cycles) + ADD (3 cycles) = 8 cycles.
+        if *op == BinOpKind::Add {
+            // Check if left child is a Mul: Add(Mul(a, b), c) -> Fma(a, b, c)
+            if let Some(left_class) = eg.classes.get(&left) {
+                for left_node in left_class.nodes.clone() {
+                    if let ENode::BinOp { op: BinOpKind::Mul, left: a, right: b } = left_node {
+                        let fma = eg.add(ENode::Fma { a, b, c: right });
+                        return Some(fma);
+                    }
+                }
+            }
+            // Check if right child is a Mul: Add(c, Mul(a, b)) -> Fma(a, b, c)
+            if let Some(right_class) = eg.classes.get(&right) {
+                for right_node in right_class.nodes.clone() {
+                    if let ENode::BinOp { op: BinOpKind::Mul, left: a, right: b } = right_node {
+                        let fma = eg.add(ENode::Fma { a, b, c: left });
+                        return Some(fma);
+                    }
+                }
+            }
+        }
+
         // Distributivity: a * (b + c) -> a*b + a*c
         //
         // DISABLED: distributivity creates cycles through the identity rule
@@ -508,6 +553,10 @@ pub fn default_cost_fn(node: &ENode, left_cost: u64, right_cost: u64) -> u64 {
             BinOpKind::Mul => 5,
             BinOpKind::Div => 20,
         },
+        // FMA: a*b + c in 1 instruction (4-cycle latency on Zen 5).
+        // Cheaper than Add(Mul, c) = 3 + 5 = 8. The third child's cost is
+        // passed via right_cost (we pack a/b into left_cost, c into right_cost).
+        ENode::Fma { .. } => 4,
     };
     self_cost + left_cost + right_cost
 }
@@ -652,6 +701,48 @@ mod tests {
             "extract should pick Col(0) (cost 1) over BinOp (cost 4); got {:?}",
             extracted
         );
+    }
+
+    #[test]
+    fn test_fma_picked_over_mul_add() {
+        // a * b + c should be rewritten to Fma(a, b, c).
+        // Fma cost = 4 + 1 + 1 + 1 = 7 (Fma=4, a=Col=1, b=Col=1, c=Col=1).
+        // Add(Mul(a, b), c) cost = 3 + (5 + 1 + 1) + 1 = 11.
+        // Extractor should pick Fma (7 < 11).
+        let mut eg = EGraph::new();
+        let a = eg.add(ENode::Col(0));
+        let b = eg.add(ENode::Col(1));
+        let c = eg.add(ENode::Col(2));
+        let ab = eg.add(ENode::BinOp { op: BinOpKind::Mul, left: a, right: b });
+        let sum = eg.add(ENode::BinOp { op: BinOpKind::Add, left: ab, right: c });
+        eg.saturate(apply_standard_rules, 10);
+        let extracted = eg.extract(sum, &default_cost_fn);
+        assert!(
+            matches!(extracted, ENode::Fma { .. }),
+            "extract should pick Fma over Add(Mul, c); got {:?}",
+            extracted
+        );
+    }
+
+    #[test]
+    fn test_fma_cost_cheaper_than_mul_add() {
+        // Verify the cost function assigns Fma=4 (cheaper than Mul=5 + Add=3 = 8).
+        let fma_cost = default_cost_fn(
+            &ENode::Fma { a: 0, b: 1, c: 2 },
+            2, // left_cost (a + b)
+            1, // right_cost (c)
+        );
+        // Fma self_cost = 4, total = 4 + 2 + 1 = 7.
+        assert_eq!(fma_cost, 7);
+
+        let mul_add_cost = default_cost_fn(
+            &ENode::BinOp { op: BinOpKind::Add, left: 0, right: 1 },
+            6, // left_cost = Mul(a, b) = 5 + 1 + 1 = 7... but we pass 6 for the test
+            1, // right_cost = c
+        );
+        // Add self_cost = 3, total = 3 + 6 + 1 = 10.
+        assert_eq!(mul_add_cost, 10);
+        assert!(fma_cost < mul_add_cost, "Fma ({}) should be cheaper than Mul+Add ({})", fma_cost, mul_add_cost);
     }
 
     #[test]

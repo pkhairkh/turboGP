@@ -324,6 +324,25 @@ fn extract_from_egraph(eg: &mut EGraph, id: EClassId) -> CompiledNode {
                 right: Box::new(right_compiled),
             }
         }
+        ENode::Fma { a, b, c } => {
+            // Fma(a, b, c) = a * b + c. Convert back to BinOp form since
+            // CompiledNode doesn't have an FMA variant. The FMA optimization
+            // is captured in the cost model (the extractor picked Fma because
+            // it's cheaper), but the scalar evaluator will use separate
+            // mul + add. For simd_agg, FMA is already used at the kernel level.
+            let a_compiled = extract_from_egraph(eg, a);
+            let b_compiled = extract_from_egraph(eg, b);
+            let c_compiled = extract_from_egraph(eg, c);
+            CompiledNode::BinOp {
+                op: '+',
+                left: Box::new(CompiledNode::BinOp {
+                    op: '*',
+                    left: Box::new(a_compiled),
+                    right: Box::new(b_compiled),
+                }),
+                right: Box::new(c_compiled),
+            }
+        }
     }
 }
 
