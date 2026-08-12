@@ -260,21 +260,44 @@ fn compute_bwt(text: &[u8]) -> Vec<u8> {
 /// store strings, scan with SIMD-accelerated substring search.
 #[derive(Clone)]
 pub struct StringSearchColumn {
-    /// Original strings. This is the sole storage — no redundant
-    /// bytes/offsets buffers. LIKE scans iterate strings[i].as_bytes()
-    /// with memchr::memmem for SIMD-accelerated substring search.
+    /// Original strings (when this is an owned column).
+    /// Empty when this is a remap view (see below).
     pub strings: Vec<String>,
+
+    /// Remap view: when Some, this column is a view into `source` via
+    /// `indices`. get(i) returns source.get(indices[i] as usize).
+    /// Used by hash joins to avoid cloning strings per output row.
+    pub source: Option<std::sync::Arc<StringSearchColumn>>,
+    pub indices: Option<std::sync::Arc<Vec<u32>>>,
 }
 
 impl std::fmt::Debug for StringSearchColumn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StringSearchColumn({} strings)", self.strings.len())
+        if self.indices.is_some() {
+            write!(f, "StringSearchColumn(remap view, {} rows)", self.len())
+        } else {
+            write!(f, "StringSearchColumn({} strings)", self.strings.len())
+        }
     }
 }
 
 impl StringSearchColumn {
     pub fn new(strings: Vec<String>) -> Self {
-        StringSearchColumn { strings }
+        StringSearchColumn { strings, source: None, indices: None }
+    }
+
+    /// Create a remap view: a column that indexes into `source` via `indices`.
+    /// No string cloning — the view holds an Arc to the source and a Vec<u32>
+    /// of row indices. get(i) returns source.get(indices[i] as usize).
+    pub fn new_remap(
+        source: std::sync::Arc<StringSearchColumn>,
+        indices: Vec<u32>,
+    ) -> Self {
+        StringSearchColumn {
+            strings: Vec::new(),
+            source: Some(source),
+            indices: Some(std::sync::Arc::new(indices)),
+        }
     }
 
     /// Create a remapped column containing only the strings at `indices`.
@@ -292,44 +315,52 @@ impl StringSearchColumn {
     /// This is fine because LIKE filters are applied to original columns
     /// during the initial scan, before any `filter_table` call.
     pub fn remap(&self, indices: &[usize]) -> Self {
-        let strings: Vec<String> = indices
-            .iter()
-            .map(|&i| self.strings.get(i).cloned().unwrap_or_default())
-            .collect();
-        StringSearchColumn { strings }
+        // If we're already a view, compose the remap through the source.
+        if let (Some(src), Some(idx)) = (&self.source, &self.indices) {
+            let composed: Vec<u32> = indices
+                .iter()
+                .map(|&i| idx.get(i).copied().unwrap_or(0))
+                .collect();
+            return StringSearchColumn::new_remap(src.clone(), composed);
+        }
+        // Owned column: create a view into ourselves.
+        let u32_indices: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        StringSearchColumn::new_remap(
+            std::sync::Arc::new(self.clone()),
+            u32_indices,
+        )
     }
 
     /// Count strings containing the pattern (LIKE '%pattern%').
     /// Uses memchr for fast byte-level substring search.
     pub fn count_like_contains(&self, pattern: &str) -> usize {
         if pattern.is_empty() {
-            return self.strings.len();
+            return self.len();
         }
         let pattern_bytes = pattern.as_bytes();
-        self.strings
-            .iter()
-            .filter(|s| memchr::memmem::find(s.as_bytes(), pattern_bytes).is_some())
+        (0..self.len())
+            .filter(|&i| memchr::memmem::find(self.get(i).as_bytes(), pattern_bytes).is_some())
             .count()
     }
 
     /// Build a boolean mask: mask[i] = true if string i contains pattern.
     pub fn like_contains_mask(&self, pattern: &str) -> Vec<bool> {
+        let n = self.len();
         if pattern.is_empty() {
-            return vec![true; self.strings.len()];
+            return vec![true; n];
         }
         let pattern_bytes = pattern.as_bytes();
-        self.strings
-            .iter()
-            .map(|s| memchr::memmem::find(s.as_bytes(), pattern_bytes).is_some())
+        (0..n)
+            .map(|i| memchr::memmem::find(self.get(i).as_bytes(), pattern_bytes).is_some())
             .collect()
     }
 
     /// Count strings starting with prefix (LIKE 'prefix%').
     pub fn count_like_prefix(&self, prefix: &str) -> usize {
         if prefix.is_empty() {
-            return self.strings.len();
+            return self.len();
         }
-        self.strings.iter().filter(|s| s.starts_with(prefix)).count()
+        (0..self.len()).filter(|&i| self.get(i).starts_with(prefix)).count()
     }
 
     /// Get the string at row index.
@@ -339,11 +370,19 @@ impl StringSearchColumn {
     /// `offsets`. The `from_utf8` check is cheap (~1ns/byte) and only
     /// applies to remapped columns (filter_table output).
     pub fn get(&self, i: usize) -> &str {
+        if let (Some(src), Some(idx)) = (&self.source, &self.indices) {
+            let src_idx = idx.get(i).copied().unwrap_or(0) as usize;
+            return src.get(src_idx);
+        }
         self.strings.get(i).map(|s| s.as_str()).unwrap_or("")
     }
 
     pub fn len(&self) -> usize {
-        self.strings.len()
+        if let Some(idx) = &self.indices {
+            idx.len()
+        } else {
+            self.strings.len()
+        }
     }
 }
 

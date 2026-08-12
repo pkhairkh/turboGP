@@ -480,7 +480,7 @@ impl<'a> QueryInterpreter<'a> {
         // Parallel probe using rayon. Each chunk produces its own output cols.
         // Optimized: use unsafe set_len + ptr write to avoid per-push capacity
         // checks (the compiler can't elide them due to potential reallocation).
-        let partial_results: Vec<Vec<Vec<u64>>> = (0..num_chunks)
+        let partial_results: Vec<(Vec<Vec<u64>>, Vec<u32>, Vec<u32>)> = (0..num_chunks)
             .into_par_iter()
             .map(|chunk_idx| {
                 let start = chunk_idx * CHUNK_SIZE;
@@ -489,6 +489,11 @@ impl<'a> QueryInterpreter<'a> {
                 let mut local_out: Vec<Vec<u64>> =
                     (0..ncol).map(|_| Vec::with_capacity(CHUNK_SIZE * 2)).collect();
                 let mut matched_rows: Vec<u32> = Vec::with_capacity(16);
+                // Track source row indices for string column remap views.
+                // left_src_idx[r] = probe row that produced output row r
+                // right_src_idx[r] = build row that produced output row r
+                let mut left_src_idx: Vec<u32> = Vec::with_capacity(CHUNK_SIZE * 2);
+                let mut right_src_idx: Vec<u32> = Vec::with_capacity(CHUNK_SIZE * 2);
 
                 // W1-B: Software prefetch distance (rows ahead). Literature default
                 // for hash-join probes is 8-32; tuned to K=8 on TPC-H (best total
@@ -549,6 +554,8 @@ impl<'a> QueryInterpreter<'a> {
                             for c in 0..right.columns.len() {
                                 local_out[left_ncol + c].push(0);
                             }
+                            left_src_idx.push(p as u32);
+                            right_src_idx.push(0);
                         }
                         continue;
                     }
@@ -561,6 +568,8 @@ impl<'a> QueryInterpreter<'a> {
                             for c in 0..right.columns.len() {
                                 local_out[left_ncol + c].push(0);
                             }
+                            left_src_idx.push(p as u32);
+                            right_src_idx.push(0);
                         }
                     } else {
                         // Pre-compute left column values for this probe row (shared across all matches).
@@ -585,6 +594,8 @@ impl<'a> QueryInterpreter<'a> {
                                 for (c, col) in right.columns.iter().enumerate() {
                                     local_out[left_ncol + c].push(col[b]);
                                 }
+                                left_src_idx.push(p as u32);
+                                right_src_idx.push(b as u32);
                             } else {
                                 // Left cols from build, right cols from probe (same for all matches).
                                 for (c, col) in left.columns.iter().enumerate() {
@@ -593,23 +604,29 @@ impl<'a> QueryInterpreter<'a> {
                                 for (c, &v) in right_vals_template.iter().enumerate() {
                                     local_out[left_ncol + c].push(v);
                                 }
+                                left_src_idx.push(b as u32);
+                                right_src_idx.push(p as u32);
                             }
                         }
                     }
                 }
-                local_out
+                (local_out, left_src_idx, right_src_idx)
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         // Merge: pre-calculate total size to avoid reallocation.
         let total_rows: usize =
-            partial_results.iter().map(|r| r.first().map(|c| c.len()).unwrap_or(0)).sum();
+            partial_results.iter().map(|r| r.0.first().map(|c| c.len()).unwrap_or(0)).sum();
         let mut out_cols: Vec<Vec<u64>> =
             (0..ncol).map(|_| Vec::with_capacity(total_rows)).collect();
-        for local_out in partial_results {
+        let mut all_left_idx: Vec<u32> = Vec::with_capacity(total_rows);
+        let mut all_right_idx: Vec<u32> = Vec::with_capacity(total_rows);
+        for (local_out, li, ri) in partial_results {
             for c in 0..ncol {
                 out_cols[c].extend_from_slice(&local_out[c]);
             }
+            all_left_idx.extend_from_slice(&li);
+            all_right_idx.extend_from_slice(&ri);
         }
         let row_count = out_cols.first().map(|c| c.len()).unwrap_or(0);
 
@@ -624,44 +641,39 @@ impl<'a> QueryInterpreter<'a> {
         for (k, v) in &right.col_map {
             col_map.insert(k.clone(), *v + off);
         }
-        // W3: Rebuild string columns from source tables using value lookup.
-        // For each string column in left/right, create a u64→String map from
-        // the source table, then populate the output string column by looking
-        // up each output row's cell value.
+        // W3-fix: Use remap views for string columns instead of cloning.
+        // Each output string column is a view into the source column via
+        // the source row indices tracked during the probe. This eliminates
+        // 18GB of string cloning for Q18 at SF=10.
+        //
+        // When swapped, left columns come from the build side (right input)
+        // and right columns come from the probe side (left input). We handle
+        // both cases by using the appropriate source index vector.
         let left_ncol = left.columns.len();
+        let (left_indices, right_indices) = if swapped {
+            // When swapped: "left" output columns came from build side (right input)
+            // and "right" output columns came from probe side (left input).
+            // all_left_idx tracks build rows, all_right_idx tracks probe rows.
+            (&all_right_idx, &all_left_idx)
+        } else {
+            (&all_left_idx, &all_right_idx)
+        };
+
         for (c, sc) in left.string_columns.iter().enumerate() {
             if let Some(ref scol) = sc {
-                // Build u64 → String lookup from left table
-                let mut val_to_str: ahash::AHashMap<u64, String> = ahash::AHashMap::new();
-                for r in 0..left.row_count {
-                    let val = left.columns[c][r];
-                    val_to_str.entry(val).or_insert_with(|| scol.get(r).to_string());
-                }
-                // Rebuild string column for output rows
-                let strings: Vec<String> = (0..row_count)
-                    .map(|r| {
-                        let val = out_cols[c][r];
-                        val_to_str.get(&val).cloned().unwrap_or_default()
-                    })
-                    .collect();
-                out_strings[c] = Some(std::sync::Arc::new(StringSearchColumn::new(strings)));
+                let scol_arc = scol.clone();
+                out_strings[c] = Some(std::sync::Arc::new(
+                    StringSearchColumn::new_remap(scol_arc, left_indices.clone()),
+                ));
             }
         }
         for (c, sc) in right.string_columns.iter().enumerate() {
             if let Some(ref scol) = sc {
                 let out_idx = left_ncol + c;
-                let mut val_to_str: ahash::AHashMap<u64, String> = ahash::AHashMap::new();
-                for r in 0..right.row_count {
-                    let val = right.columns[c][r];
-                    val_to_str.entry(val).or_insert_with(|| scol.get(r).to_string());
-                }
-                let strings: Vec<String> = (0..row_count)
-                    .map(|r| {
-                        let val = out_cols[out_idx][r];
-                        val_to_str.get(&val).cloned().unwrap_or_default()
-                    })
-                    .collect();
-                out_strings[out_idx] = Some(std::sync::Arc::new(StringSearchColumn::new(strings)));
+                let scol_arc = scol.clone();
+                out_strings[out_idx] = Some(std::sync::Arc::new(
+                    StringSearchColumn::new_remap(scol_arc, right_indices.clone()),
+                ));
             }
         }
 
