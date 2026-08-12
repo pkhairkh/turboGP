@@ -1329,6 +1329,43 @@ impl QueryEngine {
 
         let mut table = Table::from_loaded(loaded);
         table.name = table_name.to_string();
+
+        // Build a TableSchema based on inferred column types.
+        // string_columns[idx].is_some() → string column.
+        // cells > 2^60 → f64::to_bits (DECIMAL/FLOAT).
+        // Otherwise → BigInt.
+        use crate::schema::table_schema::{TableSchema, ColumnSchema};
+        use crate::sql::ddl::ColumnType;
+        let mut schema_cols = Vec::with_capacity(table.columns.len());
+        for (idx, col) in table.columns.iter().enumerate() {
+            let is_string = table.string_columns.get(idx).and_then(|s| s.as_ref()).is_some();
+            let col_type = if is_string {
+                ColumnType::Text
+            } else {
+                let has_float_bits = col.iter().any(|&v| v > (1u64 << 60));
+                if has_float_bits {
+                    ColumnType::Decimal(Some(15), Some(2))
+                } else {
+                    ColumnType::BigInt
+                }
+            };
+            let col_name = table.column_names.get(idx).cloned().unwrap_or_else(|| format!("col_{}", idx));
+            schema_cols.push(ColumnSchema {
+                name: col_name,
+                col_type,
+                not_null: false,
+                primary_key: false,
+                unique: false,
+                check: None,
+            });
+        }
+        table.schema = Some(TableSchema {
+            columns: schema_cols,
+            checks: Vec::new(),
+            unique_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+        });
+
         self.catalog.register(table);
         Ok(row_count)
     }

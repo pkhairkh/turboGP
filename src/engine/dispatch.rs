@@ -396,7 +396,12 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
             let col_idx = resolve_agg_col(&query.select[0], table)?;
             // Exclude NULLs (Wave 33).
             let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
-            let sum = vectorized::sum_masked(&table.columns[col_idx], &null_adjusted_mask);
+            let is_float = table.schema.as_ref().map(|s| s.is_float(col_idx)).unwrap_or(false);
+            let sum = if is_float {
+                vectorized::sum_masked_f64(&table.columns[col_idx], &null_adjusted_mask)
+            } else {
+                vectorized::sum_masked(&table.columns[col_idx], &null_adjusted_mask)
+            };
             Ok(single_value("sum", sum))
         }
         QueryShape::AvgCol => {
@@ -404,7 +409,12 @@ fn execute_shape(shape: QueryShape, query: &SelectQuery, table: &Table) -> Resul
             let col_idx = resolve_agg_col(&query.select[0], table)?;
             // Exclude NULLs (Wave 33).
             let null_adjusted_mask = adjust_mask_for_nulls(&mask, table, col_idx);
-            let avg = vectorized::avg_masked(&table.columns[col_idx], &null_adjusted_mask);
+            let is_float = table.schema.as_ref().map(|s| s.is_float(col_idx)).unwrap_or(false);
+            let avg = if is_float {
+                vectorized::avg_masked_f64(&table.columns[col_idx], &null_adjusted_mask)
+            } else {
+                vectorized::avg_masked(&table.columns[col_idx], &null_adjusted_mask)
+            };
             Ok(single_value("avg", avg))
         }
         QueryShape::MinMax => {
@@ -1144,9 +1154,14 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                                 }
                                 "SUM" => {
                                     let col_idx = resolve_col_name(arg, table).unwrap_or(0);
-                                    let sum: u64 =
-                                        idxs.iter().map(|&i| table.columns[col_idx][i]).sum();
-                                    (sum as f64).to_bits()
+                                    let is_float = table.schema.as_ref().map(|s| s.is_float(col_idx)).unwrap_or(false);
+                                    if is_float {
+                                        let sum: f64 = idxs.iter().map(|&i| f64::from_bits(table.columns[col_idx][i])).sum();
+                                        sum.to_bits()
+                                    } else {
+                                        let sum: u64 = idxs.iter().map(|&i| table.columns[col_idx][i]).sum();
+                                        (sum as f64).to_bits()
+                                    }
                                 }
                                 "AVG" => {
                                     let col_idx = resolve_col_name(arg, table).unwrap_or(0);
@@ -1331,8 +1346,14 @@ fn execute_group_by(query: &SelectQuery, table: &Table) -> Result<QueryResult> {
                     }
                     "SUM" => {
                         let col_idx = resolve_col_name(arg, table).unwrap_or(0);
-                        let sum: u64 = idxs.iter().map(|&i| table.columns[col_idx][i]).sum();
-                        (sum as f64).to_bits()
+                        let is_float = table.schema.as_ref().map(|s| s.is_float(col_idx)).unwrap_or(false);
+                        if is_float {
+                            let sum: f64 = idxs.iter().map(|&i| f64::from_bits(table.columns[col_idx][i])).sum();
+                            sum.to_bits()
+                        } else {
+                            let sum: u64 = idxs.iter().map(|&i| table.columns[col_idx][i]).sum();
+                            (sum as f64).to_bits()
+                        }
                     }
                     "AVG" => {
                         let col_idx = resolve_col_name(arg, table).unwrap_or(0);

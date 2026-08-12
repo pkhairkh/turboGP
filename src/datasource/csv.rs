@@ -125,17 +125,45 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
         }
 
         let cells: Vec<u64> = if all_numeric {
-            // Numeric column: cast i64 → u64 (bit-reinterpret).
+            // Integer column: cast i64 → u64 (bit-reinterpret).
             as_i64.into_iter().map(|v| v as u64).collect()
         } else {
-            // Non-numeric column: hash every value with xxh3_64.
-            parsed_rows.iter().map(|row| xxh3::xxh3_64(row[col_idx].as_bytes())).collect()
+            // Try f64 parse (DECIMAL/FLOAT columns like 5755.94).
+            // If all values parse as f64, store f64::to_bits so SUM/AVG work.
+            let mut as_f64: Vec<f64> = Vec::with_capacity(row_count);
+            let mut all_float = true;
+            for row in &parsed_rows {
+                let v = row[col_idx];
+                match v.parse::<f64>() {
+                    Ok(f) => as_f64.push(f),
+                    Err(_) => {
+                        all_float = false;
+                        break;
+                    }
+                }
+            }
+            if all_float {
+                // DECIMAL/FLOAT column: encode as f64::to_bits for correct arithmetic.
+                as_f64.into_iter().map(|v| v.to_bits()).collect()
+            } else {
+                // True string column: hash every value with xxh3_64.
+                parsed_rows.iter().map(|row| xxh3::xxh3_64(row[col_idx].as_bytes())).collect()
+            }
         };
 
-        // For non-numeric (string) columns, build a StringSearchColumn
-        // sidecar so SELECT can return the original strings (Wave 21)
-        // and LIKE filters work (Wave 2).
-        let string_search = if !all_numeric {
+        // For string columns, build a StringSearchColumn sidecar.
+        // A column is "string" only if it's neither i64 nor f64.
+        let is_string = !all_numeric && {
+            let mut all_float = true;
+            for row in &parsed_rows {
+                if row[col_idx].parse::<f64>().is_err() {
+                    all_float = false;
+                    break;
+                }
+            }
+            !all_float
+        };
+        let string_search = if is_string {
             let strings: Vec<String> =
                 parsed_rows.iter().map(|row| row[col_idx].to_string()).collect();
             Some(crate::exec::fm_index::StringSearchColumn::new(strings))

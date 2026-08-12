@@ -653,11 +653,22 @@ fn compute_aggregate(func: &str, arg: &str, indices: &[usize], table: &Table) ->
                 sum_f64.to_bits()
             } else {
                 let idx = table.column_idx(arg).unwrap_or(0);
-                indices
-                    .iter()
-                    .filter(|&&i| !is_cell_null(table, idx, i))
-                    .map(|&i| table.columns[idx][i])
-                    .sum()
+                // Check if this is a float/DECIMAL column
+                let is_float = table.schema.as_ref().map(|s| s.is_float(idx)).unwrap_or(false);
+                if is_float {
+                    indices
+                        .iter()
+                        .filter(|&&i| !is_cell_null(table, idx, i))
+                        .map(|&i| f64::from_bits(table.columns[idx][i]))
+                        .sum::<f64>()
+                        .to_bits()
+                } else {
+                    indices
+                        .iter()
+                        .filter(|&&i| !is_cell_null(table, idx, i))
+                        .map(|&i| table.columns[idx][i])
+                        .sum()
+                }
             }
         }
         "AVG" => {
@@ -668,8 +679,15 @@ fn compute_aggregate(func: &str, arg: &str, indices: &[usize], table: &Table) ->
             if non_null.is_empty() {
                 return 0;
             }
-            let sum: u64 = non_null.iter().map(|&i| table.columns[idx][i]).sum();
-            sum / non_null.len() as u64
+            // Check if this is a float/DECIMAL column
+            let is_float = table.schema.as_ref().map(|s| s.is_float(idx)).unwrap_or(false);
+            if is_float {
+                let sum: f64 = non_null.iter().map(|&i| f64::from_bits(table.columns[idx][i])).sum();
+                (sum / non_null.len() as f64).to_bits()
+            } else {
+                let sum: u64 = non_null.iter().map(|&i| table.columns[idx][i]).sum();
+                sum / non_null.len() as u64
+            }
         }
         "MIN" => {
             let idx = table.column_idx(arg).unwrap_or(0);
@@ -1079,6 +1097,38 @@ fn execute_sum(
     // Task 2.4: when MVCC is active, skip the fast path (which iterates
     // `table.columns[idx]` directly, ignoring `row_versions`) and fall
     // through to `filter_indices`, which applies the visibility filter.
+    // Check if this is a float/DECIMAL column by examining the schema.
+    // If so, decode each cell as f64::from_bits before summing.
+    let is_float_col = table.schema
+        .as_ref()
+        .map(|s| s.is_float(idx))
+        .unwrap_or(false);
+
+    if is_float_col {
+        let sum_f64: f64 = if let WhereClause::None = where_clause {
+            if mvcc.is_some() {
+                let indices = filter_indices(where_clause, table, mvcc);
+                indices.iter().map(|&i| f64::from_bits(table.columns[idx][i])).sum()
+            } else {
+                table.columns[idx].iter().map(|&v| f64::from_bits(v)).sum()
+            }
+        } else {
+            let indices = filter_indices(where_clause, table, mvcc);
+            indices.iter().map(|&i| f64::from_bits(table.columns[idx][i])).sum()
+        };
+        return Ok(QueryResult {
+            columns: vec![ResultColumn {
+                name: name.into(),
+                values: vec![sum_f64.to_bits()],
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            }],
+            row_count: 1,
+            elapsed_us: 0,
+        });
+    }
+
     let sum: u64 = if let WhereClause::None = where_clause {
         if mvcc.is_some() {
             let indices = filter_indices(where_clause, table, mvcc);
