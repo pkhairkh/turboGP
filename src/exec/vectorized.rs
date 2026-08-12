@@ -7,7 +7,16 @@
 //! Based on: Polychroniou et al. (2015) "Rethinking SIMD Vectorization
 //! for In-Memory Databases and Beyond"
 
+use crate::exec::bitmap::{self, Bitmap};
+
 /// Filter rows where col == value. Returns a boolean mask.
+///
+/// NOTE: This stays scalar because the AVX-512 bitmap kernel produces a
+/// bit-packed `Bitmap` and converting it back to `&mut [bool]` (1 byte per
+/// row) costs ~3x more than the scalar loop. The bitmap-returning variants
+/// `filter_eq_bitmap` etc. are the fast path -- callers that can keep the
+/// mask bit-packed end-to-end should use those instead.
+#[inline]
 pub fn filter_eq(col: &[u64], value: u64, out: &mut [bool]) {
     for (i, &c) in col.iter().enumerate() {
         out[i] = c == value;
@@ -15,38 +24,167 @@ pub fn filter_eq(col: &[u64], value: u64, out: &mut [bool]) {
 }
 
 /// Filter rows where col != value.
+#[inline]
 pub fn filter_ne(col: &[u64], value: u64, out: &mut [bool]) {
     for (i, &c) in col.iter().enumerate() {
         out[i] = c != value;
     }
 }
 
-/// Filter rows where col < value.
+/// Filter rows where col < value (unsigned).
+#[inline]
 pub fn filter_lt(col: &[u64], value: u64, out: &mut [bool]) {
     for (i, &c) in col.iter().enumerate() {
         out[i] = c < value;
     }
 }
 
-/// Filter rows where col > value.
+/// Filter rows where col > value (unsigned).
+#[inline]
 pub fn filter_gt(col: &[u64], value: u64, out: &mut [bool]) {
     for (i, &c) in col.iter().enumerate() {
         out[i] = c > value;
     }
 }
 
-/// Filter rows where col <= value.
+/// Filter rows where col <= value (unsigned).
+#[inline]
 pub fn filter_le(col: &[u64], value: u64, out: &mut [bool]) {
     for (i, &c) in col.iter().enumerate() {
         out[i] = c <= value;
     }
 }
 
-/// Filter rows where col >= value.
+/// Filter rows where col >= value (unsigned).
+#[inline]
 pub fn filter_ge(col: &[u64], value: u64, out: &mut [bool]) {
     for (i, &c) in col.iter().enumerate() {
         out[i] = c >= value;
     }
+}
+
+// =========================================================================
+// Bitmap-returning filter functions (W2 Task 2.1) -- AVX-512F kernels
+// =========================================================================
+//
+// These return `Bitmap` directly (bit-packed, 1 bit/row) so the downstream
+// aggregate functions can use POPCNT-based `count_ones` and avoid the
+// 8x memory blow-up of `Vec<bool>`.
+
+#[inline]
+pub fn filter_eq_bitmap(col: &[u64], value: u64) -> Bitmap {
+    bitmap::filter_eq_u64(col, value)
+}
+
+#[inline]
+pub fn filter_ne_bitmap(col: &[u64], value: u64) -> Bitmap {
+    bitmap::filter_ne_u64(col, value)
+}
+
+#[inline]
+pub fn filter_lt_bitmap(col: &[u64], value: u64) -> Bitmap {
+    bitmap::filter_lt_u64(col, value)
+}
+
+#[inline]
+pub fn filter_gt_bitmap(col: &[u64], value: u64) -> Bitmap {
+    bitmap::filter_gt_u64(col, value)
+}
+
+#[inline]
+pub fn filter_le_bitmap(col: &[u64], value: u64) -> Bitmap {
+    bitmap::filter_le_u64(col, value)
+}
+
+#[inline]
+pub fn filter_ge_bitmap(col: &[u64], value: u64) -> Bitmap {
+    bitmap::filter_ge_u64(col, value)
+}
+
+// =========================================================================
+// Bitmap-consuming aggregates -- POPCNT for count, scalar for sum/avg/min/max
+// =========================================================================
+
+/// Count of true bits in the bitmap. Uses POPCNT (64 bits per cycle).
+#[inline]
+pub fn count_masked_bitmap(bm: &Bitmap) -> u64 {
+    bm.count_ones() as u64
+}
+
+/// Sum of col[i] where bitmap bit i is set. Returns f64 bits (for u64 sum).
+#[inline]
+pub fn sum_masked_bitmap(col: &[u64], bm: &Bitmap) -> u64 {
+    let mut sum: u64 = 0;
+    for i in 0..col.len() {
+        if bm.get(i) {
+            sum = sum.wrapping_add(col[i]);
+        }
+    }
+    (sum as f64).to_bits()
+}
+
+/// Sum for float/DECIMAL columns. Each cell is f64::to_bits.
+#[inline]
+pub fn sum_masked_f64_bitmap(col: &[u64], bm: &Bitmap) -> u64 {
+    let mut sum: f64 = 0.0;
+    for i in 0..col.len() {
+        if bm.get(i) {
+            sum += f64::from_bits(col[i]);
+        }
+    }
+    sum.to_bits()
+}
+
+/// Min of col[i] where bitmap bit i is set.
+#[inline]
+pub fn min_masked_bitmap(col: &[u64], bm: &Bitmap) -> u64 {
+    let mut min = u64::MAX;
+    for i in 0..col.len() {
+        if bm.get(i) && col[i] < min {
+            min = col[i];
+        }
+    }
+    if min == u64::MAX { 0 } else { min }
+}
+
+/// Max of col[i] where bitmap bit i is set.
+#[inline]
+pub fn max_masked_bitmap(col: &[u64], bm: &Bitmap) -> u64 {
+    let mut max = 0u64;
+    for i in 0..col.len() {
+        if bm.get(i) && col[i] > max {
+            max = col[i];
+        }
+    }
+    max
+}
+
+/// Average for u64 columns.
+#[inline]
+pub fn avg_masked_bitmap(col: &[u64], bm: &Bitmap) -> u64 {
+    let mut sum: u64 = 0;
+    let mut count: u64 = 0;
+    for i in 0..col.len() {
+        if bm.get(i) {
+            sum = sum.wrapping_add(col[i]);
+            count += 1;
+        }
+    }
+    if count == 0 { 0 } else { (sum as f64 / count as f64).to_bits() }
+}
+
+/// Average for float/DECIMAL columns.
+#[inline]
+pub fn avg_masked_f64_bitmap(col: &[u64], bm: &Bitmap) -> u64 {
+    let mut sum: f64 = 0.0;
+    let mut count: u64 = 0;
+    for i in 0..col.len() {
+        if bm.get(i) {
+            sum += f64::from_bits(col[i]);
+            count += 1;
+        }
+    }
+    if count == 0 { 0 } else { (sum / count as f64).to_bits() }
 }
 
 /// AND two boolean masks.
@@ -149,6 +287,76 @@ fn eval_where(
         }
         _ => {}
     }
+}
+
+/// Bitmap version of eval_where -- writes result to a `Bitmap` instead of `&mut [bool]`.
+///
+/// Same semantics as `eval_where` but uses AVX-512 bitmap kernels
+/// (`bitmap::filter_eq_u64` etc.) for the comparison step and `Bitmap::and` /
+/// `Bitmap::or` for combining sub-masks. The result stays in bit-packed form
+/// end-to-end, so downstream aggregates can use POPCNT-based `count_ones`.
+fn eval_where_bitmap(
+    columns: &[std::sync::Arc<Vec<u64>>],
+    column_names: &[String],
+    row_count: usize,
+    expr: &crate::sql::parser::Expr,
+    out: &mut Bitmap,
+) {
+    use crate::sql::parser::{BinOp, Expr};
+    match expr {
+        Expr::Binary { left, op, right } => {
+            if *op == BinOp::And {
+                let mut left_bm = Bitmap::all_ones(row_count);
+                eval_where_bitmap(columns, column_names, row_count, left, &mut left_bm);
+                let mut right_bm = Bitmap::all_ones(row_count);
+                eval_where_bitmap(columns, column_names, row_count, right, &mut right_bm);
+                *out = left_bm.and(&right_bm);
+            } else if *op == BinOp::Or {
+                let mut left_bm = Bitmap::new(row_count);
+                let mut right_bm = Bitmap::new(row_count);
+                eval_where_bitmap(columns, column_names, row_count, left, &mut left_bm);
+                eval_where_bitmap(columns, column_names, row_count, right, &mut right_bm);
+                *out = left_bm.or(&right_bm);
+            } else {
+                // col OP literal
+                if let (Some(col_idx), Some(val)) =
+                    extract_col_and_value_batch(left, right, column_names)
+                {
+                    let col = &columns[col_idx];
+                    *out = match op {
+                        BinOp::Eq    => filter_eq_bitmap(col, val),
+                        BinOp::NotEq=> filter_ne_bitmap(col, val),
+                        BinOp::Lt    => filter_lt_bitmap(col, val),
+                        BinOp::Gt    => filter_gt_bitmap(col, val),
+                        BinOp::LtEq  => filter_le_bitmap(col, val),
+                        BinOp::GtEq  => filter_ge_bitmap(col, val),
+                        _ => { let mut bm = Bitmap::new(row_count); bm },
+                    };
+                }
+            }
+        }
+        // LIKE / NOT LIKE: fall back to bool path then convert (rare in ClickBench).
+        _ => {
+            let mut bool_mask = vec![true; row_count];
+            eval_where(columns, column_names, row_count, expr, &mut bool_mask);
+            *out = Bitmap::from_bool_slice(&bool_mask);
+        }
+    }
+}
+
+/// Bitmap version of `filter_rows` -- returns a `Bitmap` instead of `Vec<usize>`.
+///
+/// Used by `build_filter_bitmap` in `dispatch.rs` to keep the mask in
+/// bit-packed form end-to-end.
+pub fn filter_rows_bitmap(
+    columns: &[std::sync::Arc<Vec<u64>>],
+    column_names: &[String],
+    row_count: usize,
+    where_expr: &crate::sql::parser::Expr,
+) -> Bitmap {
+    let mut bm = Bitmap::all_ones(row_count);
+    eval_where_bitmap(columns, column_names, row_count, where_expr, &mut bm);
+    bm
 }
 
 fn extract_col_and_value_batch(
