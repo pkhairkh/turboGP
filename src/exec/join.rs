@@ -4,6 +4,7 @@
 //! for cache locality, radix partitioning for large datasets.
 
 use crate::datasource::table::Table;
+use crate::exec::join_hash_table::JoinHashTable;
 use crate::Error;
 use std::collections::HashMap;
 
@@ -45,7 +46,30 @@ impl JoinResult {
     }
 }
 
+/// Pack multi-key join columns into a single u64 via FxHash-multiply.
+///
+/// Uses the FxHash mixing function: `hash = hash.rotate_add(val).wrapping_mul(MULTIPLE)`.
+/// This is NOT collision-free — two different key combinations may pack to the
+/// same u64. The caller must verify the full key columns after probing.
+#[inline]
+fn pack_key(keys: &[JoinKey], table: &Table, row: usize, left_side: bool) -> u64 {
+    const FXHASH_MULT: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    let mut hash = 0u64;
+    for k in keys {
+        let col_idx = if left_side { k.left } else { k.right };
+        let val = table.columns[col_idx][row];
+        hash = (hash.wrapping_add(val)).wrapping_mul(FXHASH_MULT);
+    }
+    hash
+}
+
 /// Hash join: build hash table on right, probe with left.
+///
+/// W4-T1: replaced `HashMap<Vec<u64>, Vec<usize>>` with `JoinHashTable`
+/// (CedarDB-style bloom-filter-tagged chaining with CRC32 hardware hashing).
+/// For multi-key joins, key columns are packed into a single u64 via
+/// FxHash-multiply. After probing, full key columns are verified to handle
+/// hash collisions (FxHash is not collision-free for multi-key).
 pub fn hash_join(
     left: &Table,
     right: &Table,
@@ -56,11 +80,13 @@ pub fn hash_join(
         return Err(Error::InvalidArg("hash_join requires at least one key".into()));
     }
 
-    // Build phase: hash right table keys
-    let mut build_table: HashMap<Vec<u64>, Vec<usize>> = HashMap::new();
+    // Build phase: insert right table rows into JoinHashTable.
+    // The JoinHashTable uses CRC32 hardware hashing + 16-bit bloom tags,
+    // eliminating 99%+ of non-matching probes in the fast path.
+    let mut ht = JoinHashTable::new(right.row_count);
     for r_idx in 0..right.row_count {
-        let key: Vec<u64> = keys.iter().map(|k| right.columns[k.right][r_idx]).collect();
-        build_table.entry(key).or_default().push(r_idx);
+        let packed = pack_key(keys, right, r_idx, false);
+        ht.insert(packed, r_idx as u32);
     }
 
     let total_cols = left.columns.len() + right.columns.len();
@@ -69,11 +95,23 @@ pub fn hash_join(
     let mut row_count = 0;
 
     // Probe phase
+    let mut matches_buf: Vec<u32> = Vec::with_capacity(16);
     for l_idx in 0..left.row_count {
-        let key: Vec<u64> = keys.iter().map(|k| left.columns[k.left][l_idx]).collect();
-        let matches = build_table.get(&key).cloned().unwrap_or_default();
+        let packed = pack_key(keys, left, l_idx, true);
+        matches_buf.clear();
+        ht.probe_all(packed, &mut matches_buf);
 
-        if matches.is_empty() {
+        // Filter out hash collisions: verify full key columns match.
+        let true_matches: Vec<u32> = matches_buf
+            .iter()
+            .copied()
+            .filter(|&r_idx| {
+                let r_idx = r_idx as usize;
+                keys.iter().all(|k| left.columns[k.left][l_idx] == right.columns[k.right][r_idx])
+            })
+            .collect();
+
+        if true_matches.is_empty() {
             if matches!(join_type, JoinType::Left | JoinType::Full) {
                 for (c, col) in left.columns.iter().enumerate() {
                     out_cols[c].push(col[l_idx]);
@@ -84,13 +122,13 @@ pub fn hash_join(
                 row_count += 1;
             }
         } else {
-            for r_idx in &matches {
-                matched_right[*r_idx] = true;
+            for r_idx in &true_matches {
+                matched_right[*r_idx as usize] = true;
                 for (c, col) in left.columns.iter().enumerate() {
                     out_cols[c].push(col[l_idx]);
                 }
                 for (c, col) in right.columns.iter().enumerate() {
-                    out_cols[left.columns.len() + c].push(col[*r_idx]);
+                    out_cols[left.columns.len() + c].push(col[*r_idx as usize]);
                 }
                 row_count += 1;
             }
