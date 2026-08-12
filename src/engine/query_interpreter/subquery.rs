@@ -835,7 +835,7 @@ impl<'a> QueryInterpreter<'a> {
         &self,
         subquery: &SelectQuery2,
         inner_col_idx: usize,
-    ) -> Result<FxHashSet<u64>, Error> {
+    ) -> Result<(FxHashSet<u64>, crate::exec::bloom_filter::BloomFilter), Error> {
         // Load the subquery's FROM table(s) and join them (no correlation).
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
@@ -889,7 +889,15 @@ impl<'a> QueryInterpreter<'a> {
         for local in local_sets {
             set.extend(local);
         }
-        Ok(set)
+        // W2-T4: build a BloomFilter from the same values. The bloom filter
+        // is a fast negative-check path: bloom.might_contain returns false
+        // -> definitely not in set -> skip the (slower) FxHashSet lookup.
+        // On bloom "yes", fall back to the exact set check.
+        let mut bloom = crate::exec::bloom_filter::BloomFilter::new(set.len().max(1));
+        for &v in set.iter() {
+            bloom.insert(v);
+        }
+        Ok((set, bloom))
     }
 
     /// Check if a conjunct references a column not in `base` (i.e. correlated).

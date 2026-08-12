@@ -40,7 +40,7 @@ pub(crate) struct QueryInterpreter<'a> {
     /// column values (l_orderkey where l_commitdate < l_receiptdate) ONCE,
     /// then check membership per outer row. This decorrelates the EXISTS,
     /// reducing ~25k subquery executions to 1 hash-set build + 25k lookups.
-    pub(crate) exists_cache: std::cell::RefCell<HashMap<usize, FxHashSet<u64>>>,
+    pub(crate) exists_cache: std::cell::RefCell<HashMap<usize, (FxHashSet<u64>, crate::exec::bloom_filter::BloomFilter)>>,
     /// Cache for multi-column EXISTS: HashMap<equi_key, HashSet<ineq_col>>.
     /// For Q21's `exists (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey
     /// AND l2.l_suppkey <> l1.l_suppkey)`, we build a HashMap<l_orderkey, HashSet<l_suppkey>>

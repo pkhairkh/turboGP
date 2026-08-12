@@ -1453,16 +1453,23 @@ impl<'a> QueryInterpreter<'a> {
                 // (Q4) to 1 hash-set build + 25k lookups.
                 let ast_key = (query.as_ref() as *const SelectQuery2) as usize;
                 if let Some((outer_col_idx, inner_col_idx)) = self.find_exists_equi_join(query, t) {
-                    // Build the hash set (cached by AST pointer)
+                    // Build the hash set + bloom filter (cached by AST pointer)
                     let need_build = !self.exists_cache.borrow().contains_key(&ast_key);
                     if need_build {
-                        let set = self.build_exists_hashset(query, inner_col_idx)?;
-                        self.exists_cache.borrow_mut().insert(ast_key, set);
+                        let set_bloom = self.build_exists_hashset(query, inner_col_idx)?;
+                        self.exists_cache.borrow_mut().insert(ast_key, set_bloom);
                     }
                     let cache = self.exists_cache.borrow();
-                    if let Some(set) = cache.get(&ast_key) {
+                    if let Some((set, bloom)) = cache.get(&ast_key) {
                         let outer_val = t.columns[outer_col_idx].get(row).copied().unwrap_or(0);
-                        let exists = set.contains(&outer_val);
+                        // W2-T4: bloom filter fast path. If bloom says "no",
+                        // the value is definitely NOT in the set -> skip the
+                        // (slower) FxHashSet SipHash lookup.
+                        let exists = if !bloom.might_contain(outer_val) {
+                            false
+                        } else {
+                            set.contains(&outer_val)
+                        };
                         return Ok(Value2::Int(if if *negated { !exists } else { exists } {
                             1
                         } else {
