@@ -186,6 +186,7 @@ pub enum BinOp2 {
     Sub,
     Mul,
     Div,
+    Mod,
     Eq,
     Ne,
     Lt,

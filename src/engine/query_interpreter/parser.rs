@@ -490,12 +490,17 @@ impl QueryInterpreterParser {
     pub(crate) fn parse_multiplicative(&mut self) -> Result<Expr2, String> {
         let mut left = self.parse_unary()?;
         loop {
-            if self.is_op(&["*", "/"]) {
+            if self.is_op(&["*", "/", "%"]) {
                 let op_str =
                     if let Token::Op(o) = self.peek() { o.clone() } else { unreachable!() };
                 self.next();
                 let right = self.parse_unary()?;
-                let op = if op_str == "*" { BinOp2::Mul } else { BinOp2::Div };
+                let op = match op_str.as_str() {
+                    "*" => BinOp2::Mul,
+                    "/" => BinOp2::Div,
+                    "%" => BinOp2::Mod,
+                    _ => unreachable!(),
+                };
                 left = Expr2::BinOp { op, left: Box::new(left), right: Box::new(right) };
             } else {
                 break;

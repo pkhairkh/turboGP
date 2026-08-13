@@ -1117,6 +1117,42 @@ impl<'a> QueryInterpreter<'a> {
                     mask.set(i);
                 }
             }
+        } else if pb.len() >= 2 && pb[0] == b'%' && pb[pb.len() - 1] == b'%' && !pb[1..pb.len()-1].contains(&b'%') && !pattern.contains('_') {
+            // W14-T1: Contains match: %substring% — parallel memchr.
+            // Previously this fell into the general LIKE path (scalar self.like()
+            // per row). Now uses rayon parallel iteration with memchr::memmem::find
+            // (SIMD-accelerated substring search). For ClickBench Q21/Q22 (100M rows,
+            // URL LIKE '%page_1%'), this replaces 100M scalar LIKE calls with
+            // parallel memmem.
+            let substring = &pattern[1..pb.len()-1];
+            let sub_bytes = substring.as_bytes();
+            use rayon::prelude::*;
+            let bits = (0..n)
+                .into_par_iter()
+                .chunks(65536)
+                .map(|chunk| {
+                    let mut local_bits = vec![0u8; (chunk.len() + 7) / 8];
+                    for (j, &i) in chunk.iter().enumerate() {
+                        if memchr::memmem::find(sc.get(i).as_bytes(), sub_bytes).is_some() {
+                            local_bits[j >> 3] |= 1 << (j & 7);
+                        }
+                    }
+                    local_bits
+                })
+                .collect::<Vec<Vec<u8>>>();
+            // Merge chunk bitmaps into the output mask.
+            let mut bit_offset = 0usize;
+            for chunk_bits in bits {
+                for (byte_idx, &b) in chunk_bits.iter().enumerate() {
+                    let global_bit = bit_offset + byte_idx * 8;
+                    for bit in 0..8 {
+                        if b & (1 << bit) != 0 && global_bit + bit < n {
+                            mask.set(global_bit + bit);
+                        }
+                    }
+                }
+                bit_offset += chunk_bits.len() * 8;
+            }
         } else {
             // General LIKE
             for i in 0..n {
@@ -1139,6 +1175,54 @@ impl<'a> QueryInterpreter<'a> {
         t: &ExecTable,
         mask: &mut Bitmap,
     ) -> Result<(), Error> {
+        // W14-T1: Vectorized (Col % Lit) op Lit — e.g. WatchID % 2 = 0.
+        // Previously fell through to per-row eval (100M calls for Q19).
+        if let Expr2::BinOp { op: BinOp2::Mod, left: mleft, right: mright } = left {
+            if let Some(col_idx) = self.col_in(mleft, t) {
+                if !self.expr_has_col(mright) {
+                    let mval = self.eval_const(mright, t)?;
+                    let rval = self.eval_const(right, t)?;
+                    // Parallel vectorized modulo comparison.
+                    let col = &t.columns[col_idx];
+                    let m_u64 = mval.as_u64().unwrap_or(0);
+                    let r_u64 = rval.as_u64().unwrap_or(0);
+                    if m_u64 == 0 {
+                        return Ok(()); // mod 0 — no matches
+                    }
+                    use rayon::prelude::*;
+                    let n = t.row_count;
+                    let to_clear: Vec<usize> = (0..n)
+                        .into_par_iter()
+                        .chunks(65536)
+                        .map(|chunk| {
+                            let mut local = Vec::new();
+                            for i in chunk {
+                                let v = col[i] % m_u64;
+                                let pass = match op {
+                                    BinOp2::Eq => v == r_u64,
+                                    BinOp2::Ne => v != r_u64,
+                                    BinOp2::Lt => v < r_u64,
+                                    BinOp2::Le => v <= r_u64,
+                                    BinOp2::Gt => v > r_u64,
+                                    BinOp2::Ge => v >= r_u64,
+                                    _ => true,
+                                };
+                                if !pass {
+                                    local.push(i);
+                                }
+                            }
+                            local
+                        })
+                        .flatten()
+                        .collect();
+                    for i in to_clear {
+                        mask.clear(i);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         // Try Col op Const (right side must NOT have column refs)
         if let Some(col_idx) = self.col_in(left, t) {
             if !self.expr_has_col(right) {
@@ -1827,7 +1911,7 @@ impl<'a> QueryInterpreter<'a> {
 
     pub(crate) fn binop(&self, op: BinOp2, lv: &Value2, rv: &Value2) -> Value2 {
         match op {
-            BinOp2::Add | BinOp2::Sub | BinOp2::Mul | BinOp2::Div => {
+            BinOp2::Add | BinOp2::Sub | BinOp2::Mul | BinOp2::Div | BinOp2::Mod => {
                 let lf = lv.as_f64();
                 let rf = rv.as_f64();
                 match (lf, rf) {
@@ -1842,12 +1926,19 @@ impl<'a> QueryInterpreter<'a> {
                                 }
                                 l / r
                             }
+                            BinOp2::Mod => {
+                                if r == 0.0 {
+                                    return Value2::Null;
+                                }
+                                l % r
+                            }
                             _ => unreachable!(),
                         };
-                        // Keep as int if both are ints and op is not div
+                        // Keep as int if both are ints and op is not div/mod
                         if matches!(lv, Value2::Int(_))
                             && matches!(rv, Value2::Int(_))
                             && op != BinOp2::Div
+                            && op != BinOp2::Mod
                         {
                             let li = lv.as_i64().unwrap();
                             let ri = rv.as_i64().unwrap();
@@ -1858,6 +1949,18 @@ impl<'a> QueryInterpreter<'a> {
                                 _ => unreachable!(),
                             };
                             return Value2::Int(ir);
+                        }
+                        // For Mod on integers, return integer result.
+                        if matches!(lv, Value2::Int(_))
+                            && matches!(rv, Value2::Int(_))
+                            && op == BinOp2::Mod
+                        {
+                            let li = lv.as_i64().unwrap();
+                            let ri = rv.as_i64().unwrap();
+                            if ri == 0 {
+                                return Value2::Null;
+                            }
+                            return Value2::Int(li % ri);
                         }
                         Value2::Float(res)
                     }
