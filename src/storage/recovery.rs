@@ -1479,6 +1479,7 @@ mod tests {
                 null_bitmap: None,
             }],
             row_count: 3,
+            i32_columns: Vec::new(),
         });
         cat.register(t);
 
@@ -1520,6 +1521,7 @@ mod tests {
                 null_bitmap: None,
             }],
             row_count: 2,
+            i32_columns: Vec::new(),
         }));
 
         let n = Checkpoint::save_and_truncate(&cat, ckpt_tmp.path(), &mut wal).unwrap();
@@ -1554,6 +1556,7 @@ mod tests {
                 null_bitmap: None,
             }],
             row_count: 3,
+            i32_columns: Vec::new(),
         }));
 
         let n = Checkpoint::save_and_truncate(&cat, &ckpt_path, &mut wal).unwrap();
@@ -1597,6 +1600,7 @@ mod tests {
                 null_bitmap: None,
             }],
             row_count: 3,
+            i32_columns: Vec::new(),
         }));
 
         // Write to tmp, rename — but DON'T truncate the WAL.
@@ -1709,6 +1713,7 @@ mod tests {
                 null_bitmap: None,
             }],
             row_count: 2,
+            i32_columns: Vec::new(),
         }));
 
         Checkpoint::save_and_truncate(&cat, &ckpt_path, &mut wal).unwrap();

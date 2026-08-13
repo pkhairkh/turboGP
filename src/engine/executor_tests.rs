@@ -29,6 +29,7 @@ fn make_int_table(n: usize) -> DataSourceTable {
             null_bitmap: None,
         }],
         row_count: n,
+        i32_columns: Vec::new(),
     });
     // Pre-size row_versions so tests can fill it.
     t.row_versions = Vec::new();
@@ -58,6 +59,7 @@ fn make_two_col_table(n: usize) -> DataSourceTable {
             },
         ],
         row_count: n,
+        i32_columns: Vec::new(),
     })
 }
 

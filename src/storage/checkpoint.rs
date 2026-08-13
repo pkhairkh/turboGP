@@ -321,6 +321,7 @@ fn deserialize_table(st: SerializedTable) -> Table {
         row_count: st.row_count,
         string_columns,
         null_bitmaps,
+        i32_columns: vec![None; st.row_count],  // placeholder; checkpoint restore doesn't preserve i32 sidecar
         schema,
         row_versions,
     }
@@ -510,7 +511,7 @@ mod tests {
                 null_bitmap: None,
             })
             .collect();
-        let mut t = Table::from_loaded(LoadedTable { name: name.into(), columns, row_count });
+        let mut t = Table::from_loaded(LoadedTable { name: name.into(), columns, row_count, i32_columns: Vec::new() });
         t.schema = None;
         t
     }
@@ -547,7 +548,7 @@ mod tests {
                 null_bitmap: None,
             },
         ];
-        let mut t = Table::from_loaded(LoadedTable { name: name.into(), columns, row_count: n });
+        let mut t = Table::from_loaded(LoadedTable { name: name.into(), columns, row_count: n, i32_columns: Vec::new() });
         t.schema = Some(TableSchema {
             columns: vec![
                 ColumnSchema {

@@ -110,11 +110,15 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
             name: LoadedTable::name_from_path(path),
             columns: Vec::new(),
             row_count: 0,
+            i32_columns: Vec::new(),
         });
     }
 
     let ncols = column_names.len();
     let mut columns: Vec<LoadedColumn> = Vec::with_capacity(ncols);
+    // Wave 5C: i32 sidecar. Parallel to `columns`; Some(Vec<i32>) for
+    // numeric columns whose values all fit in i32 range, None otherwise.
+    let mut i32_columns: Vec<Option<Vec<i32>>> = Vec::with_capacity(ncols);
 
     for (col_idx, name) in column_names.iter().enumerate() {
         let strings = &column_data[col_idx];
@@ -133,8 +137,22 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
         }
 
         let cells: Vec<u64> = if all_numeric {
+            // Wave 5C: populate i32 sidecar when all values fit in i32
+            // range (4 bytes/element vs 8 for u64 — halves filter
+            // memory bandwidth). The u64 cells are still populated
+            // (the sidecar is *additional*; non-filter paths still use
+            // the u64 column).
+            let all_i32 = as_i64
+                .iter()
+                .all(|&v| v >= i32::MIN as i64 && v <= i32::MAX as i64);
+            if all_i32 {
+                i32_columns.push(Some(as_i64.iter().map(|&v| v as i32).collect()));
+            } else {
+                i32_columns.push(None);
+            }
             as_i64.into_iter().map(|v| v as u64).collect()
         } else {
+            i32_columns.push(None);
             // Try f64
             let mut as_f64: Vec<f64> = Vec::with_capacity(row_count);
             let mut all_float = true;
@@ -182,7 +200,12 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
         });
     }
 
-    Ok(LoadedTable { name: LoadedTable::name_from_path(path), columns, row_count })
+    Ok(LoadedTable {
+        name: LoadedTable::name_from_path(path),
+        columns,
+        row_count,
+        i32_columns,
+    })
 }
 
 // === TPC-H CSV loader (Wave 5) ===
@@ -567,6 +590,10 @@ pub fn read_tpc_h_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<d
     // Build LoadedColumns. String columns get their StringSearchColumn;
     // non-string columns stay `None`.
     let mut columns: Vec<LoadedColumn> = Vec::with_capacity(ncols);
+    // Wave 5C: i32 sidecar. Parallel to `columns`; Some(Vec<i32>) for
+    // Int64 columns whose values all fit in i32 range (4 bytes/element
+    // vs 8 for u64 — halves filter memory bandwidth). None otherwise.
+    let mut i32_columns: Vec<Option<Vec<i32>>> = Vec::with_capacity(ncols);
     for i in 0..ncols {
         let string_search = if !col_strings[i].is_empty() {
             Some(crate::exec::fm_index::StringSearchColumn::new(std::mem::take(
@@ -575,6 +602,27 @@ pub fn read_tpc_h_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<d
         } else {
             None
         };
+        // Wave 5C: detect narrow Int64 columns. TPC-H DDL declares
+        // l_orderkey, l_partkey, l_suppkey, l_linenumber etc. as
+        // BIGINT, but their values at SF=1/SF=10 fit in i32 range,
+        // so we stash an i32 copy for the filter path.
+        let (_, t) = schema[i];
+        let i32_side = if t == TpcHType::Int64 {
+            let all_i32 = col_cells[i]
+                .iter()
+                .all(|&c| {
+                    let v = c as i64;
+                    v >= i32::MIN as i64 && v <= i32::MAX as i64
+                });
+            if all_i32 {
+                Some(col_cells[i].iter().map(|&c| c as i32).collect())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        i32_columns.push(i32_side);
         columns.push(LoadedColumn {
             name: schema[i].0.to_string(),
             cells: std::mem::take(&mut col_cells[i]),
@@ -590,7 +638,7 @@ pub fn read_tpc_h_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<d
     // step. This matches the convention used by `QueryEngine::load_csv`
     // and `QueryEngine::load_parquet`, which both rename to the
     // caller-supplied table name after loading.
-    Ok(LoadedTable { name: table_name.to_string(), columns, row_count })
+    Ok(LoadedTable { name: table_name.to_string(), columns, row_count, i32_columns })
 }
 
 #[cfg(test)]
@@ -1014,5 +1062,111 @@ mod tests {
         assert!(shipdate0 > 5000 && shipdate0 < 30000, "l_shipdate[0] = {}", shipdate0);
 
         eprintln!("lineitem load took {}ms", elapsed.as_millis());
+    }
+
+    // === Wave 5C: i32 sidecar tests ===
+
+    /// `read_csv` populates the i32 sidecar for a narrow integer column
+    /// (all values fit in i32 range).
+    #[test]
+    fn read_csv_populates_i32_sidecar_for_narrow_int() {
+        let (_tmp, path) = write_tmp("id\n1\n2\n3\n100\n-7\n");
+        let table = read_csv(&path, true).expect("read");
+        assert_eq!(table.i32_columns.len(), 1);
+        let side = table.i32_columns[0].as_ref().expect("i32 sidecar for narrow int column");
+        assert_eq!(side, &[1i32, 2, 3, 100, -7]);
+        // u64 storage is still populated (the sidecar is additional).
+        assert_eq!(table.columns[0].cells, vec![1u64, 2, 3, 100, (-7i64) as u64]);
+    }
+
+    /// `read_csv` does NOT populate the i32 sidecar when any value
+    /// exceeds i32 range (e.g. > 2_147_483_647).
+    #[test]
+    fn read_csv_no_i32_sidecar_for_wide_int() {
+        let (_tmp, path) = write_tmp("id\n1\n3000000000\n");
+        let table = read_csv(&path, true).expect("read");
+        assert_eq!(table.i32_columns.len(), 1);
+        assert!(table.i32_columns[0].is_none(), "expected None for value > i32::MAX");
+        // u64 storage still has the value.
+        assert_eq!(table.columns[0].cells, vec![1u64, 3_000_000_000u64]);
+    }
+
+    /// `read_csv` does NOT populate the i32 sidecar for string columns.
+    #[test]
+    fn read_csv_no_i32_sidecar_for_string() {
+        let (_tmp, path) = write_tmp("name\nfoo\nbar\n");
+        let table = read_csv(&path, true).expect("read");
+        assert_eq!(table.i32_columns.len(), 1);
+        assert!(table.i32_columns[0].is_none());
+    }
+
+    /// `read_csv` does NOT populate the i32 sidecar for float columns.
+    #[test]
+    fn read_csv_no_i32_sidecar_for_float() {
+        let (_tmp, path) = write_tmp("v\n1.5\n2.5\n");
+        let table = read_csv(&path, true).expect("read");
+        assert_eq!(table.i32_columns.len(), 1);
+        assert!(table.i32_columns[0].is_none());
+    }
+
+    /// `read_tpc_h_csv` populates the i32 sidecar for Int64 columns
+    /// whose values fit in i32 range. Verify the lineitem Int64
+    /// columns (l_orderkey, l_partkey, l_suppkey, l_linenumber) all
+    /// get the sidecar.
+    #[test]
+    fn read_tpc_h_csv_lineitem_i32_sidecar() {
+        let csv = "l_orderkey|l_partkey|l_suppkey|l_linenumber|l_quantity|l_extendedprice|l_discount|l_tax|l_returnflag|l_linestatus|l_shipdate|l_commitdate|l_receiptdate|l_shipinstruct|l_shipmode|l_comment\n\
+                   1|155190|7706|1|17.00|21168.23|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|DELIVER IN PERSON|TRUCK|blah\n\
+                   2|67310|7311|2|36.00|45983.16|0.09|0.06|N|O|1996-04-12|1996-02-28|1996-04-20|TAKE BACK RETURN|MAIL|blah2\n\
+                   3|63700|3701|3|8.00|13309.60|0.10|0.02|R|F|1994-02-02|1994-01-04|1994-02-23|TAKE BACK RETURN|FOB|blah3\n";
+        let (_tmp, path) = write_tmp(csv);
+        let table = read_tpc_h_csv(&path, "lineitem").expect("read");
+        assert_eq!(table.i32_columns.len(), 16);
+
+        // l_orderkey (col 0): Int64, values 1/2/3 → sidecar populated.
+        let orderkey = table.i32_columns[0].as_ref().expect("l_orderkey i32 sidecar");
+        assert_eq!(orderkey, &[1i32, 2, 3]);
+        // l_partkey (col 1): Int64, values 155190/67310/63700 → sidecar populated.
+        let partkey = table.i32_columns[1].as_ref().expect("l_partkey i32 sidecar");
+        assert_eq!(partkey, &[155190i32, 67310, 63700]);
+        // l_suppkey (col 2): Int64 → sidecar populated.
+        let suppkey = table.i32_columns[2].as_ref().expect("l_suppkey i32 sidecar");
+        assert_eq!(suppkey, &[7706i32, 7311, 3701]);
+        // l_linenumber (col 3): Int64 → sidecar populated.
+        let lineno = table.i32_columns[3].as_ref().expect("l_linenumber i32 sidecar");
+        assert_eq!(lineno, &[1i32, 2, 3]);
+
+        // l_quantity (col 4): Float64 → no sidecar.
+        assert!(table.i32_columns[4].is_none());
+        // l_returnflag (col 8): String → no sidecar.
+        assert!(table.i32_columns[8].is_none());
+        // l_shipdate (col 10): Date → no sidecar.
+        assert!(table.i32_columns[10].is_none());
+    }
+
+    /// Integration test: load the REAL TPC-H lineitem CSV and verify
+    /// the i32 sidecar is populated for the narrow Int64 columns
+    /// (l_orderkey, l_partkey, l_suppkey, l_linenumber). SF=1 values
+    /// fit in i32 range, so the sidecar should be present.
+    #[test]
+    fn read_tpc_h_csv_lineitem_i32_sidecar_integration() {
+        let path = "/tmp/tpc_h_lineitem.csv";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: {} not present", path);
+            return;
+        }
+        let table = read_tpc_h_csv(path, "lineitem").expect("read lineitem");
+        assert_eq!(table.i32_columns.len(), 16);
+        // l_orderkey, l_partkey, l_suppkey, l_linenumber — all Int64,
+        // all should fit in i32 range for SF=1.
+        assert!(table.i32_columns[0].is_some(), "l_orderkey should have i32 sidecar");
+        assert!(table.i32_columns[1].is_some(), "l_partkey should have i32 sidecar");
+        assert!(table.i32_columns[2].is_some(), "l_suppkey should have i32 sidecar");
+        assert!(table.i32_columns[3].is_some(), "l_linenumber should have i32 sidecar");
+        // Spot-check: l_orderkey[0] should be 1.
+        let orderkey = table.i32_columns[0].as_ref().unwrap();
+        assert_eq!(orderkey[0], 1i32);
+        // The sidecar length should match row_count.
+        assert_eq!(orderkey.len(), table.row_count);
     }
 }

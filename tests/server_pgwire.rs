@@ -32,6 +32,7 @@ fn make_engine() -> QueryEngine {
             },
         ],
         row_count: 3,
+        i32_columns: Vec::new(),
     });
     let mut e = QueryEngine::in_memory();
     e.register_table(t);

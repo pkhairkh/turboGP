@@ -52,6 +52,18 @@ pub struct Table {
     /// version to the SAME chain; DELETE just marks the latest version
     /// deleted.
     pub row_versions: Vec<Vec<crate::txn::mvcc::RowVersion>>,
+    /// Optional i32 sidecar for narrow integer columns
+    /// (Int/SmallInt/TinyInt). Populated by the CSV loader when all
+    /// values fit in i32 range. None for columns that are u64/f64/string
+    /// or have values outside i32 range. When present, the filter path
+    /// uses `filter_eq_i32` etc. (4 bytes/element vs 8 for u64),
+    /// halving memory bandwidth. Wave 5C.
+    ///
+    /// Parallel to `columns`; entries past `columns.len()` (or when
+    /// None) mean no sidecar for that column. `from_loaded` pads with
+    /// None to `columns.len()` so `i32_columns.len() == columns.len()`
+    /// always holds on a constructed `Table`.
+    pub i32_columns: Vec<Option<std::sync::Arc<Vec<i32>>>>,
 }
 
 impl Table {
@@ -95,6 +107,20 @@ impl Table {
             })
             .collect();
 
+        // i32 sidecar: copy from LoadedTable.i32_columns, wrapping each
+        // Some(Vec<i32>) in an Arc. Pad with None to `columns.len()` so
+        // the parallel-length invariant holds even when the loader left
+        // `i32_columns` shorter than `columns` (e.g. old LoadedTable
+        // fixtures in tests that build the struct by hand).
+        let mut i32_columns: Vec<Option<std::sync::Arc<Vec<i32>>>> = loaded
+            .i32_columns
+            .into_iter()
+            .map(|opt| opt.map(std::sync::Arc::new))
+            .collect();
+        while i32_columns.len() < columns.len() {
+            i32_columns.push(None);
+        }
+
         Table {
             name: loaded.name,
             columns,
@@ -104,6 +130,7 @@ impl Table {
             null_bitmaps,
             schema: None,
             row_versions: Vec::new(),
+            i32_columns,
         }
     }
 
@@ -258,6 +285,7 @@ mod tests {
                 },
             ],
             row_count: 3,
+            i32_columns: vec![None, None],
         }
     }
 
@@ -321,6 +349,7 @@ mod tests {
                 },
             ],
             row_count: 5, // lie about row count
+            i32_columns: vec![None, None],
         };
         let table = Table::from_loaded(loaded);
         // row_count is clamped to the min actual column length (2).
@@ -330,7 +359,7 @@ mod tests {
     /// An empty `LoadedTable` produces an empty `Table`.
     #[test]
     fn from_loaded_empty() {
-        let loaded = LoadedTable { name: "empty".into(), columns: Vec::new(), row_count: 0 };
+        let loaded = LoadedTable { name: "empty".into(), columns: Vec::new(), row_count: 0, i32_columns: Vec::new() };
         let table = Table::from_loaded(loaded);
         assert_eq!(table.row_count, 0);
         assert_eq!(table.column_count(), 0);

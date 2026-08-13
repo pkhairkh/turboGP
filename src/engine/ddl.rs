@@ -28,6 +28,7 @@ impl QueryEngine {
                     row_count: 0,
                     string_columns: vec![None; ct.columns.len()],
                     null_bitmaps: vec![None; ct.columns.len()],
+                    i32_columns: vec![None; ct.columns.len()],
                     schema: Some(crate::schema::table_schema::TableSchema::from_create_table(&ct)),
                     row_versions: Vec::new(),
                 };

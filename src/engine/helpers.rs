@@ -507,6 +507,7 @@ pub(crate) fn result_to_table(name: &str, result: &QueryResult) -> Table {
         row_count: result.row_count,
         string_columns,
         null_bitmaps: vec![],
+        i32_columns: vec![],
         schema: None,
         row_versions: Vec::new(),
     }
@@ -598,6 +599,7 @@ pub(crate) fn query_result_to_table(name: &str, qr: &QueryResult) -> Table {
         row_count: qr.row_count,
         string_columns: vec![],
         null_bitmaps: vec![],
+        i32_columns: vec![],
         schema: None,
         row_versions: Vec::new(),
     }

@@ -187,6 +187,7 @@ fn checkpoint_preserves_float_type() {
             null_bitmap: None,
         }],
         row_count: 3,
+        i32_columns: Vec::new(),
     });
     t.schema = Some(TableSchema {
         columns: vec![ColumnSchema {
@@ -241,6 +242,7 @@ fn checkpoint_preserves_varchar_type() {
             null_bitmap: None,
         }],
         row_count: 3,
+        i32_columns: Vec::new(),
     });
     t.schema = Some(TableSchema {
         columns: vec![ColumnSchema {
@@ -290,6 +292,7 @@ fn checkpoint_emits_null_for_null_cells() {
             null_bitmap: Some(vec![false, true, false]),
         }],
         row_count: 3,
+        i32_columns: Vec::new(),
     });
     cat.register(t);
 
@@ -346,6 +349,7 @@ fn checkpoint_roundtrip_floats_and_varchars() {
             },
         ],
         row_count: 2,
+        i32_columns: Vec::new(),
     });
     t.schema = Some(TableSchema {
         columns: vec![

@@ -37,6 +37,7 @@ fn make_engine() -> QueryEngine {
             },
         ],
         row_count: 3,
+        i32_columns: Vec::new(),
     });
     let mut e = QueryEngine::in_memory();
     e.register_table(t);
@@ -279,6 +280,7 @@ fn test_route_and_execute_select_takes_read_lock() {
             null_bitmap: None,
         }],
         row_count: N_ROWS as usize,
+        i32_columns: Vec::new(),
     });
     let mut engine = QueryEngine::in_memory();
     engine.register_table(t);

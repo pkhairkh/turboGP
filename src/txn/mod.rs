@@ -120,6 +120,7 @@ mod tests {
                 null_bitmap: None,
             }],
             row_count: 3,
+            i32_columns: Vec::new(),
         });
         c.register(t);
         c

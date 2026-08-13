@@ -71,6 +71,15 @@ pub struct LoadedTable {
     pub columns: Vec<LoadedColumn>,
     /// Number of rows. Equal to every column's `row_count`.
     pub row_count: usize,
+    /// Optional i32 sidecar for narrow integer columns
+    /// (Int/SmallInt/TinyInt). Populated by the CSV loader when all
+    /// values fit in i32 range. None for columns that are u64/f64/string
+    /// or have values outside i32 range. When present, the filter path
+    /// uses `filter_eq_i32` etc. (4 bytes/element vs 8 for u64),
+    /// halving memory bandwidth. Parallel to `columns`; entries past
+    /// `columns.len()` (or when None) mean no sidecar for that column.
+    /// Wave 5C.
+    pub i32_columns: Vec<Option<Vec<i32>>>,
 }
 
 impl LoadedTable {
@@ -147,7 +156,7 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
 
     if col_cells.is_empty() {
         // Empty file — return an empty table with the inferred name.
-        return Ok(LoadedTable { name, columns: Vec::new(), row_count: 0 });
+        return Ok(LoadedTable { name, columns: Vec::new(), row_count: 0, i32_columns: Vec::new() });
     }
 
     // Verify every column has the same length.
@@ -184,7 +193,7 @@ pub fn read_parquet(path: &str) -> Result<LoadedTable, Box<dyn Error>> {
         });
     }
 
-    Ok(LoadedTable { name, columns, row_count: total_rows })
+    Ok(LoadedTable { name, columns, row_count: total_rows, i32_columns: Vec::new() })
 }
 
 /// Read a single column from a Parquet file.
@@ -612,7 +621,7 @@ mod tests {
         let col2 = col.clone();
         assert_eq!(col.cells, col2.cells);
 
-        let table = LoadedTable { name: "t".into(), columns: vec![col], row_count: 3 };
+        let table = LoadedTable { name: "t".into(), columns: vec![col], row_count: 3, i32_columns: Vec::new() };
         let _table2 = table.clone();
     }
 }

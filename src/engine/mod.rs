@@ -578,6 +578,7 @@ impl QueryEngine {
             row_count: 1,
             string_columns: vec![None],
             null_bitmaps: vec![None],
+            i32_columns: vec![None],
             schema: None,
             row_versions: Vec::new(),
         };
@@ -1393,7 +1394,7 @@ impl QueryEngine {
         }
 
         let loaded =
-            crate::datasource::parquet::LoadedTable { name: table_name.into(), columns, row_count };
+            crate::datasource::parquet::LoadedTable { name: table_name.into(), columns, row_count, i32_columns: Vec::new() };
         let mut table = Table::from_loaded(loaded);
         table.name = table_name.to_string();
         self.catalog.register(table);
@@ -2113,6 +2114,7 @@ impl QueryEngine {
                             row_count: 0,
                             string_columns: vec![],
                             null_bitmaps: vec![],
+                            i32_columns: vec![],
                             schema: None,
                             row_versions: Vec::new(),
                         }),

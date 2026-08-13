@@ -95,6 +95,7 @@ fn parquet_null_bitmap_populated() {
             null_bitmap: Some(vec![false, true, false]),
         }],
         row_count: 3,
+        i32_columns: Vec::new(),
     };
     let table = Table::from_loaded(loaded);
     // The NULL bitmap should be populated
@@ -171,6 +172,7 @@ fn expr_mixed_int_float() {
             },
         ],
         row_count: 2,
+        i32_columns: Vec::new(),
     });
     // 1 - 5 = -4 (integer arithmetic)
     let result = eval_expr("1 - discount", &table, 0);

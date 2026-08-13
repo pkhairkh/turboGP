@@ -834,6 +834,46 @@ fn eval_predicate_mask(expr: &crate::sql::parser::Expr, table: &Table) -> Option
             }
             let col = &table.columns[col_idx];
 
+            // Wave 5C: i32 sidecar fast path. If the column has an i32
+            // sidecar (populated by the CSV loader for narrow Int64
+            // columns whose values all fit in i32 range) AND the
+            // literal is an integer that also fits in i32 range, route
+            // to the AVX-512 i32 filter kernels (4 bytes/element vs 8
+            // for u64 — halves filter memory bandwidth). Falls through
+            // to the u64 path on any mismatch (non-int literal, literal
+            // out of i32 range, op outside the 6 comparison ops).
+            if col_idx < table.i32_columns.len() {
+                if let Some(ref i32_col) = table.i32_columns[col_idx] {
+                    if let Value::Int(i) = &val {
+                        let lit_i64 = *i as i64;
+                        if lit_i64 >= i32::MIN as i64 && lit_i64 <= i32::MAX as i64 {
+                            let i32_val = *i as i32;
+                            use crate::exec::bitmap;
+                            let mask: Vec<bool> = match op {
+                                BinOp::Eq => bitmap::filter_eq_i32(i32_col, i32_val).to_bool_vec(),
+                                BinOp::NotEq => {
+                                    bitmap::filter_ne_i32(i32_col, i32_val).to_bool_vec()
+                                }
+                                BinOp::Lt => bitmap::filter_lt_i32(i32_col, i32_val).to_bool_vec(),
+                                BinOp::Gt => bitmap::filter_gt_i32(i32_col, i32_val).to_bool_vec(),
+                                BinOp::LtEq => {
+                                    bitmap::filter_le_i32(i32_col, i32_val).to_bool_vec()
+                                }
+                                BinOp::GtEq => {
+                                    bitmap::filter_ge_i32(i32_col, i32_val).to_bool_vec()
+                                }
+                                _ => return None,
+                            };
+                            return Some(mask);
+                        }
+                        // Literal outside i32 range — fall through to u64 path.
+                    }
+                    // Non-Int literal (String/Float/Date/Hex/Null) — fall
+                    // through to u64 path (string-column range check below
+                    // handles String literals on string columns).
+                }
+            }
+
             // Wave 42: For range predicates (<, >, <=, >=) on string columns
             // with a StringSearchColumn sidecar, compare the original strings
             // lexicographically instead of comparing u64 hashes.
@@ -1675,7 +1715,7 @@ mod tests {
                 null_bitmap: None,
             },
         ];
-        Table::from_loaded(LoadedTable { name: "t".into(), columns: cols, row_count: n })
+        Table::from_loaded(LoadedTable { name: "t".into(), columns: cols, row_count: n, i32_columns: Vec::new() })
     }
 
     /// Build a `Table` with a string column `url` carrying a
@@ -1694,7 +1734,7 @@ mod tests {
             string_search,
             null_bitmap: None,
         }];
-        Table::from_loaded(LoadedTable { name: "t".into(), columns: cols, row_count: n })
+        Table::from_loaded(LoadedTable { name: "t".into(), columns: cols, row_count: n, i32_columns: Vec::new() })
     }
 
     #[test]
@@ -1982,6 +2022,7 @@ fn eval_arith_row(
                     null_bitmaps: vec![],
                     schema: None,
                     row_versions: Vec::new(),
+                    i32_columns: vec![],
                 },
             )
             .unwrap_or(0);

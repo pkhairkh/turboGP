@@ -41,6 +41,7 @@ fn make_engine_with_nulls() -> QueryEngine {
             },
         ],
         row_count: 3,
+        i32_columns: Vec::new(),
     });
     let mut e = QueryEngine::in_memory();
     e.register_table(t);
@@ -60,6 +61,7 @@ fn make_engine_with_rows(n: u64) -> QueryEngine {
             null_bitmap: None,
         }],
         row_count: n as usize,
+        i32_columns: Vec::new(),
     });
     let mut e = QueryEngine::in_memory();
     e.register_table(t);

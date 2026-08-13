@@ -715,6 +715,7 @@ mod tests {
                 },
             ],
             row_count: 3,
+            i32_columns: Vec::new(),
         })
     }
 

@@ -701,6 +701,7 @@ mod vacuum_tests {
                 null_bitmap: None,
             }],
             row_count: n,
+            i32_columns: Vec::new(),
         };
         let mut table = Table::from_loaded(loaded);
         // Initialize a fresh single-version chain for each row (xmin = 0,

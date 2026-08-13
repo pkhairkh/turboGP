@@ -33,6 +33,7 @@ fn parquet_null_count_excludes_null_cells() {
             null_bitmap: Some(vec![false, true, false]),
         }],
         row_count: 3,
+        i32_columns: Vec::new(),
     };
     let table = DS::from_loaded(loaded);
     let mut e = QueryEngine::in_memory();

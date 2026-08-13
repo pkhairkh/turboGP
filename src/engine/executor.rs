@@ -1942,6 +1942,7 @@ fn cross_join_into(
         row_count: total_rows,
         string_columns: vec![],
         null_bitmaps: vec![],
+        i32_columns: vec![],
         schema: None,
         row_versions: Vec::new(),
     };

@@ -272,7 +272,7 @@ mod tests {
         let scheduler = Scheduler::new(&kernel_table, &cost_model);
 
         let mut catalog = Catalog::new();
-        let mut table = Table { name: "test_table".to_string(), columns: vec![], column_names: vec![], row_count: 0, string_columns: vec![], null_bitmaps: vec![], schema: None, row_versions: vec![] };
+        let mut table = Table { name: "test_table".to_string(), columns: vec![], column_names: vec![], row_count: 0, string_columns: vec![], null_bitmaps: vec![], i32_columns: vec![], schema: None, row_versions: vec![] };
         table.column_names = vec!["id".to_string()];
         table.columns = vec![std::sync::Arc::new(vec![1, 2, 3])];
         table.row_count = 3;
