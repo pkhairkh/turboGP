@@ -1118,40 +1118,35 @@ impl<'a> QueryInterpreter<'a> {
                 }
             }
         } else if pb.len() >= 2 && pb[0] == b'%' && pb[pb.len() - 1] == b'%' && !pb[1..pb.len()-1].contains(&b'%') && !pattern.contains('_') {
-            // W14-T1: Contains match: %substring% — parallel memchr.
-            // Previously this fell into the general LIKE path (scalar self.like()
-            // per row). Now uses rayon parallel iteration with memchr::memmem::find
-            // (SIMD-accelerated substring search). For ClickBench Q21/Q22 (100M rows,
-            // URL LIKE '%page_1%'), this replaces 100M scalar LIKE calls with
-            // parallel memmem.
+            // W18-T1: Parallel LIKE contains with pre-compiled Finder.
+            // The W14-T1 approach used memchr::memmem::find per row, which
+            // re-compiles the search state (rare bytes, shift tables) on
+            // each call. Pre-compiling a Finder once and reusing it across
+            // all 100M rows avoids this overhead.
+            //
+            // The remaining bottleneck is the 100M random-access pointer
+            // chases (Vec<String> → heap allocation per string). A flat
+            // buffer would fix this but requires changing the storage format
+            // at CSV load time — deferred to a future wave.
             let substring = &pattern[1..pb.len()-1];
-            let sub_bytes = substring.as_bytes();
+            let finder = memchr::memmem::Finder::new(substring.as_bytes());
             use rayon::prelude::*;
-            let bits = (0..n)
+            let to_clear: Vec<usize> = (0..n)
                 .into_par_iter()
                 .chunks(65536)
                 .map(|chunk| {
-                    let mut local_bits = vec![0u8; (chunk.len() + 7) / 8];
-                    for (j, &i) in chunk.iter().enumerate() {
-                        if memchr::memmem::find(sc.get(i).as_bytes(), sub_bytes).is_some() {
-                            local_bits[j >> 3] |= 1 << (j & 7);
+                    let mut local = Vec::new();
+                    for i in chunk {
+                        if finder.find(sc.get(i).as_bytes()).is_none() {
+                            local.push(i);
                         }
                     }
-                    local_bits
+                    local
                 })
-                .collect::<Vec<Vec<u8>>>();
-            // Merge chunk bitmaps into the output mask.
-            let mut bit_offset = 0usize;
-            for chunk_bits in bits {
-                for (byte_idx, &b) in chunk_bits.iter().enumerate() {
-                    let global_bit = bit_offset + byte_idx * 8;
-                    for bit in 0..8 {
-                        if b & (1 << bit) != 0 && global_bit + bit < n {
-                            mask.set(global_bit + bit);
-                        }
-                    }
-                }
-                bit_offset += chunk_bits.len() * 8;
+                .flatten()
+                .collect();
+            for i in to_clear {
+                mask.clear(i);
             }
         } else {
             // General LIKE

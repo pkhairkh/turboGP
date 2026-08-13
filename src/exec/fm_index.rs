@@ -343,6 +343,68 @@ impl StringSearchColumn {
             .count()
     }
 
+    /// W18-T1: Flat-buffer LIKE contains mask.
+    ///
+    /// Builds a flat byte buffer (all strings concatenated) + offsets array,
+    /// then scans the entire buffer with a single `memchr::memmem::Finder`
+    /// pass. Match positions are mapped back to row indices via binary search
+    /// on the offsets array.
+    ///
+    /// This replaces 100M random-access pointer chases (Vec<String> →
+    /// heap allocation per string) with one sequential scan over the flat
+    /// buffer. The Finder is SIMD-accelerated (AVX2/AVX-512).
+    ///
+    /// Returns a packed Bitmap (1 bit/row).
+    pub fn like_contains_mask_flat(&self, pattern: &str) -> crate::exec::bitmap::Bitmap {
+        use crate::exec::bitmap::Bitmap;
+        let n = self.len();
+        let mut mask = Bitmap::new(n);
+        if pattern.is_empty() {
+            return Bitmap::all_ones(n);
+        }
+
+        // Build flat buffer: all strings concatenated, with offsets.
+        // For owned columns, this is O(total_bytes) memcpy.
+        // For remap views, we follow the source via indices.
+        let pattern_bytes = pattern.as_bytes();
+
+        // Build flat buffer + offsets.
+        let mut flat_data: Vec<u8> = Vec::with_capacity(n * 16); // estimate
+        let mut offsets: Vec<u32> = Vec::with_capacity(n + 1);
+        offsets.push(0);
+        for i in 0..n {
+            let s = self.get(i).as_bytes();
+            flat_data.extend_from_slice(s);
+            offsets.push(flat_data.len() as u32);
+        }
+
+        // Whole-buffer scan with Finder.
+        let finder = memchr::memmem::Finder::new(pattern_bytes);
+        let mut pos = 0usize;
+        while pos < flat_data.len() {
+            match finder.find(&flat_data[pos..]) {
+                Some(found) => {
+                    let abs_pos = pos + found;
+                    // Find which row this position belongs to.
+                    // Binary search: find the largest offset <= abs_pos.
+                    let abs_pos_u32 = abs_pos as u32;
+                    let row = match offsets.binary_search(&abs_pos_u32) {
+                        Ok(idx) => idx, // exact match — offset is the start of row idx
+                        Err(idx) => idx - 1, // abs_pos is within row idx-1
+                    };
+                    if row < n {
+                        mask.set(row);
+                    }
+                    // Move past this match to find the next one.
+                    pos = abs_pos + 1;
+                }
+                None => break,
+            }
+        }
+
+        mask
+    }
+
     /// Build a boolean mask: mask[i] = true if string i contains pattern.
     pub fn like_contains_mask(&self, pattern: &str) -> Vec<bool> {
         let n = self.len();
