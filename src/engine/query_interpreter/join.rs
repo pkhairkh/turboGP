@@ -651,20 +651,38 @@ impl<'a> QueryInterpreter<'a> {
             .collect::<Vec<_>>();
 
         // Merge: pre-calculate total size to avoid reallocation.
+        // W5B-T3: Allocate the merged output column buffers from the per-query
+        // arena (bump-allocated — pointer bump vs ~50ns malloc per column).
+        // The arena slices are filled via copy_from_slice from each chunk's
+        // partial results, then converted to owned `Arc<Vec<u64>>` for the
+        // ExecTable at the end (ExecTable.columns requires owned data for
+        // Arc sharing across later pipeline stages; a future task may change
+        // the column type to `Arc<[u64]>` and have the ExecTable own the
+        // arena to enable zero-copy output).
+        //
+        // The per-chunk `local_out` buffers (inside the rayon closure above)
+        // remain `Vec<Vec<u64>>` — the arena win there is marginal since
+        // they're reused across rows within a chunk, and migrating them would
+        // require either self-referential partial-result tuples (unsafe) or
+        // a copy-out that negates the arena savings.
         let total_rows: usize =
             partial_results.iter().map(|r| r.0.first().map(|c| c.len()).unwrap_or(0)).sum();
-        let mut out_cols: Vec<Vec<u64>> =
-            (0..ncol).map(|_| Vec::with_capacity(total_rows)).collect();
+        let arena = self.arena();
+        let mut out_cols: Vec<&mut [u64]> =
+            (0..ncol).map(|_| arena.alloc_slice(total_rows)).collect();
+        let mut out_lens: Vec<usize> = vec![0; ncol];
         let mut all_left_idx: Vec<u32> = Vec::with_capacity(total_rows);
         let mut all_right_idx: Vec<u32> = Vec::with_capacity(total_rows);
         for (local_out, li, ri) in partial_results {
             for c in 0..ncol {
-                out_cols[c].extend_from_slice(&local_out[c]);
+                let len = local_out[c].len();
+                out_cols[c][out_lens[c]..out_lens[c] + len].copy_from_slice(&local_out[c]);
+                out_lens[c] += len;
             }
             all_left_idx.extend_from_slice(&li);
             all_right_idx.extend_from_slice(&ri);
         }
-        let row_count = out_cols.first().map(|c| c.len()).unwrap_or(0);
+        let row_count = out_lens.first().copied().unwrap_or(0);
 
         let mut col_map = new_hashmap();
         for (i, name) in out_names.iter().enumerate() {
@@ -713,8 +731,20 @@ impl<'a> QueryInterpreter<'a> {
             }
         }
 
+        // W5B-T3: Convert arena-allocated column slices to owned `Arc<Vec<u64>>`.
+        // This copies the data out of the arena (the arena's lifetime is the
+        // query; ExecTable columns may be shared via Arc beyond the query).
+        // Note: this is the one copy site introduced by the arena migration;
+        // it can be eliminated in a future task by changing ExecTable.columns
+        // to `Vec<Arc<[u64]>>` and having ExecTable own the arena.
+        let out_cols_owned: Vec<std::sync::Arc<Vec<u64>>> = out_cols
+            .iter()
+            .zip(out_lens.iter().copied())
+            .map(|(slice, len)| std::sync::Arc::new(slice[..len].to_vec()))
+            .collect();
+
         Ok(ExecTable {
-            columns: out_cols.into_iter().map(std::sync::Arc::new).collect(),
+            columns: out_cols_owned,
             column_names: out_names,
             col_types: out_types,
             string_columns: out_strings,

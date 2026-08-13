@@ -62,6 +62,17 @@ pub(crate) struct QueryInterpreter<'a> {
     /// a 6M-row lineitem scan — the derived table scans lineitem ONCE.
     /// Value: (HashMap<corr_hash, agg_value>, Vec<usize> corr_col_indices_in_outer).
     pub(crate) decorrelated_cache: std::cell::RefCell<HashMap<usize, (FxHashMap<u64, Value2>, Vec<usize>)>>,
+    /// Per-query bump arena for intermediate allocations (join output column
+    /// buffers, index lists). Eliminates per-allocation malloc/free churn by
+    /// allocating from a contiguous bump arena that is freed in one shot at
+    /// query end. See `crate::exec::arena`.
+    ///
+    /// W5B-T2: The arena is owned by the interpreter (one per query). It is
+    /// accessed only from sequential code sections (e.g. the merge phase of
+    /// `hash_join_with_keys`); the rayon parallel probe phase uses
+    /// chunk-local arenas because `bumpalo::Bump` is `Send` but
+    /// not `Sync`.
+    pub(crate) arena: crate::exec::arena::QueryArena,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

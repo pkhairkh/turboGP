@@ -22,11 +22,25 @@ pub fn execute_interpreter(query: &SelectQuery2, catalog: &Catalog) -> Result<Qu
         exists_multi_cache: std::cell::RefCell::new(new_hashmap()),
         in_subquery_cache: std::cell::RefCell::new(new_hashmap()),
         decorrelated_cache: std::cell::RefCell::new(new_hashmap()),
+        arena: crate::exec::arena::QueryArena::new(),
     }
     .execute(query)
 }
 
 impl<'a> QueryInterpreter<'a> {
+    /// Access the per-query bump arena. Use for intermediate allocations
+    /// (join output buffers, index lists) to avoid per-allocation malloc/free
+    /// overhead. The arena is freed in one shot when the interpreter is
+    /// dropped at query end.
+    ///
+    /// W5B-T2: `QueryArena` wraps `bumpalo::Bump` which is `Send` but not
+    /// `Sync`. The interpreter is used single-threaded per query, so the
+    /// shared `&self` accessor is safe. Callers inside rayon parallel
+    /// sections must create their own chunk-local arenas instead of using
+    /// this accessor.
+    pub(crate) fn arena(&self) -> &crate::exec::arena::QueryArena {
+        &self.arena
+    }
     pub(crate) fn execute(&self, query: &SelectQuery2) -> Result<QueryResult, Error> {
         // Pre-execute uncorrelated scalar subqueries found in WHERE/HAVING/SELECT.
         // Each subquery is tried with outer=None — if it succeeds, it's uncorrelated
