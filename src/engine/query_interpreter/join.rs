@@ -631,21 +631,20 @@ impl<'a> QueryInterpreter<'a> {
         let probe_row_count = probe_side.row_count;
         let num_chunks = (probe_row_count + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-        // Parallel probe using rayon. Each chunk produces its own output cols.
-        // Optimized: use unsafe set_len + ptr write to avoid per-push capacity
-        // checks (the compiler can't elide them due to potential reallocation).
-        let partial_results: Vec<(Vec<Vec<u64>>, Vec<u32>, Vec<u32>)> = (0..num_chunks)
+        // Parallel probe using rayon. Each chunk produces index pairs only.
+        // W23-T1: No longer allocates local_out (Vec<Vec<u64>>) per chunk.
+        // Instead, each chunk produces (left_src_idx, right_src_idx) pairs.
+        // Column values are gathered after the probe loop via run-length fill.
+        let partial_results: Vec<(Vec<u32>, Vec<u32>)> = (0..num_chunks)
             .into_par_iter()
             .map(|chunk_idx| {
                 let start = chunk_idx * CHUNK_SIZE;
                 let end = std::cmp::min(start + CHUNK_SIZE, probe_row_count);
 
-                let mut local_out: Vec<Vec<u64>> =
-                    (0..ncol).map(|_| Vec::with_capacity(CHUNK_SIZE * 2)).collect();
                 let mut matched_rows: Vec<u32> = Vec::with_capacity(16);
-                // Track source row indices for string column remap views.
+                // Track source row indices for column gather + string remap.
                 // left_src_idx[r] = probe row that produced output row r
-                // right_src_idx[r] = build row that produced output row r
+                // right_src_idx[r] = build row that produced output row r (u32::MAX = unmatched)
                 let mut left_src_idx: Vec<u32> = Vec::with_capacity(CHUNK_SIZE * 2);
                 let mut right_src_idx: Vec<u32> = Vec::with_capacity(CHUNK_SIZE * 2);
 
@@ -747,14 +746,11 @@ impl<'a> QueryInterpreter<'a> {
                     // W5A-T4: bloom_pass is now a packed Bitmap (1 bit/row).
                     if !bloom_pass.get(idx) {
                         if jt == JoinType2::Left && !swapped {
-                            for (c, col) in left.columns.iter().enumerate() {
-                                local_out[c].push(col[p]);
-                            }
-                            for c in 0..right.columns.len() {
-                                local_out[left_ncol + c].push(0);
-                            }
+                            // W23-T1: Only collect index pairs. Column values
+                            // are gathered after the probe loop via run-length
+                            // fill. u32::MAX = unmatched (LEFT JOIN null right).
                             left_src_idx.push(p as u32);
-                            right_src_idx.push(0);
+                            right_src_idx.push(u32::MAX);
                         }
                         continue;
                     }
@@ -762,91 +758,103 @@ impl<'a> QueryInterpreter<'a> {
                     build_hash.probe_all(probe_key, &mut matched_rows);
                     if matched_rows.is_empty() {
                         if jt == JoinType2::Left && !swapped {
-                            for (c, col) in left.columns.iter().enumerate() {
-                                local_out[c].push(col[p]);
-                            }
-                            for c in 0..right.columns.len() {
-                                local_out[left_ncol + c].push(0);
-                            }
                             left_src_idx.push(p as u32);
-                            right_src_idx.push(0);
+                            right_src_idx.push(u32::MAX);
                         }
                     } else {
-                        // Pre-compute left column values for this probe row (shared across all matches).
-                        // This avoids re-reading left.columns for each match.
-                        let left_vals: Vec<u64> = if !swapped {
-                            left.columns.iter().map(|col| col[p]).collect()
-                        } else {
-                            Vec::new()
-                        };
-                        let right_vals_template: Vec<u64> = if swapped {
-                            right.columns.iter().map(|col| col[p]).collect()
-                        } else {
-                            Vec::new()
-                        };
+                        // W23-T1: Only collect (probe_idx, build_idx) pairs.
+                        // This reduces per-match work from O(n_cols) pushes to
+                        // O(1) pushes. Columns are gathered at the end.
                         for &b in &matched_rows {
-                            let b = b as usize;
                             if !swapped {
-                                // Left cols from probe (same for all matches), right cols from build.
-                                for (c, &v) in left_vals.iter().enumerate() {
-                                    local_out[c].push(v);
-                                }
-                                for (c, col) in right.columns.iter().enumerate() {
-                                    local_out[left_ncol + c].push(col[b]);
-                                }
                                 left_src_idx.push(p as u32);
-                                right_src_idx.push(b as u32);
+                                right_src_idx.push(b);
                             } else {
-                                // Left cols from build, right cols from probe (same for all matches).
-                                for (c, col) in left.columns.iter().enumerate() {
-                                    local_out[c].push(col[b]);
-                                }
-                                for (c, &v) in right_vals_template.iter().enumerate() {
-                                    local_out[left_ncol + c].push(v);
-                                }
-                                left_src_idx.push(b as u32);
+                                left_src_idx.push(b);
                                 right_src_idx.push(p as u32);
                             }
                         }
                     }
                 }
-                (local_out, left_src_idx, right_src_idx)
+                (left_src_idx, right_src_idx)
             })
             .collect::<Vec<_>>();
 
-        // Merge: pre-calculate total size to avoid reallocation.
-        // W5B-T3: Allocate the merged output column buffers from the per-query
-        // arena (bump-allocated — pointer bump vs ~50ns malloc per column).
-        // The arena slices are filled via copy_from_slice from each chunk's
-        // partial results, then converted to owned `Arc<Vec<u64>>` for the
-        // ExecTable at the end (ExecTable.columns requires owned data for
-        // Arc sharing across later pipeline stages; a future task may change
-        // the column type to `Arc<[u64]>` and have the ExecTable own the
-        // arena to enable zero-copy output).
-        //
-        // The per-chunk `local_out` buffers (inside the rayon closure above)
-        // remain `Vec<Vec<u64>>` — the arena win there is marginal since
-        // they're reused across rows within a chunk, and migrating them would
-        // require either self-referential partial-result tuples (unsafe) or
-        // a copy-out that negates the arena savings.
-        let total_rows: usize =
-            partial_results.iter().map(|r| r.0.first().map(|c| c.len()).unwrap_or(0)).sum();
+        // W23-T1: Merge — concatenate index pairs, then gather column values.
+        // This replaces the per-chunk local_out copy with a single gather pass
+        // per column. All columns are guaranteed to have the same length
+        // (the number of match pairs) because gather uses the same index arrays.
+        let total_rows: usize = partial_results.iter().map(|(li, _)| li.len()).sum();
         let arena = self.arena();
         let mut out_cols: Vec<&mut [u64]> =
             (0..ncol).map(|_| arena.alloc_slice(total_rows)).collect();
-        let mut out_lens: Vec<usize> = vec![0; ncol];
+        // Concatenate all index pairs.
         let mut all_left_idx: Vec<u32> = Vec::with_capacity(total_rows);
         let mut all_right_idx: Vec<u32> = Vec::with_capacity(total_rows);
-        for (local_out, li, ri) in partial_results {
-            for c in 0..ncol {
-                let len = local_out[c].len();
-                out_cols[c][out_lens[c]..out_lens[c] + len].copy_from_slice(&local_out[c]);
-                out_lens[c] += len;
-            }
+        for (li, ri) in partial_results {
             all_left_idx.extend_from_slice(&li);
             all_right_idx.extend_from_slice(&ri);
         }
-        let row_count = out_lens.first().copied().unwrap_or(0);
+        let row_count = all_left_idx.len();
+
+        // W23-T1: Gather left columns using run-length fill.
+        // Left output columns always come from left.columns.
+        // When !swapped: all_left_idx has probe row indices (into left.columns)
+        // When swapped: all_left_idx has build row indices (into left.columns)
+        // Either way, left.columns is the source and all_left_idx is the index array.
+        // u32::MAX sentinel = unmatched LEFT JOIN row → fill with 0.
+        let left_ncol_snap = left_ncol;
+        for c in 0..left_ncol_snap {
+            let src = &left.columns[c];
+            let gather_idx = &all_left_idx;
+            let dst = &mut out_cols[c];
+            let n = gather_idx.len();
+            let mut i = 0;
+            while i < n {
+                let idx = gather_idx[i];
+                if idx == u32::MAX {
+                    // Unmatched LEFT JOIN row — fill with 0.
+                    let mut run_end = i + 1;
+                    while run_end < n && gather_idx[run_end] == u32::MAX {
+                        run_end += 1;
+                    }
+                    let run_len = run_end - i;
+                    for j in 0..run_len {
+                        dst[i + j] = 0;
+                    }
+                    i = run_end;
+                } else {
+                    let val = src[idx as usize];
+                    // Count run length of same index value.
+                    let mut run_end = i + 1;
+                    while run_end < n && gather_idx[run_end] == idx {
+                        run_end += 1;
+                    }
+                    let run_len = run_end - i;
+                    // Fill — sequential writes (memset-like).
+                    for j in 0..run_len {
+                        dst[i + j] = val;
+                    }
+                    i = run_end;
+                }
+            }
+        }
+
+        // W23-T1: Gather right columns using direct index lookup.
+        // Right output columns always come from right.columns.
+        // When !swapped: all_right_idx has build row indices (into right.columns)
+        // When swapped: all_right_idx has probe row indices (into right.columns)
+        let right_ncol = right.columns.len();
+        for c in 0..right_ncol {
+            let src = &right.columns[c];
+            let gather_idx = &all_right_idx;
+            let dst = &mut out_cols[left_ncol_snap + c];
+            for (i, &idx) in gather_idx.iter().enumerate() {
+                dst[i] = if idx == u32::MAX { 0 } else { src[idx as usize] };
+            }
+        }
+
+        let mut out_lens: Vec<usize> = vec![row_count; ncol];
 
         let mut col_map = new_hashmap();
         for (i, name) in out_names.iter().enumerate() {
