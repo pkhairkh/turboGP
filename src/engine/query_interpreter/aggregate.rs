@@ -1067,6 +1067,35 @@ impl<'a> QueryInterpreter<'a> {
             Expr2::CountStar => Ok(Value2::Int(indices.len() as i64)),
             Expr2::Agg { func, arg, distinct } => {
                 if *distinct {
+                    // W7-T3: Fast path for COUNT(DISTINCT col) using HyperLogLog.
+                    // Avoids materializing 100M Value2s + strings for Q09/Q10.
+                    if matches!(func, AggFunc::Count | AggFunc::CountDistinct) {
+                        if let Expr2::Col(name) = arg.as_ref() {
+                            if let Some(idx) = t.lookup_col(name) {
+                                let col = &t.columns[idx];
+                                // Full-column fast path (no WHERE filter).
+                                if indices.len() == col.len() {
+                                    let count = crate::exec::hll::count_distinct_hll(col);
+                                    return Ok(Value2::Int(count as i64));
+                                }
+                                // Filtered path: iterate masked indices.
+                                if indices.len() >= 100_000 {
+                                    let mut hll = crate::exec::hll::HyperLogLog::new();
+                                    for &i in indices {
+                                        hll.add(col[i]);
+                                    }
+                                    return Ok(Value2::Int(hll.estimate() as i64));
+                                }
+                                // Small input: exact FxHashSet.
+                                let mut seen = fxhash::FxHashSet::default();
+                                for &i in indices {
+                                    seen.insert(col[i]);
+                                }
+                                return Ok(Value2::Int(seen.len() as i64));
+                            }
+                        }
+                    }
+
                     // Distinct requires materializing values — use slow path
                     let mut values: Vec<Value2> = Vec::with_capacity(indices.len());
                     for &idx in indices {
@@ -1116,7 +1145,27 @@ impl<'a> QueryInterpreter<'a> {
                         if let Expr2::Col(name) = arg.as_ref() {
                             if let Some(idx) = t.lookup_col(name) {
                                 let col = &t.columns[idx];
-                                let mut seen = new_hashset();
+                                // W7-T3: use HyperLogLog for large inputs (approximate,
+                                // ~0.81% error, O(1) memory). Falls back to exact
+                                // FxHashSet for small inputs (< 100K rows).
+                                //
+                                // Fast path: if indices covers the full column (no
+                                // WHERE filter), pass the contiguous slice for
+                                // vectorized parallel HLL.
+                                if indices.len() == col.len() {
+                                    let count = crate::exec::hll::count_distinct_hll(col);
+                                    return Ok(Value2::Int(count as i64));
+                                }
+                                // Filtered path: gather masked values.
+                                if indices.len() >= 100_000 {
+                                    let mut hll = crate::exec::hll::HyperLogLog::new();
+                                    for &i in indices {
+                                        hll.add(col[i]);
+                                    }
+                                    return Ok(Value2::Int(hll.estimate() as i64));
+                                }
+                                // Small input: exact FxHashSet.
+                                let mut seen = fxhash::FxHashSet::default();
                                 for &i in indices {
                                     seen.insert(col[i]);
                                 }

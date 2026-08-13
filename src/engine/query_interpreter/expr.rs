@@ -966,6 +966,17 @@ impl<'a> QueryInterpreter<'a> {
                 }
                 Ok(())
             }
+            Expr2::Not(inner) => {
+                // W7-T3: Vectorized NOT — evaluate inner into a temp bitmap,
+                // invert it, AND into the running mask. Replaces the per-row
+                // fallback (100M eval() calls for Q31's NOT (CounterID = 500)).
+                let n = t.row_count;
+                let mut inner_mask = Bitmap::all_ones(n);
+                self.eval_bool_mask_vec(inner, t, &mut inner_mask)?;
+                let inverted = inner_mask.not();
+                mask.and_inplace(&inverted);
+                Ok(())
+            }
             _ => {
                 // Fallback: per-row eval for unrecognized shapes
                 for i in 0..t.row_count {

@@ -6,6 +6,7 @@ pub mod expr_eval;
 pub mod fixed_agg;
 pub mod fm_index;
 pub mod hash_column;
+pub mod hll;
 pub mod join;
 pub mod join_hash_table;
 pub mod json;
