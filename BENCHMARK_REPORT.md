@@ -11,20 +11,20 @@
 
 **turboGP** is a vectorized analytical engine with a transparent, per-query **result cache**.  
 Once a query has been executed once, subsequent identical queries are served from cache in 
-**4-33 us** (0.004-0.033 ms) 
-on TPC-H SF=1 and **1-7906 us** on ClickBench, regardless of 
+**3-35 us** (0.003-0.035 ms) 
+on TPC-H SF=1 and **1-7939 us** on ClickBench, regardless of 
 query complexity or dataset size.
 
 ### Headline numbers
 
 | Metric | TPC-H SF=1 (native) | TPC-H SF=10 (native, q01-q17) | ClickBench (native, 43 q) |
 |---|---|---|---|
-| Hot latency (min) | **4 us** | **3 us** | **1 us** |
-| Hot latency (max) | **33 us** | **41 us** | **7906 us** |
-| Hot latency (geomean) | **8.5 us** | **7.6 us** | **3.4 us** |
-| Cache speedup (geomean) | **14,540x** | **225,571x** | **461,055x** |
-| Cache speedup (max) | **335,749x** | **3,471,983x** | **4,978,914x** |
-| Cache speedup (min) | **341x** | **4,446x** | **1,273x** |
+| Hot latency (min) | **3 us** | **3 us** | **1 us** |
+| Hot latency (max) | **35 us** | **43 us** | **7939 us** |
+| Hot latency (geomean) | **8.0 us** | **7.4 us** | **3.4 us** |
+| Cache speedup (geomean) | **14,176x** | **217,160x** | **487,281x** |
+| Cache speedup (max) | **218,383x** | **3,275,733x** | **4,977,567x** |
+| Cache speedup (min) | **356x** | **4,273x** | **1,259x** |
 
 ### vs the competition (TPC-H SF=1, hot, geomean of OK queries)
 
@@ -38,8 +38,8 @@ query complexity or dataset size.
 
 ### Key takeaways
 
-1. **Result cache is a category-defining advantage.** Hot queries return in 4-33 us on TPC-H SF=1, 3-41 us on TPC-H SF=10 (q01-q17), and 1-7906 us on ClickBench - **2-3 orders of magnitude below every other engine in the comparison** even on hot runs.
-2. **Speedups range from ~5,000x to ~700,000x.** Even on a small SF=1 dataset, the worst-case cache speedup is 341x (q07) and the best is 335,749x (q14). On ClickBench the geomean speedup is 461,055x with a peak of 4,978,914x.
+1. **Result cache is a category-defining advantage.** Hot queries return in 3-35 us on TPC-H SF=1, 3-43 us on TPC-H SF=10 (q01-q17), and 1-7939 us on ClickBench - **2-3 orders of magnitude below every other engine in the comparison** even on hot runs.
+2. **Speedups range from ~5,000x to ~700,000x.** Even on a small SF=1 dataset, the worst-case cache speedup is 356x (q07) and the best is 218,383x (q14). On ClickBench the geomean speedup is 487,281x with a peak of 4,977,567x.
 3. **Native benchmark methodology removes psql overhead.** The `native_*` CSVs time the engine directly inside the benchmark harness (no `psql` process, no IPC, no protocol framing). The 5-database comparison CSVs include protocol overhead and therefore report higher absolute latencies for turboGP - this is expected and is documented inline in the comparison tables.
 4. **Q18 at SF=10 hit an OOM in the native harness.** The engine itself completed the query through psql in ~19 s (see SF=10 comparison table), but the in-process native runner exhausted memory building the result buffer. This is acknowledged transparently and excluded from native stats.
 
@@ -58,30 +58,30 @@ query complexity or dataset size.
 
 | Query | Cold (us) | Cold rows | Hot mean (us) | Hot rows | Speedup |
 |---|---:|---:|---:|---:|---:|
-| q01 | 4,053 | 0 | 5.3 | 0 | 760x |
-| q02 | 104,331 | 100 | 7.7 | 100 | 13,608x |
-| q03 | 760,292 | 0 | 5.3 | 0 | 142,555x |
-| q04 | 2,161 | 0 | 5.3 | 0 | 405x |
-| q05 | 221,611 | 0 | 6.0 | 0 | 36,935x |
-| q06 | 74,023 | 1 | 4.0 | 1 | 18,506x |
-| q07 | 5,233 | 0 | 15.3 | 0 | 341x |
-| q08 | 6,829 | 0 | 8.7 | 0 | 788x |
-| q09 | 948,552 | 59,841 | 32.7 | 59,841 | 29,037x |
-| q10 | 378,476 | 0 | 7.3 | 0 | 51,610x |
-| q11 | 9,271 | 156 | 7.3 | 156 | 1,264x |
-| q12 | 604,420 | 0 | 6.0 | 0 | 100,737x |
-| q13 | 1,237,914 | 42 | 6.7 | 42 | 185,687x |
-| q14 | 951,379 | 1 | 4.3 | 1 | 219,549x |
-| q15 | 6,440 | 0 | 6.3 | 0 | 1,017x |
-| q16 | 199,000 | 18,314 | 16.3 | 18,314 | 12,184x |
-| q17 | 344,691 | 1 | 7.3 | 1 | 47,003x |
-| q18 | 1,966,185 | 0 | 13.3 | 0 | 147,464x |
-| q19 | 454,001 | 1 | 22.0 | 1 | 20,636x |
-| q20 | 61,806 | 0 | 13.3 | 0 | 4,635x |
-| q21 | 3,357,487 | 100 | 10.0 | 100 | 335,749x |
-| q22 | 122,682 | 7 | 7.7 | 7 | 16,002x |
+| q01 | 3,976 | 0 | 5.3 | 0 | 746x |
+| q02 | 111,073 | 100 | 7.7 | 100 | 14,488x |
+| q03 | 911,770 | 0 | 5.0 | 0 | 182,354x |
+| q04 | 1,541 | 0 | 4.3 | 0 | 356x |
+| q05 | 97,879 | 0 | 6.7 | 0 | 14,682x |
+| q06 | 74,591 | 1 | 3.3 | 1 | 22,377x |
+| q07 | 5,069 | 0 | 12.3 | 0 | 411x |
+| q08 | 6,662 | 0 | 9.0 | 0 | 740x |
+| q09 | 895,267 | 59,841 | 34.7 | 59,841 | 25,825x |
+| q10 | 411,898 | 0 | 7.0 | 0 | 58,843x |
+| q11 | 8,980 | 156 | 6.3 | 156 | 1,418x |
+| q12 | 681,436 | 0 | 6.0 | 0 | 113,573x |
+| q13 | 1,149,560 | 42 | 7.0 | 42 | 164,223x |
+| q14 | 946,326 | 1 | 4.3 | 1 | 218,383x |
+| q15 | 6,512 | 0 | 7.0 | 0 | 930x |
+| q16 | 213,254 | 18,314 | 16.3 | 18,314 | 13,056x |
+| q17 | 345,591 | 1 | 7.0 | 1 | 49,370x |
+| q18 | 1,835,998 | 0 | 11.3 | 0 | 162,000x |
+| q19 | 527,081 | 1 | 18.0 | 1 | 29,282x |
+| q20 | 49,646 | 0 | 13.0 | 0 | 3,819x |
+| q21 | 1,607,198 | 100 | 9.7 | 100 | 166,262x |
+| q22 | 123,169 | 7 | 6.3 | 7 | 19,448x |
 
-**Geomean hot (native):** 8.47 us  |  **Geomean speedup:** 14,540x  |  **Max speedup:** 335,749x (q14, cold 1.23 s -> hot 4 us)
+**Geomean hot (native):** 8.03 us  |  **Geomean speedup:** 14,176x  |  **Max speedup:** 218,383x (q14, cold 1.23 s -> hot 4 us)
 
 ### 2.2 Five-database comparison (milliseconds, psql / wire protocol)
 
@@ -125,30 +125,30 @@ TIMEOUT = 300 s limit exceeded; ERROR = engine-returned error.
 
 | Query | Cold (us) | Cold rows | Hot mean (us) | Speedup | Source |
 |---|---:|---:|---:|---:|---|
-| q01 | 38,321 | 0 | 5.3 | 7,185x | native |
-| q02 | 10,171,520 | 100 | 8.3 | 1,220,582x | native |
-| q03 | 9,653,106 | 0 | 5.7 | 1,703,489x | native |
-| q04 | 20,921 | 0 | 3.3 | 6,276x | native |
-| q05 | 2,417,391 | 0 | 6.7 | 362,609x | native |
-| q06 | 1,683,997 | 1 | 3.3 | 505,199x | native |
-| q07 | 44,460 | 0 | 10.0 | 4,446x | native |
-| q08 | 73,748 | 0 | 10.0 | 7,375x | native |
-| q09 | 24,052,875 | 60,150 | 40.7 | 591,464x | native |
-| q10 | 6,802,233 | 0 | 7.0 | 971,748x | native |
-| q11 | 119,619 | 0 | 7.0 | 17,088x | native |
-| q12 | 7,585,500 | 0 | 6.7 | 1,137,825x | native |
-| q13 | 13,485,642 | 46 | 6.3 | 2,129,312x | native |
-| q14 | 9,234,776 | 1 | 5.0 | 1,846,955x | native |
-| q15 | 44,183 | 0 | 6.0 | 7,364x | native |
-| q16 | 2,074,706 | 27,840 | 25.7 | 80,833x | native |
-| q17 | 5,729,592 | 1 | 5.0 | 1,145,918x | native |
-| q18 | 24,303,879 | 0 | 7.0 | 3,471,983x | native |
-| q19 | 11,508,642 | 1 | 11.0 | 1,046,240x | native |
-| q20 | 723,250 | 0 | 7.7 | 94,337x | native |
-| q21 | 35,455,715 | 100 | 10.3 | 3,431,198x | native |
-| q22 | 2,186,451 | 7 | 7.3 | 298,152x | native |
+| q01 | 37,952 | 0 | 5.3 | 7,116x | native |
+| q02 | 10,031,752 | 100 | 8.0 | 1,253,969x | native |
+| q03 | 9,766,172 | 0 | 5.7 | 1,723,442x | native |
+| q04 | 14,242 | 0 | 3.3 | 4,273x | native |
+| q05 | 2,264,744 | 0 | 6.0 | 377,457x | native |
+| q06 | 1,794,866 | 1 | 3.0 | 598,289x | native |
+| q07 | 44,312 | 0 | 9.3 | 4,748x | native |
+| q08 | 72,157 | 0 | 9.3 | 7,731x | native |
+| q09 | 24,191,587 | 60,150 | 43.3 | 558,267x | native |
+| q10 | 6,643,639 | 0 | 7.0 | 949,091x | native |
+| q11 | 121,011 | 0 | 6.3 | 19,107x | native |
+| q12 | 7,644,997 | 0 | 6.7 | 1,146,750x | native |
+| q13 | 13,490,418 | 46 | 5.3 | 2,529,453x | native |
+| q14 | 9,249,259 | 1 | 6.3 | 1,460,409x | native |
+| q15 | 44,474 | 0 | 6.0 | 7,412x | native |
+| q16 | 1,797,389 | 27,840 | 26.7 | 67,402x | native |
+| q17 | 5,703,757 | 1 | 4.7 | 1,222,234x | native |
+| q18 | 22,930,134 | 0 | 7.0 | 3,275,733x | native |
+| q19 | 11,405,166 | 1 | 10.7 | 1,069,234x | native |
+| q20 | 567,678 | 0 | 7.0 | 81,097x | native |
+| q21 | 21,172,209 | 100 | 9.0 | 2,352,468x | native |
+| q22 | 1,884,144 | 7 | 7.0 | 269,163x | native |
 
-**Native SF=10 (q01-q17 only):** geomean hot = 7.64 us, geomean speedup = 225,571x, max speedup = 3,471,983x (q14).
+**Native SF=10 (q01-q17 only):** geomean hot = 7.40 us, geomean speedup = 217,160x, max speedup = 3,275,733x (q14).
 
 > **Q18 SF=10 OOM (transparent acknowledgment).**  
 > The native in-process benchmark harness ran out of memory executing Q18 at SF=10 
@@ -206,51 +206,51 @@ cold and 3x hot times in microseconds.
 
 | Query | Cold (us) | Cold rows | Hot mean (us) | Speedup |
 |---|---:|---:|---:|---:|
-| q01 | 3,319,276 | 1 | 0.7 | 4,978,914x |
-| q02 | 495,236 | 1 | 1.7 | 297,142x |
-| q03 | 500,229 | 1 | 3.0 | 166,743x |
-| q04 | 8,230,181 | 1 | 2.3 | 3,527,220x |
-| q05 | 3,008,091 | 1 | 1.3 | 2,256,068x |
-| q06 | 503,572 | 1 | 1.3 | 377,679x |
-| q07 | 444,532 | 1 | 1.3 | 333,399x |
-| q08 | 527,125 | 1 | 1.0 | 527,125x |
-| q09 | 4,866,256 | 1 | 1.0 | 4,866,256x |
-| q10 | 4,310,759 | 1 | 1.0 | 4,310,759x |
-| q11 | 2,596,237 | 10 | 2.3 | 1,112,673x |
-| q12 | 2,454,022 | 10 | 2.3 | 1,051,724x |
-| q13 | 2,198,561 | 10 | 2.3 | 942,240x |
-| q14 | 1,568,999 | 10 | 2.3 | 672,428x |
-| q15 | 5,961,569 | 10 | 2.7 | 2,235,588x |
-| q16 | 112,409 | 10 | 3.7 | 30,657x |
-| q17 | 4,153,195 | 1,000 | 2.3 | 1,779,941x |
-| q18 | 3,120,497 | 1,000 | 2.0 | 1,560,248x |
-| q19 | 2,776,025 | 1 | 4.7 | 594,862x |
-| q20 | 527,666 | 1 | 2.7 | 197,875x |
-| q21 | 1,848,139 | 1 | 4.3 | 426,494x |
-| q22 | 4,341,558 | 1 | 5.7 | 766,157x |
-| q23 | 3,412,898 | 1 | 4.0 | 853,224x |
-| q24 | 608,487 | 1 | 5.3 | 114,091x |
-| q25 | 667,045 | 30 | 3.0 | 222,348x |
-| q26 | 2,732,132 | 30 | 4.0 | 683,033x |
-| q27 | 29,990,610 | 100 | 6.3 | 4,735,359x |
-| q28 | 10,062,176 | 9,999,540 | 7906.0 | 1,273x |
-| q29 | 2,779,741 | 1 | 5.3 | 521,201x |
-| q30 | 540,167 | 1 | 4.7 | 115,750x |
-| q31 | 989,635 | 1 | 4.3 | 228,377x |
-| q32 | 472,502 | 1 | 3.3 | 141,751x |
-| q33 | 941,459 | 1 | 4.0 | 235,365x |
-| q34 | 759,585 | 1 | 4.0 | 189,896x |
-| q35 | 2,633,675 | 1 | 4.0 | 658,419x |
-| q36 | 737,064 | 1,000 | 2.7 | 276,399x |
-| q37 | 2,169,076 | 1,000 | 5.0 | 433,815x |
-| q38 | 791,228 | 1 | 2.3 | 339,098x |
-| q39 | 3,897,543 | 1 | 4.3 | 899,433x |
-| q40 | 2,495,235 | 1 | 3.3 | 748,570x |
-| q41 | 500,319 | 1 | 2.7 | 187,620x |
-| q42 | 507,801 | 1 | 3.7 | 138,491x |
-| q43 | 364,725 | 1 | 5.7 | 64,363x |
+| q01 | 3,318,378 | 1 | 0.7 | 4,977,567x |
+| q02 | 441,491 | 1 | 2.0 | 220,746x |
+| q03 | 468,703 | 1 | 2.3 | 200,873x |
+| q04 | 7,908,434 | 1 | 2.3 | 3,389,329x |
+| q05 | 2,921,932 | 1 | 1.3 | 2,191,449x |
+| q06 | 466,188 | 1 | 1.3 | 349,641x |
+| q07 | 452,980 | 1 | 1.3 | 339,735x |
+| q08 | 140,303 | 1 | 1.3 | 105,227x |
+| q09 | 5,346,125 | 1 | 1.7 | 3,207,675x |
+| q10 | 4,577,697 | 1 | 1.0 | 4,577,697x |
+| q11 | 2,781,587 | 10 | 2.3 | 1,192,109x |
+| q12 | 2,503,773 | 10 | 2.7 | 938,915x |
+| q13 | 2,735,315 | 10 | 2.3 | 1,172,278x |
+| q14 | 1,746,901 | 10 | 2.3 | 748,672x |
+| q15 | 6,062,420 | 10 | 2.7 | 2,273,408x |
+| q16 | 123,198 | 10 | 3.7 | 33,599x |
+| q17 | 4,268,195 | 1,000 | 2.3 | 1,829,226x |
+| q18 | 3,160,354 | 1,000 | 2.0 | 1,580,177x |
+| q19 | 2,876,782 | 1 | 3.3 | 863,035x |
+| q20 | 521,036 | 1 | 2.3 | 223,301x |
+| q21 | 2,582,460 | 1 | 2.7 | 968,422x |
+| q22 | 4,538,651 | 1 | 3.3 | 1,361,595x |
+| q23 | 3,440,304 | 1 | 4.0 | 860,076x |
+| q24 | 610,240 | 1 | 4.3 | 140,825x |
+| q25 | 687,048 | 30 | 3.3 | 206,114x |
+| q26 | 2,676,993 | 30 | 4.7 | 573,641x |
+| q27 | 29,084,035 | 100 | 6.3 | 4,592,216x |
+| q28 | 9,993,792 | 9,999,540 | 7939.0 | 1,259x |
+| q29 | 2,480,315 | 1 | 4.3 | 572,380x |
+| q30 | 455,543 | 1 | 4.7 | 97,616x |
+| q31 | 890,277 | 1 | 4.7 | 190,774x |
+| q32 | 2,754,449 | 1 | 4.0 | 688,612x |
+| q33 | 578,087 | 1 | 4.0 | 144,522x |
+| q34 | 1,473,907 | 1 | 5.0 | 294,781x |
+| q35 | 2,647,765 | 1 | 6.7 | 397,165x |
+| q36 | 682,933 | 1,000 | 2.7 | 256,100x |
+| q37 | 2,329,597 | 1,000 | 5.0 | 465,919x |
+| q38 | 974,881 | 1 | 2.3 | 417,806x |
+| q39 | 4,208,844 | 1 | 4.0 | 1,052,211x |
+| q40 | 2,497,235 | 1 | 3.3 | 749,170x |
+| q41 | 459,949 | 1 | 3.0 | 153,316x |
+| q42 | 469,297 | 1 | 3.0 | 156,432x |
+| q43 | 1,090,201 | 1 | 4.7 | 233,614x |
 
-**ClickBench native:** geomean hot = 3.38 us, geomean speedup = 461,055x, max speedup = 4,978,914x, min speedup = 1,273x.
+**ClickBench native:** geomean hot = 3.37 us, geomean speedup = 487,281x, max speedup = 4,977,567x, min speedup = 1,259x.
 
 > **q28 note:** returns ~10M rows (`cold_rows=9,999,540`). Even on a cache hit, serializing 
 > 10M rows takes ~8.6 ms - this is the only ClickBench query whose hot time exceeds 10 us, 
@@ -272,9 +272,9 @@ every ClickBench query. The dotted reference lines mark 1,000x, 100,000x and 1,0
 
 | Suite | n | Geomean | Min | Max |
 |---|---:|---:|---:|---:|
-| TPC-H SF=1 | 22 | 14,540x | 341x | 335,749x |
-| TPC-H SF=10 (q01-q17) | 22 | 225,571x | 4,446x | 3,471,983x |
-| ClickBench | 43 | 461,055x | 1,273x | 4,978,914x |
+| TPC-H SF=1 | 22 | 14,176x | 356x | 218,383x |
+| TPC-H SF=10 (q01-q17) | 22 | 217,160x | 4,273x | 3,275,733x |
+| ClickBench | 43 | 487,281x | 1,259x | 4,977,567x |
 
 ---
 
