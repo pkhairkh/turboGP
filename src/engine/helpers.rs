@@ -992,6 +992,56 @@ pub(crate) fn deduplicate_rows(result: QueryResult) -> QueryResult {
     if result.row_count <= 1 {
         return result;
     }
+
+    // W16-T1: Sort-based dedup for single-column case.
+    // The HashSet<Vec<u64>> approach allocates a Vec per row (100M allocs
+    // for Q39) and does random-access HashSet insertions. For single-column
+    // results, sort + remove consecutive duplicates is O(n log n) with
+    // sequential access — much faster.
+    if result.columns.len() == 1 && result.columns[0].string_values.is_none() {
+        use rayon::prelude::*;
+        let col = &result.columns[0];
+        let n = result.row_count;
+        // Build (value, original_index) pairs, sort by value.
+        let mut pairs: Vec<(u64, u32)> = (0..n)
+            .map(|i| (col.values.get(i).copied().unwrap_or(0), i as u32))
+            .collect();
+        pairs.par_sort_unstable_by_key(|(v, _)| *v);
+        // Keep first occurrence of each value (preserve original order among
+        // duplicates by keeping the smallest original index per value).
+        let mut keep_indices: Vec<usize> = Vec::new();
+        if !pairs.is_empty() {
+            let mut cur_val = pairs[0].0;
+            let mut cur_min_idx = pairs[0].1 as usize;
+            for &(v, idx) in &pairs[1..] {
+                if v == cur_val {
+                    if (idx as usize) < cur_min_idx {
+                        cur_min_idx = idx as usize;
+                    }
+                } else {
+                    keep_indices.push(cur_min_idx);
+                    cur_val = v;
+                    cur_min_idx = idx as usize;
+                }
+            }
+            keep_indices.push(cur_min_idx);
+        }
+        // Sort keep_indices to preserve original row order.
+        keep_indices.sort_unstable();
+        let new_row_count = keep_indices.len();
+        let columns: Vec<ResultColumn> = result
+            .columns
+            .into_iter()
+            .map(|mut c| {
+                let new_values: Vec<u64> =
+                    keep_indices.iter().map(|&i| c.values.get(i).copied().unwrap_or(0)).collect();
+                c.values = new_values;
+                c
+            })
+            .collect();
+        return QueryResult { columns, row_count: new_row_count, elapsed_us: result.elapsed_us };
+    }
+
     use std::collections::HashSet;
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
     let mut keep_indices: Vec<usize> = Vec::with_capacity(result.row_count);
