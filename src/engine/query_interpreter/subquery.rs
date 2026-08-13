@@ -1143,8 +1143,7 @@ impl<'a> QueryInterpreter<'a> {
         // W6A-T1: profile the one-time multi-column EXISTS HashMap build.
         // Q21 hits this path (l_orderkey + l_suppkey correlation).
         let _g = PROFILER.section(Phase::Exists);
-        let _dbg_start = std::time::Instant::now();
-        let mut tables: Vec<ExecTable> = Vec::new();
+                let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
             tables.push(self.resolve_from_item(item)?);
         }
@@ -1153,8 +1152,7 @@ impl<'a> QueryInterpreter<'a> {
         } else {
             self.plan_join_dp(tables, &subquery.where_clause)?
         };
-        let _dbg_resolve = _dbg_start.elapsed();
-        // W2: evaluate each conjunct directly into `mask` (the simplified
+                // W2: evaluate each conjunct directly into `mask` (the simplified
         // AND/OR arms in `eval_bool_mask_vec` preserve the incoming mask).
         // W5A-T2: `mask` is a packed Bitmap.
         let mask = if let Some(ref wc) = subquery.where_clause {
@@ -1170,8 +1168,7 @@ impl<'a> QueryInterpreter<'a> {
         } else {
             Bitmap::all_ones(base.row_count)
         };
-        let _dbg_mask = _dbg_start.elapsed() - _dbg_resolve;
-        let eq_col = &base.columns[inner_eq_idx];
+                let eq_col = &base.columns[inner_eq_idx];
         let neq_col = &base.columns[inner_neq_idx];
         let n = base.row_count;
 
@@ -1188,8 +1185,7 @@ impl<'a> QueryInterpreter<'a> {
         // and the direct path is faster. For Q21 (max_eq=6M), this routes
         // to the HashMap path which has ~1.5M entries (24MB, L3-resident).
         const DIRECT_INDEX_MAX: usize = 2_000_000; // ~32 MB cap at 16 B/entry
-        let _dbg_max_start = std::time::Instant::now();
-        let mut max_eq: u64 = 0;
+                let mut max_eq: u64 = 0;
         for i in 0..n {
             if mask.get(i) {
                 let k = eq_col[i];
@@ -1198,14 +1194,10 @@ impl<'a> QueryInterpreter<'a> {
                 }
             }
         }
-        let _dbg_max = _dbg_max_start.elapsed();
-        if (max_eq as usize) < DIRECT_INDEX_MAX {
-            let _dbg_alloc_start = std::time::Instant::now();
-            let cap = (max_eq as usize).saturating_add(1);
+                if (max_eq as usize) < DIRECT_INDEX_MAX {
+                        let cap = (max_eq as usize).saturating_add(1);
             let mut vec: Vec<ExistsSummary> = vec![ExistsSummary::default(); cap];
-            let _dbg_alloc = _dbg_alloc_start.elapsed();
-            let _dbg_build_start = std::time::Instant::now();
-            // Iterate set bits via the Bitmap's bit iterator so we skip
+                                    // Iterate set bits via the Bitmap's bit iterator so we skip
             // masked-out rows without re-checking the mask per iteration.
             for i in mask.iter_set_bits() {
                 let k = eq_col[i] as usize;
@@ -1213,18 +1205,8 @@ impl<'a> QueryInterpreter<'a> {
                 // set-bit rows), and cap == max_eq + 1.
                 vec[k].add(neq_col[i]);
             }
-            let _dbg_build = _dbg_build_start.elapsed();
-            eprintln!(
-                "[w31-dbg] build_exists_multi_map: n={}, max_eq={}, cap={}, \
-                 resolve={:?}, mask={:?}, max={:?}, alloc={:?}, build={:?}",
-                n, max_eq, cap, _dbg_resolve, _dbg_mask, _dbg_max, _dbg_alloc, _dbg_build
-            );
             return Ok(ExistsMultiMap::Direct(vec));
         }
-        eprintln!(
-            "[w31-dbg] build_exists_multi_map: FALLBACK to HashMap (max_eq={}, n={})",
-            max_eq, n
-        );
 
         // ---- Fallback: parallel HashMap build (large/sparse eq_key range) ----
         // Each chunk builds a local HashMap, then merge via `ExistsSummary::merge`.

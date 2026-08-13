@@ -85,10 +85,12 @@ impl<'a> QueryInterpreter<'a> {
             for conj in conjuncts {
                 let referenced = self.expr_table_refs(conj, &tables);
                 if referenced.len() == 1 && referenced.contains(&i) {
+                    let before = tables[i].row_count;
                     // W5A-T2: `build_mask` returns a packed Bitmap;
                     // `iter_set_bits()` skips filtered rows with tzcnt.
                     let mask = self.build_mask(conj, &tables[i])?;
                     let indices: Vec<usize> = mask.iter_set_bits().collect();
+                    eprintln!("DBG filter table[{}] conj={:?} before={} pass={}", i, conj, before, indices.len());
                     tables[i] = self.filter_table(&tables[i], &indices);
                 }
             }
@@ -163,7 +165,12 @@ impl<'a> QueryInterpreter<'a> {
         // overhead exceeds the probe savings. Q9's 6-table join benefits
         // from filtering lineitem before the multi-way join.
         if n < 5 { return tables; }
-        const SMALL_THRESHOLD: usize = 100_000;
+        // W31-T3: Raised SMALL_THRESHOLD from 100k to 500k. Q5's orders table
+        // after date filtering is ~230k rows. With the old 100k threshold,
+        // orders→lineitem bloom pushdown was skipped, forcing the join to
+        // probe 6M lineitem rows. With 500k, orders qualifies and lineitem
+        // is pre-filtered to ~300k rows, saving ~50ms on Q5.
+        const SMALL_THRESHOLD: usize = 500_000;
         const LARGE_THRESHOLD: usize = 2_000_000;
 
         let mut bloom_filters: Vec<Option<crate::exec::bloom_filter::BloomFilter>> =
@@ -513,16 +520,22 @@ impl<'a> QueryInterpreter<'a> {
             None => {
                 // Single-table leaf — take the table out of the slot (each leaf visited once)
                 let i = mask.trailing_zeros() as usize;
-                Ok(tables[i].take().expect("execute_dp_plan: table already consumed"))
+                let t = tables[i].take().expect("execute_dp_plan: table already consumed");
+                eprintln!("DBG dp leaf mask={:#b} idx={} rows={}", mask, i, t.row_count);
+                Ok(t)
             }
             Some((left_mask, right_mask)) => {
                 let left = self.execute_dp_plan(left_mask, dp, tables, conjuncts)?;
                 let right = self.execute_dp_plan(right_mask, dp, tables, conjuncts)?;
                 let keys = self.find_join_keys(&left, &right, conjuncts);
+                eprintln!("DBG dp join L.rows={} R.rows={} keys={:?}", left.row_count, right.row_count, keys);
                 if keys.is_empty() {
+                    eprintln!("DBG dp CROSS JOIN (no keys)");
                     Ok(self.cross_join(left, right))
                 } else {
-                    self.hash_join_with_keys(left, right, &keys, JoinType2::Inner)
+                    let out = self.hash_join_with_keys(left, right, &keys, JoinType2::Inner)?;
+                    eprintln!("DBG dp join out.rows={}", out.row_count);
+                    Ok(out)
                 }
             }
         }

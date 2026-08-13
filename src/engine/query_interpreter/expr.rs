@@ -912,6 +912,14 @@ impl<'a> QueryInterpreter<'a> {
                         // into chunks, each thread probes independently, then
                         // merge the to_clear lists. The map and columns are
                         // read-only (Sync), so sharing across threads is safe.
+                        //
+                        // W31-T1: each entry is now an `ExistsSummary` (16 B)
+                        // rather than a heap-allocated `FxHashSet<u64>`. The
+                        // probe is `s.exists(outer_neq)` — a single HashMap
+                        // lookup + 2 field reads, no HashSet iteration. This
+                        // removes the per-group HashSet allocation (~1.5M for
+                        // Q21's orderkeys) and the per-probe HashSet contains()
+                        // SipHash cost.
                         let indices: Vec<usize> = mask.iter_set_bits().collect();
                         let neg = *negated;
                         let to_clear: Vec<usize> = indices
@@ -922,10 +930,9 @@ impl<'a> QueryInterpreter<'a> {
                                 for &i in chunk {
                                     let outer_eq = outer_eq_col[i];
                                     let outer_neq = outer_neq_col[i];
-                                    let exists = match map.get(&outer_eq) {
+                                    let exists = match map.get(outer_eq) {
                                         None => false,
-                                        Some(set) if set.len() >= 2 => true,
-                                        Some(set) => !set.is_empty() && !set.contains(&outer_neq),
+                                        Some(s) => s.exists(outer_neq),
                                     };
                                     let pass = if neg { !exists } else { exists };
                                     if !pass {
@@ -988,11 +995,8 @@ impl<'a> QueryInterpreter<'a> {
                     self.outer.set(old_outer);
                     match r {
                         Ok(r) => {
-                            eprintln!("DBG IN-subquery: {} rows, {} cols", r.row_count, r.columns.len());
                             if let Some(col) = r.columns.first() {
-                                eprintln!("DBG IN-subquery first col: name={} len={} first5={:?}", col.name, col.values.len(), &col.values[..5.min(col.values.len())]);
                                 let set: FxHashSet<u64> = col.values.iter().copied().collect();
-                                eprintln!("DBG IN-subquery set size: {}", set.len());
                                 self.in_subquery_cache.borrow_mut().insert(ast_key, set);
                             }
                         }
@@ -1307,6 +1311,16 @@ impl<'a> QueryInterpreter<'a> {
         // column indices once and does direct u64 array comparison (~18ms).
         // Only applies to Eq/Ne on Int/Date/String columns (u64 bit-comparable).
         // Float falls through (NaN/-0 edge cases require f64 semantics).
+        //
+        // W31-T3: extended to Gt/Lt/Ge/Le for Int/Date columns. Previously
+        // these fell through to the per-row `eval()` fallback (~30 ns/row →
+        // 180 ms for 6 M rows). Q21 hits this path TWICE:
+        //   1. Outer WHERE: `l1.l_receiptdate > l1.l_commitdate` on lineitem.
+        //   2. EXISTS-2 subquery filter: `l3.l_receiptdate > l3.l_commitdate`.
+        // The serial loop is ~18 ms for 6 M rows (10× speedup). Uses signed
+        // i64 comparison for Int (correct for negative values); Date values
+        // are always positive YYYYMMDD, so signed/unsigned agree. String is
+        // excluded (hash comparison gives no meaningful ordering).
         if let (Some(lidx), Some(ridx)) = (self.col_in(left, t), self.col_in(right, t)) {
             let lt = t.col_types[lidx];
             let rt = t.col_types[ridx];
@@ -1330,6 +1344,48 @@ impl<'a> QueryInterpreter<'a> {
                             }
                         }
                         return Ok(());
+                    }
+                    BinOp2::Gt => {
+                        // W31-T3: signed i64 comparison for Int; Date values
+                        // are positive so i64 == u64 ordering.
+                        if matches!(lt, ColType::Int | ColType::Date) {
+                            for i in 0..n {
+                                if mask.get(i) && (lcol[i] as i64) <= (rcol[i] as i64) {
+                                    mask.clear(i);
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                    BinOp2::Lt => {
+                        if matches!(lt, ColType::Int | ColType::Date) {
+                            for i in 0..n {
+                                if mask.get(i) && (lcol[i] as i64) >= (rcol[i] as i64) {
+                                    mask.clear(i);
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                    BinOp2::Ge => {
+                        if matches!(lt, ColType::Int | ColType::Date) {
+                            for i in 0..n {
+                                if mask.get(i) && (lcol[i] as i64) < (rcol[i] as i64) {
+                                    mask.clear(i);
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                    BinOp2::Le => {
+                        if matches!(lt, ColType::Int | ColType::Date) {
+                            for i in 0..n {
+                                if mask.get(i) && (lcol[i] as i64) > (rcol[i] as i64) {
+                                    mask.clear(i);
+                                }
+                            }
+                            return Ok(());
+                        }
                     }
                     _ => {}
                 }
@@ -1829,9 +1885,11 @@ impl<'a> QueryInterpreter<'a> {
                     if let Some(map) = cache.get(&ast_key) {
                         let outer_eq = t.columns[outer_eq_idx].get(row).copied().unwrap_or(0);
                         let outer_neq = t.columns[outer_neq_idx].get(row).copied().unwrap_or(0);
+                        // W31-T1: probe the ExistsSummary instead of iterating
+                        // a HashSet. O(1) per row: one HashMap lookup + 2 reads.
                         let exists = map
-                            .get(&outer_eq)
-                            .map_or(false, |set| set.iter().any(|&v| v != outer_neq));
+                            .get(outer_eq)
+                            .map_or(false, |s| s.exists(outer_neq));
                         return Ok(Value2::Int(if if *negated { !exists } else { exists } {
                             1
                         } else {
