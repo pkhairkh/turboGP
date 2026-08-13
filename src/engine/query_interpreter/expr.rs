@@ -834,20 +834,16 @@ impl<'a> QueryInterpreter<'a> {
                             if !pat.is_empty() && sc.len() >= t.row_count {
                                 // Only use StringSearchColumn if it has enough rows
                                 // (after a join, the string column may have the wrong length)
-                                // W5A-T3 will return a Bitmap from like_mask;
-                                // for now we iterate the bool vec and clear bits
-                                // in the packed mask.
-                                let like_mask = self.like_mask(sc, &pat);
-                                for i in 0..t.row_count {
-                                    if !mask.get(i) {
-                                        continue;
-                                    }
-                                    let lm = like_mask[i];
-                                    let keep = if *negated { !lm } else { lm };
-                                    if !keep {
-                                        mask.clear(i);
-                                    }
-                                }
+                                // W5A-T3: like_mask returns a packed Bitmap directly;
+                                // AND it into the running mask with a single AVX-512BW
+                                // word-wise pass (no per-row loop). For NOT LIKE we
+                                // invert the bitmap first via `Bitmap::not()`.
+                                // `Bitmap::and_inplace` operates on `min(self, other)`
+                                // bytes, so when `sc.len() > t.row_count` the extra
+                                // bits in `lm` are simply ignored.
+                                let lm = self.like_mask(sc, &pat);
+                                let lm = if *negated { lm.not() } else { lm };
+                                mask.and_inplace(&lm);
                                 return Ok(());
                             }
                         }
@@ -906,33 +902,43 @@ impl<'a> QueryInterpreter<'a> {
     }
 
     /// Build a LIKE mask for a string column. Handles % wildcards.
+    ///
+    /// W5A-T3: returns a packed `Bitmap` (1 bit/row) instead of `Vec<bool>`.
+    /// The caller (`eval_bool_mask_vec` LIKE arm) composes it directly with
+    /// `Bitmap::and_inplace` — an AVX-512BW word-wise pass that replaces the
+    /// prior per-row `mask[i] = mask[i] && lm[i]` scalar loop.
     pub(crate) fn like_mask(
         &self,
         sc: &crate::exec::fm_index::StringSearchColumn,
         pattern: &str,
-    ) -> Vec<bool> {
+    ) -> Bitmap {
         let n = sc.len();
-        let mut mask = vec![false; n];
+        let mut mask = Bitmap::new(n);
         if pattern.is_empty() {
-            mask.fill(true);
-            return mask;
+            return Bitmap::all_ones(n);
         }
         let pb = pattern.as_bytes();
         if pb[0] == b'%' && !pb[1..].contains(&b'%') && !pattern.contains('_') {
             // Suffix match: %suffix
             let suffix = &pattern[1..];
             for i in 0..n {
-                mask[i] = sc.get(i).ends_with(suffix);
+                if sc.get(i).ends_with(suffix) {
+                    mask.set(i);
+                }
             }
         } else if !pattern.contains('%') && !pattern.contains('_') {
             // Exact match
             for i in 0..n {
-                mask[i] = sc.get(i) == pattern;
+                if sc.get(i) == pattern {
+                    mask.set(i);
+                }
             }
         } else {
             // General LIKE
             for i in 0..n {
-                mask[i] = self.like(sc.get(i), pattern);
+                if self.like(sc.get(i), pattern) {
+                    mask.set(i);
+                }
             }
         }
         mask

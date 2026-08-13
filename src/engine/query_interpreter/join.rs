@@ -3,6 +3,7 @@
 use crate::catalog::Catalog;
 use crate::datasource::table::Table;
 use crate::engine::result::{QueryResult, ResultColumn};
+use crate::exec::bitmap::Bitmap;
 use crate::exec::fm_index::StringSearchColumn;
 use crate::Error;
 use fxhash::{FxHashMap, FxHashSet};
@@ -522,7 +523,14 @@ impl<'a> QueryInterpreter<'a> {
                     probe_keys.push(k);
                 }
                 // Batch bloom check: 8 keys per AVX-512 call.
-                let mut bloom_pass: Vec<bool> = vec![false; chunk_len];
+                //
+                // W5A-T4: bloom_pass is a packed Bitmap (1 bit/row). The
+                // __mmask8 returned by might_contain_batch is already a packed
+                // 8-bit LSB-first mask matching Bitmap's byte layout, so we
+                // write it directly to the byte buffer -- no per-8-key
+                // expansion to 8 bool bytes (8x smaller, no unpack loop).
+                let mut bloom_pass = Bitmap::new(chunk_len);
+                let bloom_bytes = bloom_pass.as_bytes_mut();
                 let mut i = 0;
                 while i + 8 <= chunk_len {
                     let mut batch = [0u64; 8];
@@ -543,14 +551,17 @@ impl<'a> QueryInterpreter<'a> {
                         }
                         m
                     };
-                    for j in 0..8 {
-                        bloom_pass[i + j] = (mask >> j) & 1 != 0;
-                    }
+                    // Write the 8-bit mask directly to the byte buffer
+                    // (bit j of `mask` corresponds to row i+j -- LSB-first,
+                    // matching Bitmap's layout). No expansion loop needed.
+                    bloom_bytes[i >> 3] = mask;
                     i += 8;
                 }
                 // Remaining keys (< 8)
                 while i < chunk_len {
-                    bloom_pass[i] = bloom.might_contain(probe_keys[i]);
+                    if bloom.might_contain(probe_keys[i]) {
+                        bloom_pass.set(i);
+                    }
                     i += 1;
                 }
 
@@ -569,7 +580,8 @@ impl<'a> QueryInterpreter<'a> {
                     }
 
                     // W2-T3: use precomputed bloom result instead of per-row might_contain
-                    if !bloom_pass[idx] {
+                    // W5A-T4: bloom_pass is now a packed Bitmap (1 bit/row).
+                    if !bloom_pass.get(idx) {
                         if jt == JoinType2::Left && !swapped {
                             for (c, col) in left.columns.iter().enumerate() {
                                 local_out[c].push(col[p]);
