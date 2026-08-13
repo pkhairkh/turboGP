@@ -136,6 +136,11 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
             }
         }
 
+        // W25: Track whether this column parsed as a date (YYYY-MM-DD).
+        // Set in the else branch below; used by `is_string` to avoid
+        // building a StringSearchColumn for date columns.
+        let mut parsed_as_date = false;
+
         let cells: Vec<u64> = if all_numeric {
             // W6C: i32 sidecar disabled — profiling showed TPC-H queries are
             // EXISTS/JoinHashProbe-bound, not filter-bandwidth-bound. The
@@ -160,13 +165,56 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
             if all_float {
                 as_f64.into_iter().map(|v| v.to_bits()).collect()
             } else {
-                // String column: hash with xxh3_64
-                strings.iter().map(|s| xxh3::xxh3_64(s.as_bytes())).collect()
+                // W25: Try date column — 'YYYY-MM-DD' strings.
+                // TPC-H date columns (o_orderdate, l_shipdate, etc.) fail
+                // both i64 and f64 parsing because they contain '-' chars.
+                // Without this branch they fell through to xxh3_64 hashing,
+                // which broke ALL date range filters (the hash values are
+                // huge u64, not comparable to the SQL literal days-since-epoch).
+                // This detects the YYYY-MM-DD format and stores days-since-epoch,
+                // matching what read_tpc_h_csv does for pipe-delimited files.
+                let mut all_date = true;
+                let mut as_date: Vec<u64> = Vec::with_capacity(row_count);
+                for s in strings {
+                    // Allow empty strings (treated as epoch 0 / NULL sentinel).
+                    if s.is_empty() {
+                        as_date.push(0);
+                        continue;
+                    }
+                    // Quick format check: must be exactly 10 bytes 'YYYY-MM-DD'.
+                    let sb = s.as_bytes();
+                    if sb.len() != 10
+                        || !sb[0].is_ascii_digit()
+                        || !sb[1].is_ascii_digit()
+                        || !sb[2].is_ascii_digit()
+                        || !sb[3].is_ascii_digit()
+                        || sb[4] != b'-'
+                        || !sb[5].is_ascii_digit()
+                        || !sb[6].is_ascii_digit()
+                        || sb[7] != b'-'
+                        || !sb[8].is_ascii_digit()
+                        || !sb[9].is_ascii_digit()
+                    {
+                        all_date = false;
+                        break;
+                    }
+                    as_date.push(parse_date_to_days(sb));
+                }
+                if all_date {
+                    parsed_as_date = true;
+                    as_date
+                } else {
+                    // String column: hash with xxh3_64
+                    strings.iter().map(|s| xxh3::xxh3_64(s.as_bytes())).collect()
+                }
             }
         };
 
-        // String sidecar: only for columns that are neither i64 nor f64
-        let is_string = !all_numeric && {
+        // String sidecar: only for columns that are neither i64, f64, nor date.
+        // W25: Added `!parsed_as_date` — date columns must NOT get a
+        // StringSearchColumn (they're stored as integer days-since-epoch,
+        // and the engine treats them as ColType::Date via tpc_h_col_types).
+        let is_string = !all_numeric && !parsed_as_date && {
             let mut all_float = true;
             for s in strings {
                 if s.parse::<f64>().is_err() {

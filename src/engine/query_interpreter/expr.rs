@@ -1123,9 +1123,17 @@ impl<'a> QueryInterpreter<'a> {
             // then scans the entire buffer with a single memchr::Finder pass.
             // This replaces 100M random-access pointer chases (Vec<String> →
             // heap allocation per string) with one sequential scan.
+            //
+            // W25-T2 BUGFIX: Previously this branch did
+            // `mask.and_inplace(&flat_mask)` where `mask` was initialized
+            // to `Bitmap::new(n)` (all zeros). AND-anything-with-zeros =
+            // zeros, so every `%substring%` LIKE filter returned 0 matches.
+            // This broke Q9 (p_name LIKE '%green%'), Q15's subquery, Q18's
+            // subquery, and any query using a contains-LIKE on a base table.
+            // Fix: return flat_mask directly (the other branches build mask
+            // via set(); this branch already has the complete result).
             let substring = &pattern[1..pb.len()-1];
-            let flat_mask = sc.like_contains_mask_flat(substring);
-            mask.and_inplace(&flat_mask);
+            mask = sc.like_contains_mask_flat(substring);
         } else {
             // General LIKE
             for i in 0..n {

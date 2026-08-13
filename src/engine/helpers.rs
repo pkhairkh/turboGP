@@ -498,8 +498,68 @@ pub(crate) fn result_to_table(name: &str, result: &QueryResult) -> Table {
     let column_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
     let columns: Vec<std::sync::Arc<Vec<u64>>> =
         result.columns.iter().map(|c| std::sync::Arc::new(c.values.clone())).collect();
+    // W25-T2: Build string_columns sidecar from ResultColumn.string_values.
+    // Previously this was always vec![None; ...], which meant CTE temp tables
+    // lost all string data — LIKE filters and string GROUP BY on CTE columns
+    // silently returned wrong results.
     let string_columns: Vec<Option<std::sync::Arc<crate::exec::fm_index::StringSearchColumn>>> =
-        vec![None; result.columns.len()];
+        result.columns.iter().map(|c| {
+            c.string_values.as_ref().map(|sv| {
+                std::sync::Arc::new(crate::exec::fm_index::StringSearchColumn::new(sv.clone()))
+            })
+        }).collect();
+
+    // W25-T2: Build a TableSchema with inferred column types.
+    // Previously schema was None, which caused from_catalog() to default
+    // ALL columns to ColType::Int. This broke CTE queries where the CTE
+    // produced float columns (e.g. SUM(price) AS total_revenue in Q15) —
+    // the float bit-patterns were treated as integers, breaking MAX
+    // scalar subqueries and equality comparisons.
+    use crate::schema::table_schema::{TableSchema, ColumnSchema};
+    use crate::sql::ddl::ColumnType;
+    let schema_cols: Vec<ColumnSchema> = result.columns.iter().enumerate().map(|(i, c)| {
+        let is_string = c.string_values.is_some();
+        let col_type = if is_string {
+            ColumnType::Text
+        } else {
+            // Check if any value looks like an f64 bit pattern.
+            // f64::to_bits for any nonzero float >= 2^-1022 produces a
+            // u64 > 2^60 (the exponent field alone is 11 bits at the top).
+            // Integer values in TPC-H never exceed ~10M (lineitem row count),
+            // which is well under 2^24.
+            let has_float_bits = c.values.iter().any(|&v| v > (1u64 << 60));
+            if has_float_bits {
+                ColumnType::Float
+            } else {
+                // Check for date-like column names.
+                let lname = c.name.to_lowercase();
+                if lname.contains("date")
+                    || lname.contains("shipdate")
+                    || lname.contains("commitdate")
+                    || lname.contains("receiptdate")
+                {
+                    ColumnType::Date
+                } else {
+                    ColumnType::BigInt
+                }
+            }
+        };
+        ColumnSchema {
+            name: c.name.clone(),
+            col_type,
+            not_null: false,
+            primary_key: false,
+            unique: false,
+            check: None,
+        }
+    }).collect();
+    let schema = Some(TableSchema {
+        columns: schema_cols,
+        checks: Vec::new(),
+        unique_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
+    });
+
     Table {
         name: name.to_string(),
         columns,
@@ -508,7 +568,7 @@ pub(crate) fn result_to_table(name: &str, result: &QueryResult) -> Table {
         string_columns,
         null_bitmaps: vec![],
         i32_columns: vec![],
-        schema: None,
+        schema,
         row_versions: Vec::new(),
     }
 }
