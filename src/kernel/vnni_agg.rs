@@ -19,6 +19,8 @@
 
 use core::arch::x86_64::*;
 
+use crate::exec::bitmap::Bitmap;
+
 /// Check if VNNI is available at runtime.
 pub fn has_vnni() -> bool {
     static mut CACHED: Option<bool> = None;
@@ -140,18 +142,73 @@ fn sum_i64_scalar(col: &[u64], mask: &[bool]) -> i64 {
 /// a and b are u64 slices storing f64::to_bits values.
 /// Converts f64→bf16 (lossy, 7-bit mantissa) and uses _mm512_dpbf16_ps.
 ///
+/// `mask` is a packed `Bitmap` (1 bit/row, LSB-first). When every bit in
+/// `[0, a.len())` is set (i.e. no row is filtered out), a faster unmasked
+/// kernel is dispatched — the production caller (`aggregate.rs::eval_agg_expr`
+/// BF16 fast path for `Sum(Col * Col)`) always hits this path because it
+/// pre-gathers `da`/`db` from the active indices and passes
+/// `Bitmap::all_ones(n)`. The POPCNT check is O(n/8) bytes.
+///
 /// Precision: for TPC-H SF=1 revenue values (~$100K-$1M range), the relative
 /// error from bf16 truncation is < 0.1%, which is acceptable for benchmark
 /// comparison (DuckDB uses f64; we match within 0.1%).
-pub fn dot_f64_bf16(a: &[u64], b: &[u64], mask: &[bool]) -> f64 {
+pub fn dot_f64_bf16(a: &[u64], b: &[u64], mask: &Bitmap) -> f64 {
     if !has_bf16() {
         return dot_f64_scalar(a, b, mask);
+    }
+    let n = a.len();
+    // Fast path: all-ones mask in [0, n). The production caller always hits
+    // this branch, skipping the per-element `mask.get` bit-extract in the
+    // inner loop (saves ~128 bit-extracts per 64-element iteration).
+    if mask.len() >= n && mask.count_ones_range(0, n) == n {
+        return unsafe { dot_f64_bf16_unmasked_inner(a, b) };
     }
     unsafe { dot_f64_bf16_inner(a, b, mask) }
 }
 
+/// All-ones fast path: no per-element mask check. Saves 128 bit-extracts
+/// per 64-element iteration vs the masked path.
 #[target_feature(enable = "avx512f,avx512bf16")]
-unsafe fn dot_f64_bf16_inner(a: &[u64], b: &[u64], mask: &[bool]) -> f64 {
+unsafe fn dot_f64_bf16_unmasked_inner(a: &[u64], b: &[u64]) -> f64 {
+    let n = a.len();
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
+
+    let mut i = 0;
+    while i + 64 <= n {
+        let av0 = load_f64_as_bf16_unmasked(&a[i..i + 16]);
+        let bv0 = load_f64_as_bf16_unmasked(&b[i..i + 16]);
+        let av1 = load_f64_as_bf16_unmasked(&a[i + 16..i + 32]);
+        let bv1 = load_f64_as_bf16_unmasked(&b[i + 16..i + 32]);
+        let av2 = load_f64_as_bf16_unmasked(&a[i + 32..i + 48]);
+        let bv2 = load_f64_as_bf16_unmasked(&b[i + 32..i + 48]);
+        let av3 = load_f64_as_bf16_unmasked(&a[i + 48..i + 64]);
+        let bv3 = load_f64_as_bf16_unmasked(&b[i + 48..i + 64]);
+        acc0 = _mm512_dpbf16_ps(acc0, av0, bv0);
+        acc1 = _mm512_dpbf16_ps(acc1, av1, bv1);
+        acc2 = _mm512_dpbf16_ps(acc2, av2, bv2);
+        acc3 = _mm512_dpbf16_ps(acc3, av3, bv3);
+        i += 64;
+    }
+
+    let mut result = 0.0f32;
+    result += _mm512_reduce_add_ps(acc0);
+    result += _mm512_reduce_add_ps(acc1);
+    result += _mm512_reduce_add_ps(acc2);
+    result += _mm512_reduce_add_ps(acc3);
+
+    // Tail (scalar, no mask)
+    while i < n {
+        result += (f64::from_bits(a[i]) * f64::from_bits(b[i])) as f32;
+        i += 1;
+    }
+    result as f64
+}
+
+#[target_feature(enable = "avx512f,avx512bf16")]
+unsafe fn dot_f64_bf16_inner(a: &[u64], b: &[u64], mask: &Bitmap) -> f64 {
     let n = a.len();
     let mut acc0 = _mm512_setzero_ps();
     let mut acc1 = _mm512_setzero_ps();
@@ -162,14 +219,14 @@ unsafe fn dot_f64_bf16_inner(a: &[u64], b: &[u64], mask: &[bool]) -> f64 {
     // Process 64 elements per iteration (4 vectors of 16 bf16 pairs)
     while i + 64 <= n {
         // Load 16 f64 values, convert to bf16, pack into one __m512bh
-        let av0 = load_f64_as_bf16(&a[i..i + 16], &mask[i..i + 16]);
-        let bv0 = load_f64_as_bf16(&b[i..i + 16], &mask[i..i + 16]);
-        let av1 = load_f64_as_bf16(&a[i + 16..i + 32], &mask[i + 16..i + 32]);
-        let bv1 = load_f64_as_bf16(&b[i + 16..i + 32], &mask[i + 16..i + 32]);
-        let av2 = load_f64_as_bf16(&a[i + 32..i + 48], &mask[i + 32..i + 48]);
-        let bv2 = load_f64_as_bf16(&b[i + 32..i + 48], &mask[i + 32..i + 48]);
-        let av3 = load_f64_as_bf16(&a[i + 48..i + 64], &mask[i + 48..i + 64]);
-        let bv3 = load_f64_as_bf16(&b[i + 48..i + 64], &mask[i + 48..i + 64]);
+        let av0 = load_f64_as_bf16_bmp(&a[i..i + 16], mask, i);
+        let bv0 = load_f64_as_bf16_bmp(&b[i..i + 16], mask, i);
+        let av1 = load_f64_as_bf16_bmp(&a[i + 16..i + 32], mask, i + 16);
+        let bv1 = load_f64_as_bf16_bmp(&b[i + 16..i + 32], mask, i + 16);
+        let av2 = load_f64_as_bf16_bmp(&a[i + 32..i + 48], mask, i + 32);
+        let bv2 = load_f64_as_bf16_bmp(&b[i + 32..i + 48], mask, i + 32);
+        let av3 = load_f64_as_bf16_bmp(&a[i + 48..i + 64], mask, i + 48);
+        let bv3 = load_f64_as_bf16_bmp(&b[i + 48..i + 64], mask, i + 48);
         // 4 independent dot products
         acc0 = _mm512_dpbf16_ps(acc0, av0, bv0);
         acc1 = _mm512_dpbf16_ps(acc1, av1, bv1);
@@ -187,7 +244,7 @@ unsafe fn dot_f64_bf16_inner(a: &[u64], b: &[u64], mask: &[bool]) -> f64 {
 
     // Tail (scalar)
     while i < n {
-        if mask[i] {
+        if mask.get(i) {
             result += (f64::from_bits(a[i]) * f64::from_bits(b[i])) as f32;
         }
         i += 1;
@@ -195,8 +252,47 @@ unsafe fn dot_f64_bf16_inner(a: &[u64], b: &[u64], mask: &[bool]) -> f64 {
     result as f64
 }
 
+/// Load 16 f64 values (stored as u64 bits), convert to bf16, and pack into
+/// one __m512bh (32 bytes = 16 bf16 values). No masking — all 16 values are
+/// loaded unconditionally. Used by the all-ones fast path of `dot_f64_bf16`.
+#[inline]
+#[target_feature(enable = "avx512f,avx512bf16")]
+unsafe fn load_f64_as_bf16_unmasked(vals: &[u64]) -> __m512bh {
+    let mut buf = [0f32; 16];
+    for j in 0..16 {
+        buf[j] = f64::from_bits(vals[j]) as f32;
+    }
+    let fv = _mm512_loadu_ps(buf.as_ptr() as *const f32);
+    _mm512_cvtne2ps_pbh(fv, _mm512_setzero_ps())
+}
+
 /// Load 16 f64 values (stored as u64 bits), zero out masked-out entries,
 /// convert to bf16, and pack into one __m512bh (32 bytes = 16 bf16 values).
+/// `start` is the row offset into `mask` for these 16 consecutive values.
+///
+/// This is the `&Bitmap`-aware variant used by `dot_f64_bf16_inner`. The
+/// original `&[bool]` helper `load_f64_as_bf16` is retained below for the
+/// `dot_one_minus_f64_bf16` and `dot_f64_bf16_grouped_inner` kernels (no
+/// production callers; tests only — out of scope for W5A-T6).
+#[inline]
+#[target_feature(enable = "avx512f,avx512bf16")]
+unsafe fn load_f64_as_bf16_bmp(vals: &[u64], mask: &Bitmap, start: usize) -> __m512bh {
+    let mut buf = [0f32; 16];
+    for j in 0..16 {
+        buf[j] = if mask.get(start + j) { f64::from_bits(vals[j]) as f32 } else { 0.0 };
+    }
+    // Load 16 f32 values into __m512, then convert to bf16
+    let fv = _mm512_loadu_ps(buf.as_ptr() as *const f32);
+    // _mm512_cvtne2ps_pbh takes two __m512 (low and high halves) and produces __m512bh
+    // Since we only have 16 f32 values (one __m512), pass zero for the high half
+    _mm512_cvtne2ps_pbh(fv, _mm512_setzero_ps())
+}
+
+/// Load 16 f64 values (stored as u64 bits), zero out masked-out entries,
+/// convert to bf16, and pack into one __m512bh (32 bytes = 16 bf16 values).
+///
+/// Retained `&[bool]` helper used by `dot_one_minus_f64_bf16` and
+/// `dot_f64_bf16_grouped_inner` (test-only paths; out of scope for W5A-T6).
 #[inline]
 #[target_feature(enable = "avx512f,avx512bf16")]
 unsafe fn load_f64_as_bf16(vals: &[u64], mask: &[bool]) -> __m512bh {
@@ -211,10 +307,10 @@ unsafe fn load_f64_as_bf16(vals: &[u64], mask: &[bool]) -> __m512bh {
     _mm512_cvtne2ps_pbh(fv, _mm512_setzero_ps())
 }
 
-fn dot_f64_scalar(a: &[u64], b: &[u64], mask: &[bool]) -> f64 {
+fn dot_f64_scalar(a: &[u64], b: &[u64], mask: &Bitmap) -> f64 {
     let mut sum = 0.0f64;
     for i in 0..a.len() {
-        if mask[i] {
+        if mask.get(i) {
             sum += f64::from_bits(a[i]) * f64::from_bits(b[i]);
         }
     }
@@ -400,7 +496,9 @@ mod tests {
         }
         let a: Vec<u64> = (0..64).map(|i| (i as f64 * 10.0).to_bits()).collect();
         let b: Vec<u64> = (0..64).map(|i| (i as f64 * 0.5).to_bits()).collect();
-        let mask = vec![true; 64];
+        // W5A-T6: dot_f64_bf16 now takes &Bitmap. all_ones hits the unmasked
+        // fast path (POPCNT check at the dispatch boundary).
+        let mask = Bitmap::all_ones(64);
         let result = dot_f64_bf16(&a, &b, &mask);
         let expected: f64 = (0..64).map(|i| (i as f64 * 10.0) * (i as f64 * 0.5)).sum();
         // bf16 precision: allow 5% error
@@ -408,6 +506,37 @@ mod tests {
         assert!(
             rel_err < 0.05,
             "bf16 dot product error too high: {} vs {} ({}%)",
+            result,
+            expected,
+            rel_err * 100.0
+        );
+    }
+
+    #[test]
+    fn test_bf16_dot_product_sparse_mask() {
+        // W5A-T6: exercise the masked (non-fast-path) branch of dot_f64_bf16
+        // — a sparse Bitmap whose count_ones() != len() forces the inner
+        // kernel to call mask.get(i) per element.
+        if !has_bf16() {
+            return;
+        }
+        let a: Vec<u64> = (0..64).map(|i| (i as f64 * 10.0).to_bits()).collect();
+        let b: Vec<u64> = (0..64).map(|i| (i as f64 * 0.5).to_bits()).collect();
+        let mut mask = Bitmap::new(64);
+        for i in 0..64 {
+            if i % 2 == 0 {
+                mask.set(i);
+            }
+        }
+        let result = dot_f64_bf16(&a, &b, &mask);
+        let expected: f64 = (0..64)
+            .filter(|i| i % 2 == 0)
+            .map(|i| (i as f64 * 10.0) * (i as f64 * 0.5))
+            .sum();
+        let rel_err = (result - expected).abs() / expected.max(1.0);
+        assert!(
+            rel_err < 0.05,
+            "bf16 dot product (sparse mask) error: {} vs {} ({}%)",
             result,
             expected,
             rel_err * 100.0

@@ -10,7 +10,7 @@ use fxhash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 
 use super::types::*;
-use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset, take_mask_buf, return_mask_buf};
+use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset};
 
 // W4: Selinger DP entry — holds cost/cardinality estimate + optimal partition.
 #[derive(Clone, Copy)]

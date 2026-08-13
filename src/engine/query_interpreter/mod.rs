@@ -34,12 +34,9 @@ use crate::Error;
 use fxhash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 
-
-
 // Use ahash (hardware AES) instead of std SipHash for all HashMap/HashSet.
 type HashMap<K, V> = ahash::AHashMap<K, V>;
 type HashSet<T> = ahash::AHashSet<T>;
-
 
 /// Create a HashMap without calling OS entropy (avoids getrandom syscall).
 fn new_hashmap<K, V>() -> HashMap<K, V> {
@@ -60,52 +57,6 @@ fn new_fxhashmap<K, V>() -> FxHashMap<K, V> {
 fn new_fxhashset<T>() -> FxHashSet<T> {
     FxHashSet::default()
 }
-
-// =============================================================================
-// W2: Reusable bool-mask buffer pool.
-//
-// `eval_bool_mask_vec`'s AND arm previously cloned the running mask per
-// conjunct (`mask.to_vec()`, 6 MB for a 6 M-row lineitem scan); the OR
-// fallback arm allocated two fresh `vec![true; N]` masks per call. Both
-// paths are now backed by this thread-local pool, eliminating the
-// malloc/free overhead in the hot WHERE-evaluation loop.
-//
-// The pool is a stack of `Vec<bool>` buffers. `take_mask_buf(n)` pops a
-// buffer (or allocates if the pool is empty) and resizes it to at least
-// `n`; `return_mask_buf(buf)` pushes it back. Recursion (AND inside OR
-// inside AND, etc.) is safe: a recursive `take_mask_buf` simply pops a
-// different buffer or allocates if the pool is exhausted. After warmup
-// the pool size equals the max recursion depth, and no further
-// allocations occur.
-// ============================================================================
-
-thread_local! {
-    static MASK_POOL: std::cell::RefCell<Vec<Vec<bool>>> =
-        std::cell::RefCell::new(Vec::new());
-}
-
-/// Take a `Vec<bool>` of length >= `n` from the thread-local pool
-/// (allocating if necessary). The caller MUST return it via
-/// `return_mask_buf` to avoid re-allocating on the next call.
-pub(crate) fn take_mask_buf(n: usize) -> Vec<bool> {
-    MASK_POOL.with(|cell| {
-        let mut pool = cell.borrow_mut();
-        let mut buf = pool.pop().unwrap_or_else(|| Vec::with_capacity(n));
-        if buf.len() < n {
-            buf.resize(n, false);
-        }
-        buf
-    })
-}
-
-/// Return a buffer to the thread-local pool for reuse by the next
-/// `take_mask_buf` call on this thread.
-pub(crate) fn return_mask_buf(buf: Vec<bool>) {
-    MASK_POOL.with(|cell| {
-        cell.borrow_mut().push(buf);
-    });
-}
-
 
 pub(crate) fn date_to_days_q4(y: i32, m: u32, d: u32) -> u64 {
     let y = if m <= 2 { y - 1 } else { y };

@@ -10,7 +10,7 @@ use fxhash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 
 use super::types::*;
-use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset, take_mask_buf, return_mask_buf};
+use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset};
 
 impl<'a> QueryInterpreter<'a> {
     pub(crate) fn has_agg(&self, select: &[SelectItem2]) -> bool {
@@ -1227,7 +1227,12 @@ impl<'a> QueryInterpreter<'a> {
                             da[k] = ca[i];
                             db[k] = cb[i];
                         }
-                        let mask = vec![true; n];
+                        // W5A-T6: Vec<bool> -> Bitmap. `da`/`db` are already
+                        // pre-gathered from the active indices, so the mask is
+                        // all-ones; dot_f64_bf16 detects this via POPCNT and
+                        // dispatches to the unmasked AVX-512 BF16 inner kernel
+                        // (skips the per-element bit-extract in the hot loop).
+                        let mask = Bitmap::all_ones(n);
                         return Ok(Value2::Float(crate::kernel::vnni_agg::dot_f64_bf16(
                             &da, &db, &mask,
                         )));

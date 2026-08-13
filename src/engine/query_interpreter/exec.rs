@@ -11,7 +11,7 @@ use std::cell::{Cell, RefCell};
 use rayon::prelude::*;
 
 use super::types::*;
-use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset, take_mask_buf, return_mask_buf};
+use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset};
 
 pub fn execute_interpreter(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResult, Error> {
     QueryInterpreter {
