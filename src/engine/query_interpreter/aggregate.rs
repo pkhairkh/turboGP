@@ -527,6 +527,16 @@ impl<'a> QueryInterpreter<'a> {
             return Ok(result);
         }
 
+        // W7-T2: Accumulator-based grouping for simple aggregates.
+        // Uses O(1)-per-group accumulators (counters, sums, mins, maxs)
+        // instead of Vec<usize> per group (which is O(n) memory + O(n)
+        // push calls). Handles COUNT(*), SUM, AVG, MIN, MAX, and GROUP BY
+        // columns, with simple HAVING and single-column ORDER BY.
+        // Falls back to the Vec<usize> path for unsupported patterns.
+        if let Some(result) = self.try_accumulator_grouped(query, t, mask)? {
+            return Ok(result);
+        }
+
         // Fallback: HashMap-based grouping for high cardinality.
         // PARALLEL: split into chunks, each thread builds a local HashMap,
         // then merge. This is critical for Q3 (10k groups, 300k rows) which

@@ -17,6 +17,7 @@
 //!   [`tpc_h_queries_q19_q22`] — TPC-H per-query detectors (to be deleted in Wave 6)
 
 pub mod aggregate;
+pub mod accum_grouped;
 pub mod exec;
 pub mod expr;
 pub mod join;
