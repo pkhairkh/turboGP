@@ -883,6 +883,192 @@ unsafe fn or_inplace_avx512(dst: &mut [u8], src: &[u8]) {
 }
 
 // =============================================================================
+// i32 narrow-type filter kernels
+// =============================================================================
+//
+// These operate on `&[i32]` directly (4 bytes/element vs 8 bytes for u64),
+// halving memory bandwidth on filter-heavy queries against i32 columns.
+// The AVX-512 path uses `_mm512_cmpeq_epi32_mask` / `_mm512_cmpgt_epi32_mask`
+// which compare 16 i32 lanes per instruction (vs 8 u64 lanes for the u64
+// kernels), writing 2 bytes of mask per 16-element chunk.
+
+/// `col == val` for an i32 column.
+pub fn filter_eq_i32(col: &[i32], val: i32) -> Bitmap {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") {
+        return unsafe {
+            filter_i32_avx512_inner(col, val, |v, t| _mm512_cmpeq_epi32_mask(v, t))
+        };
+    }
+    let mut bm = Bitmap::new(col.len());
+    for (i, &c) in col.iter().enumerate() {
+        if c == val {
+            bm.set(i);
+        }
+    }
+    bm
+}
+
+/// `col != val` for an i32 column.
+pub fn filter_ne_i32(col: &[i32], val: i32) -> Bitmap {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") {
+        return unsafe {
+            filter_i32_avx512_inner(col, val, |v, t| !_mm512_cmpeq_epi32_mask(v, t))
+        };
+    }
+    let mut bm = Bitmap::new(col.len());
+    for (i, &c) in col.iter().enumerate() {
+        if c != val {
+            bm.set(i);
+        }
+    }
+    bm
+}
+
+/// `col < val` (signed) for an i32 column.
+/// Implemented as `val > col` (swapped operands to `_mm512_cmpgt_epi32_mask`).
+pub fn filter_lt_i32(col: &[i32], val: i32) -> Bitmap {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") {
+        return unsafe {
+            filter_i32_avx512_inner(col, val, |v, t| _mm512_cmpgt_epi32_mask(t, v))
+        };
+    }
+    let mut bm = Bitmap::new(col.len());
+    for (i, &c) in col.iter().enumerate() {
+        if c < val {
+            bm.set(i);
+        }
+    }
+    bm
+}
+
+/// `col <= val` (signed) for an i32 column.
+/// Implemented as `!(col > val)` (negated `_mm512_cmpgt_epi32_mask`).
+pub fn filter_le_i32(col: &[i32], val: i32) -> Bitmap {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") {
+        return unsafe {
+            filter_i32_avx512_inner(col, val, |v, t| !_mm512_cmpgt_epi32_mask(v, t))
+        };
+    }
+    let mut bm = Bitmap::new(col.len());
+    for (i, &c) in col.iter().enumerate() {
+        if c <= val {
+            bm.set(i);
+        }
+    }
+    bm
+}
+
+/// `col > val` (signed) for an i32 column.
+pub fn filter_gt_i32(col: &[i32], val: i32) -> Bitmap {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") {
+        return unsafe {
+            filter_i32_avx512_inner(col, val, |v, t| _mm512_cmpgt_epi32_mask(v, t))
+        };
+    }
+    let mut bm = Bitmap::new(col.len());
+    for (i, &c) in col.iter().enumerate() {
+        if c > val {
+            bm.set(i);
+        }
+    }
+    bm
+}
+
+/// `col >= val` (signed) for an i32 column.
+/// Implemented as `!(val > col)` (negated `_mm512_cmpgt_epi32_mask` with
+/// swapped operands).
+pub fn filter_ge_i32(col: &[i32], val: i32) -> Bitmap {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") {
+        return unsafe {
+            filter_i32_avx512_inner(col, val, |v, t| !_mm512_cmpgt_epi32_mask(t, v))
+        };
+    }
+    let mut bm = Bitmap::new(col.len());
+    for (i, &c) in col.iter().enumerate() {
+        if c >= val {
+            bm.set(i);
+        }
+    }
+    bm
+}
+
+/// 4-way unrolled AVX-512 inner loop for i32 filters. The `cmp` closure
+/// returns a `__mmask16` (16 bits, one per i32 lane); the low 8 bits pack
+/// into one bitmap byte (lanes 0..7), the high 8 bits into the next byte
+/// (lanes 8..15). Same multi-accumulator discipline as
+/// `filter_u64_avx512_inner`: 4 independent load+compare chains (4 × 16 =
+/// 64 rows) per iteration hide load+compare latency.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl")]
+unsafe fn filter_i32_avx512_inner<F>(col: &[i32], val: i32, cmp: F) -> Bitmap
+where
+    F: Fn(__m512i, __m512i) -> __mmask16,
+{
+    let n = col.len();
+    let mut bm = Bitmap::new(n);
+    let bytes = bm.as_bytes_mut();
+    let target = _mm512_set1_epi32(val);
+
+    let mut i = 0usize;
+    let mut byte_idx = 0usize;
+    // 4-way unrolled: 4 × 16 = 64 rows per iteration → 8 mask bytes.
+    while i + 64 <= n {
+        let v0 = _mm512_loadu_si512(col.as_ptr().add(i) as *const __m512i);
+        let v1 = _mm512_loadu_si512(col.as_ptr().add(i + 16) as *const __m512i);
+        let v2 = _mm512_loadu_si512(col.as_ptr().add(i + 32) as *const __m512i);
+        let v3 = _mm512_loadu_si512(col.as_ptr().add(i + 48) as *const __m512i);
+        // 4 independent compares — no accumulator dependency chain.
+        let m0: __mmask16 = cmp(v0, target);
+        let m1: __mmask16 = cmp(v1, target);
+        let m2: __mmask16 = cmp(v2, target);
+        let m3: __mmask16 = cmp(v3, target);
+        // Pack 16-bit masks: low byte (lanes 0..7) + high byte (lanes 8..15).
+        *bytes.get_unchecked_mut(byte_idx)     = (m0 & 0xFF) as u8;
+        *bytes.get_unchecked_mut(byte_idx + 1) = (m0 >> 8) as u8;
+        *bytes.get_unchecked_mut(byte_idx + 2) = (m1 & 0xFF) as u8;
+        *bytes.get_unchecked_mut(byte_idx + 3) = (m1 >> 8) as u8;
+        *bytes.get_unchecked_mut(byte_idx + 4) = (m2 & 0xFF) as u8;
+        *bytes.get_unchecked_mut(byte_idx + 5) = (m2 >> 8) as u8;
+        *bytes.get_unchecked_mut(byte_idx + 6) = (m3 & 0xFF) as u8;
+        *bytes.get_unchecked_mut(byte_idx + 7) = (m3 >> 8) as u8;
+        i += 64;
+        byte_idx += 8;
+    }
+    // 1-vector tail (16 rows → 2 mask bytes).
+    while i + 16 <= n {
+        let v = _mm512_loadu_si512(col.as_ptr().add(i) as *const __m512i);
+        let m: __mmask16 = cmp(v, target);
+        *bytes.get_unchecked_mut(byte_idx)     = (m & 0xFF) as u8;
+        *bytes.get_unchecked_mut(byte_idx + 1) = (m >> 8) as u8;
+        i += 16;
+        byte_idx += 2;
+    }
+    // Scalar tail (0..15 rows). Reuse `cmp` by loading a single-lane vector
+    // so the comparison semantics match the vectorized path exactly. Use
+    // `i >> 3` for the byte index because the tail (up to 15 elements) can
+    // span two bitmap bytes.
+    if i < n {
+        let mut lane = [0i32; 16];
+        while i < n {
+            lane[0] = col[i];
+            let v = _mm512_loadu_si512(lane.as_ptr() as *const __m512i);
+            if (cmp(v, target) & 1) != 0 {
+                *bytes.get_unchecked_mut(i >> 3) |= 1u8 << (i & 7);
+            }
+            i += 1;
+        }
+    }
+    bm
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1194,6 +1380,93 @@ mod tests {
         assert_eq!(bm.count_ones_range(50, 100), 0);
         assert_eq!(bm.count_ones_range(20, 30), 10);
         assert_eq!(bm.count_ones_range(15, 45), 30);
+    }
+
+    // === W5C-T4 tests: i32 narrow-type filter kernels ===
+
+    #[test]
+    fn test_filter_eq_i32() {
+        let col: Vec<i32> = vec![1, 5, 5, 3, 5, 7, 8, 5, 9, 10];
+        let bm = filter_eq_i32(&col, 5);
+        assert_bits(&bm, &[false, true, true, false, true, false, false, true, false, false]);
+    }
+
+    #[test]
+    fn test_filter_lt_i32() {
+        // Includes negatives to verify signed compare (NOT unsigned).
+        let col: Vec<i32> = vec![-5, -3, 0, 3, 5, 7, 9, 12, 15, 20];
+        let bm = filter_lt_i32(&col, 5);
+        assert_bits(&bm, &[true, true, true, true, false, false, false, false, false, false]);
+    }
+
+    #[test]
+    fn test_filter_i32_all_ops_small() {
+        // Smoke test every operator on a small column that exercises the
+        // scalar tail (no AVX-512 vector path) and the boundary at `val`.
+        let col: Vec<i32> = vec![-2, -1, 0, 1, 2, 3, 4, 5];
+        let val = 2i32;
+        assert_bits(&filter_eq_i32(&col, val), &[false, false, false, false, true, false, false, false]);
+        assert_bits(&filter_ne_i32(&col, val), &[true, true, true, true, false, true, true, true]);
+        assert_bits(&filter_lt_i32(&col, val), &[true, true, true, true, false, false, false, false]);
+        assert_bits(&filter_le_i32(&col, val), &[true, true, true, true, true, false, false, false]);
+        assert_bits(&filter_gt_i32(&col, val), &[false, false, false, false, false, true, true, true]);
+        assert_bits(&filter_ge_i32(&col, val), &[false, false, false, false, true, true, true, true]);
+    }
+
+    #[test]
+    fn test_filter_i32_avx512_vs_scalar() {
+        // 1000-element column with mixed positives/negatives; verify every
+        // operator produces AVX-512 and scalar results that are bit-for-bit
+        // identical. The column length forces all three tails: 4-way
+        // unrolled (64-row), 1-vector (16-row), and scalar (0..15-row).
+        let n = 1000usize;
+        let col: Vec<i32> = (0..n as i32).map(|i| ((i * 7) % 51) - 25).collect();
+
+        let scalar_ref = |op: &str, val: i32| -> Bitmap {
+            let mut bm = Bitmap::new(n);
+            for (i, &c) in col.iter().enumerate() {
+                let set = match op {
+                    "eq" => c == val,
+                    "ne" => c != val,
+                    "lt" => c < val,
+                    "le" => c <= val,
+                    "gt" => c > val,
+                    "ge" => c >= val,
+                    _ => false,
+                };
+                if set {
+                    bm.set(i);
+                }
+            }
+            bm
+        };
+
+        for &val in &[-100i32, -25, -1, 0, 7, 25, 100] {
+            for op in &["eq", "ne", "lt", "le", "gt", "ge"] {
+                let avx = match *op {
+                    "eq" => filter_eq_i32(&col, val),
+                    "ne" => filter_ne_i32(&col, val),
+                    "lt" => filter_lt_i32(&col, val),
+                    "le" => filter_le_i32(&col, val),
+                    "gt" => filter_gt_i32(&col, val),
+                    "ge" => filter_ge_i32(&col, val),
+                    _ => unreachable!(),
+                };
+                let sc = scalar_ref(op, val);
+                assert_eq!(avx.len(), sc.len(), "len mismatch op={} val={}", op, val);
+                assert_eq!(
+                    avx.count_ones(), sc.count_ones(),
+                    "count_ones mismatch op={} val={}", op, val,
+                );
+                for i in 0..n {
+                    assert_eq!(
+                        avx.get(i), sc.get(i),
+                        "op={} val={} idx={} mismatch: avx={} scalar={}",
+                        op, val, i, avx.get(i), sc.get(i),
+                    );
+                }
+            }
+        }
     }
 
 }
