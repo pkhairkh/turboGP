@@ -269,37 +269,40 @@ pub(crate) struct ExecTable {
 
 impl ExecTable {
     pub(crate) fn from_catalog(table: &Table, alias: &str) -> Self {
-        // Wave 57 fix: tpc_h_col_types() returns an empty Vec for user-created
-        // tables (it only knows TPC-H schemas). When that happens, we fall
-        // back to inferring types from the table's schema (set by CREATE TABLE)
-        // — defaulting to ColType::Int for unknown columns. Previously, the
-        // empty Vec caused `t.col_types[idx]` to panic with index-out-of-bounds
-        // whenever a CASE WHEN / arithmetic / string evaluation ran against a
-        // user-created table through the interpreter fallback path.
-        let mut col_types = tpc_h_col_types(&table.name);
-        if col_types.is_empty() {
-            col_types = (0..table.column_names.len())
+        // W30: Schema-first type inference. Previously tpc_h_col_types() was
+        // checked FIRST (hardcoded TPC-H schema), with table.schema as a
+        // fallback. This was backwards — the table's schema (set by CREATE
+        // TABLE or the CSV loader) is the source of truth. Now we check
+        // table.schema first, and only fall back to tpc_h_col_types() for
+        // legacy tables without a schema (backward compatibility).
+        let col_types: Vec<ColType> = if let Some(ref schema) = table.schema {
+            (0..table.column_names.len())
                 .map(|i| {
-                    // Infer from the schema if available.
-                    if let Some(ref schema) = table.schema {
-                        if schema.is_float(i) {
-                            ColType::Float
-                        } else if schema.is_string(i) {
-                            ColType::String
-                        } else {
-                            // Check for Date/Timestamp types.
-                            match schema.col_type_at(i) {
-                                Some(crate::sql::ddl::ColumnType::Date) => ColType::Date,
-                                Some(crate::sql::ddl::ColumnType::Timestamp) => ColType::Date,
-                                _ => ColType::Int,
-                            }
-                        }
+                    if schema.is_float(i) {
+                        ColType::Float
+                    } else if schema.is_string(i) {
+                        ColType::String
                     } else {
-                        ColType::Int
+                        match schema.col_type_at(i) {
+                            Some(crate::sql::ddl::ColumnType::Date) => ColType::Date,
+                            Some(crate::sql::ddl::ColumnType::Timestamp) => ColType::Date,
+                            _ => ColType::Int,
+                        }
                     }
                 })
-                .collect();
-        }
+                .collect()
+        } else {
+            // Fallback: TPC-H hardcoded schema (legacy path for tables
+            // loaded without a schema). This will be removed once all
+            // load paths set table.schema.
+            let tpch_types = tpc_h_col_types(&table.name);
+            if !tpch_types.is_empty() {
+                tpch_types
+            } else {
+                // No schema and not a TPC-H table — default to Int.
+                vec![ColType::Int; table.column_names.len()]
+            }
+        };
         let mut col_map = new_hashmap();
         for (i, name) in table.column_names.iter().enumerate() {
             let lower = name.to_lowercase();
