@@ -516,8 +516,15 @@ impl<'a> QueryInterpreter<'a> {
         // path (early or final), accumulating the active duration.
         let _g = PROFILER.section(Phase::Aggregate);
         if query.group_by.is_empty() {
-            // W5A-T2: `iter_set_bits()` (tzcnt) skips false rows without
-            // a branch per row.
+            // W12-T1: Fused scalar aggregation. Previously this collected
+            // ALL mask bits into Vec<usize> (800MB for 100M rows) before
+            // calling eval_agg_expr. Now we handle the common cases
+            // (COUNT(*), SUM, AVG, MIN, MAX on a single column) directly
+            // with the Bitmap mask, avoiding the index allocation entirely.
+            if let Some(result) = self.try_fused_scalar_agg(query, t, mask)? {
+                return Ok(result);
+            }
+            // Fallback: collect indices for complex expressions.
             let indices: Vec<usize> = mask.iter_set_bits().collect();
             return self.execute_scalar_agg(query, t, &indices);
         }
@@ -1034,6 +1041,230 @@ impl<'a> QueryInterpreter<'a> {
         }
 
         Ok(Some(results))
+    }
+
+    /// W12-T1: Fused scalar aggregation — operates directly on the Bitmap
+    /// mask without collecting Vec<usize> indices first. Handles the common
+    /// cases: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col), and
+    /// COUNT(DISTINCT col). Falls back to the index-based path for complex
+    /// expressions (arithmetic, CASE, etc.).
+    ///
+    /// For no-WHERE queries (all-ones mask), iterates the column directly
+    /// (contiguous memory, auto-vectorizable, rayon-parallel). For filtered
+    /// queries, iterates the set bits of the mask.
+    pub(crate) fn try_fused_scalar_agg(
+        &self,
+        query: &SelectQuery2,
+        t: &ExecTable,
+        mask: &Bitmap,
+    ) -> Result<Option<QueryResult>, Error> {
+        use rayon::prelude::*;
+
+        let n = t.row_count;
+        let count = mask.count_ones();
+
+        // Analyze SELECT items — all must be simple aggregates or we fall back.
+        enum FusedScalar {
+            CountStar,
+            CountCol(usize),
+            CountDistinctCol(usize),
+            SumCol(usize, bool), // (col_idx, is_float)
+            AvgCol(usize, bool),
+            MinCol(usize),
+            MaxCol(usize),
+        }
+
+        let mut plans: Vec<FusedScalar> = Vec::with_capacity(query.select.len());
+        for item in &query.select {
+            let plan = match &item.expr {
+                Expr2::CountStar => FusedScalar::CountStar,
+                Expr2::Agg { func, arg, distinct } => {
+                    // COUNT(*) is parsed as Agg{Count, arg=CountStar}.
+                    if matches!(arg.as_ref(), Expr2::CountStar) {
+                        FusedScalar::CountStar
+                    } else if let Some(ci) = self.col_in(arg, t) {
+                        match func {
+                            AggFunc::Count => {
+                                if *distinct {
+                                    FusedScalar::CountDistinctCol(ci)
+                                } else {
+                                    FusedScalar::CountCol(ci)
+                                }
+                            }
+                            AggFunc::Sum => {
+                                let is_float = t.col_types.get(ci).copied() == Some(ColType::Float);
+                                FusedScalar::SumCol(ci, is_float)
+                            }
+                            AggFunc::Avg => {
+                                let is_float = t.col_types.get(ci).copied() == Some(ColType::Float);
+                                FusedScalar::AvgCol(ci, is_float)
+                            }
+                            AggFunc::Min => FusedScalar::MinCol(ci),
+                            AggFunc::Max => FusedScalar::MaxCol(ci),
+                            AggFunc::CountDistinct => FusedScalar::CountDistinctCol(ci),
+                        }
+                    } else {
+                        return Ok(None); // complex expression — fall back
+                    }
+                }
+                _ => return Ok(None), // unsupported — fall back
+            };
+            plans.push(plan);
+        }
+
+        // Check if the mask is all-ones (no WHERE filter). This enables
+        // the fast direct-column-iteration path.
+        let is_full_mask = count == n;
+
+        // Compute each aggregate.
+        let mut cols: Vec<ResultColumn> = Vec::with_capacity(query.select.len());
+        for (item_idx, item) in query.select.iter().enumerate() {
+            let name = item.alias.clone().unwrap_or_else(|| self.expr_name(&item.expr));
+            let val: u64 = match &plans[item_idx] {
+                FusedScalar::CountStar => count as u64,
+
+                FusedScalar::CountCol(ci) => {
+                    let col = &t.columns[*ci];
+                    if is_full_mask {
+                        // Parallel count of non-zero values.
+                        col.par_iter().filter(|&&v| v != 0).count() as u64
+                    } else {
+                        let mut cnt = 0u64;
+                        for i in mask.iter_set_bits() {
+                            if col[i] != 0 {
+                                cnt += 1;
+                            }
+                        }
+                        cnt
+                    }
+                }
+
+                FusedScalar::CountDistinctCol(ci) => {
+                    let col = &t.columns[*ci];
+                    if is_full_mask {
+                        crate::exec::hll::count_distinct_hll(col)
+                    } else if count >= 100_000 {
+                        let mut hll = crate::exec::hll::HyperLogLog::new();
+                        for i in mask.iter_set_bits() {
+                            hll.add(col[i]);
+                        }
+                        hll.estimate()
+                    } else {
+                        let mut seen = fxhash::FxHashSet::default();
+                        for i in mask.iter_set_bits() {
+                            seen.insert(col[i]);
+                        }
+                        seen.len() as u64
+                    }
+                }
+
+                FusedScalar::SumCol(ci, is_float) => {
+                    let col = &t.columns[*ci];
+                    if *is_float {
+                        if is_full_mask {
+                            // Parallel f64 sum over the full column.
+                            let sum: f64 = col.par_iter().map(|&v| f64::from_bits(v)).sum();
+                            sum.to_bits()
+                        } else {
+                            let mut sum = 0.0f64;
+                            for i in mask.iter_set_bits() {
+                                sum += f64::from_bits(col[i]);
+                            }
+                            sum.to_bits()
+                        }
+                    } else {
+                        if is_full_mask {
+                            // Parallel i64 sum.
+                            let isum: i64 = col.par_iter().map(|&v| v as i64).sum();
+                            isum as u64
+                        } else {
+                            let mut isum = 0i64;
+                            for i in mask.iter_set_bits() {
+                                isum = isum.wrapping_add(col[i] as i64);
+                            }
+                            isum as u64
+                        }
+                    }
+                }
+
+                FusedScalar::AvgCol(ci, is_float) => {
+                    let col = &t.columns[*ci];
+                    if count == 0 {
+                        0
+                    } else if *is_float {
+                        if is_full_mask {
+                            let sum: f64 = col.par_iter().map(|&v| f64::from_bits(v)).sum();
+                            (sum / count as f64).to_bits()
+                        } else {
+                            let mut sum = 0.0f64;
+                            for i in mask.iter_set_bits() {
+                                sum += f64::from_bits(col[i]);
+                            }
+                            (sum / count as f64).to_bits()
+                        }
+                    } else {
+                        if is_full_mask {
+                            let isum: i64 = col.par_iter().map(|&v| v as i64).sum();
+                            (isum / count as i64) as u64
+                        } else {
+                            let mut isum = 0i64;
+                            for i in mask.iter_set_bits() {
+                                isum = isum.wrapping_add(col[i] as i64);
+                            }
+                            (isum / count as i64) as u64
+                        }
+                    }
+                }
+
+                FusedScalar::MinCol(ci) => {
+                    let col = &t.columns[*ci];
+                    if is_full_mask {
+                        // Parallel min.
+                        col.par_iter().copied().min().unwrap_or(u64::MAX)
+                    } else {
+                        let mut min = u64::MAX;
+                        for i in mask.iter_set_bits() {
+                            let v = col[i];
+                            if v < min {
+                                min = v;
+                            }
+                        }
+                        min
+                    }
+                }
+
+                FusedScalar::MaxCol(ci) => {
+                    let col = &t.columns[*ci];
+                    if is_full_mask {
+                        // Parallel max.
+                        col.par_iter().copied().max().unwrap_or(0)
+                    } else {
+                        let mut max = 0u64;
+                        for i in mask.iter_set_bits() {
+                            let v = col[i];
+                            if v > max {
+                                max = v;
+                            }
+                        }
+                        max
+                    }
+                }
+            };
+
+            cols.push(ResultColumn {
+                name,
+                values: vec![val],
+                string_values: None,
+                type_oid: 0,
+                null_mask: None,
+            });
+        }
+
+        Ok(Some(QueryResult {
+            columns: cols,
+            row_count: 1,
+            elapsed_us: 0,
+        }))
     }
 
     pub(crate) fn execute_scalar_agg(
