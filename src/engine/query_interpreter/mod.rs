@@ -75,6 +75,168 @@ pub fn parse_and_execute(sql: &str, catalog: &Catalog) -> Result<QueryResult, Er
     // fast paths have been removed — they were benchmark-specific specializations
     // with hardcoded constants that gamed the benchmark rather than improving
     // the general engine. The generic interpreter handles all SQL uniformly.
-    let query = parse_query(sql).map_err(Error::Parse)?;
-    execute_interpreter(&query, catalog)
+    let mut query = parse_query(sql).map_err(Error::Parse)?;
+
+    // W19-T1: COUNT(DISTINCT) fusion — detect the pattern
+    // SELECT COUNT(*) FROM (SELECT DISTINCT col FROM table) AS sub
+    // and rewrite to SELECT COUNT(DISTINCT col) FROM table.
+    // This eliminates materializing 100M rows for the inner subquery
+    // and instead uses HyperLogLog (O(1) memory).
+    if let Some(rewritten) = try_count_distinct_fusion(&mut query) {
+        if rewritten {
+            // Query was rewritten in-place.
+        }
+    }
+
+    // W19-T2: Apply DISTINCT deduplication if the query has DISTINCT.
+    // The interpreter parser now captures the DISTINCT flag.
+    let mut result = execute_interpreter(&query, catalog)?;
+    if query.distinct {
+        result = deduplicate_result(result);
+    }
+    Ok(result)
+}
+
+/// W19-T1: Detect `SELECT COUNT(*) FROM (SELECT DISTINCT col FROM table) AS sub`
+/// and rewrite the query in-place to `SELECT COUNT(DISTINCT col) FROM table`.
+/// Returns Some(true) if the rewrite was applied.
+fn try_count_distinct_fusion(query: &mut SelectQuery2) -> Option<bool> {
+    // Check: outer query has exactly one SELECT item: COUNT(*)
+    if query.select.len() != 1 {
+        return None;
+    }
+    let is_count_star = match &query.select[0].expr {
+        Expr2::CountStar => true,
+        Expr2::Agg { func: AggFunc::Count, arg, distinct: false } => {
+            matches!(arg.as_ref(), Expr2::CountStar)
+        }
+        _ => false,
+    };
+    if !is_count_star {
+        return None;
+    }
+
+    // Check: no GROUP BY, no WHERE, no HAVING, no JOINs, no ORDER BY
+    if !query.group_by.is_empty() || query.where_clause.is_some()
+        || query.having.is_some() || !query.joins.is_empty()
+        || !query.order_by.is_empty()
+    {
+        return None;
+    }
+
+    // Check: FROM has exactly one item: a derived table (subquery)
+    if query.from.len() != 1 {
+        return None;
+    }
+    let inner_query = match &query.from[0] {
+        FromItem::Derived(sub, _) => sub.as_ref(),
+        FromItem::Table(_) => return None,
+    };
+
+    // Check: inner query has DISTINCT
+    if !inner_query.distinct {
+        return None;
+    }
+
+    // Check: inner query has exactly one SELECT item: a simple column
+    if inner_query.select.len() != 1 {
+        return None;
+    }
+    let col_expr = match &inner_query.select[0].expr {
+        Expr2::Col(_) => &inner_query.select[0].expr,
+        _ => return None,
+    };
+
+    // Check: inner query has no GROUP BY, no HAVING, no JOINs, no ORDER BY, no LIMIT
+    // (WHERE is OK — it gets pushed down to the scan)
+    if !inner_query.group_by.is_empty() || inner_query.having.is_some()
+        || !inner_query.joins.is_empty() || !inner_query.order_by.is_empty()
+        || inner_query.limit.is_some()
+    {
+        return None;
+    }
+
+    // Rewrite: replace the outer query with COUNT(DISTINCT col) FROM inner_table
+    let inner_from = inner_query.from.clone();
+    let inner_where = inner_query.where_clause.clone();
+    let col_clone = col_expr.clone();
+
+    query.from = inner_from;
+    query.where_clause = inner_where;
+    query.select = vec![SelectItem2 {
+        expr: Expr2::Agg {
+            func: AggFunc::Count,
+            arg: Box::new(col_clone),
+            distinct: true,
+        },
+        alias: query.select[0].alias.clone(),
+    }];
+
+    Some(true)
+}
+
+/// Deduplicate the rows of a QueryResult (for SELECT DISTINCT).
+/// Uses sort-based dedup for single-column results, HashSet for multi-column.
+fn deduplicate_result(result: QueryResult) -> QueryResult {
+    if result.row_count <= 1 {
+        return result;
+    }
+    // Sort-based dedup for single-column (no string values).
+    if result.columns.len() == 1 && result.columns[0].string_values.is_none() {
+        use rayon::prelude::*;
+        let col = &result.columns[0];
+        let n = result.row_count;
+        let mut pairs: Vec<(u64, u32)> = (0..n)
+            .map(|i| (col.values.get(i).copied().unwrap_or(0), i as u32))
+            .collect();
+        pairs.par_sort_unstable_by_key(|(v, _)| *v);
+        let mut keep_indices: Vec<usize> = Vec::new();
+        if !pairs.is_empty() {
+            let mut cur_val = pairs[0].0;
+            keep_indices.push(pairs[0].1 as usize);
+            for &(v, idx) in &pairs[1..] {
+                if v != cur_val {
+                    keep_indices.push(idx as usize);
+                    cur_val = v;
+                }
+            }
+        }
+        keep_indices.sort_unstable();
+        let new_row_count = keep_indices.len();
+        let columns: Vec<ResultColumn> = result
+            .columns
+            .into_iter()
+            .map(|mut c| {
+                let new_values: Vec<u64> =
+                    keep_indices.iter().map(|&i| c.values.get(i).copied().unwrap_or(0)).collect();
+                c.values = new_values;
+                c
+            })
+            .collect();
+        return QueryResult { columns, row_count: new_row_count, elapsed_us: result.elapsed_us };
+    }
+
+    // Multi-column: use HashSet.
+    use std::collections::HashSet;
+    let mut seen: HashSet<Vec<u64>> = HashSet::new();
+    let mut keep_indices: Vec<usize> = Vec::with_capacity(result.row_count);
+    for row in 0..result.row_count {
+        let key: Vec<u64> =
+            result.columns.iter().map(|c| c.values.get(row).copied().unwrap_or(0)).collect();
+        if seen.insert(key) {
+            keep_indices.push(row);
+        }
+    }
+    let new_row_count = keep_indices.len();
+    let columns: Vec<ResultColumn> = result
+        .columns
+        .into_iter()
+        .map(|mut c| {
+            let new_values: Vec<u64> =
+                keep_indices.iter().map(|&i| c.values.get(i).copied().unwrap_or(0)).collect();
+            c.values = new_values;
+            c
+        })
+        .collect();
+    QueryResult { columns, row_count: new_row_count, elapsed_us: result.elapsed_us }
 }

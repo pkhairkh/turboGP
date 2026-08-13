@@ -161,7 +161,7 @@ impl QueryInterpreterParser {
 
     pub(crate) fn parse_select(&mut self) -> Result<SelectQuery2, String> {
         self.expect_kw("SELECT")?;
-        let _ = self.match_kw("DISTINCT");
+        let distinct = self.match_kw("DISTINCT");
         let select = self.parse_select_list()?;
         self.expect_kw("FROM")?;
         let from = self.parse_from_list()?;
@@ -207,7 +207,7 @@ impl QueryInterpreterParser {
         };
         let limit = if self.match_ident_or_kw("LIMIT") { Some(self.parse_usize()?) } else { None };
 
-        Ok(SelectQuery2 { select, from, joins, where_clause, group_by, having, order_by, limit })
+        Ok(SelectQuery2 { select, from, joins, where_clause, group_by, having, order_by, limit, distinct })
     }
 
     pub(crate) fn parse_select_list(&mut self) -> Result<Vec<SelectItem2>, String> {

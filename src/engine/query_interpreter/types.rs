@@ -248,6 +248,9 @@ pub struct SelectQuery2 {
     pub having: Option<Expr2>,
     pub order_by: Vec<(Expr2, bool)>,
     pub limit: Option<usize>,
+    /// Whether SELECT DISTINCT was specified. When true, the result
+    /// is deduplicated before ORDER BY/LIMIT.
+    pub distinct: bool,
 }
 
 // =========================================================================
