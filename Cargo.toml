@@ -49,6 +49,9 @@ mimalloc = { version = "0.1", features = ["override"] }
 # Fast hashing — replaces std SipHash (9% of Q21 time) with hardware AES.
 # Used for all HashMap/HashSet in query_interpreter/ via type aliases.
 ahash = "0.8"
+# Per-query arena allocator (W5B) — eliminates malloc/free churn for
+# intermediate allocations (join output, index lists, masks).
+bumpalo = "3"
 # CPU detection
 raw-cpuid = "11.0"
 # Logging

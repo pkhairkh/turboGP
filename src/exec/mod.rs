@@ -1,4 +1,5 @@
 pub mod bitmap;
+pub mod arena;
 pub mod egraph;
 pub mod bloom_filter;
 pub mod expr_eval;
