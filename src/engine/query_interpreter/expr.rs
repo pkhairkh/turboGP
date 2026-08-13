@@ -974,6 +974,82 @@ impl<'a> QueryInterpreter<'a> {
                 mask.and_inplace(&inverted);
                 Ok(())
             }
+            Expr2::InSubquery { expr, query, negated } => {
+                // W13-T1: Vectorized IN-subquery. Previously this fell through
+                // to the per-row path (100M eval() calls for Q04). Now we
+                // build the HashSet once (cached by AST pointer), then probe
+                // in bulk with rayon parallelism.
+                let ast_key = (query.as_ref() as *const SelectQuery2) as usize;
+                let need_build = !self.in_subquery_cache.borrow().contains_key(&ast_key);
+                if need_build {
+                    let old_outer = self.outer.get();
+                    self.outer.set(None);
+                    let r = self.execute(query);
+                    self.outer.set(old_outer);
+                    match r {
+                        Ok(r) => {
+                            if let Some(col) = r.columns.first() {
+                                let set: FxHashSet<u64> = col.values.iter().copied().collect();
+                                self.in_subquery_cache.borrow_mut().insert(ast_key, set);
+                            }
+                        }
+                        Err(_) => {
+                            self.in_subquery_cache.borrow_mut().insert(ast_key, new_fxhashset());
+                        }
+                    }
+                }
+                let cache = self.in_subquery_cache.borrow();
+                if let Some(set) = cache.get(&ast_key) {
+                    if !set.is_empty() || self.outer.get().is_none() {
+                        // Uncorrelated — bulk probe.
+                        if let Some(ci) = self.col_in(expr, t) {
+                            let col = &t.columns[ci];
+                            let neg = *negated;
+                            let indices: Vec<usize> = mask.iter_set_bits().collect();
+                            let to_clear: Vec<usize> = indices
+                                .par_iter()
+                                .chunks(65536)
+                                .map(|chunk| {
+                                    let mut local = Vec::new();
+                                    for &i in chunk {
+                                        let found = set.contains(&col[i]);
+                                        let pass = if neg { !found } else { found };
+                                        if !pass {
+                                            local.push(i);
+                                        }
+                                    }
+                                    local
+                                })
+                                .flatten()
+                                .collect();
+                            drop(cache);
+                            for i in to_clear {
+                                mask.clear(i);
+                            }
+                            return Ok(());
+                        }
+                        // expr is not a simple column — fall through to per-row.
+                    }
+                }
+                drop(cache);
+                // Correlated or complex — fall through to per-row.
+                for i in 0..t.row_count {
+                    if !mask.get(i) { continue; }
+                    let v = self.eval(expr, t, i)?;
+                    let v_u64 = v.to_u64();
+                    // Check cache (may be correlated).
+                    let cache = self.in_subquery_cache.borrow();
+                    let found = if let Some(set) = cache.get(&ast_key) {
+                        set.contains(&v_u64)
+                    } else {
+                        false
+                    };
+                    drop(cache);
+                    let pass = if *negated { !found } else { found };
+                    if !pass { mask.clear(i); }
+                }
+                Ok(())
+            }
             _ => {
                 // Fallback: per-row eval for unrecognized shapes
                 for i in 0..t.row_count {
