@@ -907,38 +907,35 @@ impl<'a> QueryInterpreter<'a> {
                     if let Some(map) = cache.get(&ast_key) {
                         let outer_eq_col: &[u64] = &t.columns[outer_eq_idx];
                         let outer_neq_col: &[u64] = &t.columns[outer_neq_idx];
-                        // Collect failing rows during iteration, then clear
-                        // them after. We can't clear inside the
-                        // `iter_set_bits()` loop because the iterator
-                        // holds an immutable borrow of `mask`.
-                        let mut to_clear: Vec<usize> = Vec::new();
-                        for i in mask.iter_set_bits() {
-                            let outer_eq = outer_eq_col[i];
-                            let outer_neq = outer_neq_col[i];
-                            // O(1) fast path on the inner HashSet cardinality:
-                            //   empty set  -> no inner row matches the equi-key
-                            //                 -> exists = false
-                            //   len == 1   -> exists iff that single value
-                            //                 differs from outer_neq
-                            //                 (one hash lookup)
-                            //   len >= 2   -> the set holds DISTINCT values,
-                            //                 so at most one can equal
-                            //                 outer_neq; at least one other
-                            //                 value must differ
-                            //                 -> exists = true (no iteration)
-                            // This replaces the prior O(|set|) short-circuit
-                            // scan with an O(1) len check for the common Q21
-                            // case (most orderkeys have >=2 suppliers).
-                            let exists = match map.get(&outer_eq) {
-                                None => false,
-                                Some(set) if set.len() >= 2 => true,
-                                Some(set) => !set.is_empty() && !set.contains(&outer_neq),
-                            };
-                            let pass = if *negated { !exists } else { exists };
-                            if !pass {
-                                to_clear.push(i);
-                            }
-                        }
+                        // W10-T1: Parallel EXISTS probe. The serial loop was
+                        // 83% of Q21's runtime (1772ms). Split the set bits
+                        // into chunks, each thread probes independently, then
+                        // merge the to_clear lists. The map and columns are
+                        // read-only (Sync), so sharing across threads is safe.
+                        let indices: Vec<usize> = mask.iter_set_bits().collect();
+                        let neg = *negated;
+                        let to_clear: Vec<usize> = indices
+                            .par_iter()
+                            .chunks(65536)
+                            .map(|chunk| {
+                                let mut local = Vec::new();
+                                for &i in chunk {
+                                    let outer_eq = outer_eq_col[i];
+                                    let outer_neq = outer_neq_col[i];
+                                    let exists = match map.get(&outer_eq) {
+                                        None => false,
+                                        Some(set) if set.len() >= 2 => true,
+                                        Some(set) => !set.is_empty() && !set.contains(&outer_neq),
+                                    };
+                                    let pass = if neg { !exists } else { exists };
+                                    if !pass {
+                                        local.push(i);
+                                    }
+                                }
+                                local
+                            })
+                            .flatten()
+                            .collect();
                         // Release the cache borrow before mutating `mask`
                         // (not strictly required — different RefCells — but
                         // makes the borrow scope explicit).
