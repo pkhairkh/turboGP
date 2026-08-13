@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 
 REPO = "/root/turboGP"
-RESULTS = f"{REPO}/benchmarks/results"
+RESULTS = f"{REPO}/bench/results"
 
 def read_turbogp_tpch(path):
     """turboGP TPC-H CSV: query,cold_us,cold_rows,cold_status,..."""

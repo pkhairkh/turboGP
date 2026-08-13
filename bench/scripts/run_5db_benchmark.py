@@ -15,8 +15,8 @@ from pathlib import Path
 
 REPO = Path("/root/turboGP")
 TURBOGP = REPO / "target/release/turbogp"
-TPCH_QUERIES = REPO / "benchmarks/tpch/queries"
-TPCH_RESULTS = REPO / "benchmarks/tpch/results"
+TPCH_QUERIES = REPO / "bench/queries/tpch/queries"
+TPCH_RESULTS = REPO / "bench/queries/tpch/results"
 CHARTS = REPO / "benchmarks/charts"
 ANALYSIS = REPO / "benchmarks/analysis"
 

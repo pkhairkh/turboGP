@@ -13,8 +13,8 @@ from /root/turboGP/benchmarks/ and produces:
   - benchmarks/charts/cache_speedup.png          (speedup factor cold/hot, log scale)
 
 Run on the sandbox where CSVs live at:
-    /root/turboGP/benchmarks/tpch/results/{native_sf1,native_sf10_merged,sf1_results,sf10_results}.csv
-    /root/turboGP/benchmarks/clickbench/results/native_bench.csv
+    /root/turboGP/bench/queries/tpch/results/{native_sf1,native_sf10_merged,sf1_results,sf10_results}.csv
+    /root/turboGP/bench/queries/clickbench/results/native_bench.csv
 """
 from __future__ import annotations
 
@@ -695,13 +695,13 @@ def build_report(native_sf1, native_sf10, native_click,
     A("cd /root/turboGP")
     A("")
     A("# Native (microseconds, no psql)")
-    A("python3 benchmarks/tpch/run_native.py --sf 1   --out benchmarks/tpch/results/native_sf1.csv")
-    A("python3 benchmarks/tpch/run_native.py --sf 10  --out benchmarks/tpch/results/native_sf10.csv")
-    A("python3 benchmarks/clickbench/run_native.py --out benchmarks/clickbench/results/native_bench.csv")
+    A("python3 bench/queries/tpch/run_native.py --sf 1   --out bench/queries/tpch/results/native_sf1.csv")
+    A("python3 bench/queries/tpch/run_native.py --sf 10  --out bench/queries/tpch/results/native_sf10.csv")
+    A("python3 bench/queries/clickbench/run_native.py --out bench/queries/clickbench/results/native_bench.csv")
     A("")
     A("# 5-database comparison (milliseconds, psql/HTTP/EXAplus)")
-    A("python3 benchmarks/tpch/run_comparison.py --sf 1  --out benchmarks/tpch/results/sf1_results.csv")
-    A("python3 benchmarks/tpch/run_comparison.py --sf 10 --out benchmarks/tpch/results/sf10_results.csv")
+    A("python3 bench/queries/tpch/run_comparison.py --sf 1  --out bench/queries/tpch/results/sf1_results.csv")
+    A("python3 bench/queries/tpch/run_comparison.py --sf 10 --out bench/queries/tpch/results/sf10_results.csv")
     A("")
     A("# This report")
     A("python3 generate_report.py")
@@ -711,11 +711,11 @@ def build_report(native_sf1, native_sf10, native_click,
     A("")
     A("| File | Description |")
     A("|---|---|")
-    A("| `benchmarks/tpch/results/native_sf1.csv` | TPC-H SF=1 native (us) |")
-    A("| `benchmarks/tpch/results/native_sf10.csv` | TPC-H SF=10 native (us); q18-q22 FAIL/OOM |")
-    A("| `benchmarks/tpch/results/sf1_results.csv` | TPC-H SF=1 5-db comparison (ms) |")
-    A("| `benchmarks/tpch/results/sf10_results.csv` | TPC-H SF=10 5-db comparison (ms) |")
-    A("| `benchmarks/clickbench/results/native_bench.csv` | ClickBench native (us) |")
+    A("| `bench/queries/tpch/results/native_sf1.csv` | TPC-H SF=1 native (us) |")
+    A("| `bench/queries/tpch/results/native_sf10.csv` | TPC-H SF=10 native (us); q18-q22 FAIL/OOM |")
+    A("| `bench/queries/tpch/results/sf1_results.csv` | TPC-H SF=1 5-db comparison (ms) |")
+    A("| `bench/queries/tpch/results/sf10_results.csv` | TPC-H SF=10 5-db comparison (ms) |")
+    A("| `bench/queries/clickbench/results/native_bench.csv` | ClickBench native (us) |")
     A("| `benchmarks/charts/tpch_sf1_geomean.png` | Chart: SF=1 geomean hot, log scale |")
     A("| `benchmarks/charts/tpch_sf1_cold_vs_hot.png` | Chart: turboGP SF=1 cold vs hot |")
     A("| `benchmarks/charts/clickbench_cold_vs_hot.png` | Chart: ClickBench cold vs hot (43 q) |")

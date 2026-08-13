@@ -17,8 +17,8 @@ from pathlib import Path
 
 REPO = Path("/root/turboGP")
 TURBOGP = REPO / "target/release/turbogp"
-CB_QUERIES = REPO / "benchmarks/clickbench/queries"
-CB_RESULTS = REPO / "benchmarks/clickbench/results"
+CB_QUERIES = REPO / "bench/queries/clickbench/queries"
+CB_RESULTS = REPO / "bench/queries/clickbench/results"
 CHARTS = REPO / "benchmarks/charts"
 ANALYSIS = REPO / "benchmarks/analysis"
 
@@ -68,7 +68,7 @@ def start_turbogp():
     if not csv_path.exists():
         print("  Converting hits.tbl to turboGP CSV...")
         csv_path.parent.mkdir(parents=True, exist_ok=True)
-        tbl_path = REPO / "benchmarks/clickbench/data/hits.tbl"
+        tbl_path = REPO / "bench/queries/clickbench/data/hits.tbl"
         import csv as csvmod
         with open(tbl_path, "r") as fin, open(csv_path, "w", newline="") as fout:
             w = csvmod.writer(fout)

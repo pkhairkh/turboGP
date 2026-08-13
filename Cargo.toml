@@ -130,74 +130,76 @@ optional = true
 [[bench]]
 name = "throughput"
 harness = false
-path = "benches/throughput.rs"
+path = "bench/rust_benches/throughput.rs"
 required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_kernels"
 harness = false
-path = "benches/bench_kernels.rs"
+path = "bench/rust_benches/bench_kernels.rs"
 required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_tpc_h"
 harness = false
-path = "benches/bench_tpc_h.rs"
+path = "bench/rust_benches/bench_tpc_h.rs"
 required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_sketches"
 harness = false
-path = "benches/bench_sketches.rs"
+path = "bench/rust_benches/bench_sketches.rs"
 required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_wcoj"
 harness = false
-path = "benches/bench_wcoj.rs"
+path = "bench/rust_benches/bench_wcoj.rs"
 required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_cardinality"
 harness = false
-path = "benches/bench_cardinality.rs"
+path = "bench/rust_benches/bench_cardinality.rs"
 required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_planner"
 harness = false
-path = "benches/bench_planner.rs"
+path = "bench/rust_benches/bench_planner.rs"
 required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_eddy"
 harness = false
-path = "benches/bench_eddy.rs"
+path = "bench/rust_benches/bench_eddy.rs"
 required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_tensor"
 harness = false
-path = "benches/bench_tensor.rs"
+path = "bench/rust_benches/bench_tensor.rs"
 required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_3x_proof"
 harness = false
-path = "benches/bench_3x_proof.rs"
+path = "bench/rust_benches/bench_3x_proof.rs"
 required-features = ["bench-external"]
 
 [[bench]]
 name = "bench_tpc_h_full"
 harness = false
-path = "benches/bench_tpc_h_full.rs"
+path = "bench/rust_benches/bench_tpc_h_full.rs"
 required-features = ["bench-external"]
 
 [[example]]
+path = "bench/examples/bench_duckdb_inproc.rs"
 name = "bench_duckdb_inproc"
 required-features = ["bench-external"]
 
 [[example]]
+path = "bench/examples/bench_clickhouse_inproc.rs"
 name = "bench_clickhouse_inproc"
 required-features = ["bench-external"]
 

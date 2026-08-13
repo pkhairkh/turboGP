@@ -41,7 +41,7 @@ enum BenchCommand {
         #[arg(long)]
         csv_dir: String,
         /// Output CSV file path
-        #[arg(long, default_value = "benchmarks/tpch/results/native_bench.csv")]
+        #[arg(long, default_value = "bench/queries/tpch/results/native_bench.csv")]
         output: String,
         /// Number of hot iterations (after 1 cold warmup)
         #[arg(long, default_value = "3")]
@@ -59,7 +59,7 @@ enum BenchCommand {
         #[arg(long)]
         csv_dir: String,
         /// Output CSV file path
-        #[arg(long, default_value = "benchmarks/clickbench/results/native_bench.csv")]
+        #[arg(long, default_value = "bench/queries/clickbench/results/native_bench.csv")]
         output: String,
         /// Number of hot iterations
         #[arg(long, default_value = "3")]
@@ -357,8 +357,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Repo dir: {}", repo_dir.display());
 
             let csv_path = Path::new(&csv_dir).canonicalize()?;
-            let schema_path = repo_dir.join("benchmarks/tpch/schema/turbogp.sql");
-            let queries_dir = repo_dir.join("benchmarks/tpch/queries/turbogp");
+            let schema_path = repo_dir.join("bench/queries/tpch/schema/turbogp.sql");
+            let queries_dir = repo_dir.join("bench/queries/tpch/queries/turbogp");
 
             eprintln!("Loading schema from {}...", schema_path.display());
             let mut engine = QueryEngine::in_memory();
@@ -378,7 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Repo dir: {}", repo_dir.display());
 
             let csv_path = Path::new(&csv_dir).canonicalize()?;
-            let queries_dir = repo_dir.join("benchmarks/clickbench/queries/turbogp");
+            let queries_dir = repo_dir.join("bench/queries/clickbench/queries/turbogp");
 
             eprintln!("Creating hits table schema...");
             let mut engine = QueryEngine::in_memory();

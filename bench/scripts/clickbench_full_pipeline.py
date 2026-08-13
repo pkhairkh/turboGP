@@ -16,7 +16,7 @@ import re
 from pathlib import Path
 
 REPO = Path("/root/turboGP")
-DATA_DIR = REPO / "benchmarks/clickbench/data"
+DATA_DIR = REPO / "bench/queries/clickbench/data"
 NUM_ROWS = 100_000_000  # 100M rows
 BATCH_WRITE = 10_000_000  # Write in 10M row batches
 

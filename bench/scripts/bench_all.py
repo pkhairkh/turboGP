@@ -33,7 +33,7 @@ def read_query(path):
 def list_queries(db, bench, sf=None):
     """Return list of (qid, filepath) for the given db/bench."""
     if bench == "tpch":
-        qdir = f"{REPO}/benchmarks/tpch/queries/{db}"
+        qdir = f"{REPO}/bench/queries/tpch/queries/{db}"
         queries = []
         for i in range(1, 23):
             for ext in [".sql"]:
@@ -43,7 +43,7 @@ def list_queries(db, bench, sf=None):
                     break
         return queries
     elif bench == "clickbench":
-        qdir = f"{REPO}/benchmarks/clickbench/queries/{db}"
+        qdir = f"{REPO}/bench/queries/clickbench/queries/{db}"
         queries = []
         for i in range(1, 44):
             p = f"{qdir}/q{i:02d}.sql"
