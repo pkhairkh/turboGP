@@ -141,10 +141,21 @@ impl<'a> QueryInterpreter<'a> {
         let slots_per_group: usize = slots.iter().map(|s| s.n_slots()).sum();
 
         // 3. Check HAVING — only support `slot_expr OP literal`.
-        let having_filter: Option<(usize, BinOp2, i64)> = if let Some(ref having) = query.having {
+        // W31-T2: Support both integer and float literals. Previously the
+        // HAVING literal was stored as i64 and compared via `acc[slot_idx] as i64`,
+        // which reinterprets float bit patterns as integers (wrong for float
+        // SUM/AVG columns like Q18's SUM(l_quantity) > 300).
+        let having_filter: Option<(usize, BinOp2, HavingLit)> = if let Some(ref having) = query.having {
             if let Expr2::BinOp { op, left, right } = having {
                 let slot_idx = self.match_expr_to_slot(left, &query.select, &slots, &slot_offsets, t);
-                let lit = self.eval_const_i64(right, t);
+                // Try i64 first, then f64.
+                let lit = if let Some(iv) = self.eval_const_i64(right, t) {
+                    Some(HavingLit::Int(iv))
+                } else if let Some(fv) = self.eval_const_f64(right, t) {
+                    Some(HavingLit::Float(fv))
+                } else {
+                    None
+                };
                 if let (Some(idx), Some(val)) = (slot_idx, lit) {
                     Some((idx, *op, val))
                 } else {return Ok(None); // complex HAVING — fall back
@@ -327,18 +338,14 @@ impl<'a> QueryInterpreter<'a> {
         let mut groups: Vec<Vec<u64>> = global.into_values().collect();
 
         // 8. HAVING filter.
+        // W31-T2: Use HavingLit::compare to handle both int and float slots.
         if let Some((slot_idx, op, val)) = having_filter {
+            // Determine if this slot is a float slot by checking the AccSlot.
+            let is_float = slots.iter().enumerate().any(|(i, s)| {
+                slot_offsets[i] == slot_idx && matches!(s, AccSlot::SumCol(_, true) | AccSlot::AvgCol(_, true))
+            });
             groups.retain(|acc| {
-                let v = acc[slot_idx] as i64;
-                match op {
-                    BinOp2::Gt => v > val,
-                    BinOp2::Ge => v >= val,
-                    BinOp2::Lt => v < val,
-                    BinOp2::Le => v <= val,
-                    BinOp2::Eq => v == val,
-                    BinOp2::Ne => v != val,
-                    _ => true,
-                }
+                val.compare(acc[slot_idx], is_float, op)
             });
         }
 
@@ -414,7 +421,7 @@ impl<'a> QueryInterpreter<'a> {
         gb_cols: &[usize],
         slots: &[AccSlot],
         slot_offsets: &[usize],
-        having_filter: Option<(usize, BinOp2, i64)>,
+        having_filter: Option<(usize, BinOp2, HavingLit)>,
         order_spec: Option<(usize, bool)>,
     ) -> Result<Option<QueryResult>, Error> {
         use rayon::prelude::*;
@@ -555,7 +562,7 @@ impl<'a> QueryInterpreter<'a> {
         groups: &[(u64, u64)],
         slots: &[AccSlot],
         slot_offsets: &[usize],
-        having_filter: Option<(usize, BinOp2, i64)>,
+        having_filter: Option<(usize, BinOp2, HavingLit)>,
         order_spec: Option<(usize, bool)>,
     ) -> Result<Option<QueryResult>, Error> {
         let mut groups: Vec<(u64, u64)> = groups.to_vec();
@@ -570,19 +577,11 @@ impl<'a> QueryInterpreter<'a> {
         });
 
         // HAVING: only supports filtering by COUNT(*) (slot offset = countall_offset).
+        // W31-T2: Use HavingLit::compare for correct float handling.
         if let Some((slot_idx, op, val)) = having_filter {
             if Some(slot_idx) == countall_offset {
                 groups.retain(|(count, _)| {
-                    let v = *count as i64;
-                    match op {
-                        BinOp2::Gt => v > val,
-                        BinOp2::Ge => v >= val,
-                        BinOp2::Lt => v < val,
-                        BinOp2::Le => v <= val,
-                        BinOp2::Eq => v == val,
-                        BinOp2::Ne => v != val,
-                        _ => true,
-                    }
+                    val.compare(*count as u64, false, op)
                 });
             } else {
                 let gb_col_idx = slots.iter().enumerate().find_map(|(i, s)| {
@@ -595,16 +594,8 @@ impl<'a> QueryInterpreter<'a> {
                 });
                 if let Some(ci) = gb_col_idx {
                     groups.retain(|(_, first_idx)| {
-                        let v = t.columns[ci][*first_idx as usize] as i64;
-                        match op {
-                            BinOp2::Gt => v > val,
-                            BinOp2::Ge => v >= val,
-                            BinOp2::Lt => v < val,
-                            BinOp2::Le => v <= val,
-                            BinOp2::Eq => v == val,
-                            BinOp2::Ne => v != val,
-                            _ => true,
-                        }
+                        let v = t.columns[ci][*first_idx as usize];
+                        val.compare(v, false, op)
                     });
                 }
             }
@@ -724,6 +715,72 @@ impl<'a> QueryInterpreter<'a> {
             Expr2::Float(f) => Some(*f as i64),
             Expr2::Date(d) => Some(*d as i64),
             _ => None,
+        }
+    }
+
+    /// W31-T2: Evaluate a constant expression to f64. Returns None for non-constant.
+    fn eval_const_f64(&self, expr: &Expr2, _t: &ExecTable) -> Option<f64> {
+        match expr {
+            Expr2::Int(v) => Some(*v as f64),
+            Expr2::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+}
+
+/// W31-T2: HAVING literal — supports both integer and float comparisons.
+/// Previously the accumulator path stored HAVING literals as i64 and
+/// compared via `acc[slot_idx] as i64`, which reinterprets float bit
+/// patterns as integers (wrong for float SUM/AVG columns).
+#[derive(Clone, Copy)]
+enum HavingLit {
+    Int(i64),
+    Float(f64),
+}
+
+impl HavingLit {
+    /// Compare an accumulator slot value against this literal.
+    /// `is_float` indicates whether the slot stores an f64::to_bits value.
+    #[inline]
+    fn compare(&self, slot_val: u64, is_float: bool, op: BinOp2) -> bool {
+        match self {
+            HavingLit::Int(val) => {
+                if is_float {
+                    let sv = f64::from_bits(slot_val);
+                    match op {
+                        BinOp2::Gt => sv > *val as f64,
+                        BinOp2::Ge => sv >= *val as f64,
+                        BinOp2::Lt => sv < *val as f64,
+                        BinOp2::Le => sv <= *val as f64,
+                        BinOp2::Eq => (sv - *val as f64).abs() < f64::EPSILON,
+                        BinOp2::Ne => (sv - *val as f64).abs() >= f64::EPSILON,
+                        _ => true,
+                    }
+                } else {
+                    let sv = slot_val as i64;
+                    match op {
+                        BinOp2::Gt => sv > *val,
+                        BinOp2::Ge => sv >= *val,
+                        BinOp2::Lt => sv < *val,
+                        BinOp2::Le => sv <= *val,
+                        BinOp2::Eq => sv == *val,
+                        BinOp2::Ne => sv != *val,
+                        _ => true,
+                    }
+                }
+            }
+            HavingLit::Float(val) => {
+                let sv = if is_float { f64::from_bits(slot_val) } else { slot_val as f64 };
+                match op {
+                    BinOp2::Gt => sv > *val,
+                    BinOp2::Ge => sv >= *val,
+                    BinOp2::Lt => sv < *val,
+                    BinOp2::Le => sv <= *val,
+                    BinOp2::Eq => (sv - val).abs() < f64::EPSILON,
+                    BinOp2::Ne => (sv - val).abs() >= f64::EPSILON,
+                    _ => true,
+                }
+            }
         }
     }
 }
