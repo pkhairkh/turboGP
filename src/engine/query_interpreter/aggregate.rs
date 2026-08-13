@@ -3,6 +3,7 @@
 use crate::catalog::Catalog;
 use crate::datasource::table::Table;
 use crate::engine::result::{QueryResult, ResultColumn};
+use crate::exec::bitmap::Bitmap;
 use crate::exec::fm_index::StringSearchColumn;
 use crate::Error;
 use fxhash::{FxHashMap, FxHashSet};
@@ -44,7 +45,7 @@ impl<'a> QueryInterpreter<'a> {
         &self,
         query: &SelectQuery2,
         t: &ExecTable,
-        mask: &[bool],
+        mask: &Bitmap,
     ) -> Result<Option<QueryResult>, Error> {
         use crate::exec::fixed_agg::{FixedAccumulator, MAX_FIXED_GROUPS};
 
@@ -272,7 +273,7 @@ impl<'a> QueryInterpreter<'a> {
                 let mut local_counts: Vec<u64> = Vec::new();
 
                 for i in start..end {
-                    if !mask[i] {
+                    if !mask.get(i) {
                         continue;
                     }
 
@@ -402,7 +403,7 @@ impl<'a> QueryInterpreter<'a> {
                 let mut mm =
                     vec![if is_min { f64::INFINITY } else { f64::NEG_INFINITY }; num_groups_found];
                 for i in 0..n {
-                    if !mask[i] {
+                    if !mask.get(i) {
                         continue;
                     }
                     let mut key_hash: u64 = 0;
@@ -506,10 +507,12 @@ impl<'a> QueryInterpreter<'a> {
         &self,
         query: &SelectQuery2,
         t: &ExecTable,
-        mask: &[bool],
+        mask: &Bitmap,
     ) -> Result<QueryResult, Error> {
         if query.group_by.is_empty() {
-            let indices: Vec<usize> = (0..t.row_count).filter(|&i| mask[i]).collect();
+            // W5A-T2: `iter_set_bits()` (tzcnt) skips false rows without
+            // a branch per row.
+            let indices: Vec<usize> = mask.iter_set_bits().collect();
             return self.execute_scalar_agg(query, t, &indices);
         }
 
@@ -522,7 +525,7 @@ impl<'a> QueryInterpreter<'a> {
         // PARALLEL: split into chunks, each thread builds a local HashMap,
         // then merge. This is critical for Q3 (10k groups, 300k rows) which
         // was serial and took ~200ms just for grouping.
-        let indices: Vec<usize> = (0..t.row_count).filter(|&i| mask[i]).collect();
+        let indices: Vec<usize> = mask.iter_set_bits().collect();
 
         // Pre-resolve GROUP BY column indices. For computed expressions
         // (extract, substr), pre-evaluate per row (serial — needed because

@@ -11,7 +11,7 @@ use fxhash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 
 use super::types::*;
-use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset, take_mask_buf, return_mask_buf};
+use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset};
 
 // =========================================================================
 // Top-N heap (W1 Task 1.3) — O(N log K) replacement for full sort + truncate
@@ -415,9 +415,14 @@ impl<'a> QueryInterpreter<'a> {
 
     // --- WHERE ---
 
-    pub(crate) fn build_mask(&self, expr: &Expr2, table: &ExecTable) -> Result<Vec<bool>, Error> {
+    pub(crate) fn build_mask(&self, expr: &Expr2, table: &ExecTable) -> Result<Bitmap, Error> {
         // Try vectorized fast path first; fall back to per-row eval.
-        let mut mask = vec![true; table.row_count];
+        // W5A-T2: mask is a packed Bitmap (1 bit/row) instead of Vec<bool>
+        // (1 byte/row). The leaf comparison fast paths in `apply_comparison`
+        // already produce a Bitmap via `bitmap::filter_*` — composing
+        // directly with `Bitmap::and_inplace` removes the prior
+        // `and_into_bool` expansion (8x memory bandwidth) on every leaf.
+        let mut mask = Bitmap::all_ones(table.row_count);
         self.eval_bool_mask_vec(expr, table, &mut mask)?;
         Ok(mask)
     }
@@ -491,7 +496,7 @@ impl<'a> QueryInterpreter<'a> {
         &self,
         or_expr: &Expr2,
         t: &ExecTable,
-        mask: &mut [bool],
+        mask: &mut Bitmap,
     ) -> Result<bool, Error> {
         use xxhash_rust::xxh3::xxh3_64;
 
@@ -598,20 +603,20 @@ impl<'a> QueryInterpreter<'a> {
                 });
             }
             if let Some(bm) = acc {
-                // mask[i] = mask[i] && bm.get(i)  (AVX-512BW bit expansion)
-                bitmap::and_into_bool(&bm, &mut mask[..n]);
+                // mask[i] = mask[i] && bm.get(i)  (AVX-512BW bitwise AND)
+                mask.and_inplace(&bm);
             }
         } else {
             // FxHashSet fallback for large N (no current TPC-H query hits
             // this; kept for correctness on hypothetical future queries).
             let set: FxHashSet<(u64, u64)> = pairs.iter().copied().collect();
             for i in 0..n {
-                if !mask[i] {
+                if !mask.get(i) {
                     continue;
                 }
                 let key = (col_a_data[i], col_b_data[i]);
                 if !set.contains(&key) {
-                    mask[i] = false;
+                    mask.clear(i);
                 }
             }
         }
@@ -626,19 +631,22 @@ impl<'a> QueryInterpreter<'a> {
         &self,
         expr: &Expr2,
         t: &ExecTable,
-        mask: &mut [bool],
+        mask: &mut Bitmap,
     ) -> Result<(), Error> {
         match expr {
             Expr2::BinOp { op: BinOp2::And, left, right } => {
                 // W2: evaluate left then right directly into the same mask.
                 // All leaf comparisons AND into the mask in place (via
-                // `bitmap::and_into_bool`), the OR arm has been fixed to
+                // `Bitmap::and_inplace`), the OR arm has been fixed to
                 // AND its disjunction into the mask, and the per-row
-                // fallback paths still early-exit on `if !mask[i] { continue; }`
+                // fallback paths still early-exit on `if !mask.get(i) { continue; }`
                 // so rows already filtered out by the left side are
                 // skipped on the right side. This eliminates the previous
                 // `mask.to_vec()` allocation (6 MB for a 6 M-row lineitem
                 // scan) per conjunct.
+                // W5A-T2: mask is a packed Bitmap; `and_inplace` uses the
+                // AVX-512BW kernel (64 bytes/iter) directly on the packed
+                // bytes, removing the prior `and_into_bool` byte expansion.
                 self.eval_bool_mask_vec(left, t, mask)?;
                 self.eval_bool_mask_vec(right, t, mask)?;
                 Ok(())
@@ -651,25 +659,21 @@ impl<'a> QueryInterpreter<'a> {
                 if self.try_nation_pair_or_lut(expr, t, mask)? {
                     return Ok(());
                 }
-                // W2: generic OR fallback — reuse thread-local pool buffers
-                // instead of allocating 2 fresh `vec![true; N]` masks per
-                // call. The disjunction is AND-ed into the incoming mask
-                // (previously the OR arm OVERWROTE mask, relying on the
-                // outer conjunct loop to re-AND — a latent bug if
-                // eval_bool_mask_vec was ever called on an OR expression
-                // with a non-trivial incoming mask).
+                // W2/W5A-T2: generic OR fallback. Each arm recursively fills
+                // its own all-ones Bitmap (lmask / rmask), then the
+                // disjunction is AND-ed into the incoming mask in place.
+                // W5A-T5 will replace these two allocations with a
+                // thread-local Bitmap pool; for now `Bitmap::all_ones(n)` is
+                // a single ~n/8-byte allocation (8x smaller than the prior
+                // `vec![true; N]`).
                 let n = t.row_count;
-                let mut lmask = take_mask_buf(n);
-                lmask[..n].fill(true);
-                self.eval_bool_mask_vec(left, t, &mut lmask[..n])?;
-                let mut rmask = take_mask_buf(n);
-                rmask[..n].fill(true);
-                self.eval_bool_mask_vec(right, t, &mut rmask[..n])?;
-                for i in 0..n {
-                    mask[i] = mask[i] && (lmask[i] || rmask[i]);
-                }
-                return_mask_buf(lmask);
-                return_mask_buf(rmask);
+                let mut lmask = Bitmap::all_ones(n);
+                self.eval_bool_mask_vec(left, t, &mut lmask)?;
+                let mut rmask = Bitmap::all_ones(n);
+                self.eval_bool_mask_vec(right, t, &mut rmask)?;
+                // mask &= (lmask | rmask) — two AVX-512BW word ops, no row loop.
+                lmask.or_inplace(&rmask);
+                mask.and_inplace(&lmask);
                 Ok(())
             }
             Expr2::BinOp { op, left, right } => {
@@ -746,19 +750,24 @@ impl<'a> QueryInterpreter<'a> {
                             bm
                         }
                     };
-                    bitmap::and_into_bool(&bm, &mut mask[..n]);
+                    // W5A-T2: AND the packed bitmap directly into the
+                    // running mask via AVX-512BW bitwise-and (was
+                    // `and_into_bool` byte expansion).
+                    mask.and_inplace(&bm);
                     Ok(())
                 } else {
                     // Fallback: per-row eval
                     for i in 0..t.row_count {
-                        if !mask[i] {
+                        if !mask.get(i) {
                             continue;
                         }
                         let v = self.eval(expr, t, i)?;
                         let lo = self.eval(low, t, i)?;
                         let hi = self.eval(high, t, i)?;
                         let in_range = self.cmp_le(&lo, &v) && self.cmp_le(&v, &hi);
-                        mask[i] = mask[i] && (*negated != in_range);
+                        if *negated == in_range {
+                            mask.clear(i);
+                        }
                     }
                     Ok(())
                 }
@@ -777,17 +786,19 @@ impl<'a> QueryInterpreter<'a> {
                         .collect();
                     let col = &t.columns[col_idx];
                     for i in 0..t.row_count {
-                        if !mask[i] {
+                        if !mask.get(i) {
                             continue;
                         }
                         let v = col[i];
                         let found = vals.iter().any(|&x| x == v);
-                        mask[i] = mask[i] && (*negated != found);
+                        if *negated == found {
+                            mask.clear(i);
+                        }
                     }
                     Ok(())
                 } else {
                     for i in 0..t.row_count {
-                        if !mask[i] {
+                        if !mask.get(i) {
                             continue;
                         }
                         let v = self.eval(expr, t, i)?;
@@ -799,7 +810,9 @@ impl<'a> QueryInterpreter<'a> {
                                 break;
                             }
                         }
-                        mask[i] = mask[i] && (*negated != found);
+                        if *negated == found {
+                            mask.clear(i);
+                        }
                     }
                     Ok(())
                 }
@@ -821,12 +834,18 @@ impl<'a> QueryInterpreter<'a> {
                             if !pat.is_empty() && sc.len() >= t.row_count {
                                 // Only use StringSearchColumn if it has enough rows
                                 // (after a join, the string column may have the wrong length)
+                                // W5A-T3 will return a Bitmap from like_mask;
+                                // for now we iterate the bool vec and clear bits
+                                // in the packed mask.
                                 let like_mask = self.like_mask(sc, &pat);
                                 for i in 0..t.row_count {
-                                    if *negated {
-                                        mask[i] = mask[i] && !like_mask[i];
-                                    } else {
-                                        mask[i] = mask[i] && like_mask[i];
+                                    if !mask.get(i) {
+                                        continue;
+                                    }
+                                    let lm = like_mask[i];
+                                    let keep = if *negated { !lm } else { lm };
+                                    if !keep {
+                                        mask.clear(i);
                                     }
                                 }
                                 return Ok(());
@@ -836,7 +855,7 @@ impl<'a> QueryInterpreter<'a> {
                 }
                 // Fallback: per-row eval
                 for i in 0..t.row_count {
-                    if !mask[i] {
+                    if !mask.get(i) {
                         continue;
                     }
                     let v = self.eval(expr, t, i)?;
@@ -845,18 +864,22 @@ impl<'a> QueryInterpreter<'a> {
                         (Value2::Str(s), Value2::Str(p)) => self.like(s, p),
                         _ => false,
                     };
-                    mask[i] = mask[i] && (*negated != r);
+                    if *negated == r {
+                        mask.clear(i);
+                    }
                 }
                 Ok(())
             }
             _ => {
                 // Fallback: per-row eval for unrecognized shapes
                 for i in 0..t.row_count {
-                    if !mask[i] {
+                    if !mask.get(i) {
                         continue;
                     }
                     let v = self.eval(expr, t, i)?;
-                    mask[i] = mask[i] && self.truthy(&v);
+                    if !self.truthy(&v) {
+                        mask.clear(i);
+                    }
                 }
                 Ok(())
             }
@@ -924,7 +947,7 @@ impl<'a> QueryInterpreter<'a> {
         left: &Expr2,
         right: &Expr2,
         t: &ExecTable,
-        mask: &mut [bool],
+        mask: &mut Bitmap,
     ) -> Result<(), Error> {
         // Try Col op Const (right side must NOT have column refs)
         if let Some(col_idx) = self.col_in(left, t) {
@@ -1011,16 +1034,16 @@ impl<'a> QueryInterpreter<'a> {
                 match op {
                     BinOp2::Eq => {
                         for i in 0..n {
-                            if mask[i] && lcol[i] != rcol[i] {
-                                mask[i] = false;
+                            if mask.get(i) && lcol[i] != rcol[i] {
+                                mask.clear(i);
                             }
                         }
                         return Ok(());
                     }
                     BinOp2::Ne => {
                         for i in 0..n {
-                            if mask[i] && lcol[i] == rcol[i] {
-                                mask[i] = false;
+                            if mask.get(i) && lcol[i] == rcol[i] {
+                                mask.clear(i);
                             }
                         }
                         return Ok(());
@@ -1031,13 +1054,15 @@ impl<'a> QueryInterpreter<'a> {
         }
         // Fallback: per-row eval for Col op Col or complex expressions
         for i in 0..t.row_count {
-            if !mask[i] {
+            if !mask.get(i) {
                 continue;
             }
             let lv = self.eval(left, t, i)?;
             let rv = self.eval(right, t, i)?;
             let result = self.binop(op, &lv, &rv);
-            mask[i] = mask[i] && self.truthy(&result);
+            if !self.truthy(&result) {
+                mask.clear(i);
+            }
         }
         Ok(())
     }
@@ -1049,14 +1074,13 @@ impl<'a> QueryInterpreter<'a> {
         col_idx: usize,
         val: &Value2,
         t: &ExecTable,
-        mask: &mut [bool],
+        mask: &mut Bitmap,
         _negated: bool,
     ) -> Result<(), Error> {
         use crate::exec::bitmap;
         let col: &[u64] = &t.columns[col_idx];
         let col_type = t.col_types[col_idx];
         let n = t.row_count;
-        let mask = &mut mask[..n];
         match (col_type, val) {
             (ColType::Int, Value2::Int(ival)) => {
                 let bm = match op {
@@ -1068,7 +1092,9 @@ impl<'a> QueryInterpreter<'a> {
                     BinOp2::Ge => bitmap::filter_ge_i64(col, *ival),
                     _ => return Ok(()),
                 };
-                bitmap::and_into_bool(&bm, mask);
+                // W5A-T2: AVX-512BW bitwise AND on packed bytes
+                // (was `and_into_bool` byte expansion).
+                mask.and_inplace(&bm);
             }
             (ColType::Date, Value2::Date(dval)) => {
                 let target = *dval as u64;
@@ -1081,7 +1107,7 @@ impl<'a> QueryInterpreter<'a> {
                     BinOp2::Ge => bitmap::filter_ge_u64(col, target),
                     _ => return Ok(()),
                 };
-                bitmap::and_into_bool(&bm, mask);
+                mask.and_inplace(&bm);
             }
             (ColType::Float, Value2::Float(fval)) => {
                 let bm = match op {
@@ -1093,7 +1119,7 @@ impl<'a> QueryInterpreter<'a> {
                     BinOp2::Ge => bitmap::filter_ge_f64(col, *fval),
                     _ => return Ok(()),
                 };
-                bitmap::and_into_bool(&bm, mask);
+                mask.and_inplace(&bm);
             }
             (ColType::Float, Value2::Int(ival)) => {
                 let fval = *ival as f64;
@@ -1106,18 +1132,18 @@ impl<'a> QueryInterpreter<'a> {
                     BinOp2::Ge => bitmap::filter_ge_f64(col, fval),
                     _ => return Ok(()),
                 };
-                bitmap::and_into_bool(&bm, mask);
+                mask.and_inplace(&bm);
             }
             (ColType::String, Value2::Str(sval)) => {
                 let target_hash = xxhash_rust::xxh3::xxh3_64(sval.as_bytes());
                 match op {
                     BinOp2::Eq => {
                         let bm = bitmap::filter_eq_u64(col, target_hash);
-                        bitmap::and_into_bool(&bm, mask);
+                        mask.and_inplace(&bm);
                     }
                     BinOp2::Ne => {
                         let bm = bitmap::filter_ne_u64(col, target_hash);
-                        bitmap::and_into_bool(&bm, mask);
+                        mask.and_inplace(&bm);
                     }
                     _ => {}
                 }
@@ -1125,7 +1151,7 @@ impl<'a> QueryInterpreter<'a> {
             _ => {
                 // Fallback: per-row eval
                 for i in 0..n {
-                    if !mask[i] {
+                    if !mask.get(i) {
                         continue;
                     }
                     let cv = unsafe { std::ptr::read(col.as_ptr().add(i)) };
@@ -1144,7 +1170,9 @@ impl<'a> QueryInterpreter<'a> {
                         BinOp2::Ge => !self.cmp_lt(&v, val),
                         _ => false,
                     };
-                    mask[i] = mask[i] && matches;
+                    if !matches {
+                        mask.clear(i);
+                    }
                 }
             }
         }

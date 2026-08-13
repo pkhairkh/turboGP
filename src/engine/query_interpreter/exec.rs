@@ -3,6 +3,7 @@
 use crate::catalog::Catalog;
 use crate::datasource::table::Table;
 use crate::engine::result::{QueryResult, ResultColumn};
+use crate::exec::bitmap::Bitmap;
 use crate::exec::fm_index::StringSearchColumn;
 use crate::Error;
 use fxhash::{FxHashMap, FxHashSet};
@@ -69,7 +70,7 @@ impl<'a> QueryInterpreter<'a> {
             let mask = if let Some(ref wc) = query.where_clause {
                 self.build_mask(wc, &base)?
             } else {
-                vec![true; base.row_count]
+                Bitmap::all_ones(base.row_count)
             };
             (base, mask)
         } else {
@@ -87,7 +88,7 @@ impl<'a> QueryInterpreter<'a> {
                 .collect();
             let base = self.plan_join_dp(tables, &query.where_clause)?;
             let mask = if multi_table.is_empty() {
-                vec![true; base.row_count]
+                Bitmap::all_ones(base.row_count)
             } else {
                 // W2: evaluate each multi-table conjunct directly into the
                 // running mask. The simplified AND arm + fixed OR arm in
@@ -95,7 +96,9 @@ impl<'a> QueryInterpreter<'a> {
                 // leaf ANDs into it), so the previous per-conjunct
                 // `mask.clone()` (6 MB for a 6 M-row base table) is no
                 // longer needed.
-                let mut mask = vec![true; base.row_count];
+                // W5A-T2: mask is a packed Bitmap (1 bit/row) — 8x smaller
+                // than the prior `vec![true; N]`.
+                let mut mask = Bitmap::all_ones(base.row_count);
                 for conj in &multi_table {
                     self.eval_bool_mask_vec(conj, &base, &mut mask)?;
                 }
@@ -110,7 +113,9 @@ impl<'a> QueryInterpreter<'a> {
         }
 
         // 6. Non-grouped: filter, project, order, limit
-        let indices: Vec<usize> = (0..base.row_count).filter(|&i| mask[i]).collect();
+        // W5A-T2: `iter_set_bits()` (tzcnt-based) skips false rows without
+        // a branch per row.
+        let indices: Vec<usize> = mask.iter_set_bits().collect();
         let result = self.project(&query.select, &base, &indices)?;
         let mut result = if !query.order_by.is_empty() {
             self.apply_order_by(result, &query.order_by, &base, &indices, query.limit)?

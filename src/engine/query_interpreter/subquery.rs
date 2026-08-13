@@ -3,6 +3,7 @@
 use crate::catalog::Catalog;
 use crate::datasource::table::Table;
 use crate::engine::result::{QueryResult, ResultColumn};
+use crate::exec::bitmap::Bitmap;
 use crate::exec::fm_index::StringSearchColumn;
 use crate::Error;
 use fxhash::{FxHashMap, FxHashSet};
@@ -428,8 +429,9 @@ impl<'a> QueryInterpreter<'a> {
         // Apply local (non-correlated) conjuncts only.
         // W2: evaluate each conjunct directly into `m` (the simplified
         // AND/OR arms in `eval_bool_mask_vec` preserve the incoming mask).
+        // W5A-T2: `m` is a packed Bitmap.
         let mask = {
-            let mut m = vec![true; base.row_count];
+            let mut m = Bitmap::all_ones(base.row_count);
             for conj in &local_conjuncts {
                 self.eval_bool_mask_vec(conj, &base, &mut m)?;
             }
@@ -443,7 +445,7 @@ impl<'a> QueryInterpreter<'a> {
         // Group rows by composite hash of inner corr cols.
         let mut groups: FxHashMap<u64, Vec<usize>> = new_fxhashmap();
         for i in 0..base.row_count {
-            if !mask[i] {
+            if !mask.get(i) {
                 continue;
             }
             let mut h: u64 = 0;
@@ -849,9 +851,10 @@ impl<'a> QueryInterpreter<'a> {
         // Apply the subquery's WHERE conjuncts, EXCEPT the correlated equi-join.
         // W2: evaluate each conjunct directly into `mask` (the simplified
         // AND/OR arms in `eval_bool_mask_vec` preserve the incoming mask).
+        // W5A-T2: `mask` is a packed Bitmap.
         let mask = if let Some(ref wc) = subquery.where_clause {
             let conjuncts = self.split_conjuncts(&subquery.where_clause);
-            let mut mask = vec![true; base.row_count];
+            let mut mask = Bitmap::all_ones(base.row_count);
             for conj in &conjuncts {
                 if self.is_conjunct_correlated(conj, &base) {
                     continue;
@@ -860,7 +863,7 @@ impl<'a> QueryInterpreter<'a> {
             }
             mask
         } else {
-            vec![true; base.row_count]
+            Bitmap::all_ones(base.row_count)
         };
         // Build hash set of inner col values — PARALLEL using rayon.
         // Split into chunks, each thread builds a local HashSet, then merge.
@@ -877,7 +880,7 @@ impl<'a> QueryInterpreter<'a> {
                 let end = std::cmp::min(start + CHUNK_SIZE, n);
                 let mut local = new_fxhashset();
                 for i in start..end {
-                    if mask[i] {
+                    if mask.get(i) {
                         local.insert(col[i]);
                     }
                 }
@@ -1125,9 +1128,10 @@ impl<'a> QueryInterpreter<'a> {
         };
         // W2: evaluate each conjunct directly into `mask` (the simplified
         // AND/OR arms in `eval_bool_mask_vec` preserve the incoming mask).
+        // W5A-T2: `mask` is a packed Bitmap.
         let mask = if let Some(ref wc) = subquery.where_clause {
             let conjuncts = self.split_conjuncts(&subquery.where_clause);
-            let mut mask = vec![true; base.row_count];
+            let mut mask = Bitmap::all_ones(base.row_count);
             for conj in &conjuncts {
                 if self.is_conjunct_correlated(conj, &base) {
                     continue;
@@ -1136,7 +1140,7 @@ impl<'a> QueryInterpreter<'a> {
             }
             mask
         } else {
-            vec![true; base.row_count]
+            Bitmap::all_ones(base.row_count)
         };
         let eq_col = &base.columns[inner_eq_idx];
         let neq_col = &base.columns[inner_neq_idx];
@@ -1152,7 +1156,7 @@ impl<'a> QueryInterpreter<'a> {
                 let end = std::cmp::min(start + CHUNK_SIZE, n);
                 let mut local: FxHashMap<u64, FxHashSet<u64>> = new_fxhashmap();
                 for i in start..end {
-                    if mask[i] {
+                    if mask.get(i) {
                         local.entry(eq_col[i]).or_default().insert(neq_col[i]);
                     }
                 }

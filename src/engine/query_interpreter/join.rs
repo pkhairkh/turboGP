@@ -82,9 +82,10 @@ impl<'a> QueryInterpreter<'a> {
             for conj in conjuncts {
                 let referenced = self.expr_table_refs(conj, &tables);
                 if referenced.len() == 1 && referenced.contains(&i) {
+                    // W5A-T2: `build_mask` returns a packed Bitmap;
+                    // `iter_set_bits()` skips filtered rows with tzcnt.
                     let mask = self.build_mask(conj, &tables[i])?;
-                    let indices: Vec<usize> =
-                        (0..tables[i].row_count).filter(|&r| mask[r]).collect();
+                    let indices: Vec<usize> = mask.iter_set_bits().collect();
                     tables[i] = self.filter_table(&tables[i], &indices);
                 }
             }
