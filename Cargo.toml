@@ -103,6 +103,10 @@ tokio = { version = "1", features = ["full"] }
 
 [features]
 default = []
+# Wave 6A-T1: per-query phase profiler for the query interpreter.
+# Compile with --features profile to enable phase timing (stderr output
+# at the end of each query). Zero cost when disabled.
+profile = []
 # External benchmark baselines. Compile with `--features bench-external` to enable
 # DuckDB (bundled libduckdb C++) and ClickHouse TCP client. Used by examples/bench_*.
 bench-external = ["dep:duckdb", "dep:clickhouse"]

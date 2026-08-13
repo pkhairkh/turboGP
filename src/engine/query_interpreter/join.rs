@@ -11,6 +11,7 @@ use rayon::prelude::*;
 
 use super::types::*;
 use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset};
+use super::profiler::{Phase, PROFILER};
 
 // W4: Selinger DP entry — holds cost/cardinality estimate + optimal partition.
 #[derive(Clone, Copy)]
@@ -427,6 +428,10 @@ impl<'a> QueryInterpreter<'a> {
         // filter narrows to 1 nation, then supplier=10K, then ~7K final),
         // 90%+ of probe keys are absent — the L1 bloom check lets us
         // skip the L2 directory probe entirely for those keys.
+        // W6A-T1: profile the build phase (JoinHashTable + BloomFilter
+        // construction). Explicitly dropped before the parallel probe
+        // starts so JoinBuild time excludes probe time.
+        let _build_g = PROFILER.section(Phase::JoinBuild);
         let mut build_hash = JoinHashTable::new(build_side.row_count);
         let mut bloom = BloomFilter::new(build_side.row_count);
         if keys.len() == 1 {
@@ -453,6 +458,7 @@ impl<'a> QueryInterpreter<'a> {
                 bloom.insert(key);
             }
         };
+        drop(_build_g); // end JoinBuild
 
         // --- Probe phase (PARALLEL morsel-driven) ---
         // Split the probe side into chunks, each thread probes independently
@@ -503,6 +509,9 @@ impl<'a> QueryInterpreter<'a> {
                 // might_contain costs ~10 cycles/key, while might_contain_batch
                 // costs ~20 cycles for 8 keys = 2.5 cycles/key (4x speedup on
                 // the bloom filter step, which is Q21's #1 hot spot).
+                // W6A-T1: profile the bloom probe (might_contain_batch
+                // loop). Explicitly dropped before the hash probe loop.
+                let _bloom_g = PROFILER.section(Phase::BloomProbe);
                 let chunk_len = end - start;
                 let mut probe_keys: Vec<u64> = Vec::with_capacity(chunk_len);
                 for p in start..end {
@@ -564,10 +573,17 @@ impl<'a> QueryInterpreter<'a> {
                     }
                     i += 1;
                 }
+                drop(_bloom_g); // end BloomProbe
 
                 // W1-B: Software prefetch distance (rows ahead). Literature default
                 // for hash-join probes is 8-32; tuned to K=8 on TPC-H (best total
                 // of 3 distances tested: K=8 total=11093, K=16 total=11224, K=32 total=111174).
+                // W6A-T1: profile the JoinHashTable probe loop
+                // (build_hash.probe_all + output construction). The
+                // guard drops at the end of this closure scope, so
+                // each rayon worker accumulates its own probe time
+                // into the global JoinHashProbe counter.
+                let _hash_g = PROFILER.section(Phase::JoinHashProbe);
                 const PREFETCH_DIST: usize = 8;
                 for (idx, p) in (start..end).enumerate() {
                     // W1-B: Prefetch the hash-table directory slot for the

@@ -12,9 +12,14 @@ use rayon::prelude::*;
 
 use super::types::*;
 use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset};
+use super::profiler::PROFILER;
 
 pub fn execute_interpreter(query: &SelectQuery2, catalog: &Catalog) -> Result<QueryResult, Error> {
-    QueryInterpreter {
+    // W6A-T1: reset the per-query phase profiler. The accumulator is a
+    // process-wide static; reset ensures each query's profile is
+    // independent. Zero-cost when the `profile` feature is disabled.
+    PROFILER.reset();
+    let result = QueryInterpreter {
         catalog,
         outer: std::cell::Cell::new(None),
         subquery_cache: std::cell::RefCell::new(new_hashmap()),
@@ -24,7 +29,11 @@ pub fn execute_interpreter(query: &SelectQuery2, catalog: &Catalog) -> Result<Qu
         decorrelated_cache: std::cell::RefCell::new(new_hashmap()),
         arena: crate::exec::arena::QueryArena::new(),
     }
-    .execute(query)
+    .execute(query);
+    // W6A-T1: dump the phase breakdown to stderr. No-op when the
+    // `profile` feature is disabled.
+    PROFILER.print();
+    result
 }
 
 impl<'a> QueryInterpreter<'a> {

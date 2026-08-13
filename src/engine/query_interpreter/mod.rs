@@ -21,6 +21,7 @@ pub mod exec;
 pub mod expr;
 pub mod join;
 pub mod parser;
+pub mod profiler;
 pub mod subquery;
 pub mod types;
 

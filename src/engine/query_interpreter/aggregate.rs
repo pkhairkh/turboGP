@@ -11,6 +11,7 @@ use rayon::prelude::*;
 
 use super::types::*;
 use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset};
+use super::profiler::{Phase, PROFILER};
 
 impl<'a> QueryInterpreter<'a> {
     pub(crate) fn has_agg(&self, select: &[SelectItem2]) -> bool {
@@ -509,6 +510,11 @@ impl<'a> QueryInterpreter<'a> {
         t: &ExecTable,
         mask: &Bitmap,
     ) -> Result<QueryResult, Error> {
+        // W6A-T1: profile the entire aggregation phase — scalar agg
+        // fast path, low-cardinality fast path, and the HashMap-based
+        // parallel grouping fallback. The guard drops on every return
+        // path (early or final), accumulating the active duration.
+        let _g = PROFILER.section(Phase::Aggregate);
         if query.group_by.is_empty() {
             // W5A-T2: `iter_set_bits()` (tzcnt) skips false rows without
             // a branch per row.

@@ -12,6 +12,7 @@ use rayon::prelude::*;
 
 use super::types::*;
 use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset};
+use super::profiler::{Phase, PROFILER};
 
 // =========================================================================
 // Top-N heap (W1 Task 1.3) — O(N log K) replacement for full sort + truncate
@@ -416,6 +417,8 @@ impl<'a> QueryInterpreter<'a> {
     // --- WHERE ---
 
     pub(crate) fn build_mask(&self, expr: &Expr2, table: &ExecTable) -> Result<Bitmap, Error> {
+        // W6A-T1: profile the WHERE-clause mask build.
+        let _g = PROFILER.section(Phase::FilterMask);
         // Try vectorized fast path first; fall back to per-row eval.
         // W5A-T2: mask is a packed Bitmap (1 bit/row) instead of Vec<bool>
         // (1 byte/row). The leaf comparison fast paths in `apply_comparison`
@@ -1352,6 +1355,10 @@ impl<'a> QueryInterpreter<'a> {
                 Ok(Value2::Int(if !self.truthy(&v) { 1 } else { 0 }))
             }
             Expr2::BinOp { op, left, right } => {
+                // W6A-T1: profile per-row arithmetic. Note: eval recurses,
+                // so nested BinOp/Extract expressions accumulate once per
+                // active guard (upper bound — see profiler.rs docs).
+                let _g = PROFILER.section(Phase::ExprEval);
                 let lv = self.eval(left, t, row)?;
                 let rv = self.eval(right, t, row)?;
                 Ok(self.binop(*op, &lv, &rv))
@@ -1406,6 +1413,9 @@ impl<'a> QueryInterpreter<'a> {
                 Ok(Value2::Null)
             }
             Expr2::Extract { field, expr } => {
+                // W6A-T1: profile EXTRACT (Q9 has EXTRACT(YEAR FROM
+                // o_orderdate) on every projection row).
+                let _g = PROFILER.section(Phase::ExprEval);
                 let v = self.eval(expr, t, row)?;
                 Ok(self.extract(field, &v))
             }
@@ -1489,6 +1499,14 @@ impl<'a> QueryInterpreter<'a> {
                 Ok(v)
             }
             Expr2::Exists { query, negated } => {
+                // W6A-T1: profile EXISTS decorrelation. Wraps both the
+                // one-time build (delegated to build_exists_hashset /
+                // build_exists_multi_map in subquery.rs — those are
+                // separately wrapped, so the build time is double-counted
+                // ONCE per ast_key, which is negligible vs the per-row
+                // probe cost across Q21's millions of lineitem rows) and
+                // the per-row bloom+hashset probe (the Q21 hot path).
+                let _g = PROFILER.section(Phase::Exists);
                 // Semi-join fast path: if the subquery has a single correlation
                 // column with an equi-join (e.g. `l_orderkey = o_orderkey`),
                 // build a hash set of inner col values ONCE and check membership.
@@ -1905,6 +1923,9 @@ impl<'a> QueryInterpreter<'a> {
         if order_by.is_empty() || result.row_count <= 1 {
             return Ok(result);
         }
+        // W6A-T1: profile the sort phase (key extraction + top-N heap +
+        // column reorder). Excludes the trivial early-return path above.
+        let _g = PROFILER.section(Phase::Sort);
         let mut sort_keys: Vec<Vec<(f64, bool)>> = Vec::with_capacity(result.row_count);
         for row_idx in 0..result.row_count {
             let mut keys = Vec::new();

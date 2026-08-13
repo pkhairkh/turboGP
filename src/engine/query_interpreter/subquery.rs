@@ -11,6 +11,7 @@ use rayon::prelude::*;
 
 use super::types::*;
 use super::{HashMap, HashSet, new_hashmap, new_hashset, new_fxhashmap, new_fxhashset};
+use super::profiler::{Phase, PROFILER};
 
 impl<'a> QueryInterpreter<'a> {
     pub(crate) fn precache_subqueries(&self, expr: &Expr2) {
@@ -838,6 +839,10 @@ impl<'a> QueryInterpreter<'a> {
         subquery: &SelectQuery2,
         inner_col_idx: usize,
     ) -> Result<(FxHashSet<u64>, crate::exec::bloom_filter::BloomFilter), Error> {
+        // W6A-T1: profile the one-time EXISTS hash-set + bloom build.
+        // The per-row probe (set.contains + bloom.might_contain) is
+        // profiled separately in expr.rs::eval (Expr2::Exists arm).
+        let _g = PROFILER.section(Phase::Exists);
         // Load the subquery's FROM table(s) and join them (no correlation).
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
@@ -1117,6 +1122,9 @@ impl<'a> QueryInterpreter<'a> {
         inner_eq_idx: usize,
         inner_neq_idx: usize,
     ) -> Result<FxHashMap<u64, FxHashSet<u64>>, Error> {
+        // W6A-T1: profile the one-time multi-column EXISTS HashMap build.
+        // Q21 hits this path (l_orderkey + l_suppkey correlation).
+        let _g = PROFILER.section(Phase::Exists);
         let mut tables: Vec<ExecTable> = Vec::new();
         for item in &subquery.from {
             tables.push(self.resolve_from_item(item)?);
