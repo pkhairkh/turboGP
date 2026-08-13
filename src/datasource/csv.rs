@@ -147,7 +147,18 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
             // sidecar duplicated storage (+16GB RSS at SF=10). The i32
             // filter kernels remain in bitmap.rs for future use.
             i32_columns.push(None);
-            as_i64.into_iter().map(|v| v as u64).collect()
+            // W25-T2: TPC-H float columns that may have integer-looking
+            // values in the CSV (e.g. l_quantity=17 instead of 17.00).
+            // tpc_h_col_types() identifies these as Float, so the SUM/AVG
+            // kernels do f64::from_bits(col[i]). If we store them as raw
+            // integers, f64::from_bits(17) = 8.4e-323 (denormalized),
+            // breaking all float aggregates. Fix: encode as f64::to_bits
+            // for known TPC-H float columns.
+            if is_tpch_float_column(name) {
+                as_i64.into_iter().map(|v| (v as f64).to_bits()).collect()
+            } else {
+                as_i64.into_iter().map(|v| v as u64).collect()
+            }
         } else {
             i32_columns.push(None);
             // Try f64
@@ -380,6 +391,28 @@ pub fn tpc_h_schema(table: &str) -> Option<Vec<(&'static str, TpcHType)>> {
         _ => return None,
     };
     Some(schema)
+}
+
+/// W25-T2: Check if a column name is a known TPC-H float column.
+/// TPC-H CSVs may store float values without decimal points (e.g.
+/// l_quantity=17 instead of 17.00). The generic read_csv() infers
+/// these as i64, but tpc_h_col_types() identifies them as Float.
+/// This mismatch causes SUM/AVG to interpret raw integers as f64
+/// bit patterns (f64::from_bits(17) = 8.4e-323, a denormalized
+/// float near zero), breaking all float aggregates.
+///
+/// This function returns true for column names that are Float64 in
+/// the TPC-H schema, so read_csv() can encode them as f64::to_bits
+/// even when the values parse as i64.
+pub fn is_tpch_float_column(name: &str) -> bool {
+    // Note: ps_availqty is Int64 in TPC-H, NOT Float64 — do not include it.
+    matches!(
+        name,
+        "l_quantity" | "l_extendedprice" | "l_discount" | "l_tax"
+            | "ps_supplycost"
+            | "s_acctbal" | "c_acctbal"
+            | "o_totalprice" | "p_retailprice"
+    )
 }
 
 /// Parse a 'YYYY-MM-DD' byte slice into days since Unix epoch
