@@ -2,7 +2,7 @@
 
 **Generated:** 2026-08-13 17:35:56 UTC
 **Sandbox:** root@192.248.158.130 (AMD EPYC-Turin, 125GB RAM)
-**turboGP commit:** 327f436 (post-Q9 bloom pushdown fix)
+**turboGP commit:** 6abf464 (post-W19 COUNT DISTINCT fusion)
 
 ## TPC-H SF=1 (22 queries, sequential execution)
 
