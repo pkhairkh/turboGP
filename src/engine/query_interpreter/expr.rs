@@ -1118,36 +1118,14 @@ impl<'a> QueryInterpreter<'a> {
                 }
             }
         } else if pb.len() >= 2 && pb[0] == b'%' && pb[pb.len() - 1] == b'%' && !pb[1..pb.len()-1].contains(&b'%') && !pattern.contains('_') {
-            // W18-T1: Parallel LIKE contains with pre-compiled Finder.
-            // The W14-T1 approach used memchr::memmem::find per row, which
-            // re-compiles the search state (rare bytes, shift tables) on
-            // each call. Pre-compiling a Finder once and reusing it across
-            // all 100M rows avoids this overhead.
-            //
-            // The remaining bottleneck is the 100M random-access pointer
-            // chases (Vec<String> → heap allocation per string). A flat
-            // buffer would fix this but requires changing the storage format
-            // at CSV load time — deferred to a future wave.
+            // W22-T1: Flat-buffer LIKE contains — whole-buffer memchr scan.
+            // Builds a flat byte buffer (all strings concatenated) + offsets,
+            // then scans the entire buffer with a single memchr::Finder pass.
+            // This replaces 100M random-access pointer chases (Vec<String> →
+            // heap allocation per string) with one sequential scan.
             let substring = &pattern[1..pb.len()-1];
-            let finder = memchr::memmem::Finder::new(substring.as_bytes());
-            use rayon::prelude::*;
-            let to_clear: Vec<usize> = (0..n)
-                .into_par_iter()
-                .chunks(65536)
-                .map(|chunk| {
-                    let mut local = Vec::new();
-                    for i in chunk {
-                        if finder.find(sc.get(i).as_bytes()).is_none() {
-                            local.push(i);
-                        }
-                    }
-                    local
-                })
-                .flatten()
-                .collect();
-            for i in to_clear {
-                mask.clear(i);
-            }
+            let flat_mask = sc.like_contains_mask_flat(substring);
+            mask.and_inplace(&flat_mask);
         } else {
             // General LIKE
             for i in 0..n {
