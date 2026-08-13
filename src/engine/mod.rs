@@ -1952,6 +1952,42 @@ impl QueryEngine {
         // materialized table.
         let expanded_sql = self.materialize_views_in_sql(sql);
 
+        // W7-T1: Route SELECT through the new interpreter FIRST.
+        //
+        // The interpreter (`query_interpreter`) is the optimized path: it
+        // uses the W5A packed `Bitmap` AVX-512 filter kernels (tzcnt-based
+        // iteration), FMA aggregation, the CedarDB-style `JoinHashTable`,
+        // the arena allocator, and the bloom-filter pushdown from W6. The
+        // old scalar executor (`dispatch.rs` → `executor.rs`) uses
+        // `Vec<bool>` filters and `std::collections::HashSet` for
+        // COUNT(DISTINCT) — it was the ClickBench path under the old
+        // fallback-only routing, which is why the W2/W5A AVX-512 work was
+        // effectively dead code on ClickBench (14.96× gap vs DuckDB).
+        //
+        // We skip this fast path when MVCC is active: the interpreter does
+        // not apply row-version visibility filtering, so routing through it
+        // would leak aborted/hidden rows. MVCC is never enabled for the
+        // benchmark suites (TPC-H / ClickBench), so this guard does not
+        // affect the gap-closure targets.
+        //
+        // If the interpreter returns Ok, we return immediately. If it
+        // returns Err (parse failure on an unsupported feature, e.g. window
+        // functions, or an execution error), we fall through to the old
+        // executor path below — which still handles window functions, PIVOT
+        // post-processing, MVCC visibility, and the indexed-lookup fast
+        // path.
+        if !self.mvcc_enabled {
+            match crate::engine::query_interpreter::parse_and_execute(&expanded_sql, &self.catalog) {
+                Ok(mut interpreter_result) => {
+                    interpreter_result.elapsed_us = start.elapsed().as_micros() as u64;
+                    return Ok(interpreter_result);
+                }
+                Err(_interp_err) => {
+                    // Fall through to the old executor path below.
+                }
+            }
+        }
+
         // Parse as SELECT.
         let (query, extensions) = match crate::sql::parse_with_extensions(&expanded_sql) {
             Ok(qe) => qe,
@@ -1959,6 +1995,9 @@ impl QueryEngine {
                 // The basic parser failed — try the TPC-H interpreter
                 // which has a richer parser (CASE, EXTRACT, subqueries,
                 // HAVING, arithmetic in aggregates, etc.).
+                // (Reaches here only when MVCC is enabled and the pre-check
+                // above was skipped, OR when the pre-check returned Err and
+                // the basic parser also fails.)
                 let mut interpreter_result =
                     crate::engine::query_interpreter::parse_and_execute(&expanded_sql, &self.catalog)?;
                 interpreter_result.elapsed_us = start.elapsed().as_micros() as u64;
