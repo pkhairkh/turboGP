@@ -137,19 +137,11 @@ pub fn read_csv(path: &str, has_header: bool) -> Result<LoadedTable, Box<dyn Err
         }
 
         let cells: Vec<u64> = if all_numeric {
-            // Wave 5C: populate i32 sidecar when all values fit in i32
-            // range (4 bytes/element vs 8 for u64 — halves filter
-            // memory bandwidth). The u64 cells are still populated
-            // (the sidecar is *additional*; non-filter paths still use
-            // the u64 column).
-            let all_i32 = as_i64
-                .iter()
-                .all(|&v| v >= i32::MIN as i64 && v <= i32::MAX as i64);
-            if all_i32 {
-                i32_columns.push(Some(as_i64.iter().map(|&v| v as i32).collect()));
-            } else {
-                i32_columns.push(None);
-            }
+            // W6C: i32 sidecar disabled — profiling showed TPC-H queries are
+            // EXISTS/JoinHashProbe-bound, not filter-bandwidth-bound. The
+            // sidecar duplicated storage (+16GB RSS at SF=10). The i32
+            // filter kernels remain in bitmap.rs for future use.
+            i32_columns.push(None);
             as_i64.into_iter().map(|v| v as u64).collect()
         } else {
             i32_columns.push(None);
@@ -602,27 +594,8 @@ pub fn read_tpc_h_csv(path: &str, table_name: &str) -> Result<LoadedTable, Box<d
         } else {
             None
         };
-        // Wave 5C: detect narrow Int64 columns. TPC-H DDL declares
-        // l_orderkey, l_partkey, l_suppkey, l_linenumber etc. as
-        // BIGINT, but their values at SF=1/SF=10 fit in i32 range,
-        // so we stash an i32 copy for the filter path.
-        let (_, t) = schema[i];
-        let i32_side = if t == TpcHType::Int64 {
-            let all_i32 = col_cells[i]
-                .iter()
-                .all(|&c| {
-                    let v = c as i64;
-                    v >= i32::MIN as i64 && v <= i32::MAX as i64
-                });
-            if all_i32 {
-                Some(col_cells[i].iter().map(|&c| c as i32).collect())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        i32_columns.push(i32_side);
+        // W6C: i32 sidecar disabled (see generic read_csv comment above).
+        i32_columns.push(None);
         columns.push(LoadedColumn {
             name: schema[i].0.to_string(),
             cells: std::mem::take(&mut col_cells[i]),
@@ -1069,13 +1042,13 @@ mod tests {
     /// `read_csv` populates the i32 sidecar for a narrow integer column
     /// (all values fit in i32 range).
     #[test]
-    fn read_csv_populates_i32_sidecar_for_narrow_int() {
+    fn read_csv_no_i32_sidecar_for_narrow_int_w6c() {
         let (_tmp, path) = write_tmp("id\n1\n2\n3\n100\n-7\n");
         let table = read_csv(&path, true).expect("read");
         assert_eq!(table.i32_columns.len(), 1);
-        let side = table.i32_columns[0].as_ref().expect("i32 sidecar for narrow int column");
-        assert_eq!(side, &[1i32, 2, 3, 100, -7]);
-        // u64 storage is still populated (the sidecar is additional).
+        // W6C: i32 sidecar disabled (was duplicating storage, +16GB RSS at SF=10)
+        assert!(table.i32_columns[0].is_none(), "i32 sidecar should be None after W6c");
+        // u64 storage is still populated.
         assert_eq!(table.columns[0].cells, vec![1u64, 2, 3, 100, (-7i64) as u64]);
     }
 
@@ -1114,7 +1087,7 @@ mod tests {
     /// columns (l_orderkey, l_partkey, l_suppkey, l_linenumber) all
     /// get the sidecar.
     #[test]
-    fn read_tpc_h_csv_lineitem_i32_sidecar() {
+    fn read_tpc_h_csv_lineitem_no_i32_sidecar_w6c() {
         let csv = "l_orderkey|l_partkey|l_suppkey|l_linenumber|l_quantity|l_extendedprice|l_discount|l_tax|l_returnflag|l_linestatus|l_shipdate|l_commitdate|l_receiptdate|l_shipinstruct|l_shipmode|l_comment\n\
                    1|155190|7706|1|17.00|21168.23|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|DELIVER IN PERSON|TRUCK|blah\n\
                    2|67310|7311|2|36.00|45983.16|0.09|0.06|N|O|1996-04-12|1996-02-28|1996-04-20|TAKE BACK RETURN|MAIL|blah2\n\
@@ -1123,18 +1096,11 @@ mod tests {
         let table = read_tpc_h_csv(&path, "lineitem").expect("read");
         assert_eq!(table.i32_columns.len(), 16);
 
-        // l_orderkey (col 0): Int64, values 1/2/3 → sidecar populated.
-        let orderkey = table.i32_columns[0].as_ref().expect("l_orderkey i32 sidecar");
-        assert_eq!(orderkey, &[1i32, 2, 3]);
-        // l_partkey (col 1): Int64, values 155190/67310/63700 → sidecar populated.
-        let partkey = table.i32_columns[1].as_ref().expect("l_partkey i32 sidecar");
-        assert_eq!(partkey, &[155190i32, 67310, 63700]);
-        // l_suppkey (col 2): Int64 → sidecar populated.
-        let suppkey = table.i32_columns[2].as_ref().expect("l_suppkey i32 sidecar");
-        assert_eq!(suppkey, &[7706i32, 7311, 3701]);
-        // l_linenumber (col 3): Int64 → sidecar populated.
-        let lineno = table.i32_columns[3].as_ref().expect("l_linenumber i32 sidecar");
-        assert_eq!(lineno, &[1i32, 2, 3]);
+        // W6C: i32 sidecar disabled — all should be None.
+        assert!(table.i32_columns[0].is_none(), "l_orderkey sidecar should be None");
+        assert!(table.i32_columns[1].is_none(), "l_partkey sidecar should be None");
+        assert!(table.i32_columns[2].is_none(), "l_suppkey sidecar should be None");
+        assert!(table.i32_columns[3].is_none(), "l_linenumber sidecar should be None");
 
         // l_quantity (col 4): Float64 → no sidecar.
         assert!(table.i32_columns[4].is_none());
