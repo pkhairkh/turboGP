@@ -869,6 +869,103 @@ impl<'a> QueryInterpreter<'a> {
                 }
                 Ok(())
             }
+            Expr2::Exists { query, negated } => {
+                // W6B-T1: Vectorized EXISTS probe. Replaces the per-row
+                // `self.eval(expr, t, i)` catchall (which called the
+                // scalar `Expr2::Exists` arm once per outer row, each
+                // doing a RefCell borrow + HashMap lookup + HashSet scan)
+                // with a single bulk pass that borrows the cache ONCE and
+                // iterates only the still-set mask bits via
+                // `Bitmap::iter_set_bits`. For Q21 (~80k outer rows x
+                // 2 EXISTS subqueries = 160k scalar probes), this eliminates
+                // the per-row RefCell/AST-key/cache-lookup overhead.
+                //
+                // The one-time build (build_exists_hashset /
+                // build_exists_multi_map) is separately profiled in
+                // subquery.rs; the `_g` guard here captures the new
+                // vectorized probe cost (replacing the prior per-row probe
+                // cost captured by the scalar `eval` Exists arm).
+                let _g = PROFILER.section(Phase::Exists);
+                let ast_key = (query.as_ref() as *const SelectQuery2) as usize;
+
+                // ---- Multi-column fast path (Q21 path: equi-join + inequality) ----
+                // Pattern: EXISTS (SELECT * FROM inner WHERE inner.k = outer.k
+                // AND inner.v <> outer.v). Build HashMap<equi_key,
+                // HashSet<ineq_val>> once, then per outer row: look up the
+                // equi_key and check if any ineq_val differs from outer's.
+                if let Some((outer_eq_idx, inner_eq_idx, outer_neq_idx, inner_neq_idx)) =
+                    self.find_exists_multi_col(query, t)
+                {
+                    let need_build = !self.exists_multi_cache.borrow().contains_key(&ast_key);
+                    if need_build {
+                        let map =
+                            self.build_exists_multi_map(query, inner_eq_idx, inner_neq_idx)?;
+                        self.exists_multi_cache.borrow_mut().insert(ast_key, map);
+                    }
+                    // Borrow the cache ONCE for the whole probe loop.
+                    let cache = self.exists_multi_cache.borrow();
+                    if let Some(map) = cache.get(&ast_key) {
+                        let outer_eq_col: &[u64] = &t.columns[outer_eq_idx];
+                        let outer_neq_col: &[u64] = &t.columns[outer_neq_idx];
+                        // Collect failing rows during iteration, then clear
+                        // them after. We can't clear inside the
+                        // `iter_set_bits()` loop because the iterator
+                        // holds an immutable borrow of `mask`.
+                        let mut to_clear: Vec<usize> = Vec::new();
+                        for i in mask.iter_set_bits() {
+                            let outer_eq = outer_eq_col[i];
+                            let outer_neq = outer_neq_col[i];
+                            // O(1) fast path on the inner HashSet cardinality:
+                            //   empty set  -> no inner row matches the equi-key
+                            //                 -> exists = false
+                            //   len == 1   -> exists iff that single value
+                            //                 differs from outer_neq
+                            //                 (one hash lookup)
+                            //   len >= 2   -> the set holds DISTINCT values,
+                            //                 so at most one can equal
+                            //                 outer_neq; at least one other
+                            //                 value must differ
+                            //                 -> exists = true (no iteration)
+                            // This replaces the prior O(|set|) short-circuit
+                            // scan with an O(1) len check for the common Q21
+                            // case (most orderkeys have >=2 suppliers).
+                            let exists = match map.get(&outer_eq) {
+                                None => false,
+                                Some(set) if set.len() >= 2 => true,
+                                Some(set) => !set.is_empty() && !set.contains(&outer_neq),
+                            };
+                            let pass = if *negated { !exists } else { exists };
+                            if !pass {
+                                to_clear.push(i);
+                            }
+                        }
+                        // Release the cache borrow before mutating `mask`
+                        // (not strictly required — different RefCells — but
+                        // makes the borrow scope explicit).
+                        drop(cache);
+                        for i in to_clear {
+                            mask.clear(i);
+                        }
+                        return Ok(());
+                    }
+                }
+
+                // ---- Fallback: per-row correlated subquery execution ----
+                // Neither fast path applied (e.g. EXISTS with a non-equi
+                // correlation or 3+ correlation columns). Defer to the
+                // scalar `eval` Exists arm, which sets up the outer
+                // context and re-executes the subquery per row.
+                for i in 0..t.row_count {
+                    if !mask.get(i) {
+                        continue;
+                    }
+                    let v = self.eval(expr, t, i)?;
+                    if !self.truthy(&v) {
+                        mask.clear(i);
+                    }
+                }
+                Ok(())
+            }
             _ => {
                 // Fallback: per-row eval for unrecognized shapes
                 for i in 0..t.row_count {
