@@ -419,6 +419,83 @@ impl<'a> QueryInterpreter<'a> {
     ) -> Result<Option<QueryResult>, Error> {
         use rayon::prelude::*;
 
+        let n = t.row_count;
+        let count = mask.count_ones();
+
+        // W15-T1: Sort-based GROUP BY for high-cardinality cases.
+        // The HashMap-based approach struggles with 100M groups due to
+        // random-access insertion and resize overhead. The sort-based
+        // approach: compute (hash, row_idx) pairs, sort by hash, then
+        // group consecutive equal hashes (sequential scan, cache-friendly).
+        //
+        // For full-mask (no WHERE), we skip the mask iteration entirely
+        // and iterate the column directly.
+        //
+        // For low-cardinality cases (count < 1M), the HashMap approach is
+        // faster (no sort overhead), so we keep the old path.
+
+        if count > 1_000_000 {
+            // Build (hash, row_idx) pairs.
+            let mut pairs: Vec<(u64, u32)> = if count == n {
+                // Full mask — iterate directly.
+                (0..n)
+                    .into_par_iter()
+                    .map(|i| {
+                        let mut key_hash: u64 = 0;
+                        for &ci in gb_cols {
+                            let v = t.columns[ci][i];
+                            key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
+                        }
+                        (key_hash, i as u32)
+                    })
+                    .collect()
+            } else {
+                // Filtered — iterate mask bits.
+                let indices: Vec<usize> = mask.iter_set_bits().collect();
+                indices
+                    .par_iter()
+                    .map(|&i| {
+                        let mut key_hash: u64 = 0;
+                        for &ci in gb_cols {
+                            let v = t.columns[ci][i];
+                            key_hash = key_hash.wrapping_mul(0x517cc1b727220a95).wrapping_add(v);
+                        }
+                        (key_hash, i as u32)
+                    })
+                    .collect()
+            };
+
+            // Parallel sort by hash.
+            pairs.par_sort_unstable_by_key(|(h, _)| *h);
+
+            // Group consecutive equal hashes — sequential scan.
+            // Each group: (count, first_row_idx).
+            let mut groups: Vec<(u64, u64)> = Vec::with_capacity(pairs.len() / 2);
+            if !pairs.is_empty() {
+                let mut cur_hash = pairs[0].0;
+                let mut cur_count: u64 = 1;
+                let mut cur_first: u64 = pairs[0].1 as u64;
+                for &(h, row_idx) in &pairs[1..] {
+                    if h == cur_hash {
+                        cur_count += 1;
+                    } else {
+                        groups.push((cur_count, cur_first));
+                        cur_hash = h;
+                        cur_count = 1;
+                        cur_first = row_idx as u64;
+                    }
+                }
+                groups.push((cur_count, cur_first));
+            }
+
+            // Continue with HAVING / ORDER BY / LIMIT / column building
+            // (same as the HashMap path below).
+            return self.finish_fast_count_grouped(
+                query, t, &groups, slots, slot_offsets, having_filter, order_spec,
+            );
+        }
+
+        // Low-cardinality path: HashMap-based (original).
         let indices: Vec<usize> = mask.iter_set_bits().collect();
         let n_indices = indices.len();
         const GROUP_CHUNK_SIZE: usize = 65536;
@@ -461,7 +538,27 @@ impl<'a> QueryInterpreter<'a> {
         }
 
         // Collect groups: Vec<(count, first_row_idx)>.
-        let mut groups: Vec<(u64, u64)> = global.into_values().collect();
+        let groups: Vec<(u64, u64)> = global.into_values().collect();
+
+        // Shared HAVING / ORDER BY / LIMIT / column building.
+        self.finish_fast_count_grouped(
+            query, t, &groups, slots, slot_offsets, having_filter, order_spec,
+        )
+    }
+
+    /// Shared finishing logic for the fast-count GROUP BY path:
+    /// HAVING filter, ORDER BY, LIMIT, and result column construction.
+    fn finish_fast_count_grouped(
+        &self,
+        query: &SelectQuery2,
+        t: &ExecTable,
+        groups: &[(u64, u64)],
+        slots: &[AccSlot],
+        slot_offsets: &[usize],
+        having_filter: Option<(usize, BinOp2, i64)>,
+        order_spec: Option<(usize, bool)>,
+    ) -> Result<Option<QueryResult>, Error> {
+        let mut groups: Vec<(u64, u64)> = groups.to_vec();
 
         // Find the CountAll slot offset (for HAVING/ORDER BY).
         let countall_offset: Option<usize> = slots.iter().enumerate().find_map(|(i, s)| {
@@ -474,8 +571,6 @@ impl<'a> QueryInterpreter<'a> {
 
         // HAVING: only supports filtering by COUNT(*) (slot offset = countall_offset).
         if let Some((slot_idx, op, val)) = having_filter {
-            // The having_filter slot_idx is an offset into the Vec<u64> layout.
-            // For the fast-count path, only COUNT(*) is supported.
             if Some(slot_idx) == countall_offset {
                 groups.retain(|(count, _)| {
                     let v = *count as i64;
@@ -490,8 +585,6 @@ impl<'a> QueryInterpreter<'a> {
                     }
                 });
             } else {
-                // HAVING on a GROUP BY col — need the column value.
-                // Look up the slot's GroupByCol index.
                 let gb_col_idx = slots.iter().enumerate().find_map(|(i, s)| {
                     if slot_offsets[i] == slot_idx {
                         if let AccSlot::GroupByCol(ci) = s {
@@ -520,12 +613,10 @@ impl<'a> QueryInterpreter<'a> {
         // ORDER BY: sort by the slot referenced.
         if let Some((slot_idx, desc)) = order_spec {
             if Some(slot_idx) == countall_offset {
-                // Sort by count.
                 groups.sort_by(|a, b| {
                     if desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) }
                 });
             } else {
-                // Sort by a GROUP BY column — look up the value from first_idx.
                 let gb_col_idx = slots.iter().enumerate().find_map(|(i, s)| {
                     if slot_offsets[i] == slot_idx {
                         if let AccSlot::GroupByCol(ci) = s {
@@ -566,7 +657,7 @@ impl<'a> QueryInterpreter<'a> {
                     }
                 })
                 .collect();
-            let _ = off; // suppress unused warning
+            let _ = off;
             cols.push(ResultColumn {
                 name,
                 values,
